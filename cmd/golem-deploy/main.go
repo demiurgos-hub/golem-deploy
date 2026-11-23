@@ -95,6 +95,30 @@ func envBool(key string) (bool, error) {
 	return b, nil
 }
 
+func envInt(key string) (int, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid integer %q", key, v)
+	}
+	return n, nil
+}
+
+func envFloat(key string) (float64, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return 0, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid number %q", key, v)
+	}
+	return f, nil
+}
+
 func dataDirFlag(fs *flag.FlagSet) *string {
 	return fs.String("data-dir", envDefault("GOLEM_DEPLOY_DATA_DIR", "./data"), "data directory (env GOLEM_DEPLOY_DATA_DIR)")
 }
@@ -112,6 +136,20 @@ func cmdServe(args []string, stderr io.Writer) int {
 	tlsCert := fs.String("tls-cert", envDefault("GOLEM_DEPLOY_TLS_CERT", ""), "TLS certificate file (env GOLEM_DEPLOY_TLS_CERT)")
 	tlsKey := fs.String("tls-key", envDefault("GOLEM_DEPLOY_TLS_KEY", ""), "TLS private key file (env GOLEM_DEPLOY_TLS_KEY)")
 	insecure := fs.Bool("insecure-http", insecureDefault, "allow plaintext HTTP on a non-loopback address, e.g. behind a TLS-terminating proxy (env GOLEM_DEPLOY_INSECURE_HTTP)")
+	portRange := fs.String("port-range", envDefault("GOLEM_DEPLOY_PORT_RANGE", "7000-7099"), "host port range for game servers, published as UDP and TCP (env GOLEM_DEPLOY_PORT_RANGE)")
+	portBind := fs.String("port-bind-address", envDefault("GOLEM_DEPLOY_PORT_BIND_ADDRESS", ""), "host IP game server ports are published on; empty means all interfaces (env GOLEM_DEPLOY_PORT_BIND_ADDRESS)")
+	memDefault, err := envInt("GOLEM_DEPLOY_SERVER_MEMORY_MB")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	cpuDefault, err := envFloat("GOLEM_DEPLOY_SERVER_CPUS")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	memoryMB := fs.Int("server-memory-mb", memDefault, "memory limit per server container in MiB; 0 means unlimited (env GOLEM_DEPLOY_SERVER_MEMORY_MB)")
+	cpus := fs.Float64("server-cpus", cpuDefault, "CPU limit per server container; 0 means unlimited (env GOLEM_DEPLOY_SERVER_CPUS)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -124,14 +162,18 @@ func cmdServe(args []string, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err = daemon.Run(ctx, daemon.Options{
-		DataDir:      *dataDir,
-		Listen:       *listen,
-		TLSCert:      *tlsCert,
-		TLSKey:       *tlsKey,
-		InsecureHTTP: *insecure,
-		Version:      buildVersion(),
-		Logger:       logger,
-		SPA:          frontend.Handler(),
+		DataDir:         *dataDir,
+		Listen:          *listen,
+		TLSCert:         *tlsCert,
+		TLSKey:          *tlsKey,
+		InsecureHTTP:    *insecure,
+		PortRange:       *portRange,
+		PortBindAddress: *portBind,
+		ServerMemoryMB:  *memoryMB,
+		ServerCPUs:      *cpus,
+		Version:         buildVersion(),
+		Logger:          logger,
+		SPA:             frontend.Handler(),
 	})
 	if err != nil {
 		logger.Error("golem-deploy failed", "err", err)

@@ -72,8 +72,7 @@ func TestValidateEnv(t *testing.T) {
 func TestValidateRefs(t *testing.T) {
 	for ref, ok := range map[string]bool{
 		"game:latest": true, "registry.local/team/game:v1": true, "sha256:" + strings.Repeat("a", 64): true,
-		"game@sha256:" + strings.Repeat("b", 64): true,
-		"": false, "-rm": false, "--privileged": false, "a b": false, "a\nb": false, "../x": false,
+		"game@sha256:" + strings.Repeat("b", 64): true, "": false, "-rm": false, "--privileged": false, "a b": false, "a\nb": false, "../x": false,
 	} {
 		if err := ValidateImageRef(ref); (err == nil) != ok {
 			t.Errorf("image ref %q: err=%v, want ok=%v", ref, err, ok)

@@ -37,6 +37,7 @@ const (
 	JobKindServerStart   JobKind = "server.start"
 	JobKindServerStop    JobKind = "server.stop"
 	JobKindServerRestart JobKind = "server.restart"
+	JobKindServerDelete  JobKind = "server.delete"
 )
 
 // Job is a long-running operation. Routes that start one respond 202 with the

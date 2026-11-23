@@ -40,7 +40,9 @@ type Server struct {
 	// ProjectID is the project the image was built from; null for servers
 	// using an image not built by Golem Deploy, or after that project was
 	// deleted. Immutable.
-	ProjectID    *int64       `json:"project_id" tstype:"number | null,required"`
+	ProjectID *int64 `json:"project_id" tstype:"number | null,required"`
+	// Image is the immutable id ("sha256:...") of the managed image the
+	// server runs; references given on create/update are resolved to it.
 	Image        string       `json:"image"`
 	Port         int          `json:"port"`
 	EnvKeys      []string     `json:"env_keys"`
@@ -50,8 +52,12 @@ type Server struct {
 	ContainerID string      `json:"container_id"`
 	StartedAt   *time.Time  `json:"started_at" tstype:"string | null,required"`
 	ExitCode    *int        `json:"exit_code" tstype:"number | null,required"`
-	CreatedAt   time.Time   `json:"created_at"`
-	UpdatedAt   time.Time   `json:"updated_at"`
+	// RestartRequired is true when the container is running with an older
+	// definition (image, port, env or daemon run settings changed since it
+	// was started). Changes never restart a server implicitly.
+	RestartRequired bool      `json:"restart_required"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // ServerList is the body of GET /api/v1/servers.
@@ -59,10 +65,13 @@ type ServerList struct {
 	Items []Server `json:"items"`
 }
 
-// CreateServerRequest is the body of POST /api/v1/servers. Port, when absent,
-// is auto-assigned from the configured port range. Env keys must match
-// ^[A-Za-z_][A-Za-z0-9_]*$. DesiredState defaults to "stopped"; "running"
-// starts the server right after creation.
+// CreateServerRequest is the body of POST /api/v1/servers. Image is the id or
+// a tag of a managed image (it is stored as the resolved image id). Port,
+// when absent, is auto-assigned from the configured port range. Env keys must
+// match ^[A-Za-z_][A-Za-z0-9_]{0,127}$, be unique ignoring case and not be
+// reserved (DOCKER_*, PATH, HOME, proxy variables, ...); at most 128
+// variables and 64 KiB in total. DesiredState defaults to "stopped";
+// "running" starts a server.start job right after creation.
 type CreateServerRequest struct {
 	Name         string            `json:"name"`
 	ProjectID    *int64            `json:"project_id,omitempty"`
@@ -97,7 +106,9 @@ type ServerStats struct {
 }
 
 // ServerSpec is the portable definition of one server in an export.
-// Project is referenced by name because ids differ between hosts.
+// Project is referenced by name because ids differ between hosts. On import,
+// Image must name a managed image present on the host and DesiredState is
+// validated but imported servers are always created stopped.
 type ServerSpec struct {
 	Name         string            `json:"name"`
 	Project      string            `json:"project,omitempty"`

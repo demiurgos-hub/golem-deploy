@@ -87,6 +87,45 @@ func (s *Store) CreateServer(ctx context.Context, sv Server, seal SealFunc) (Ser
 	return out, err
 }
 
+// CreateServers inserts every server of list in one transaction: either all
+// are created or none (ErrConflict when a name or port is taken). seal, when
+// non-nil, is called with each server's index and new id inside the
+// transaction and its result stored as that server's env.
+func (s *Store) CreateServers(ctx context.Context, list []Server, seal func(i int, id int64) ([]byte, error)) ([]Server, error) {
+	out := make([]Server, 0, len(list))
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		now := formatTime(s.nowUTC())
+		for i, sv := range list {
+			if sv.DesiredState == "" {
+				sv.DesiredState = "stopped"
+			}
+			created, err := scanServer(tx.QueryRowContext(ctx,
+				`INSERT INTO servers (name, project_id, image, port, env, desired_state, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, NULL, ?, ?, ?) RETURNING `+serverCols,
+				sv.Name, nullInt64(sv.ProjectID), sv.Image, intPtrArg(sv.Port), sv.DesiredState, now, now))
+			if err != nil {
+				return mapErr("create servers", err)
+			}
+			if seal != nil {
+				ct, err := seal(i, created.ID)
+				if err != nil {
+					return err
+				}
+				if _, err := tx.ExecContext(ctx, `UPDATE servers SET env = ? WHERE id = ?`, blobArg(ct), created.ID); err != nil {
+					return mapErr("create servers", err)
+				}
+				created.Env = ct
+			}
+			out = append(out, created)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GetServer returns server id, or ErrNotFound.
 func (s *Store) GetServer(ctx context.Context, id int64) (Server, error) {
 	sv, err := scanServer(s.db.QueryRowContext(ctx, `SELECT `+serverCols+` FROM servers WHERE id = ?`, id))
@@ -133,6 +172,22 @@ func (s *Store) UpdateServer(ctx context.Context, sv Server) (Server, error) {
 		return Server{}, mapErr("update server", err)
 	}
 	return out, nil
+}
+
+// SetServerDesiredState sets only desired_state (and updated_at) of server
+// id, so it never overwrites a concurrent change of other columns.
+func (s *Store) SetServerDesiredState(ctx context.Context, id int64, state string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE servers SET desired_state = ?, updated_at = ? WHERE id = ? AND desired_state <> ?`,
+		state, formatTime(s.nowUTC()), id, state)
+	if err != nil {
+		return mapErr("set server desired state", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if _, err := s.GetServer(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // DeleteServer deletes server id.

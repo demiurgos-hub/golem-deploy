@@ -47,32 +47,32 @@ func (s *Server) routes() []route {
 		{method: "POST", path: "/projects/{id}/branch", access: AccessDeveloper, handler: ni},
 		{method: "GET", path: "/projects/{id}/branches", access: AccessDeveloper, handler: ni},
 
-		// Servers (task C).
-		{method: "GET", path: "/servers", access: AccessDeveloper, handler: ni},
-		{method: "POST", path: "/servers", access: AccessDeveloper, handler: ni},
-		{method: "GET", path: "/servers/export", access: AccessAdmin, handler: ni},
-		{method: "POST", path: "/servers/import", access: AccessAdmin, handler: ni},
-		{method: "GET", path: "/servers/{id}", access: AccessDeveloper, handler: ni},
-		{method: "PATCH", path: "/servers/{id}", access: AccessDeveloper, handler: ni},
-		{method: "DELETE", path: "/servers/{id}", access: AccessDeveloper, handler: ni},
-		{method: "POST", path: "/servers/{id}/start", access: AccessDeveloper, handler: ni},
-		{method: "POST", path: "/servers/{id}/stop", access: AccessDeveloper, handler: ni},
-		{method: "POST", path: "/servers/{id}/restart", access: AccessDeveloper, handler: ni},
-		{method: "GET", path: "/servers/{id}/logs", access: AccessDeveloper, handler: ni},
-		{method: "GET", path: "/servers/{id}/stats", access: AccessDeveloper, handler: ni},
+		// Servers.
+		{method: "GET", path: "/servers", access: AccessDeveloper, handler: s.handleListServers},
+		{method: "POST", path: "/servers", access: AccessDeveloper, handler: s.handleCreateServer},
+		{method: "GET", path: "/servers/export", access: AccessAdmin, handler: s.handleExportServers},
+		{method: "POST", path: "/servers/import", access: AccessAdmin, handler: s.handleImportServers},
+		{method: "GET", path: "/servers/{id}", access: AccessDeveloper, handler: s.handleGetServer},
+		{method: "PATCH", path: "/servers/{id}", access: AccessDeveloper, handler: s.handleUpdateServer},
+		{method: "DELETE", path: "/servers/{id}", access: AccessDeveloper, handler: s.handleDeleteServer},
+		{method: "POST", path: "/servers/{id}/start", access: AccessDeveloper, handler: s.handleStartServer()},
+		{method: "POST", path: "/servers/{id}/stop", access: AccessDeveloper, handler: s.handleStopServer()},
+		{method: "POST", path: "/servers/{id}/restart", access: AccessDeveloper, handler: s.handleRestartServer()},
+		{method: "GET", path: "/servers/{id}/logs", access: AccessDeveloper, handler: s.handleServerLogs},
+		{method: "GET", path: "/servers/{id}/stats", access: AccessDeveloper, handler: s.handleServerStats},
 
-		// Images (task C).
-		{method: "GET", path: "/images", access: AccessDeveloper, handler: ni},
-		{method: "DELETE", path: "/images/{id}", access: AccessAdmin, handler: ni},
+		// Images.
+		{method: "GET", path: "/images", access: AccessDeveloper, handler: s.handleListImages},
+		{method: "DELETE", path: "/images/{id}", access: AccessAdmin, handler: s.handleDeleteImage},
 
-		// Static files (task C).
-		{method: "GET", path: "/static", access: AccessDeveloper, handler: ni},
-		{method: "POST", path: "/static", access: AccessDeveloper, handler: ni, maxBody: StaticUploadLimit},
-		{method: "GET", path: "/static/{name}", access: AccessDeveloper, handler: ni},
-		{method: "DELETE", path: "/static/{name}", access: AccessDeveloper, handler: ni},
+		// Static files.
+		{method: "GET", path: "/static", access: AccessDeveloper, handler: s.handleListStatic},
+		{method: "POST", path: "/static", access: AccessDeveloper, handler: s.handleUploadStatic, maxBody: StaticUploadLimit},
+		{method: "GET", path: "/static/{name}", access: AccessDeveloper, handler: s.handleDownloadStatic},
+		{method: "DELETE", path: "/static/{name}", access: AccessDeveloper, handler: s.handleDeleteStatic},
 
-		// Volumes (task C).
-		{method: "GET", path: "/volumes", access: AccessDeveloper, handler: ni},
-		{method: "DELETE", path: "/volumes/{name}", access: AccessAdmin, handler: ni},
+		// Volumes.
+		{method: "GET", path: "/volumes", access: AccessDeveloper, handler: s.handleListVolumes},
+		{method: "DELETE", path: "/volumes/{name}", access: AccessAdmin, handler: s.handleDeleteVolume},
 	}
 }

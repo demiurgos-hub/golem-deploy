@@ -7,18 +7,25 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"os/exec"
+	"net/netip"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
+	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/httpapi"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
+	"github.com/demiurgos-hub/golem-deploy/internal/ports"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
+	"github.com/demiurgos-hub/golem-deploy/internal/servers"
+	"github.com/demiurgos-hub/golem-deploy/internal/staticfiles"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -32,12 +39,54 @@ type Options struct {
 	Version      string
 	Logger       *slog.Logger
 	SPA          http.Handler
+	// PortRange is the host port range for game servers ("LO-HI"; default
+	// ports.DefaultRange).
+	PortRange string
+	// PortBindAddress is the host IP game ports are published on; empty
+	// means all interfaces.
+	PortBindAddress string
+	// ServerMemoryMB and ServerCPUs limit every server container (0 means
+	// unlimited).
+	ServerMemoryMB int
+	ServerCPUs     float64
 	// Ready, if set, is called with the bound address once serving.
 	Ready func(addr net.Addr)
 
 	bcryptCost  int                 // tests only; 0 means auth.DefaultBcryptCost
 	docker      httpapi.DockerProbe // tests only
+	dockerCLI   docker.Runner       // tests only; nil runs the docker CLI
 	storeClosed func(error)         // tests only
+}
+
+// serverConfig validates the game server settings.
+func serverConfig(o Options) (servers.Config, error) {
+	spec := o.PortRange
+	if spec == "" {
+		spec = ports.DefaultRange
+	}
+	rng, err := ports.Parse(spec)
+	if err != nil {
+		return servers.Config{}, err
+	}
+	panel := 0
+	if _, p, err := net.SplitHostPort(o.Listen); err == nil {
+		panel, _ = strconv.Atoi(p)
+	}
+	if err := rng.Validate(panel); err != nil {
+		return servers.Config{}, err
+	}
+	if o.PortBindAddress != "" {
+		if ip, err := netip.ParseAddr(o.PortBindAddress); err != nil || ip.Zone() != "" {
+			return servers.Config{}, fmt.Errorf("--port-bind-address %q is not an IP address", o.PortBindAddress)
+		}
+	}
+	if o.ServerMemoryMB < 0 || (o.ServerMemoryMB > 0 && o.ServerMemoryMB < 8) {
+		return servers.Config{}, errors.New("--server-memory-mb must be 0 (unlimited) or at least 8")
+	}
+	if o.ServerCPUs < 0 || o.ServerCPUs > 1024 {
+		return servers.Config{}, errors.New("--server-cpus must be between 0 (unlimited) and 1024")
+	}
+	return servers.Config{Ports: rng, BindAddress: o.PortBindAddress, MemoryMB: o.ServerMemoryMB, CPUs: o.ServerCPUs}, nil
 }
 
 // jobShutdownGrace bounds how long running jobs get to stop.
@@ -54,6 +103,10 @@ func Run(ctx context.Context, o Options) (err error) {
 		return errors.New("--tls-cert and --tls-key must be set together")
 	}
 	if err := httpapi.CheckListen(o.Listen, o.TLSCert != "", o.InsecureHTTP); err != nil {
+		return err
+	}
+	srvCfg, err := serverConfig(o)
+	if err != nil {
 		return err
 	}
 
@@ -112,10 +165,16 @@ func Run(ctx context.Context, o Options) (err error) {
 		logger.Warn("no approved admin account exists; create one with: golem-deploy admin create --username <name> --data-dir " + layout.Root)
 	}
 
+	static, err := staticfiles.Open(layout.Static())
+	if err != nil {
+		return err
+	}
 	runner := jobs.New(st, layout.JobLogs(), jobs.Options{Logger: logger})
-	probe := o.docker
-	if probe == nil {
-		probe = &dockerCLIProbe{}
+	dockerClient := docker.New(docker.Options{Runner: o.dockerCLI, Logger: logger})
+	svc := servers.New(st, box, dockerClient, srvCfg, logger)
+	var probe httpapi.DockerProbe = dockerClient
+	if o.docker != nil {
+		probe = o.docker
 	}
 	srv, err := httpapi.New(httpapi.Config{
 		Listen:       o.Listen,
@@ -131,6 +190,8 @@ func Run(ctx context.Context, o Options) (err error) {
 		Jobs:     runner,
 		Logger:   logger,
 		Docker:   probe,
+		Servers:  svc,
+		Static:   static,
 		SPA:      o.SPA,
 	})
 	if err != nil {
@@ -145,7 +206,8 @@ func Run(ctx context.Context, o Options) (err error) {
 	if o.TLSCert != "" {
 		scheme = "https"
 	}
-	logger.Info("golem-deploy listening", "addr", ln.Addr().String(), "scheme", scheme, "data_dir", layout.Root, "version", o.Version)
+	logger.Info("golem-deploy listening", "addr", ln.Addr().String(), "scheme", scheme, "data_dir", layout.Root, "version", o.Version,
+		"port_range", srvCfg.Ports.String())
 	if o.Ready != nil {
 		o.Ready(ln.Addr())
 	}
@@ -154,7 +216,11 @@ func Run(ctx context.Context, o Options) (err error) {
 	// the store is closed (deferred above) only after both have finished.
 	var wg sync.WaitGroup
 	var jobErr error
-	wg.Add(1)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		reconcileServers(ctx, svc, runner, logger)
+	}()
 	go func() {
 		defer wg.Done()
 		<-ctx.Done()
@@ -176,24 +242,17 @@ func Run(ctx context.Context, o Options) (err error) {
 	return jobErr
 }
 
-// dockerCLIProbe checks Docker with the docker CLI, caching the answer.
-type dockerCLIProbe struct {
-	mu      sync.Mutex
-	checked time.Time
-	ok      bool
-}
-
-const dockerProbeTTL = 15 * time.Second
-
-func (p *dockerCLIProbe) Reachable(ctx context.Context) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if time.Since(p.checked) < dockerProbeTTL {
-		return p.ok
-	}
-	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+// reconcileServers starts, as jobs, the servers whose desired state is
+// running but whose container is not (the job runner bounds concurrency).
+func reconcileServers(ctx context.Context, svc *servers.Service, runner *jobs.Runner, logger *slog.Logger) {
+	rctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	p.ok = exec.CommandContext(cctx, "docker", "version", "--format", "{{.Server.Version}}").Run() == nil
-	p.checked = time.Now()
-	return p.ok
+	err := svc.Reconcile(rctx, func(id int64) error {
+		_, err := runner.Start(rctx, string(apitypes.JobKindServerStart), jobs.Subject{Type: string(apitypes.SubjectTypeServer), ID: jobs.SubjectID(id)}, nil,
+			func(jctx context.Context, log io.Writer) error { return svc.Start(jctx, id, log) })
+		return err
+	})
+	if err != nil && ctx.Err() == nil {
+		logger.Warn("server reconciliation skipped", "err", err)
+	}
 }

@@ -112,7 +112,9 @@ func TestRunSpecOptionsAndExtensionPoints(t *testing.T) {
 		func(s *docker.RunSpec) { s.Env = map[string]string{"DOCKER_HOST": "tcp://evil"} },
 		func(s *docker.RunSpec) { s.Env = map[string]string{"A": "x\x00"} },
 		func(s *docker.RunSpec) { s.MemoryMB = 2 },
-		func(s *docker.RunSpec) { s.ReadOnlyBinds = []docker.BindMount{{Source: "/a,bind-propagation=shared", Target: "/b"}} },
+		func(s *docker.RunSpec) {
+			s.ReadOnlyBinds = []docker.BindMount{{Source: "/a,bind-propagation=shared", Target: "/b"}}
+		},
 		func(s *docker.RunSpec) { s.ReadOnlyBinds = []docker.BindMount{{Source: "relative", Target: "/b"}} },
 		func(s *docker.RunSpec) { s.DataVolume = &docker.VolumeMount{Name: "-x", Target: "/d"} },
 		func(s *docker.RunSpec) { s.ServerID = 0 },
