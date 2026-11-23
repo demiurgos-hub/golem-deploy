@@ -11,5 +11,5 @@ alwaysApply: false
 - Timestamps are TEXT in the fixed-width layout `2006-01-02T15:04:05.000Z` (lexically sortable); use `formatTime` and `parseTime`.
 - Methods return domain structs and the sentinels `ErrNotFound`, `ErrConflict` (UNIQUE violation), `ErrLastAdmin` and `ErrSelf`; HTTP mapping belongs to the caller. Keep SQL parameterised.
 - Encrypted columns (`projects.auth_secret`, `servers.env`) are opaque `[]byte` here. `CreateProject` and `CreateServer` take a `SealFunc` that is called with the new id inside the insert transaction, so ciphertext can be bound to the row. Fields holding secrets or hashes are tagged `json:"-"`.
-- `Reconcile` runs once at startup: active jobs become `error` "interrupted by daemon restart" and transient project statuses become `idle`. Update its status list when adding transient statuses.
+- `Reconcile` runs once at startup: active jobs become `error` "interrupted by daemon restart" and transient project statuses (`cloning`, `pulling`, `switching_branch`) become `error`. Update its status list when adding transient statuses. Project jobs and PATCH write disjoint columns (`SetProjectCheckout`, `UpdateProjectRemote`) so they cannot overwrite each other.
 - Verify with `go test ./internal/store/...`.

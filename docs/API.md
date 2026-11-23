@@ -49,7 +49,7 @@ Every non-2xx response has this body:
 | `rate_limited` | 429 | Too many attempts; wait `Retry-After` seconds |
 | `internal_error` | 500 | Unexpected failure; see the daemon log for the request id |
 | `not_implemented` | 501 | Route planned but not built yet |
-| `service_unavailable` | 503 | Docker unreachable or daemon shutting down |
+| `service_unavailable` | 503 | Docker or git unavailable, a Git remote failed (`/projects/{id}/branches`), or daemon shutting down |
 
 ## Authentication
 
@@ -122,24 +122,31 @@ Kinds: `project.clone`, `project.pull`, `project.branch`, `server.start`, `serve
 
 `/jobs/{id}/log` returns the log so far. With `follow=1` the response stays open and streams appended output (flushed per chunk) until the job ends, the client disconnects or the daemon shuts down. Browsers should read it with `fetch` and a `ReadableStream` (it needs the bearer header, so not `EventSource`).
 
-### Projects (task B)
+### Projects
 
-A project is a Git repository the daemon clones (and later builds). `Project` is `{id, name, repo_url, branch, auth_type, auth_username, has_secret, last_commit, last_pulled_at, status, created_at, updated_at}`; secrets are never returned. `status`: `idle`, `cloning`, `pulling`, `switching_branch`, `error`.
+A project is a Git repository the daemon clones (and later builds). `Project` is `{id, name, repo_url, branch, auth_type, auth_username, has_secret, last_commit, last_pulled_at, status, created_at, updated_at}`; secrets are never returned. `status`: `idle`, `cloning`, `pulling`, `switching_branch` (a job is active), `error` (the last clone failed, an operation failed after modifying the checkout, or the daemon restarted during an operation; a pull repairs it). Operators: see [REPOSITORIES.md](REPOSITORIES.md) for URL forms, credential handling and SSH host keys.
 
-| Method | Path | Access | Request | Response | Status |
-|--------|------|--------|---------|----------|--------|
-| GET | `/projects` | developer | — | 200 `ProjectList` | planned (task B) |
-| POST | `/projects` | admin | `CreateProjectRequest` `{name, repo_url, branch?, auth}` | 201 `CreateProjectResponse` `{project, job}` (clone job) | planned (task B) |
-| GET | `/projects/{id}` | developer | — | 200 `Project` | planned (task B) |
-| PATCH | `/projects/{id}` | admin | `UpdateProjectRequest` `{repo_url?, auth?}` | 200 `Project` | planned (task B) |
-| DELETE | `/projects/{id}` | admin | — | 204 | planned (task B) |
-| POST | `/projects/{id}/pull` | developer | — | 202 `Job` | planned (task B) |
-| POST | `/projects/{id}/branch` | developer | `SwitchBranchRequest` `{branch}` | 202 `Job` | planned (task B) |
-| GET | `/projects/{id}/branches` | developer | — | 200 `BranchList` `{current, items}` | planned (task B) |
+| Method | Path | Access | Request | Response | Status | Errors |
+|--------|------|--------|---------|----------|--------|--------|
+| GET | `/projects` | developer | — | 200 `ProjectList` (by name) | implemented | |
+| POST | `/projects` | admin | `CreateProjectRequest` `{name, repo_url, branch?, auth}` | 201 `CreateProjectResponse` `{project, job}` (`project.clone` job) | implemented | `validation_failed`, `name_taken`, `service_unavailable` |
+| GET | `/projects/{id}` | developer | — | 200 `Project` | implemented | `not_found` |
+| PATCH | `/projects/{id}` | admin | `UpdateProjectRequest` `{repo_url?, auth?}` | 200 `Project` | implemented | `validation_failed`, `not_found` |
+| DELETE | `/projects/{id}` | admin | — | 204 | implemented | `not_found`, `job_in_progress` |
+| POST | `/projects/{id}/pull` | developer | — | 202 `Job` (`project.pull`, or `project.clone` without a checkout) | implemented | `not_found`, `job_in_progress`, `service_unavailable` |
+| POST | `/projects/{id}/branch` | developer | `SwitchBranchRequest` `{branch}` | 202 `Job` (`project.branch`, or `project.clone` of that branch without a checkout) | implemented | `validation_failed`, `not_found`, `job_in_progress`, `service_unavailable` |
+| GET | `/projects/{id}/branches` | developer | — | 200 `BranchList` `{current, items}` | implemented | `not_found`, `service_unavailable` |
 
-- `name`: `^[a-z0-9][a-z0-9-]{0,62}$`, unique, immutable. `repo_url`: `https://…`, `ssh://…` or scp-style `user@host:path`; local paths and other schemes are rejected.
-- `auth` (`ProjectAuth`) is a union on `type`: `{"type":"none"}`, `{"type":"https","username":"…","password":"…"}`, `{"type":"ssh","private_key":"…"}`. Fields of other types are rejected. In PATCH, omit `auth` to keep the stored credentials; sending it replaces them entirely.
-- Expected errors: `validation_failed`, `name_taken`, `not_found`, `job_in_progress`.
+- `name`: `^[a-z0-9][a-z0-9-]{0,62}$`, unique, immutable. The checkout lives at `<data-dir>/repositories/<id>`; the name is never used in paths.
+- `repo_url`: `https://host[:port]/path`, `ssh://[user@]host[:port]/path` or scp-style `user@host:path`. Rejected: other schemes (including `http://`, `git://`, `file://`, `ext::`), local paths, user name or password inside https URLs (use `auth`), query strings, fragments, whitespace, control characters, backslashes and a leading `-`.
+- `branch`: optional on create (empty: the remote's default branch, recorded after the clone); rules of `git check-ref-format --branch`, at most 255 bytes, no leading `-`.
+- `auth` (`ProjectAuth`) is a union on `type`: `{"type":"none"}`, `{"type":"https","username":"…","password":"…"}` (https URLs only; password or access token, one line), `{"type":"ssh","private_key":"…"}` (SSH URLs only; unencrypted OpenSSH or PEM key — passphrase-protected keys are rejected; put the SSH user in the URL). Fields of other types are rejected. Validation errors name the field as `auth.type`, `auth.username`, `auth.password` or `auth.private_key`.
+- PATCH: omit `auth` to keep the stored credentials, send it to replace them entirely, `{"type":"none"}` clears them. Changing `repo_url` to a different kind (https ↔ SSH) requires `auth` of the new kind in the same request. A new URL does not re-clone: the next pull or branch switch points the checkout's `origin` at it and hard-resets to what it serves. PATCH never runs git and is allowed while a job runs (that job keeps the settings it started with).
+- Pull = fetch the project's branch, hard-reset the tree to it (`checkout -B` + `clean -ffdx`; local changes are discarded, there is no merge) and fetch Git LFS content; the job sets `last_commit`, `last_pulled_at` and `branch`. A failure before the tree is touched (network, authentication, missing branch) leaves `status` as it was; a later failure sets `error`.
+- DELETE refuses while a job is queued or running for the project. It removes the checkout first and the row second, so a failed delete can be retried; servers referencing the project keep running with `project_id: null`.
+- `/branches` asks the remote synchronously (30 s timeout); results are cached per project for 30 s (failures for 10 s) and at most 4 listings run at once. Remote failures answer `503 service_unavailable` with a safe message (e.g. authentication failed, remote unreachable). `current` is the project's checked-out branch.
+- Job `detail` on failure is a short safe message (e.g. `authentication with the Git remote failed; check the project's credentials`); the scrubbed git output is in the job log. Credentials never appear in responses, job details or logs.
+- When git is not installed on the host, routes that need it answer `503 service_unavailable`.
 
 ### Servers (task C)
 

@@ -1,13 +1,16 @@
 ---
-description: Git checkout library and the planned projects API
-globs: "{internal/git/**/*.go,internal/store/projects.go}"
+description: Hardened git runner and the projects API
+globs: "{internal/git/**/*.go,internal/httpapi/handlers_projects.go,internal/httpapi/projects_test.go,internal/store/projects.go,docs/REPOSITORIES.md}"
 alwaysApply: false
 ---
 
 # Repositories and projects
 
-- `internal/git` (clone, pull, branch via the host `git` binary) is legacy code kept compiling but **not wired to any HTTP route**; task B hardens it and implements the planned `/api/v1/projects` routes (types in `internal/apitypes/projects.go`, table `projects`, store methods in `internal/store/projects.go`).
-- Checkouts belong under the data directory's `repositories/` (`datadir.Layout.Repositories()`), never relative to the working directory. Validate names and derived paths before filesystem or command operations.
-- Clone, pull and branch switches run as jobs (`project.clone`, `project.pull`, `project.branch`) with subject `("project", id)`; update the project's transient status (`cloning`, `pulling`, `switching_branch`) and restore a terminal one on every exit path.
-- Credentials are stored encrypted in `projects.auth_secret` (purpose `secrets.ProjectAuthPurpose(id)`) and never returned, logged or written to job logs; responses expose only `auth_type`, `auth_username` and `has_secret`.
-- Verify with `go test ./internal/git/... ./internal/store/...`.
+- `internal/git` is a library (no HTTP). `Runner` owns the git binary, a minimal allowlisted environment (`filterEnv`), timeouts and per-operation sessions (private HOME, SSH key file, scrubbing log writer). Every command goes through `session.run`: `exec.CommandContext`, never a shell, `hardening()` `-c` options first, process-tree kill on cancel (`proc_unix.go`, `proc_windows.go`). Add new commands as `xxxArgs` functions and pin them in `TestArgv`.
+- Invariants: validate URLs and branches with `ValidateRemoteURL`/`ValidateBranch` before use; positional arguments follow `--` or `--end-of-options`; credentials never go into argv, URLs, `.git/config` or logs (HTTPS via `GIT_ASKPASS` = the golem-deploy binary, see `Askpass`, wired first thing in `cmd/golem-deploy/main.go`; SSH via a 0600 key file in the session dir); everything written to the job log passes the `scrubber`; `Auth` renders without secrets in fmt and slog.
+- Failures are `*git.Error` with a `Reason` (classified from scrubbed English output, `LC_ALL=C`) and `Unchanged` (checkout untouched); show users only `Message()`/`SafeMessage`, never git output.
+- Clone stages under the temp dir and renames into place; pull/branch = set-url, explicit fetch, `checkout --force -B`, `clean -ffdx`, then `git lfs pull` when `.gitattributes` uses `filter=lfs` (filter config is passed per command because global/system config is disabled).
+- Checkouts are `<datadir>/repositories/<project id>` (`git.CheckoutDir`), never derived from names. Delete through `git.RemoveCheckout` (containment check, symlinks not followed, moved aside first). `SweepTemp`/`SweepCheckouts` run at daemon startup.
+- HTTP (`handlers_projects.go`): handlers depend on the `GitClient` interface (`Deps.Git`, nil means 503) so tests inject a fake. Job start and delete decisions hold `projectState.mu`; jobs own the project status (transient on start; idle, previous or error on exit) and update the row with `SetProjectCheckout`; PATCH uses `UpdateProjectRemote` and never runs git. Secrets are sealed with `secrets.ProjectAuthPurpose(id)` and only `auth_type`, `auth_username`, `has_secret` are returned.
+- Integration tests serve bare repos over loopback HTTPS (`git http-backend` via `net/http/cgi`, CA via `GIT_SSL_CAINFO`); `TestMain` makes the test binary the askpass helper. They skip when git or `git-http-backend` is missing.
+- Verify with `go test ./internal/git/... ./internal/httpapi/... ./internal/store/...`.

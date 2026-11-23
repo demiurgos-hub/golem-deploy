@@ -430,8 +430,10 @@ export const ProjectAuthTypeSSH = "ssh";
 export type ProjectAuthType = typeof ProjectAuthTypeNone | typeof ProjectAuthTypeHTTPS | typeof ProjectAuthTypeSSH;
 /**
  * ProjectStatus is the checkout state of a project. cloning, pulling and
- * switching_branch are transient (a job is active); the daemon resets them to
- * idle at startup.
+ * switching_branch are transient (a job is active). error means the last
+ * clone failed (no checkout) or an operation failed after modifying the
+ * checkout; a pull repairs it. A daemon restart turns interrupted transient
+ * statuses into error.
  */
 export const ProjectStatusIdle = "idle";
 export const ProjectStatusCloning = "cloning";
@@ -510,7 +512,9 @@ export interface CreateProjectResponse {
 /**
  * UpdateProjectRequest is the body of PATCH /api/v1/projects/{id} (admin).
  * Absent fields are unchanged. Auth replaces the stored credentials entirely;
- * to keep the stored secret, omit Auth. Use POST .../branch to change branch.
+ * to keep the stored secret, omit Auth; {"type":"none"} clears it. A new
+ * RepoURL is applied to the checkout by the next pull (no re-clone). Use
+ * POST .../branch to change branch.
  */
 export interface UpdateProjectRequest {
   repo_url?: string;
