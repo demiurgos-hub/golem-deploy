@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -43,7 +44,9 @@ func TestRunRejectsBadServerSettings(t *testing.T) {
 // Startup reconciliation starts servers that should run and leaves
 // orphaned managed containers alone.
 func TestRunReconcilesServers(t *testing.T) {
-	dir := t.TempDir()
+	// A fresh path: t.TempDir() itself may be group/world-readable under the
+	// umask, which Prepare refuses on Unix.
+	dir := filepath.Join(t.TempDir(), "data")
 	layout, err := datadir.Prepare(dir)
 	if err != nil {
 		t.Fatal(err)
