@@ -1,6 +1,10 @@
 // Package extract unpacks static ZIP add-ons into fresh staging
 // directories with hard limits: total and per-file size, entry count,
-// compression ratio, path depth and length. Entry paths are never trusted:
+// compression ratio (per entry and against the real archive size), path
+// depth and length. The archive's own records are checked first: entries
+// whose data overlaps (several entries sharing compressed bytes) or whose
+// local header names another path are rejected. Entry paths are never
+// trusted:
 // absolute, traversing, backslashed, device-like and colliding paths
 // (including case-insensitive collisions) are rejected, only regular files
 // and directories are accepted and file modes are reduced to 0644/0755.
@@ -26,7 +30,8 @@ type Limits struct {
 	MaxFileBytes  int64 // one file's uncompressed size
 	MaxEntries    int   // files and directories
 	// MaxRatio bounds uncompressed/compressed size, checked for the whole
-	// archive and for each entry larger than ratioMinBytes.
+	// archive, for each entry larger than ratioMinBytes and against the
+	// archive file's real size (declared and actually written bytes).
 	MaxRatio   int64
 	MaxDepth   int // path segments
 	MaxPathLen int // bytes of an entry path
@@ -116,8 +121,19 @@ type entry struct {
 	exec bool
 }
 
+// ratioBudget is the most output an archive of archiveSize bytes may
+// produce: MaxRatio times its real size (at least ratioMinBytes), and never
+// more than MaxTotalBytes.
+func ratioBudget(lim Limits, archiveSize int64) int64 {
+	b := lim.MaxTotalBytes
+	if lim.MaxRatio > 0 && archiveSize > 0 && archiveSize <= b/lim.MaxRatio {
+		b = max(archiveSize*lim.MaxRatio, ratioMinBytes)
+	}
+	return min(b, lim.MaxTotalBytes)
+}
+
 // plan validates the central directory before anything is written.
-func plan(files []*zip.File, lim Limits) ([]entry, error) {
+func plan(files []*zip.File, lim Limits, archiveSize int64) ([]entry, error) {
 	if len(files) > lim.MaxEntries {
 		return nil, unsafe("archive has more than %d entries", lim.MaxEntries)
 	}
@@ -159,6 +175,9 @@ func plan(files []*zip.File, lim Limits) ([]entry, error) {
 	if total > ratioMinBytes && total > uint64(lim.MaxRatio)*max(compressed, 1) {
 		return nil, unsafe("archive has a suspicious compression ratio")
 	}
+	if total > uint64(ratioBudget(lim, archiveSize)) {
+		return nil, unsafe("archive expands to more than %d times its size", lim.MaxRatio)
+	}
 	// A file may not also be a parent directory of another entry.
 	for key := range seen {
 		for dir := path.Dir(key); dir != "."; dir = path.Dir(dir) {
@@ -185,7 +204,11 @@ func Zip(zipPath, tmpRoot string, lim Limits) (string, error) {
 		return "", fmt.Errorf("open zip: %w", err)
 	}
 	defer r.Close()
-	entries, err := plan(r.File, lim)
+	size, err := checkRecords(zipPath, r.File)
+	if err != nil {
+		return "", err
+	}
+	entries, err := plan(r.File, lim, size)
 	if err != nil {
 		return "", err
 	}
@@ -196,14 +219,46 @@ func Zip(zipPath, tmpRoot string, lim Limits) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := extractAll(entries, dest, lim); err != nil {
+	if err := extractAll(entries, dest, lim, ratioBudget(lim, size)); err != nil {
 		_ = os.RemoveAll(dest)
 		return "", err
 	}
 	return dest, nil
 }
 
-func extractAll(entries []entry, dest string, lim Limits) error {
+// checkRecords validates the archive's own records against archive/zip's
+// view (see layout.go) and returns the archive's size.
+func checkRecords(zipPath string, files []*zip.File) (int64, error) {
+	f, err := os.Open(zipPath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	cd, cdOffset, err := readCentral(f, info.Size())
+	if err != nil {
+		return 0, err
+	}
+	if len(cd) != len(files) {
+		return 0, unsafe("central directory entry count mismatch")
+	}
+	for i := range cd {
+		if string(cd[i].name) != files[i].Name {
+			return 0, unsafe("central directory mismatch at entry %d", i)
+		}
+	}
+	if err := checkLayout(f, cd, cdOffset); err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+// extractAll writes the planned entries; budget bounds the bytes actually
+// written in total.
+func extractAll(entries []entry, dest string, lim Limits, budget int64) error {
 	var written int64
 	for _, e := range entries {
 		target := filepath.Join(dest, filepath.FromSlash(e.path))
@@ -223,7 +278,7 @@ func extractAll(entries []entry, dest string, lim Limits) error {
 		if e.exec {
 			mode = 0o755
 		}
-		n, err := writeFile(e.f, target, mode, min(lim.MaxFileBytes, lim.MaxTotalBytes-written))
+		n, err := writeFile(e.f, target, mode, min(lim.MaxFileBytes, budget-written))
 		if err != nil {
 			return err
 		}
