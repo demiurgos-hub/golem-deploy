@@ -299,8 +299,6 @@ type cmdOpts struct {
 	stdout io.Writer
 	// quiet suppresses the "$ git ..." log line.
 	quiet bool
-	// display replaces args in the "$ git ..." log line (to hide temp paths).
-	display []string
 	// lfsSmudge lets the LFS filter download content (only "git lfs pull").
 	lfsSmudge bool
 }
@@ -316,11 +314,7 @@ func (s *session) run(ctx context.Context, op, dir string, o cmdOpts, args ...st
 	defer cancel()
 
 	if !o.quiet {
-		shown := args
-		if o.display != nil {
-			shown = o.display
-		}
-		s.log.println("$ git " + strings.Join(shown, " "))
+		s.log.println("$ git " + strings.Join(args, " "))
 	}
 	s.log.resetTail()
 

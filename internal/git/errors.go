@@ -38,12 +38,13 @@ type Error struct {
 	Err       error
 }
 
+// Error returns "git <op>: <cause>", or the reason's message when there is
+// no cause (callers usually show Message separately).
 func (e *Error) Error() string {
-	msg := "git " + e.Op + ": " + e.Message()
 	if e.Err != nil {
-		msg += ": " + e.Err.Error()
+		return "git " + e.Op + ": " + e.Err.Error()
 	}
-	return msg
+	return "git " + e.Op + ": " + e.Message()
 }
 
 func (e *Error) Unwrap() error { return e.Err }

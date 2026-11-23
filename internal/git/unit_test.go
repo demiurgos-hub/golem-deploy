@@ -192,7 +192,7 @@ func TestClassify(t *testing.T) {
 		}
 	}
 	e := &Error{Op: "clone", Reason: ReasonAuth, Err: errors.New("git clone exited with status 128")}
-	if SafeMessage(e) == "" || SafeMessage(errors.New("x")) == "" || !strings.Contains(e.Error(), "authentication") {
+	if SafeMessage(e) == "" || SafeMessage(errors.New("x")) == "" || !strings.Contains(e.Error(), "git clone: git clone exited") || !strings.Contains(e.Message(), "authentication") {
 		t.Fatal("messages")
 	}
 }

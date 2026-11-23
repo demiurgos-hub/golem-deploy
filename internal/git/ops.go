@@ -53,11 +53,10 @@ func (r *Runner) Clone(ctx context.Context, remote Remote, dir string, log io.Wr
 		return Checkout{}, &Error{Op: op, Reason: ReasonLocal, Unchanged: true, Err: err}
 	}
 	defer os.RemoveAll(staging)
+	// Clone into a relative directory from inside the staging dir so git's
+	// messages ("Cloning into 'repo'...") do not reveal data-dir paths.
 	target := filepath.Join(staging, "repo")
-
-	args := cloneArgs(remote.URL, remote.Branch, target)
-	display := cloneArgs(remote.URL, remote.Branch, "<checkout>")
-	if err := s.run(ctx, op, staging, cmdOpts{network: true, display: display}, args...); err != nil {
+	if err := s.run(ctx, op, staging, cmdOpts{network: true}, cloneArgs(remote.URL, remote.Branch, "repo")...); err != nil {
 		return Checkout{}, markUnchanged(err)
 	}
 	co, err := s.finish(ctx, op, target, "")

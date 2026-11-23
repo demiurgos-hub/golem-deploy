@@ -214,6 +214,9 @@ func TestIntegrationCloneAndPull(t *testing.T) {
 	if !strings.Contains(log.String(), "$ git clone") {
 		t.Fatalf("log lacks command line: %s", log.String())
 	}
+	if strings.Contains(log.String(), "data dir") {
+		t.Fatalf("log reveals data-dir paths:\n%s", log.String())
+	}
 	assertNoLeftovers(t, filepath.Join(base, "tmp"))
 
 	// New upstream commit, plus local damage that a pull must discard.
