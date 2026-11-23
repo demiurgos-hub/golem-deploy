@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -42,13 +43,16 @@ func (r *Runner) Clone(ctx context.Context, remote Remote, dir string, log io.Wr
 	if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
 		return Checkout{}, &Error{Op: op, Reason: ReasonLocal, Unchanged: true, Err: errors.New("checkout directory already exists")}
 	}
+	if err := r.checkFreeSpace(op); err != nil {
+		return Checkout{}, err
+	}
 	s, err := r.begin(remote, log)
 	if err != nil {
 		return Checkout{}, &Error{Op: op, Reason: ReasonLocal, Unchanged: true, Err: err}
 	}
 	defer s.close()
 
-	staging, err := os.MkdirTemp(r.tmp, "clone-")
+	staging, err := os.MkdirTemp(r.tmp, clonePrefix)
 	if err != nil {
 		return Checkout{}, &Error{Op: op, Reason: ReasonLocal, Unchanged: true, Err: err}
 	}
@@ -56,7 +60,7 @@ func (r *Runner) Clone(ctx context.Context, remote Remote, dir string, log io.Wr
 	// Clone into a relative directory from inside the staging dir so git's
 	// messages ("Cloning into 'repo'...") do not reveal data-dir paths.
 	target := filepath.Join(staging, "repo")
-	if err := s.run(ctx, op, staging, cmdOpts{network: true}, cloneArgs(remote.URL, remote.Branch, "repo")...); err != nil {
+	if err := s.run(ctx, op, staging, cmdOpts{network: true, watch: staging}, cloneArgs(remote.URL, remote.Branch, "repo")...); err != nil {
 		return Checkout{}, markUnchanged(err)
 	}
 	co, err := s.finish(ctx, op, target, "")
@@ -115,6 +119,9 @@ func (r *Runner) sync(ctx context.Context, op string, remote Remote, dir string,
 	if !HasCheckout(dir) {
 		return Checkout{}, &Error{Op: op, Reason: ReasonLocal, Unchanged: true, Err: errors.New("no checkout")}
 	}
+	if err := r.checkFreeSpace(op); err != nil {
+		return Checkout{}, err
+	}
 	s, err := r.begin(remote, log)
 	if err != nil {
 		return Checkout{}, &Error{Op: op, Reason: ReasonLocal, Unchanged: true, Err: err}
@@ -124,7 +131,8 @@ func (r *Runner) sync(ctx context.Context, op string, remote Remote, dir string,
 	if err := s.run(ctx, op, dir, cmdOpts{}, setURLArgs(remote.URL)...); err != nil {
 		return Checkout{}, markUnchanged(err)
 	}
-	if err := s.run(ctx, op, dir, cmdOpts{network: true}, fetchArgs(remote.Branch)...); err != nil {
+	if err := s.run(ctx, op, dir, cmdOpts{network: true, watch: dir}, fetchArgs(remote.Branch)...); err != nil {
+		removePartialDownloads(dir)
 		return Checkout{}, markUnchanged(err)
 	}
 	co, err := s.finish(ctx, op, dir, remote.Branch)
@@ -140,7 +148,7 @@ func (r *Runner) sync(ctx context.Context, op string, remote Remote, dir string,
 // content if needed and reads the branch and commit.
 func (s *session) finish(ctx context.Context, op, dir, branch string) (Checkout, error) {
 	if branch != "" {
-		if err := s.run(ctx, op, dir, cmdOpts{}, checkoutArgs(branch)...); err != nil {
+		if err := s.run(ctx, op, dir, cmdOpts{watch: dir}, checkoutArgs(branch)...); err != nil {
 			return Checkout{}, localErr(err)
 		}
 		if err := s.run(ctx, op, dir, cmdOpts{}, cleanArgs()...); err != nil {
@@ -164,7 +172,11 @@ func (s *session) finish(ctx context.Context, op, dir, branch string) (Checkout,
 			s.log.println("error: this repository uses Git LFS, but git-lfs is not installed on the host")
 			return Checkout{}, &Error{Op: op, Reason: ReasonLFSMissing}
 		}
-		if err := s.run(ctx, op, dir, cmdOpts{network: true, lfsSmudge: true}, lfsPullArgs()...); err != nil {
+		if err := s.checkLFSConfig(ctx, op, dir); err != nil {
+			return Checkout{}, err
+		}
+		if err := s.run(ctx, op, dir, cmdOpts{network: true, lfsSmudge: true, watch: dir}, lfsPullArgs()...); err != nil {
+			removePartialDownloads(dir)
 			return Checkout{}, err
 		}
 		co.LFS = true
@@ -365,6 +377,117 @@ func attributesArgs() []string {
 
 func lfsPullArgs() []string { return []string{"lfs", "pull"} }
 
+func lfsConfigListArgs() []string {
+	return []string{"config", "--file=.lfsconfig", "--no-includes", "--list", "-z"}
+}
+
 func lsRemoteArgs(url string) []string {
 	return []string{"ls-remote", "--heads", "--end-of-options", url}
+}
+
+// removePartialDownloads deletes what an interrupted fetch or "git lfs pull"
+// leaves in a checkout (temporary pack files, incomplete LFS objects), so a
+// download stopped by the size limit does not keep its bytes.
+func removePartialDownloads(dir string) {
+	for _, pattern := range []string{
+		filepath.Join(dir, ".git", "objects", "pack", "tmp_*"),
+		filepath.Join(dir, ".git", "objects", "incoming-*"),
+		filepath.Join(dir, ".git", "lfs", "incomplete", "*"),
+		filepath.Join(dir, ".git", "lfs", "tmp", "*"),
+	} {
+		matches, _ := filepath.Glob(pattern)
+		for _, m := range matches {
+			_ = os.RemoveAll(m)
+		}
+	}
+}
+
+// maxLFSConfig bounds the "git config --list" output read for .lfsconfig.
+const maxLFSConfig = 1 << 20
+
+// checkLFSConfig refuses a checkout whose .lfsconfig sets endpoint or
+// transfer settings. The endpoint is pinned on the command line anyway
+// (see lfsPin); the refusal makes the situation visible instead of
+// silently ignoring the repository's settings. The file is parsed by git
+// itself (git config --file, includes disabled), never by hand. Only a
+// regular file is read: a symlink could point anywhere on the host.
+func (s *session) checkLFSConfig(ctx context.Context, op, dir string) error {
+	if s.r.skipLFSCheck {
+		return nil
+	}
+	fi, err := os.Lstat(filepath.Join(dir, ".lfsconfig"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return &Error{Op: op, Reason: ReasonLocal, Err: errors.New("could not read .lfsconfig")}
+	}
+	if !fi.Mode().IsRegular() {
+		s.log.println("error: .lfsconfig is not a regular file")
+		return &Error{Op: op, Reason: ReasonLFSConfig, Err: errors.New(".lfsconfig is not a regular file")}
+	}
+	out := &limitedBuffer{max: maxLFSConfig}
+	if err := s.run(ctx, op, dir, cmdOpts{quiet: true, stdout: out}, lfsConfigListArgs()...); err != nil {
+		var ge *Error
+		if errors.As(err, &ge) && (ge.Reason == ReasonCancelled || ge.Reason == ReasonTimeout) {
+			return err
+		}
+		s.log.println("error: .lfsconfig could not be parsed")
+		return &Error{Op: op, Reason: ReasonLFSConfig, Err: errors.New(".lfsconfig could not be parsed")}
+	}
+	if out.overflow {
+		s.log.println("error: .lfsconfig is too large")
+		return &Error{Op: op, Reason: ReasonLFSConfig, Err: errors.New(".lfsconfig is too large")}
+	}
+	bad := disallowedLFSKeys(out.Bytes(), s.lfsEndpoint)
+	if len(bad) == 0 {
+		return nil
+	}
+	for _, k := range bad {
+		if len(k) > 200 {
+			k = k[:200] + "..."
+		}
+		s.log.println("error: .lfsconfig sets " + strconv.Quote(k) + ", which Golem Deploy does not allow")
+	}
+	s.log.println("The Git LFS server is always derived from the project's repository URL (" + s.lfsEndpoint + "). " +
+		"Remove these settings from .lfsconfig, or point the project at the repository that hosts the LFS objects.")
+	return &Error{Op: op, Reason: ReasonLFSConfig, Err: fmt.Errorf(".lfsconfig sets %d disallowed key(s)", len(bad))}
+}
+
+// disallowedLFSKeys returns the keys of "git config --list -z" output that
+// change where or how git-lfs transfers objects: lfs.url, lfs.pushurl,
+// remote.*.lfsurl, remote.*.lfspushurl, lfs.<url>.access for any URL but
+// endpoint, lfs.customtransfer.*, lfs.standalonetransferagent,
+// lfs.extension.* and url.*.insteadof / url.*.pushinsteadof.
+func disallowedLFSKeys(list []byte, endpoint string) []string {
+	var bad []string
+	for _, entry := range strings.Split(string(list), "\x00") {
+		key, _, _ := strings.Cut(entry, "\n")
+		if key == "" {
+			continue
+		}
+		// git lower-cases section and variable names; subsections keep
+		// their case, which does not matter for these patterns.
+		k := strings.ToLower(key)
+		hasSuffix := func(sfx ...string) bool {
+			for _, x := range sfx {
+				if strings.HasSuffix(k, x) {
+					return true
+				}
+			}
+			return false
+		}
+		switch {
+		case k == "lfs.url", k == "lfs.pushurl", k == "lfs.standalonetransferagent",
+			strings.HasPrefix(k, "lfs.customtransfer."), strings.HasPrefix(k, "lfs.extension."),
+			strings.HasPrefix(k, "remote.") && hasSuffix(".lfsurl", ".lfspushurl"),
+			strings.HasPrefix(k, "url.") && hasSuffix(".insteadof", ".pushinsteadof"):
+			bad = append(bad, key)
+		case strings.HasPrefix(k, "lfs.") && strings.HasSuffix(k, ".access") && len(k) > len("lfs..access"):
+			if key[len("lfs."):len(key)-len(".access")] != endpoint {
+				bad = append(bad, key)
+			}
+		}
+	}
+	return bad
 }

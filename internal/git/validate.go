@@ -3,7 +3,9 @@ package git
 import (
 	"errors"
 	"net/url"
+	"path"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"unicode"
@@ -211,6 +213,100 @@ func URLHost(raw string) string {
 		return u.Host
 	}
 	return ""
+}
+
+// origin is the scheme kind, lower-case host (IPv6 without brackets) and
+// port (the default port when the URL has none) of a remote URL.
+type origin struct {
+	kind Kind
+	host string
+	port string
+}
+
+// remoteOrigin returns the origin of a URL accepted by ValidateRemoteURL.
+func remoteOrigin(raw string) (origin, bool) {
+	kind, err := ValidateRemoteURL(raw)
+	if err != nil {
+		return origin{}, false
+	}
+	def := "443"
+	if kind == KindSSH {
+		def = "22"
+	}
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return origin{}, false
+		}
+		port := u.Port()
+		if port == "" {
+			port = def
+		}
+		return origin{kind: kind, host: strings.ToLower(u.Hostname()), port: port}, true
+	}
+	// scp-like user@host:path or user@[v6]:path
+	rest := raw[strings.IndexByte(raw, '@')+1:]
+	var host string
+	if strings.HasPrefix(rest, "[") {
+		host = rest[1:strings.Index(rest, "]")]
+	} else {
+		host = rest[:strings.IndexByte(rest, ':')]
+	}
+	return origin{kind: kind, host: strings.ToLower(host), port: def}, true
+}
+
+// SameOrigin reports whether two remote URLs accepted by ValidateRemoteURL
+// use the same transport, host and port (default ports made explicit; an
+// scp-like URL is SSH on port 22). Stored credentials may only be reused
+// for a new URL with the same origin.
+func SameOrigin(a, b string) bool {
+	oa, ok1 := remoteOrigin(a)
+	ob, ok2 := remoteOrigin(b)
+	return ok1 && ok2 && oa == ob
+}
+
+// LFSEndpoint returns the Git LFS endpoint the runner pins for a remote URL
+// accepted by ValidateRemoteURL, with git-lfs's own derivation rules: for
+// https, the URL without trailing slashes, with ".git" appended unless it
+// already ends in ".git", plus "/info/lfs"; for SSH, the remote itself
+// (git-lfs then asks the SSH server through git-lfs-authenticate or
+// git-lfs-transfer).
+func LFSEndpoint(raw string) string {
+	kind, err := ValidateRemoteURL(raw)
+	if err != nil {
+		return ""
+	}
+	if kind == KindSSH {
+		return raw
+	}
+	u := strings.TrimRight(raw, "/")
+	if path.Ext(u) != ".git" {
+		u += ".git"
+	}
+	return u + "/info/lfs"
+}
+
+// CheckSSHConfigPath reports whether the absolute path p can be written
+// into the per-operation ssh_config file. ssh_config has no portable way to
+// escape a double quote, a backslash (an escape character in newer
+// OpenSSH) or "${" (environment expansion in IdentityFile and
+// UserKnownHostsFile), and a line break would end the option; such paths
+// are refused. On Windows backslashes are written as '/'. '%' is escaped
+// as "%%" when the file is written. Error messages are safe to show to the
+// operator.
+func CheckSSHConfigPath(p string) error {
+	if strings.ContainsAny(p, "\"$") {
+		return errors.New(`the path must not contain '"' or '$'`)
+	}
+	if runtime.GOOS != "windows" && strings.ContainsRune(p, '\\') {
+		return errors.New("the path must not contain a backslash")
+	}
+	for _, c := range p {
+		if c < 0x20 || c == 0x7f || c == utf8.RuneError {
+			return errors.New("the path must not contain control characters, line breaks or invalid UTF-8")
+		}
+	}
+	return nil
 }
 
 // ValidateBranch checks a branch name with the rules of

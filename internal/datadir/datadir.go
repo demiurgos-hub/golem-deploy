@@ -7,10 +7,12 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -46,14 +48,46 @@ func (l Layout) JobLogs() string { return filepath.Join(l.Root, "logs", "jobs") 
 // Tmp is scratch space on the same filesystem as the other directories.
 func (l Layout) Tmp() string { return filepath.Join(l.Root, "tmp") }
 
-// Prepare resolves root to an absolute path, creates missing directories of
-// the layout with mode 0700 and creates the database file with mode 0600 if
-// it does not exist (so SQLite's -wal and -shm files inherit that mode).
+// Marker is the file that identifies a data directory initialised by Golem
+// Deploy.
+func (l Layout) Marker() string { return filepath.Join(l.Root, MarkerName) }
+
+// LockFile is the file serve locks for as long as it runs.
+func (l Layout) LockFile() string { return filepath.Join(l.Root, ".lock") }
+
+// MarkerName is the base name of the data directory marker file.
+const MarkerName = ".golem-deploy-data"
+
+// markerFormat is the data directory format written into the marker.
+const markerFormat = 1
+
+// legacyEntries are the names a data directory created before the marker
+// existed can contain (see checkDedicated).
+var legacyEntries = map[string]bool{
+	"golem-deploy.db": true, "golem-deploy.db-wal": true, "golem-deploy.db-shm": true, "golem-deploy.db-journal": true,
+	"keys": true, "repositories": true, "static": true, "logs": true, "tmp": true, "known_hosts": true, ".lock": true,
+}
+
+// Prepare resolves root to an absolute path and initialises or reuses the
+// data directory there. The data directory is dedicated to Golem Deploy
+// (startup sweeps delete leftovers below it), so Prepare accepts only:
 //
-// It never changes the mode of an existing directory: the operator may have
-// pointed --data-dir at a directory they use for other things. Instead, on
-// Unix, an existing data directory that is accessible by group or others is
-// refused with the chmod command to run.
+//   - a path that does not exist (created with mode 0700),
+//   - an existing empty directory (a lone "lost+found", as at the root of
+//     a freshly formatted volume, counts as empty),
+//   - a directory that contains the marker file (MarkerName) written when
+//     it was initialised,
+//   - a data directory created before the marker existed: nothing but
+//     layout entries, including the database file (the marker is added).
+//
+// Anything else is refused. The marker (0600, a format version line) is
+// written once the layout exists. Prepare creates missing directories of
+// the layout with mode 0700 and the database file with mode 0600 if it does
+// not exist (so SQLite's -wal and -shm files inherit that mode).
+//
+// It never changes the mode of an existing directory. Instead, on Unix, an
+// existing data directory that is accessible by group or others is refused
+// with the chmod command to run.
 func Prepare(root string) (Layout, error) {
 	if root == "" {
 		return Layout{}, errors.New("data directory must not be empty")
@@ -70,6 +104,9 @@ func Prepare(root string) (Layout, error) {
 			return Layout{}, fmt.Errorf("data directory %s is not a directory", abs)
 		}
 		if err := checkPrivate(abs, info); err != nil {
+			return Layout{}, err
+		}
+		if err := checkDedicated(l); err != nil {
 			return Layout{}, err
 		}
 	case errors.Is(err, fs.ErrNotExist):
@@ -93,7 +130,129 @@ func Prepare(root string) (Layout, error) {
 	case !errors.Is(err, fs.ErrExist):
 		return Layout{}, fmt.Errorf("create database file: %w", err)
 	}
+	if err := writeMarker(l); err != nil {
+		return Layout{}, err
+	}
 	return l, nil
+}
+
+// Open resolves root and returns the layout of an existing data directory
+// initialised by Golem Deploy (it must contain the marker). It creates
+// nothing; the admin CLI uses it for commands that need existing data.
+func Open(root string) (Layout, error) {
+	if root == "" {
+		return Layout{}, errors.New("data directory must not be empty")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return Layout{}, fmt.Errorf("resolve data directory: %w", err)
+	}
+	l := Layout{Root: abs}
+	info, err := os.Stat(abs)
+	if errors.Is(err, fs.ErrNotExist) {
+		return Layout{}, fmt.Errorf("data directory %s does not exist; golem-deploy serve or golem-deploy admin create initialises it", abs)
+	}
+	if err != nil {
+		return Layout{}, fmt.Errorf("stat data directory: %w", err)
+	}
+	if !info.IsDir() {
+		return Layout{}, fmt.Errorf("data directory %s is not a directory", abs)
+	}
+	if err := checkPrivate(abs, info); err != nil {
+		return Layout{}, err
+	}
+	ok, err := hasMarker(l)
+	if err != nil {
+		return Layout{}, err
+	}
+	if !ok {
+		return Layout{}, fmt.Errorf("%s is not an initialised Golem Deploy data directory (no %s file); check --data-dir", abs, MarkerName)
+	}
+	return l, nil
+}
+
+// checkDedicated accepts an existing data directory that has a valid
+// marker, is empty, or holds a data directory created before markers
+// existed (only layout entries, including the database file).
+func checkDedicated(l Layout) error {
+	ok, err := hasMarker(l)
+	if err != nil || ok {
+		return err
+	}
+	entries, err := os.ReadDir(l.Root)
+	if err != nil {
+		return fmt.Errorf("read data directory: %w", err)
+	}
+	empty, legacy, hasDB := true, true, false
+	for _, e := range entries {
+		n := e.Name()
+		if n != "lost+found" {
+			empty = false
+		}
+		if !legacyEntries[n] {
+			legacy = false
+		}
+		if n == "golem-deploy.db" && e.Type().IsRegular() {
+			hasDB = true
+		}
+	}
+	if empty || (legacy && hasDB) {
+		return nil
+	}
+	return fmt.Errorf("data directory %s is not empty and was not initialised by Golem Deploy (it has no %s file); "+
+		"the data directory must be empty or previously initialised by Golem Deploy, because the daemon removes leftover files below it; "+
+		"point --data-dir at a new or empty directory", l.Root, MarkerName)
+}
+
+// hasMarker reports whether the marker exists and is valid. A marker that
+// is not a regular file or names an unknown format is an error.
+func hasMarker(l Layout) (bool, error) {
+	fi, err := os.Lstat(l.Marker())
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", l.Marker(), err)
+	}
+	if !fi.Mode().IsRegular() {
+		return false, fmt.Errorf("%s is not a regular file", l.Marker())
+	}
+	f, err := os.Open(l.Marker())
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", l.Marker(), err)
+	}
+	defer f.Close()
+	buf := make([]byte, 256)
+	n, _ := io.ReadFull(f, buf)
+	line, _, _ := strings.Cut(string(buf[:n]), "\n")
+	v, ok := strings.CutPrefix(strings.TrimSpace(line), "format=")
+	format, err := strconv.Atoi(v)
+	switch {
+	case !ok || err != nil || format < 1:
+		return false, fmt.Errorf("%s is malformed; it must start with the line format=%d", l.Marker(), markerFormat)
+	case format > markerFormat:
+		return false, fmt.Errorf("data directory %s has format %d, written by a newer Golem Deploy (this version supports %d)", l.Root, format, markerFormat)
+	}
+	return true, nil
+}
+
+// writeMarker creates the marker (0600) if it does not exist.
+func writeMarker(l Layout) error {
+	f, err := os.OpenFile(l.Marker(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		_, err := hasMarker(l)
+		return err
+	}
+	if err != nil {
+		return fmt.Errorf("create %s: %w", l.Marker(), err)
+	}
+	_, werr := fmt.Fprintf(f, "format=%d\n# This is a Golem Deploy data directory. Do not store other files in it.\n", markerFormat)
+	serr := f.Sync()
+	cerr := f.Close()
+	if err := errors.Join(werr, serr, cerr); err != nil {
+		return fmt.Errorf("write %s: %w", l.Marker(), err)
+	}
+	return nil
 }
 
 // checkPrivate refuses, on Unix, an existing data directory that group or

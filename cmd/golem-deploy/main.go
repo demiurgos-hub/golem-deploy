@@ -157,6 +157,14 @@ func cmdServe(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	repoSizeDefault := 10240
+	if v := envDefault("GOLEM_DEPLOY_MAX_REPO_SIZE_MB", ""); v != "" {
+		if repoSizeDefault, err = strconv.Atoi(v); err != nil {
+			fmt.Fprintf(stderr, "GOLEM_DEPLOY_MAX_REPO_SIZE_MB: invalid integer %q\n", v)
+			return 2
+		}
+	}
+	maxRepoSize := fs.Int("max-repo-size-mb", repoSizeDefault, "maximum size of each project checkout in MiB, enforced during clone, pull and Git LFS downloads; 0 means unlimited (env GOLEM_DEPLOY_MAX_REPO_SIZE_MB)")
 	memoryMB := fs.Int("server-memory-mb", memDefault, "memory limit per server container in MiB; 0 means unlimited (env GOLEM_DEPLOY_SERVER_MEMORY_MB)")
 	cpus := fs.Float64("server-cpus", cpuDefault, "CPU limit per server container; 0 means unlimited (env GOLEM_DEPLOY_SERVER_CPUS)")
 	if err := fs.Parse(args); err != nil {
@@ -182,6 +190,7 @@ func cmdServe(args []string, stderr io.Writer) int {
 		PortBindAddress: *portBind,
 		ServerMemoryMB:  *memoryMB,
 		ServerCPUs:      *cpus,
+		MaxRepoSizeMB:   *maxRepoSize,
 		Version:         buildVersion(),
 		Logger:          logger,
 		SPA:             frontend.Handler(),

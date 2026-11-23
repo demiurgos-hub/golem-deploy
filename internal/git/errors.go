@@ -24,6 +24,14 @@ const (
 	ReasonLFSMissing
 	ReasonGitMissing
 	ReasonLocal
+	// ReasonLFSConfig: the checkout's .lfsconfig sets endpoint or transfer
+	// settings, which are refused (the LFS endpoint is pinned).
+	ReasonLFSConfig
+	// ReasonSizeLimit: the checkout grew beyond Options.MaxRepoSize.
+	ReasonSizeLimit
+	// ReasonDiskSpace: free space on the data filesystem is below
+	// Options.MinFreeSpace.
+	ReasonDiskSpace
 )
 
 // Error is returned by Runner operations. Its Error text contains no
@@ -78,6 +86,13 @@ func (e *Error) Message() string {
 		return "git is not installed on the host"
 	case ReasonLocal:
 		return "updating the checkout failed; see the job log"
+	case ReasonLFSConfig:
+		return "the repository's .lfsconfig sets the Git LFS server or transfer settings, which is not allowed; " +
+			"the LFS server is always derived from the project's repository URL (see the job log)"
+	case ReasonSizeLimit:
+		return "the checkout exceeds the maximum repository size configured on the host"
+	case ReasonDiskSpace:
+		return "not enough free disk space on the host for the checkout"
 	}
 	return "the Git operation failed; see the job log"
 }

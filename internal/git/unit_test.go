@@ -105,7 +105,8 @@ func TestAskpass(t *testing.T) {
 	}{
 		{"Username for 'https://git.example.com:8443': ", "alice\n", 0},
 		{"Password for 'https://alice@git.example.com:8443': ", plantedPassword + "\n", 0},
-		{"Password for 'https://alice@GIT.example.com:8443': ", plantedPassword + "\n", 0},
+		// Only the configured spelling (and its lower-case form) is answered.
+		{"Password for 'https://alice@GIT.example.com:8443': ", "", 1},
 		// Another host (e.g. after a redirect) gets nothing.
 		{"Password for 'https://alice@evil.example': ", "", 1},
 		{"Password for 'https://alice@git.example.com': ", "", 1},
@@ -218,14 +219,22 @@ func TestArgv(t *testing.T) {
 		"-c", "gc.autoDetach=false",
 		"-c", "maintenance.autoDetach=false",
 	}
-	got := r.argv([]string{"status"})
+	got := r.argv("https://h/x.git/info/lfs", []string{"status"})
 	if !reflect.DeepEqual(got, append(slices.Clone(wantPrefix), "status")) {
 		t.Fatalf("argv:\n%q", got)
 	}
 	r2 := &Runner{}
 	r2.lfsOnce.Do(func() { r2.lfsOK = true })
-	if got := r2.argv(nil); !slices.Contains(got, "filter.lfs.process=git-lfs filter-process") || !slices.Contains(got, "filter.lfs.required=true") {
+	if got := r2.argv("", nil); !slices.Contains(got, "filter.lfs.process=git-lfs filter-process") || !slices.Contains(got, "filter.lfs.required=true") ||
+		slices.ContainsFunc(got, func(a string) bool { return strings.HasPrefix(a, "lfs.url=") }) {
 		t.Fatalf("lfs filter missing: %q", got)
+	}
+	// With LFS available the endpoint is pinned through both keys, before
+	// the subcommand.
+	got = r2.argv("https://h/x.git/info/lfs", []string{"lfs", "pull"})
+	tail := got[len(got)-6:]
+	if !reflect.DeepEqual(tail, []string{"-c", "lfs.url=https://h/x.git/info/lfs", "-c", "remote.origin.lfsurl=https://h/x.git/info/lfs", "lfs", "pull"}) {
+		t.Fatalf("lfs pin: %q", got)
 	}
 
 	golden := map[string][2][]string{
@@ -249,17 +258,92 @@ func TestArgv(t *testing.T) {
 	}
 }
 
-func TestSSHCommandQuoting(t *testing.T) {
-	cmd := sshCommand(`/data dir/known_hosts`, `/tmp/it's here/id_key`)
-	want := `ssh -F none -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o 'UserKnownHostsFile=/data dir/known_hosts' -o ConnectTimeout=30 -i '/tmp/it'\''s here/id_key'`
-	if cmd != want {
-		t.Fatalf("got  %s\nwant %s", cmd, want)
+// TestG5_SSHCommandAndConfig: GIT_SSH_COMMAND carries only "-F <file>" as
+// one shell word; every path lives in the config file, double quoted with
+// '%' doubled, never in a -o value that ssh would split and expand.
+func TestG5_SSHCommandAndConfig(t *testing.T) {
+	if got, want := sshCommand(`/tmp/it's here/ssh_config`), `ssh -F '/tmp/it'\''s here/ssh_config'`; got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	if strings.Contains(sshCommand("/k", ""), " -i ") {
-		t.Fatal("-i without a key")
+	cfg := sshConfig(`/data dir %d/known_hosts`, `/data dir %d/tmp/git-1/id_key`)
+	want := `# Written by golem-deploy for one git operation and removed when it ends.
+BatchMode yes
+IdentitiesOnly yes
+IdentityFile "/data dir %%d/tmp/git-1/id_key"
+IdentityAgent none
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+HostbasedAuthentication no
+StrictHostKeyChecking accept-new
+UserKnownHostsFile "/data dir %%d/known_hosts"
+GlobalKnownHostsFile none
+UpdateHostKeys no
+CheckHostIP no
+HashKnownHosts no
+ConnectTimeout 30
+ForwardAgent no
+ForwardX11 no
+ClearAllForwardings yes
+ProxyCommand none
+PermitLocalCommand no
+ControlMaster no
+ControlPath none
+SendEnv -*
+SendEnv GIT_PROTOCOL
+`
+	if cfg != want {
+		t.Fatalf("config:\n%s\nwant:\n%s", cfg, want)
 	}
 	if runtime.GOOS == "windows" && sshPath(`C:\Program Files\x`) != "C:/Program Files/x" {
 		t.Fatal("windows path not converted")
+	}
+
+	// Paths that cannot be represented are refused, by CheckSSHConfigPath
+	// and by New.
+	bad := []string{`/data/"x`, `/data/$HOME`, "/data/a\nb", "/data/a\rb", "/data/\x7f"}
+	if runtime.GOOS != "windows" {
+		bad = append(bad, `/data/a\b`)
+	}
+	for _, p := range bad {
+		if CheckSSHConfigPath(p) == nil {
+			t.Errorf("accepted %q", p)
+		}
+	}
+	for _, p := range []string{"/data dir/x", "/data/%d/x", "/data/it's", "/data/#x", "/dätä"} {
+		if err := CheckSSHConfigPath(p); err != nil {
+			t.Errorf("refused %q: %v", p, err)
+		}
+	}
+	if _, err := New(Options{GitPath: "git", TempDir: filepath.Join(t.TempDir(), "a$b"), KnownHostsFile: filepath.Join(t.TempDir(), "kh")}); err == nil {
+		t.Fatal("New accepted a temp dir with '$'")
+	}
+}
+
+// TestG6_SSHConfigWithoutKey: without a key nothing is offered: IdentityFile
+// is explicitly none (which also suppresses ~/.ssh/id_*), public-key
+// authentication is off and the agent is never consulted.
+func TestG6_SSHConfigWithoutKey(t *testing.T) {
+	cfg := sshConfig("/d/known_hosts", "")
+	for _, line := range []string{"IdentityFile none\n", "PubkeyAuthentication no\n", "IdentityAgent none\n", "IdentitiesOnly yes\n",
+		"PasswordAuthentication no\n", "KbdInteractiveAuthentication no\n", "ForwardAgent no\n", "ProxyCommand none\n",
+		"PermitLocalCommand no\n", "ControlMaster no\n", "SendEnv -*\n"} {
+		if !strings.Contains(cfg, line) {
+			t.Errorf("missing %q", line)
+		}
+	}
+	if strings.Contains(cfg, "PubkeyAuthentication yes") {
+		t.Fatal("public key authentication enabled without a key")
+	}
+	// SSH remotes require a key at every layer.
+	if err := CheckAuthKind(AuthNone, KindSSH); err == nil {
+		t.Fatal("auth none accepted for SSH")
+	}
+	if _, err := (Remote{URL: "git@h:x"}).Validate(); err == nil {
+		t.Fatal("Remote.Validate accepted SSH without a key")
+	}
+	if err := CheckAuthKind(AuthNone, KindHTTPS); err != nil {
+		t.Fatalf("auth none refused for https: %v", err)
 	}
 }
 
@@ -306,8 +390,12 @@ func TestSessionEnvironment(t *testing.T) {
 			t.Errorf("%s = %q, want %q", k, env[k], v)
 		}
 	}
-	if !strings.Contains(env["GIT_SSH_COMMAND"], "StrictHostKeyChecking=accept-new") {
-		t.Error("ssh command missing")
+	sshCfg := filepath.Join(s.dir, "ssh_config")
+	if env["GIT_SSH_COMMAND"] != "ssh -F "+shQuote(sshPath(sshCfg)) {
+		t.Errorf("ssh command %q", env["GIT_SSH_COMMAND"])
+	}
+	if b, err := os.ReadFile(sshCfg); err != nil || !strings.Contains(string(b), "StrictHostKeyChecking accept-new\n") || !strings.Contains(string(b), "IdentityFile none\n") {
+		t.Errorf("ssh config: %v\n%s", err, b)
 	}
 	dir := s.dir
 	s.close()
@@ -338,8 +426,13 @@ func TestSessionEnvironment(t *testing.T) {
 			t.Fatalf("modes %v %v", fi.Mode().Perm(), di.Mode().Perm())
 		}
 	}
-	if !strings.Contains(env["GIT_SSH_COMMAND"], shQuote(sshPath(keyFile))) {
-		t.Errorf("ssh command lacks key: %s", env["GIT_SSH_COMMAND"])
+	if b, _ := os.ReadFile(filepath.Join(s.dir, "ssh_config")); !strings.Contains(string(b), "IdentityFile "+sshConfigQuote(keyFile)+"\n") {
+		t.Errorf("ssh config lacks key:\n%s", b)
+	}
+	if runtime.GOOS != "windows" {
+		if fi, _ := os.Stat(filepath.Join(s.dir, "ssh_config")); fi.Mode().Perm() != 0o600 {
+			t.Errorf("ssh config mode %v", fi.Mode().Perm())
+		}
 	}
 	if _, ok := env["GIT_ASKPASS"]; ok {
 		t.Error("askpass set for ssh")

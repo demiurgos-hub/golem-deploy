@@ -573,7 +573,7 @@ func TestProjectUpdate(t *testing.T) {
 	// Switching to an SSH URL needs SSH auth in the same request.
 	sshURL := "git@git.example.com:team/game.git"
 	e := errBody(t, ph.do("PATCH", path, ph.admin, apitypes.UpdateProjectRequest{RepoURL: &sshURL}), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
-	if e.Field != "repo_url" {
+	if e.Field != "auth" {
 		t.Fatalf("field %q", e.Field)
 	}
 	p = decode[apitypes.Project](t, ph.do("PATCH", path, ph.admin, apitypes.UpdateProjectRequest{RepoURL: &sshURL,
@@ -584,8 +584,8 @@ func TestProjectUpdate(t *testing.T) {
 	if c := pull(); c.remote.Auth.Method != git.AuthSSH || len(c.remote.Auth.PrivateKey) == 0 {
 		t.Fatal("ssh key not used")
 	}
-	// Clearing credentials explicitly.
-	p = decode[apitypes.Project](t, ph.do("PATCH", path, ph.admin, apitypes.UpdateProjectRequest{Auth: &apitypes.ProjectAuth{Type: apitypes.ProjectAuthTypeNone}}))
+	// Clearing credentials explicitly (back on an https URL: SSH needs a key).
+	p = decode[apitypes.Project](t, ph.do("PATCH", path, ph.admin, apitypes.UpdateProjectRequest{RepoURL: &newURL, Auth: &apitypes.ProjectAuth{Type: apitypes.ProjectAuthTypeNone}}))
 	if p.AuthType != apitypes.ProjectAuthTypeNone || p.HasSecret {
 		t.Fatalf("clear auth %+v", p)
 	}
@@ -771,5 +771,83 @@ func TestProjectGitUnavailable(t *testing.T) {
 	errBody(t, ph.do("POST", "/api/v1/projects", ph.admin, httpsProject("game")), http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
 	if n, _ := ph.st.CountProjects(context.Background()); n != 0 {
 		t.Fatal("project created without git")
+	}
+}
+
+// TestG6_SSHRequiresKey: auth type "none" is refused for SSH URLs on create
+// and on patch (ssh would otherwise offer the daemon user's own keys).
+func TestG6_SSHRequiresKey(t *testing.T) {
+	ph := newProjectHarness(t)
+	for _, url := range []string{"git@git.example.com:team/game.git", "ssh://git@git.example.com:2222/team/game.git"} {
+		req := apitypes.CreateProjectRequest{Name: "game", RepoURL: url, Auth: apitypes.ProjectAuth{Type: apitypes.ProjectAuthTypeNone}}
+		e := errBody(t, ph.do("POST", "/api/v1/projects", ph.admin, req), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
+		if e.Field != "auth.type" || !strings.Contains(e.Message, "private key") {
+			t.Fatalf("%s: field %q message %q", url, e.Field, e.Message)
+		}
+	}
+	res := ph.create(apitypes.CreateProjectRequest{Name: "ssh-game", RepoURL: "git@git.example.com:team/game.git",
+		Auth: apitypes.ProjectAuth{Type: apitypes.ProjectAuthTypeSSH, PrivateKey: sshKey(t, "")}})
+	ph.wait(res.Job)
+	path := fmt.Sprintf("/api/v1/projects/%d", res.Project.ID)
+	e := errBody(t, ph.do("PATCH", path, ph.admin, apitypes.UpdateProjectRequest{Auth: &apitypes.ProjectAuth{Type: apitypes.ProjectAuthTypeNone}}),
+		http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
+	if e.Field != "auth.type" {
+		t.Fatalf("patch: field %q", e.Field)
+	}
+	if p := ph.project(res.Project.ID); p.AuthType != apitypes.ProjectAuthTypeSSH || !p.HasSecret {
+		t.Fatalf("refused patch changed the project: %+v", p)
+	}
+	// A public https repository may still use none.
+	pub := apitypes.CreateProjectRequest{Name: "public", RepoURL: "https://git.example.com/team/public.git", Auth: apitypes.ProjectAuth{Type: apitypes.ProjectAuthTypeNone}}
+	ph.wait(ph.create(pub).Job)
+}
+
+// TestG7_HostChangeRequiresAuth: a PATCH that moves the URL to another
+// scheme, host or port must carry auth; a path-only change on the same
+// origin keeps the stored secret.
+func TestG7_HostChangeRequiresAuth(t *testing.T) {
+	ph := newProjectHarness(t)
+	res := ph.create(httpsProject("game"))
+	ph.wait(res.Job)
+	path := fmt.Sprintf("/api/v1/projects/%d", res.Project.ID)
+	for _, url := range []string{
+		"https://evil.example/team/game.git",
+		"https://git.example.com:8443/team/game.git",
+		"https://GIT.example.com.evil.example/team/game.git",
+		"git@git.example.com:team/game.git",
+	} {
+		u := url
+		e := errBody(t, ph.do("PATCH", path, ph.admin, apitypes.UpdateProjectRequest{RepoURL: &u}), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
+		if e.Field != "auth" || !strings.Contains(e.Message, "host") {
+			t.Fatalf("%s: field %q message %q", url, e.Field, e.Message)
+		}
+		if strings.Contains(e.Message, plantedProjectPassword) {
+			t.Fatal("message echoes the password")
+		}
+	}
+	if p := ph.project(res.Project.ID); p.RepoURL != res.Project.RepoURL {
+		t.Fatalf("refused patch changed the URL: %s", p.RepoURL)
+	}
+	// Same origin (path change, explicit default port, host case): kept.
+	for _, url := range []string{"https://git.example.com/team/other.git", "https://GIT.EXAMPLE.COM:443/team/other.git"} {
+		u := url
+		p := decode[apitypes.Project](t, ph.do("PATCH", path, ph.admin, apitypes.UpdateProjectRequest{RepoURL: &u}))
+		if p.RepoURL != url || !p.HasSecret || p.AuthUsername != "deployer" {
+			t.Fatalf("same-origin patch %+v", p)
+		}
+	}
+	// New host with auth in the same request: accepted, new secret used.
+	newHost := "https://git.other.example/team/game.git"
+	p := decode[apitypes.Project](t, ph.do("PATCH", path, ph.admin, apitypes.UpdateProjectRequest{RepoURL: &newHost,
+		Auth: &apitypes.ProjectAuth{Type: apitypes.ProjectAuthTypeHTTPS, Username: "other", Password: "other-token"}}))
+	if p.RepoURL != newHost || p.AuthUsername != "other" {
+		t.Fatalf("host change with auth %+v", p)
+	}
+	// Or explicitly none for a public repository on the new host.
+	pubHost := "https://public.example/team/game.git"
+	p = decode[apitypes.Project](t, ph.do("PATCH", path, ph.admin, apitypes.UpdateProjectRequest{RepoURL: &pubHost,
+		Auth: &apitypes.ProjectAuth{Type: apitypes.ProjectAuthTypeNone}}))
+	if p.RepoURL != pubHost || p.HasSecret {
+		t.Fatalf("host change with none %+v", p)
 	}
 }

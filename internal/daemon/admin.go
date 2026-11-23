@@ -16,8 +16,20 @@ var ErrUsernameExists = errors.New("an account with that username already exists
 // ErrNoSuchAccount is returned by ResetPassword for an unknown username.
 var ErrNoSuchAccount = errors.New("no account with that username")
 
-func openForAdmin(ctx context.Context, dataDir string) (*store.Store, error) {
-	layout, err := datadir.Prepare(dataDir)
+// openForAdmin opens the store for the admin CLI. It never takes the
+// serve lock (the commands work while the daemon runs). create may
+// initialise a new or empty data directory (so the first admin can be
+// created before the first serve); other commands require an initialised
+// one.
+func openForAdmin(ctx context.Context, dataDir string, initialise bool) (*store.Store, error) {
+	open := datadir.Open
+	if initialise {
+		if err := checkDataDirPath(dataDir); err != nil {
+			return nil, err
+		}
+		open = datadir.Prepare
+	}
+	layout, err := open(dataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +58,7 @@ func createAdmin(ctx context.Context, dataDir, username, password string, cost i
 	if err != nil {
 		return store.Account{}, err
 	}
-	st, err := openForAdmin(ctx, dataDir)
+	st, err := openForAdmin(ctx, dataDir, true)
 	if err != nil {
 		return store.Account{}, err
 	}
@@ -77,7 +89,7 @@ func resetPassword(ctx context.Context, dataDir, username, password string, cost
 	if err != nil {
 		return 0, err
 	}
-	st, err := openForAdmin(ctx, dataDir)
+	st, err := openForAdmin(ctx, dataDir, false)
 	if err != nil {
 		return 0, err
 	}

@@ -78,7 +78,14 @@ type Options struct {
 	// stay queued.
 	Workers int
 	Logger  *slog.Logger
+	// MaxLogBytes caps each job's log file (default DefaultMaxLogBytes).
+	// Output beyond it is replaced by one truncation marker line and
+	// discarded; the job keeps running.
+	MaxLogBytes int64
 }
+
+// DefaultMaxLogBytes is the default cap of a job log file.
+const DefaultMaxLogBytes = 16 << 20
 
 // Runner executes jobs. Create it with New after store.Reconcile and stop it
 // with Shutdown.
@@ -87,6 +94,7 @@ type Runner struct {
 	logDir string
 	logger *slog.Logger
 	sem    chan struct{}
+	maxLog int64
 
 	baseCtx    context.Context
 	cancelBase context.CancelFunc
@@ -115,12 +123,16 @@ func New(st *store.Store, logDir string, opts Options) *Runner {
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
+	if opts.MaxLogBytes <= 0 {
+		opts.MaxLogBytes = DefaultMaxLogBytes
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
 		store:      st,
 		logDir:     logDir,
 		logger:     opts.Logger,
 		sem:        make(chan struct{}, opts.Workers),
+		maxLog:     opts.MaxLogBytes,
 		baseCtx:    ctx,
 		cancelBase: cancel,
 		subjects:   map[Subject]int64{},
@@ -229,7 +241,9 @@ func (r *Runner) run(ctx context.Context, job store.Job, aj *activeJob, logFile 
 	}
 	r.logger.Info("job started", "job_id", job.ID, "kind", job.Kind, "subject_type", job.SubjectType, "subject_id", job.SubjectID)
 
-	err := r.call(ctx, job, logFile, fn)
+	// The job writes through the cap; the runner's own final lines below
+	// go to the file directly so they survive a truncated log.
+	err := r.call(ctx, job, newCappedWriter(logFile, r.maxLog), fn)
 	switch {
 	case err == nil:
 		status, detail = store.JobSuccess, ""
@@ -340,4 +354,39 @@ func (r *Runner) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return fmt.Errorf("jobs did not stop in time: %w", ctx.Err())
 	}
+}
+
+// cappedWriter forwards up to limit bytes to w, then writes one truncation
+// marker line and discards the rest. It never fails or blocks the writer
+// (write errors of w are dropped too), so a job is not affected by the cap.
+type cappedWriter struct {
+	mu        sync.Mutex
+	w         io.Writer
+	limit     int64
+	left      int64
+	truncated bool
+}
+
+func newCappedWriter(w io.Writer, limit int64) *cappedWriter {
+	return &cappedWriter{w: w, limit: limit, left: limit}
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.truncated {
+		return len(p), nil
+	}
+	if int64(len(p)) <= c.left {
+		c.left -= int64(len(p))
+		_, _ = c.w.Write(p)
+		return len(p), nil
+	}
+	if c.left > 0 {
+		_, _ = c.w.Write(p[:c.left])
+	}
+	c.left = 0
+	c.truncated = true
+	_, _ = fmt.Fprintf(c.w, "\n[log truncated: the job log reached its limit of %d MiB; further output is discarded]\n", c.limit>>20)
+	return len(p), nil
 }

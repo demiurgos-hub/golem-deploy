@@ -41,15 +41,16 @@ func TestPrepareNeverChmodsExistingDirectory(t *testing.T) {
 		t.Fatalf("refused directory was written to: %v", entries)
 	}
 
-	// An existing private directory with a loose subdirectory: used, and the
-	// subdirectory is left alone (the root already protects it).
+	// An existing private (empty) directory is initialised; a subdirectory
+	// the operator loosened afterwards is left alone (the root already
+	// protects it).
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	sub := filepath.Join(dir, "static")
-	if err := os.Mkdir(sub, 0o755); err != nil {
+	if _, err := Prepare(dir); err != nil {
 		t.Fatal(err)
 	}
+	sub := filepath.Join(dir, "static")
 	if err := os.Chmod(sub, 0o755); err != nil {
 		t.Fatal(err)
 	}

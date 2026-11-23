@@ -72,6 +72,10 @@ type gitServer struct {
 	hang       bool
 	goodAuth   int    // requests with the right credentials
 	redirectTo string // base URL that /redirect/ paths are sent to
+	// Minimal Git LFS server (see lfs_integration_test.go): objects by oid,
+	// and the paths of the batch requests received.
+	lfsObjects map[string][]byte
+	lfsBatches []string
 }
 
 func newGitServer(t *testing.T) *gitServer {
@@ -109,6 +113,10 @@ func newGitServer(t *testing.T) *gitServer {
 			http.Redirect(w, r, target+"/git/"+strings.TrimPrefix(r.URL.Path, "/redirect/")+"?"+r.URL.RawQuery, http.StatusFound)
 			return
 		}
+		if strings.HasPrefix(r.URL.Path, "/lfs-obj/") {
+			g.serveLFSObject(w, r)
+			return
+		}
 		u, p, ok := r.BasicAuth()
 		if !ok || u != srvUser || p != srvPass {
 			w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
@@ -118,6 +126,10 @@ func newGitServer(t *testing.T) *gitServer {
 		g.mu.Lock()
 		g.goodAuth++
 		g.mu.Unlock()
+		if strings.HasSuffix(r.URL.Path, "/info/lfs/objects/batch") {
+			g.serveLFSBatch(w, r)
+			return
+		}
 		cgiHandler.ServeHTTP(w, r)
 	}))
 	t.Cleanup(g.srv.Close)

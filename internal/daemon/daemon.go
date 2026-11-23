@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -56,6 +57,9 @@ type Options struct {
 	// unlimited).
 	ServerMemoryMB int
 	ServerCPUs     float64
+	// MaxRepoSizeMB bounds the size of each project checkout in MiB
+	// (--max-repo-size-mb); 0 means unlimited.
+	MaxRepoSizeMB int
 	// Ready, if set, is called with the bound address once serving.
 	Ready func(addr net.Addr)
 
@@ -124,11 +128,25 @@ func Run(ctx context.Context, o Options) (err error) {
 	if err != nil {
 		return err
 	}
+	if o.MaxRepoSizeMB < 0 {
+		return errors.New("--max-repo-size-mb must be 0 (unlimited) or positive")
+	}
+	if err := checkDataDirPath(o.DataDir); err != nil {
+		return err
+	}
 
 	layout, err := datadir.Prepare(o.DataDir)
 	if err != nil {
 		return err
 	}
+	// Held until Run returns (released last, after the store is closed);
+	// taken before reconciliation and the startup sweeps, which would
+	// otherwise fail or delete the live state of another daemon.
+	lock, err := datadir.AcquireLock(layout)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Release() }()
 	jwtKey, err := datadir.LoadOrCreateKey(layout.JWTKey(), auth.JWTKeySize)
 	if err != nil {
 		return err
@@ -180,7 +198,7 @@ func Run(ctx context.Context, o Options) (err error) {
 		logger.Warn("no approved admin account exists; create one with: golem-deploy admin create --username <name> --data-dir " + layout.Root)
 	}
 
-	gitClient, err := prepareGit(ctx, st, layout, logger)
+	gitClient, err := prepareGit(ctx, st, layout, int64(o.MaxRepoSizeMB)<<20, logger)
 	if err != nil {
 		return err
 	}
@@ -278,7 +296,7 @@ func Run(ctx context.Context, o Options) (err error) {
 // prepareGit sweeps git scratch files and orphaned checkouts left by a
 // previous run and returns the git runner, or nil (project git operations
 // then answer 503) when git is not installed.
-func prepareGit(ctx context.Context, st *store.Store, layout datadir.Layout, logger *slog.Logger) (httpapi.GitClient, error) {
+func prepareGit(ctx context.Context, st *store.Store, layout datadir.Layout, maxRepoSize int64, logger *slog.Logger) (httpapi.GitClient, error) {
 	if err := git.SweepTemp(layout.Tmp()); err != nil {
 		logger.Warn("could not remove git scratch files from a previous run", "err", err)
 	}
@@ -297,12 +315,26 @@ func prepareGit(ctx context.Context, st *store.Store, layout datadir.Layout, log
 	if err != nil {
 		logger.Warn("could not remove all orphaned checkouts", "err", err)
 	}
-	r, err := git.New(git.Options{TempDir: layout.Tmp(), KnownHostsFile: layout.KnownHosts()})
+	r, err := git.New(git.Options{TempDir: layout.Tmp(), KnownHostsFile: layout.KnownHosts(), MaxRepoSize: maxRepoSize})
 	if err != nil {
 		logger.Warn("git is not available; project clone, pull and branch operations are disabled", "err", err)
 		return nil, nil
 	}
 	return r, nil
+}
+
+// checkDataDirPath refuses a data directory whose absolute path cannot be
+// written safely into the per-operation ssh_config of git operations (the
+// SSH key and known_hosts paths live below it).
+func checkDataDirPath(dir string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("resolve data directory: %w", err)
+	}
+	if err := git.CheckSSHConfigPath(abs); err != nil {
+		return fmt.Errorf("data directory %q cannot be used: %w (it is written into the SSH configuration of git operations); choose another --data-dir", abs, err)
+	}
+	return nil
 }
 
 // reconcileServers starts, as jobs, the servers whose desired state is

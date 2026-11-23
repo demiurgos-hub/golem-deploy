@@ -129,6 +129,10 @@ func CheckAuthKind(method AuthMethod, kind Kind) error {
 		return errors.New("https credentials require an https:// repository URL")
 	case method == AuthSSH && kind != KindSSH:
 		return errors.New("an SSH key requires an ssh:// or user@host:path repository URL")
+	case method == AuthNone && kind == KindSSH:
+		// Without a key of its own, ssh would offer the daemon user's
+		// personal keys (found through the passwd entry, not $HOME).
+		return errors.New(`SSH repository URLs need a private key: use auth type "ssh" with a deploy key`)
 	}
 	return nil
 }
