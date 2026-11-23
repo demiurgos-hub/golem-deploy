@@ -1,168 +1,266 @@
+// Package extract unpacks static ZIP add-ons into fresh staging
+// directories with hard limits: total and per-file size, entry count,
+// compression ratio, path depth and length. Entry paths are never trusted:
+// absolute, traversing, backslashed, device-like and colliding paths
+// (including case-insensitive collisions) are rejected, only regular files
+// and directories are accepted and file modes are reduced to 0644/0755.
+// The destination is always a new directory created by Zip itself, never an
+// existing tree such as a repository checkout.
 package extract
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
-
-	"github.com/demiurgos-hub/golem-deploy/internal/utils"
 )
 
-// ExtractZipArchiveOnly extracts a zip file into destDir. Nested archives are
-// left as-is. Executable permission bits from ZIP entries are preserved via
-// file.Mode().
-func ExtractZipArchiveOnly(zipPath string, destDir string) error {
-	// Create destination directory
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		return fmt.Errorf("failed to create destination directory: %w", err)
-	}
-
-	// Open the zip file
-	reader, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return fmt.Errorf("failed to open zip file: %w", err)
-	}
-	defer reader.Close()
-
-	// Extract each file
-	for _, file := range reader.File {
-		if err := extractZipFile(file, destDir); err != nil {
-			return fmt.Errorf("failed to extract %s: %w", file.Name, err)
-		}
-	}
-
-	return nil
+// Limits bounds one extraction.
+type Limits struct {
+	MaxTotalBytes int64 // sum of uncompressed file sizes
+	MaxFileBytes  int64 // one file's uncompressed size
+	MaxEntries    int   // files and directories
+	// MaxRatio bounds uncompressed/compressed size, checked for the whole
+	// archive and for each entry larger than ratioMinBytes.
+	MaxRatio   int64
+	MaxDepth   int // path segments
+	MaxPathLen int // bytes of an entry path
 }
 
-// ExtractStaticAddonIntoContext extracts a static ZIP archive into contextDir/extractTo.
-// Empty and "." destinations merge the archive's top-level entries into the context
-// root. The ZIP itself is never copied into the build context, and existing paths
-// are never overwritten.
-func ExtractStaticAddonIntoContext(zipPath, contextDir, extractTo string) error {
-	cleaned, err := utils.ValidateExtractToPath(extractTo)
-	if err != nil {
-		return err
+// DefaultLimits suits game add-ons (a few GiB of assets at most).
+func DefaultLimits() Limits {
+	return Limits{
+		MaxTotalBytes: 4 << 30,
+		MaxFileBytes:  2 << 30,
+		MaxEntries:    20000,
+		MaxRatio:      200,
+		MaxDepth:      32,
+		MaxPathLen:    512,
 	}
-
-	fmt.Printf("Extracting static addon %s -> %s\n", filepath.Base(zipPath), cleaned)
-	if cleaned == "." {
-		return extractStaticAddonAtRoot(zipPath, contextDir)
-	}
-
-	destDir, err := utils.ValidatePathWithinDirectory(contextDir, cleaned)
-	if err != nil {
-		return fmt.Errorf("extract_to escapes the build context: %w", err)
-	}
-
-	if _, err := os.Stat(destDir); err == nil {
-		return fmt.Errorf("extract destination already exists in build context: %s", cleaned)
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("failed to check extract destination %s: %w", cleaned, err)
-	}
-
-	if err := ExtractZipArchiveOnly(zipPath, destDir); err != nil {
-		// Best-effort cleanup of a partial extract
-		os.RemoveAll(destDir)
-		return fmt.Errorf("failed to extract static addon %s: %w", filepath.Base(zipPath), err)
-	}
-
-	return nil
 }
 
-func extractStaticAddonAtRoot(zipPath, contextDir string) error {
-	absContext, err := filepath.Abs(contextDir)
-	if err != nil {
-		return fmt.Errorf("failed to resolve build context: %w", err)
-	}
+// ratioMinBytes exempts small entries from the per-entry ratio check
+// (small runs of zeros legitimately compress very well).
+const ratioMinBytes = 1 << 20
 
-	stagingDir, err := os.MkdirTemp(filepath.Dir(absContext), ".golem-deploy-static-addon-*")
-	if err != nil {
-		return fmt.Errorf("failed to create static addon staging directory: %w", err)
-	}
-	defer os.RemoveAll(stagingDir)
+// ErrUnsafe is wrapped by every rejection of archive content.
+var ErrUnsafe = errors.New("unsafe or oversized archive")
 
-	if err := ExtractZipArchiveOnly(zipPath, stagingDir); err != nil {
-		return fmt.Errorf("failed to extract static addon %s: %w", filepath.Base(zipPath), err)
-	}
+func unsafe(format string, a ...any) error {
+	return fmt.Errorf("%w: %s", ErrUnsafe, fmt.Sprintf(format, a...))
+}
 
-	entries, err := os.ReadDir(stagingDir)
-	if err != nil {
-		return fmt.Errorf("failed to inspect static addon %s: %w", filepath.Base(zipPath), err)
+// cleanEntry validates an entry name and returns it in slash form without
+// a trailing slash.
+func cleanEntry(name string, lim Limits) (string, error) {
+	if name == "" || len(name) > lim.MaxPathLen {
+		return "", unsafe("entry path is empty or too long")
 	}
-
-	for _, entry := range entries {
-		targetPath := filepath.Join(absContext, entry.Name())
-		if _, err := os.Lstat(targetPath); err == nil {
-			return fmt.Errorf("static addon path already exists in build context: %s", entry.Name())
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("failed to check static addon path %s: %w", entry.Name(), err)
+	if strings.ContainsAny(name, "\\:\x00") {
+		return "", unsafe("entry %q contains a backslash, colon or NUL", clip(name))
+	}
+	trimmed := strings.TrimSuffix(name, "/")
+	if trimmed == "" || strings.HasPrefix(trimmed, "/") {
+		return "", unsafe("entry %q is absolute", clip(name))
+	}
+	segs := strings.Split(trimmed, "/")
+	if len(segs) > lim.MaxDepth {
+		return "", unsafe("entry %q is nested too deeply", clip(name))
+	}
+	for _, s := range segs {
+		switch {
+		case s == "" || s == "." || s == "..":
+			return "", unsafe("entry %q has an empty, '.' or '..' segment", clip(name))
+		case strings.HasSuffix(s, ".") || strings.HasSuffix(s, " "):
+			return "", unsafe("entry %q has a segment ending in a dot or space", clip(name))
+		case reservedDevice(s):
+			return "", unsafe("entry %q uses a reserved device name", clip(name))
 		}
-	}
-
-	movedPaths := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		sourcePath := filepath.Join(stagingDir, entry.Name())
-		targetPath := filepath.Join(absContext, entry.Name())
-		if err := os.Rename(sourcePath, targetPath); err != nil {
-			for _, movedPath := range movedPaths {
-				_ = os.RemoveAll(movedPath)
+		for _, r := range s {
+			if r < 0x20 || r == 0x7f {
+				return "", unsafe("entry %q contains control characters", clip(name))
 			}
-			return fmt.Errorf("failed to add static addon path %s to build context: %w", entry.Name(), err)
 		}
-		movedPaths = append(movedPaths, targetPath)
 	}
+	if path.Clean(trimmed) != trimmed || !filepath.IsLocal(filepath.FromSlash(trimmed)) {
+		return "", unsafe("entry %q is not a local path", clip(name))
+	}
+	return trimmed, nil
+}
 
+func reservedDevice(seg string) bool {
+	base, _, _ := strings.Cut(strings.ToUpper(seg), ".")
+	switch base {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+		return true
+	}
+	return len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '0' && base[3] <= '9'
+}
+
+func clip(s string) string {
+	if len(s) > 80 {
+		return s[:80] + "…"
+	}
+	return s
+}
+
+type entry struct {
+	f    *zip.File
+	path string
+	dir  bool
+	exec bool
+}
+
+// plan validates the central directory before anything is written.
+func plan(files []*zip.File, lim Limits) ([]entry, error) {
+	if len(files) > lim.MaxEntries {
+		return nil, unsafe("archive has more than %d entries", lim.MaxEntries)
+	}
+	var total, compressed uint64
+	seen := map[string]bool{} // lower-cased paths
+	isFile := map[string]bool{}
+	entries := make([]entry, 0, len(files))
+	for _, f := range files {
+		p, err := cleanEntry(f.Name, lim)
+		if err != nil {
+			return nil, err
+		}
+		mode := f.Mode()
+		dir := mode.IsDir() || strings.HasSuffix(f.Name, "/")
+		if !dir && !mode.IsRegular() {
+			return nil, unsafe("entry %q is not a regular file or directory (links and devices are not allowed)", clip(f.Name))
+		}
+		key := strings.ToLower(p)
+		if seen[key] {
+			return nil, unsafe("entry %q collides with another entry (paths are compared ignoring case)", clip(f.Name))
+		}
+		seen[key] = true
+		if !dir {
+			isFile[key] = true
+			if f.UncompressedSize64 > uint64(lim.MaxFileBytes) {
+				return nil, unsafe("entry %q exceeds the %d byte file limit", clip(f.Name), lim.MaxFileBytes)
+			}
+			if f.UncompressedSize64 > ratioMinBytes && f.UncompressedSize64 > uint64(lim.MaxRatio)*max(f.CompressedSize64, 1) {
+				return nil, unsafe("entry %q has a suspicious compression ratio", clip(f.Name))
+			}
+			total += f.UncompressedSize64
+			compressed += f.CompressedSize64
+			if total > uint64(lim.MaxTotalBytes) {
+				return nil, unsafe("archive exceeds the %d byte total limit", lim.MaxTotalBytes)
+			}
+		}
+		entries = append(entries, entry{f: f, path: p, dir: dir, exec: mode&0o111 != 0})
+	}
+	if total > ratioMinBytes && total > uint64(lim.MaxRatio)*max(compressed, 1) {
+		return nil, unsafe("archive has a suspicious compression ratio")
+	}
+	// A file may not also be a parent directory of another entry.
+	for key := range seen {
+		for dir := path.Dir(key); dir != "."; dir = path.Dir(dir) {
+			if isFile[dir] {
+				return nil, unsafe("entry %q is both a file and a directory", clip(dir))
+			}
+		}
+	}
+	return entries, nil
+}
+
+// Zip extracts the archive at zipPath into a new directory created with
+// os.MkdirTemp under tmpRoot and returns that directory. On any error
+// nothing is left behind. The caller removes the directory when done.
+func Zip(zipPath, tmpRoot string, lim Limits) (string, error) {
+	r, err := zip.OpenReader(zipPath)
+	if errors.Is(err, zip.ErrInsecurePath) {
+		if r != nil {
+			_ = r.Close()
+		}
+		return "", unsafe("archive contains insecure paths")
+	}
+	if err != nil {
+		return "", fmt.Errorf("open zip: %w", err)
+	}
+	defer r.Close()
+	entries, err := plan(r.File, lim)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(tmpRoot, 0o700); err != nil {
+		return "", err
+	}
+	dest, err := os.MkdirTemp(tmpRoot, "static-extract-")
+	if err != nil {
+		return "", err
+	}
+	if err := extractAll(entries, dest, lim); err != nil {
+		_ = os.RemoveAll(dest)
+		return "", err
+	}
+	return dest, nil
+}
+
+func extractAll(entries []entry, dest string, lim Limits) error {
+	var written int64
+	for _, e := range entries {
+		target := filepath.Join(dest, filepath.FromSlash(e.path))
+		if rel, err := filepath.Rel(dest, target); err != nil || !filepath.IsLocal(rel) {
+			return unsafe("entry %q escapes the destination", clip(e.path))
+		}
+		if e.dir {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		mode := fs.FileMode(0o644)
+		if e.exec {
+			mode = 0o755
+		}
+		n, err := writeFile(e.f, target, mode, min(lim.MaxFileBytes, lim.MaxTotalBytes-written))
+		if err != nil {
+			return err
+		}
+		written += n
+	}
 	return nil
 }
 
-// extractZipFile extracts a single file from a zip archive
-func extractZipFile(file *zip.File, destDir string) error {
-	// ZIP paths conventionally use forward slashes. Normalize backslashes too so
-	// malicious Windows-style traversal is rejected on every host platform.
-	entryName := filepath.FromSlash(strings.ReplaceAll(file.Name, `\`, "/"))
-	cleanedName := filepath.Clean(entryName)
-	if cleanedName == "." || filepath.IsAbs(cleanedName) || filepath.VolumeName(cleanedName) != "" {
-		return fmt.Errorf("invalid file path: %s", file.Name)
-	}
-
-	absDest, err := filepath.Abs(destDir)
+// writeFile copies one entry, never trusting its declared size: at most
+// limit bytes are accepted.
+func writeFile(f *zip.File, target string, mode fs.FileMode, limit int64) (int64, error) {
+	src, err := f.Open()
 	if err != nil {
-		return fmt.Errorf("failed to resolve destination directory: %w", err)
+		return 0, fmt.Errorf("open entry %q: %w", clip(f.Name), err)
 	}
-	filePath := filepath.Join(absDest, cleanedName)
-	rel, err := filepath.Rel(absDest, filePath)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return fmt.Errorf("invalid file path: %s", file.Name)
-	}
-
-	// Create directories if needed
-	if file.FileInfo().IsDir() {
-		return os.MkdirAll(filePath, file.Mode())
-	}
-
-	// Create parent directory
-	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
-		return err
-	}
-
-	// Create the file
-	destFile, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+	defer src.Close()
+	// O_EXCL: the staging tree is fresh, so an existing path means two
+	// entries resolved to the same file.
+	dst, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
-		return err
+		if errors.Is(err, fs.ErrExist) {
+			return 0, unsafe("entry %q collides with another entry", clip(f.Name))
+		}
+		return 0, err
 	}
-	defer destFile.Close()
-
-	// Open the file in the zip archive
-	srcFile, err := file.Open()
+	n, err := io.Copy(dst, io.LimitReader(src, limit+1))
+	if cerr := dst.Close(); err == nil {
+		err = cerr
+	}
 	if err != nil {
-		return err
+		if errors.Is(err, zip.ErrFormat) || errors.Is(err, zip.ErrChecksum) {
+			return n, unsafe("entry %q is corrupt or larger than declared", clip(f.Name))
+		}
+		return n, err
 	}
-	defer srcFile.Close()
-
-	// Copy contents
-	_, err = io.Copy(destFile, srcFile)
-	return err
+	if n > limit {
+		return n, unsafe("entry %q exceeds the size limit", clip(f.Name))
+	}
+	return n, nil
 }
