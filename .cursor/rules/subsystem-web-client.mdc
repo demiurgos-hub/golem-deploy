@@ -1,17 +1,18 @@
 ---
 description: Embedded React web client architecture and API integration
-globs: "{frontend/src/**/*.{ts,tsx},frontend/*.json,frontend/vite.config.ts,frontend/index.html,frontend/eslint.config.js}"
+globs: "{frontend/src/**/*.{ts,tsx},frontend/*.json,frontend/vite.config.ts,frontend/vitest.config.ts,frontend/index.html,frontend/eslint.config.js}"
 alwaysApply: false
 ---
 
 # Web client
 
-- This is the only UI: React, TypeScript, Vite, Tailwind, Radix, and TanStack Query. `@tanstack/react-router` is installed but not used yet.
-- The daemon API is `/api/v1` (see `docs/API.md`). Wire types come from the generated `src/api/types.gen.ts` (do not edit; run `scripts/gen-types.sh`). The existing pages, `src/api/client.ts` and the hand-written `src/api/types.ts` still target the removed pre-v1 API and are broken at runtime until the frontend rewrite (task D) replaces them.
-- Use relative API URLs in production. The Vite dev server proxies `/api` to the daemon on `127.0.0.1:8000`.
-- Send credentials only as `Authorization: Bearer`; never rely on cookies. Stream job and server logs with `fetch` + `ReadableStream` (bearer header), not `EventSource`. Switch on `error.code` from the error envelope; on `unauthenticated` drop the token.
-- The daemon serves the SPA with a strict CSP (`script-src 'self'`, no inline scripts, `connect-src 'self'`); keep the build free of inline scripts and external origins.
-- Authentication state and token persistence are centralized in `src/hooks/use-auth.ts`; client-side JWT parsing is display gating, not authorization. Browser storage keys use the `golem_deploy_` prefix.
-- Reuse query invalidation and operation tracking instead of adding parallel request state.
-- `npm run lint` must pass with zero warnings; `npm run build` type-checks (`noUnusedLocals`) and produces `frontend/dist` for Go embedding.
-- Any backend contract change must be applied here.
+- The only UI: React 19, TypeScript (strict), Vite, Tailwind v4, Radix dialogs, TanStack Query, TanStack Router (code-based route tree in `src/router.tsx`, routes code-split with `lazyRouteComponent`), TanStack Virtual for log windowing.
+- Wiring: `src/main.tsx` builds `AppServices` (`src/app/services.ts`: API client, endpoints, `SessionStore`, `SessionRefresher`, QueryClient) and renders `AppRoot`, which reacts to session events. Tests build the same services over a fake `Transport`; never add module-level singletons.
+- API layer (`src/api`): `client.ts` is the only code that calls `fetch`/`XMLHttpRequest`; every failure is an `ApiError` (`errors.ts`) parsed from the error envelope or mapped to `network_error`/`invalid_response`/`aborted`. Components show `describeError(err)` and the request id, never response text. All wire types come from `types.gen.ts` (generated; run `scripts/gen-types.sh`). Add routes to `endpoints.ts`, query keys to `query-keys.ts`, hooks to `queries.ts`.
+- Session: token in memory, mirrored to sessionStorage (default) or localStorage ("Keep me signed in"), key `golem_deploy_session`; tabs sync over the `golem_deploy_session` BroadcastChannel. A 401 `unauthenticated` for the current token ends the session once (`SessionStore.handleUnauthenticated`). `SessionRefresher` refreshes 30 minutes before the JWT `exp` and on tab return after long inactivity. The displayed role comes from `GET /account`, never from the JWT.
+- Credentials only as `Authorization: Bearer`; never cookies. Streams (job logs, server logs) use `client.stream` + `readLines` (`src/api/stream.ts`) through `useLogStream`; the contract has no resume offset, so streams are not auto-reconnected.
+- React Query: no retry on 4xx, polling only for state that changes on its own (active jobs, busy projects, server lists/state, stats, status) and only while visible. Per-row actions own their mutation so pending state stays per row. Every job-returning action shows the job inline (`InlineJob`).
+- UI primitives live in `src/components/ui`; reuse them instead of new class strings. Render server strings as text; no `dangerouslySetInnerHTML`; links from server data go through `safeHttpUrl`.
+- The daemon serves the SPA with a strict CSP (`script-src 'self'`, `connect-src 'self'`, no external origins). Keep the build free of inline scripts, eval and remote assets.
+- Mock layer: `src/mock/transport.ts` simulates the not-yet-implemented routes under `VITE_API_MOCK=1 npm run dev` (`GOLEM_DEPLOY_DEV_API` overrides the dev proxy target). It is imported only behind `import.meta.env.DEV`; `vite.config.ts` refuses to build with the flag and fails if the mock reaches the bundle. Remove a domain from the mock once the daemon implements it.
+- Verification: `npm run lint` (zero warnings), `npm test` (Vitest + Testing Library, jsdom), `npm run build` (type-check + bundle for Go embedding).

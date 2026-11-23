@@ -2,7 +2,7 @@
 
 Golem Deploy is an open-source tool for self-hosting games built on [Golem Engine](https://golemengine.dev), the Go engine for server-authoritative multiplayer games. It runs on a Linux host next to Docker and is managed through an embedded web client.
 
-**Status: early development.** Golem Deploy is not yet usable in production. APIs, storage formats and configuration will change without migration paths until a first release. The daemon core (accounts, sessions, API tokens, jobs, encrypted secrets) has been rebuilt; projects, the Docker runner, servers, images, static files and volumes are being rebuilt on top of it and their API routes currently answer `501 not_implemented`. The web client still targets the previous API and does not work against this daemon yet.
+**Status: early development.** Golem Deploy is not yet usable in production. APIs, storage formats and configuration will change without migration paths until a first release. The daemon core (accounts, sessions, API tokens, jobs, encrypted secrets) has been rebuilt; projects, the Docker runner, servers, images, static files and volumes are being rebuilt on top of it and their API routes currently answer `501 not_implemented`. The web client targets API v1: sign-in, account, API tokens and administration work against the daemon; the project, server, image, static file and volume pages show the daemon's "not implemented" error until those routes land (they can be tried against a browser-side mock, see Develop the web client).
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -42,12 +42,23 @@ After changing `internal/apitypes`, regenerate the web client's types with `scri
 Run the checks used in CI:
 
 ```sh
-(cd frontend && npm run lint && npm run build)
+(cd frontend && npm run lint && npm test && npm run build)
 go vet ./...
 go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 go test -race ./...
 ```
+
+## Develop the web client
+
+```sh
+cd frontend
+npm run dev                       # Vite on :5173, proxies /api to the daemon on 127.0.0.1:8000
+VITE_API_MOCK=1 npm run dev       # also simulates the routes the daemon does not implement yet
+npm test                          # Vitest + Testing Library
+```
+
+`GOLEM_DEPLOY_DEV_API=http://127.0.0.1:18080 npm run dev` points the proxy at a daemon on another address. The mock is development-only: a production build refuses `VITE_API_MOCK` and fails if the mock code ends up in the bundle.
 
 ## Run
 

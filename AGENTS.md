@@ -16,7 +16,7 @@ Golem Deploy is an open-source tool for self-hosting games built on Golem Engine
 - No package-level mutable state: dependencies flow from `internal/daemon` through `httpapi.Deps`.
 - Treat `frontend/dist` (except its committed `.gitkeep`), `frontend/node_modules`, `bin`, `data` (the default data directory, including its keys), and other secrets as generated or runtime state.
 - Build the web client before the binary because `frontend/embed.go` embeds `frontend/dist`. Without a build, the binary serves a plain-text "web client not built" notice instead of the SPA.
-- Before finishing, run what CI runs: `npm run lint` and `npm run build` in `frontend/`, then `scripts/gen-types.sh` (the generated file must not change), `go vet ./...`, `staticcheck ./...`, `govulncheck ./...`, and `go test -race ./...` from the root (see `.github/workflows/ci.yml`).
+- Before finishing, run what CI runs: `npm run lint`, `npm test` and `npm run build` in `frontend/`, then `scripts/gen-types.sh` (the generated file must not change), `go vet ./...`, `staticcheck ./...`, `govulncheck ./...`, and `go test -race ./...` from the root (see `.github/workflows/ci.yml`).
 
 ## Required rule maintenance
 
