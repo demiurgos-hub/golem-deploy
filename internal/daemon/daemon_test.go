@@ -16,6 +16,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
+	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
 	"github.com/demiurgos-hub/golem-deploy/internal/httpapi"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
@@ -70,6 +71,7 @@ func TestRunServesAndShutsDownGracefully(t *testing.T) {
 			Ready:       func(a net.Addr) { addrCh <- a },
 			bcryptCost:  bcrypt.MinCost,
 			docker:      noDocker{},
+			dockerCLI:   dockertest.New(),
 			storeClosed: func(err error) { closed <- err },
 		})
 	}()

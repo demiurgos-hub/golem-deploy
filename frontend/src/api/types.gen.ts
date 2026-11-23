@@ -343,12 +343,21 @@ export interface Image {
    */
   id: string;
   tags: string[];
+  /**
+   * ProjectID and Commit come from the image's build labels; null/empty for
+   * images not built by the build pipeline.
+   */
   project_id: number | null;
+  commit: string;
   size_bytes: number /* int64 */;
   created_at: string /* RFC 3339, UTC */;
   /**
-   * InUse reports whether any server's container uses the image; such images
-   * cannot be deleted (409 conflict).
+   * ServerIDs lists the servers configured with this image.
+   */
+  server_ids: number /* int64 */[];
+  /**
+   * InUse reports whether a server references the image or any container
+   * was created from it; such images cannot be deleted (409 conflict).
    */
   in_use: boolean;
 }
@@ -361,13 +370,18 @@ export interface ImageList {
 /**
  * StaticFile is a file in the static store, made available to builds.
  * Name: a single path segment of 1 to 128 characters from [A-Za-z0-9._-],
- * not starting with a dot.
+ * starting with a letter or digit, not ending with a dot and not a Windows
+ * reserved device name.
  */
 export interface StaticFile {
   name: string;
   size_bytes: number /* int64 */;
-  sha256: string;
   modified_at: string /* RFC 3339, UTC */;
+  /**
+   * IsZip reports whether the file has a .zip name and ZIP signature (only
+   * ZIP archives can be extracted as static add-ons).
+   */
+  is_zip: boolean;
 }
 /**
  * StaticFileList is the body of GET /api/v1/static and the 201 response of
@@ -437,10 +451,11 @@ export const JobKindProjectBranch = "project.branch";
 export const JobKindServerStart = "server.start";
 export const JobKindServerStop = "server.stop";
 export const JobKindServerRestart = "server.restart";
+export const JobKindServerDelete = "server.delete";
 /**
  * Job kinds.
  */
-export type JobKind = typeof JobKindProjectClone | typeof JobKindProjectPull | typeof JobKindProjectBranch | typeof JobKindServerStart | typeof JobKindServerStop | typeof JobKindServerRestart;
+export type JobKind = typeof JobKindProjectClone | typeof JobKindProjectPull | typeof JobKindProjectBranch | typeof JobKindServerStart | typeof JobKindServerStop | typeof JobKindServerRestart | typeof JobKindServerDelete;
 /**
  * Job is a long-running operation. Routes that start one respond 202 with the
  * Job; poll GET /api/v1/jobs/{id} or stream GET /api/v1/jobs/{id}/log?follow=1.
@@ -649,6 +664,10 @@ export interface Server {
    * deleted. Immutable.
    */
   project_id: number | null;
+  /**
+   * Image is the immutable id ("sha256:...") of the managed image the
+   * server runs; references given on create/update are resolved to it.
+   */
   image: string;
   port: number /* int */;
   env_keys: string[];
@@ -660,6 +679,12 @@ export interface Server {
   container_id: string;
   started_at: string | null;
   exit_code: number | null;
+  /**
+   * RestartRequired is true when the container is running with an older
+   * definition (image, port, env or daemon run settings changed since it
+   * was started). Changes never restart a server implicitly.
+   */
+  restart_required: boolean;
   created_at: string /* RFC 3339, UTC */;
   updated_at: string /* RFC 3339, UTC */;
 }
@@ -670,10 +695,13 @@ export interface ServerList {
   items: Server[];
 }
 /**
- * CreateServerRequest is the body of POST /api/v1/servers. Port, when absent,
- * is auto-assigned from the configured port range. Env keys must match
- * ^[A-Za-z_][A-Za-z0-9_]*$. DesiredState defaults to "stopped"; "running"
- * starts the server right after creation.
+ * CreateServerRequest is the body of POST /api/v1/servers. Image is the id or
+ * a tag of a managed image (it is stored as the resolved image id). Port,
+ * when absent, is auto-assigned from the configured port range. Env keys must
+ * match ^[A-Za-z_][A-Za-z0-9_]{0,127}$, be unique ignoring case and not be
+ * reserved (DOCKER_*, PATH, HOME, proxy variables, ...); at most 128
+ * variables and 64 KiB in total. DesiredState defaults to "stopped";
+ * "running" starts a server.start job right after creation.
  */
 export interface CreateServerRequest {
   name: string;
@@ -711,7 +739,9 @@ export interface ServerStats {
 }
 /**
  * ServerSpec is the portable definition of one server in an export.
- * Project is referenced by name because ids differ between hosts.
+ * Project is referenced by name because ids differ between hosts. On import,
+ * Image must name a managed image present on the host and DesiredState is
+ * validated but imported servers are always created stopped.
  */
 export interface ServerSpec {
   name: string;

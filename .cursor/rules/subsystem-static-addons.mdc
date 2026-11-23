@@ -1,11 +1,11 @@
 ---
-description: Static file and static ZIP add-on extraction library
-globs: "{internal/extract/**/*.go,internal/utils/**/*.go,internal/docker/static_addons*.go}"
+description: Static file store and safe ZIP extraction
+globs: "{internal/staticfiles/**/*.go,internal/extract/**/*.go}"
 alwaysApply: false
 ---
 
-# Static files and add-ons
+# Static files and add-on extraction
 
-- `internal/utils`, `internal/extract` and `internal/docker/static_addons.go` are legacy library code kept compiling but **not wired to any HTTP route**. Task C implements the planned `/api/v1/static` routes (types in `internal/apitypes/host.go`) on top of the data directory's `static/` (`datadir.Layout.Static()`); `utils.StaticDir` still points at the old working-directory path and must not be used by new code.
-- Extraction rules to preserve: empty or `.` `extract_to` means the build-context root; root extraction stages entries and rejects collisions without overwriting; never trust archive entry paths; nested archives are not expanded.
-- Verify with `go test ./internal/extract/... ./internal/utils/... ./internal/docker/...`.
+- `internal/staticfiles.Store` owns `datadir.Layout.Static()`. Names are allowlisted by `ValidateName` (no Windows device names, no trailing dot) and resolved inside the directory; invalid names are rejected, never rewritten. Uploads go through `Stage` (temp file `.upload-*` in the same directory, size-limited, fsynced) and `Commit` (hard link for no-overwrite, rename for `replace`; all files of one request or none). `Open` removes stale temporaries. Never buffer whole uploads in memory; the HTTP handler streams multipart parts and reads the raw `filename` parameter (not `Part.FileName`, which strips directories).
+- `internal/extract.Zip(zipPath, tmpRoot, Limits)` is the only extractor (ZIP only, no tar). It validates the whole central directory first (entry count, sizes, compression ratio, depth, path length, unsafe or colliding names including case-insensitive collisions, non-regular entries), creates its own fresh `os.MkdirTemp` destination under `tmpRoot` (use `datadir.Layout.Tmp()`), masks modes to 0644/0755 and enforces sizes again while copying. Never extract into an existing tree such as a repository checkout. It has no HTTP caller yet; the build pipeline will use it.
+- Verify with `go test ./internal/staticfiles/... ./internal/extract/...` (bombs, traversal, modes, concurrent and interrupted uploads are covered).

@@ -182,3 +182,10 @@ func (k *KnownIPs) evictLocked() {
 	}
 	delete(k.users, oldest)
 }
+
+// Count reports how many operations are in progress for key.
+func (f *InFlight) Count(key string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.n[key]
+}

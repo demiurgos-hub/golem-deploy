@@ -20,6 +20,8 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
+	"github.com/demiurgos-hub/golem-deploy/internal/servers"
+	"github.com/demiurgos-hub/golem-deploy/internal/staticfiles"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -66,6 +68,10 @@ type Deps struct {
 	Git     GitClient
 	RepoDir string
 	TempDir string
+	// Servers backs the server, image and volume routes and Static the
+	// static file routes; when nil those routes answer 503.
+	Servers *servers.Service
+	Static  *staticfiles.Store
 	// SPA serves non-API paths (the embedded web client). Nil serves 404.
 	SPA http.Handler
 	// Now overrides the clock (tests).
@@ -87,6 +93,8 @@ type Server struct {
 	jobs     *jobs.Runner
 	logger   *slog.Logger
 	docker   DockerProbe
+	servers  *servers.Service
+	static   *staticfiles.Store
 	spa      http.Handler
 	now      func() time.Time
 	proj     *projectState
@@ -180,6 +188,8 @@ func New(cfg Config, d Deps) (*Server, error) {
 		jobs:       d.Jobs,
 		logger:     d.Logger,
 		docker:     d.Docker,
+		servers:    d.Servers,
+		static:     d.Static,
 		spa:        d.SPA,
 		now:        d.Now,
 		proj:       newProjectState(d),

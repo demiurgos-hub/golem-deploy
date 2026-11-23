@@ -5,13 +5,18 @@ import "time"
 // Image is a Docker image managed (built and labelled) by Golem Deploy.
 type Image struct {
 	// ID is the image id ("sha256:..."); use it with DELETE /api/v1/images/{id}.
-	ID        string    `json:"id"`
-	Tags      []string  `json:"tags"`
+	ID   string   `json:"id"`
+	Tags []string `json:"tags"`
+	// ProjectID and Commit come from the image's build labels; null/empty for
+	// images not built by the build pipeline.
 	ProjectID *int64    `json:"project_id" tstype:"number | null,required"`
+	Commit    string    `json:"commit"`
 	SizeBytes int64     `json:"size_bytes"`
 	CreatedAt time.Time `json:"created_at"`
-	// InUse reports whether any server's container uses the image; such images
-	// cannot be deleted (409 conflict).
+	// ServerIDs lists the servers configured with this image.
+	ServerIDs []int64 `json:"server_ids"`
+	// InUse reports whether a server references the image or any container
+	// was created from it; such images cannot be deleted (409 conflict).
 	InUse bool `json:"in_use"`
 }
 
@@ -22,12 +27,15 @@ type ImageList struct {
 
 // StaticFile is a file in the static store, made available to builds.
 // Name: a single path segment of 1 to 128 characters from [A-Za-z0-9._-],
-// not starting with a dot.
+// starting with a letter or digit, not ending with a dot and not a Windows
+// reserved device name.
 type StaticFile struct {
 	Name       string    `json:"name"`
 	SizeBytes  int64     `json:"size_bytes"`
-	SHA256     string    `json:"sha256"`
 	ModifiedAt time.Time `json:"modified_at"`
+	// IsZip reports whether the file has a .zip name and ZIP signature (only
+	// ZIP archives can be extracted as static add-ons).
+	IsZip bool `json:"is_zip"`
 }
 
 // StaticFileList is the body of GET /api/v1/static and the 201 response of

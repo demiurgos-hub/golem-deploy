@@ -2,7 +2,7 @@
 
 This is the human and agent guide to the Golem Deploy HTTP API. The route table with access levels is `internal/httpapi/routes.go`; wire types are `internal/apitypes` (the web client's `frontend/src/api/types.gen.ts` is generated from them). When this file and the code disagree, the code wins and this file is a bug.
 
-Status column: **implemented**, or **planned (task B/C)** — planned routes are registered with their final access level and currently answer `501 not_implemented`; their request and response types already exist in `internal/apitypes`.
+Every route listed here is implemented.
 
 ## Conventions
 
@@ -39,13 +39,13 @@ Every non-2xx response has this body:
 | `method_not_allowed` | 405 | See `Allow` header |
 | `bad_host` | 421 | `Host` header is not an IP address, `localhost` or a `--public-host` name |
 | `username_taken` | 409 | Account username exists |
-| `name_taken` | 409 | Project/server name exists (task B/C) |
-| `port_in_use` | 409 | Host port already assigned (task C) |
+| `name_taken` | 409 | Project/server name exists |
+| `port_in_use` | 409 | Host port already assigned to another server, or the port range is full |
 | `last_admin` | 409 | Change would leave no approved admin |
 | `cannot_modify_self` | 409 | Admin tried to delete, demote or unapprove themselves |
 | `job_in_progress` | 409 | Another job is queued/running for the same subject |
 | `job_not_active` | 409 | Job already finished |
-| `conflict` | 409 | Other state conflict (e.g. resource in use, token limit) |
+| `conflict` | 409 | Other state conflict (e.g. resource in use, file exists, token limit) |
 | `request_too_large` | 413 | Body over the route limit |
 | `unsupported_media_type` | 415 | Body is not `application/json` |
 | `rate_limited` | 429 | Too many attempts, or too many concurrent logins / log streams; wait `Retry-After` seconds |
@@ -132,7 +132,7 @@ There is always at least one approved admin: the last one cannot be deleted, dem
 
 A `Job` is `{id, kind, subject_type, subject_id, status, detail, restricted, created_by, created_at, started_at, finished_at}`. `status` is `queued` → `running` → `success` | `error` | `cancelled`. At most one job is active per `(subject_type, subject_id)`; starting another returns `409 job_in_progress`. `detail` is a short user-safe message (empty on success); the full output is the job log. Jobs that were active when the daemon stopped abruptly become `error` with detail `interrupted by daemon restart`; jobs cancelled by a graceful shutdown become `cancelled`.
 
-Kinds: `project.clone`, `project.pull`, `project.branch`, `server.start`, `server.stop`, `server.restart` (more may be added; display unknown kinds verbatim). Subject types: `project`, `server`; `subject_id` is the subject's id as a string.
+Kinds: `project.clone`, `project.pull`, `project.branch`, `server.start`, `server.stop`, `server.restart`, `server.delete` (more may be added; display unknown kinds verbatim). Subject types: `project`, `server`; `subject_id` is the subject's id as a string.
 
 | Method | Path | Access | Request | Response | Status | Errors |
 |--------|------|--------|---------|----------|--------|--------|
@@ -178,43 +178,55 @@ A project is a Git repository the daemon clones (and later builds). `Project` is
 - Job `detail` on failure is a short safe message (e.g. `authentication with the Git remote failed; check the project's credentials`); the scrubbed git output is in the job log. Credentials never appear in responses, job details or logs.
 - When git is not installed on the host, routes that need it answer `503 service_unavailable`.
 
-### Servers (task C)
+### Servers
 
-A server is a container run from an image, its host `port` published as both `<port>/udp` and `<port>/tcp`. `Server` is `{id, name, project_id, image, port, env_keys, desired_state, state, container_id, started_at, exit_code, created_at, updated_at}`. Environment values are secrets: encrypted at rest and never returned — only `env_keys`. `state`: `created`, `running`, `restarting`, `exited`, `paused`, `dead`, `missing` (no container), `unknown` (Docker unreachable).
-
-| Method | Path | Access | Request | Response | Status |
-|--------|------|--------|---------|----------|--------|
-| GET | `/servers` | developer | — | 200 `ServerList` | planned (task C) |
-| POST | `/servers` | developer | `CreateServerRequest` `{name, project_id?, image, port?, env?, desired_state?}` | 201 `Server` | planned (task C) |
-| GET | `/servers/export` | admin | — | 200 `ServerExport` (contains env values in plain text) | planned (task C) |
-| POST | `/servers/import` | admin | `ServerExport` | 201 `ServerImportResult` (all-or-nothing) | planned (task C) |
-| GET | `/servers/{id}` | developer | — | 200 `Server` | planned (task C) |
-| PATCH | `/servers/{id}` | developer | `UpdateServerRequest` `{image?, port?, env_set?, env_unset?}` | 200 `Server` | planned (task C) |
-| DELETE | `/servers/{id}` | developer | — | 204 | planned (task C) |
-| POST | `/servers/{id}/start` | developer | — | 202 `Job` | planned (task C) |
-| POST | `/servers/{id}/stop` | developer | — | 202 `Job` | planned (task C) |
-| POST | `/servers/{id}/restart` | developer | — | 202 `Job` | planned (task C) |
-| GET | `/servers/{id}/logs` | developer | query `tail=N`, `follow=1` | 200 `text/plain` (streams like job logs) | planned (task C) |
-| GET | `/servers/{id}/stats` | developer | — | 200 `ServerStats` | planned (task C) |
-
-- `name`: `^[a-z0-9][a-z0-9-]{0,62}$`, unique, immutable; `project_id` is immutable. Omitting `port` on create auto-assigns one from the configured range. `desired_state` defaults to `stopped`.
-- Env keys match `^[A-Za-z_][A-Za-z0-9_]*$`. To edit env without re-sending secrets, PATCH with `env_set` (add/overwrite) and `env_unset` (remove); unmentioned keys keep their values; a key may not be in both. Changes apply on the next (re)start.
-- Expected errors: `validation_failed`, `name_taken`, `port_in_use`, `not_found`, `job_in_progress`, `service_unavailable`.
-
-### Images, static files, volumes (task C)
+A server is a container run from a managed image, its host `port` published as both `<port>/udp` and `<port>/tcp` to container port 7777. `Server` is `{id, name, project_id, image, port, env_keys, desired_state, state, container_id, started_at, exit_code, restart_required, created_at, updated_at}`. Environment values are secrets: encrypted at rest and never returned — only `env_keys`. `state`: `created`, `running`, `restarting`, `exited`, `paused`, `dead`, `missing` (no container), `unknown` (Docker unreachable; the stored fields are still returned). Operator background (managed objects, container hardening, ports, firewall): [SERVERS.md](SERVERS.md).
 
 | Method | Path | Access | Request | Response | Status |
 |--------|------|--------|---------|----------|--------|
-| GET | `/images` | developer | — | 200 `ImageList` (managed images only) | planned (task C) |
-| DELETE | `/images/{id}` | admin | — | 204 (`conflict` if in use) | planned (task C) |
-| GET | `/static` | developer | — | 200 `StaticFileList` | planned (task C) |
-| POST | `/static` | developer | `multipart/form-data`, repeatable field `files`, at most 1 GiB per request | 201 `StaticFileList` (stored files) | planned (task C) |
-| GET | `/static/{name}` | developer | — | 200 file download | planned (task C) |
-| DELETE | `/static/{name}` | developer | — | 204 | planned (task C) |
-| GET | `/volumes` | developer | — | 200 `VolumeList` (managed volumes only) | planned (task C) |
-| DELETE | `/volumes/{name}` | admin | — | 204 (`conflict` if in use) | planned (task C) |
+| GET | `/servers` | developer | — | 200 `ServerList` | implemented |
+| POST | `/servers` | developer | `CreateServerRequest` `{name, project_id?, image, port?, env?, desired_state?}` | 201 `Server` | implemented |
+| GET | `/servers/export` | admin | — | 200 `ServerExport` (contains env values in plain text) | implemented |
+| POST | `/servers/import` | admin | `ServerExport` | 201 `ServerImportResult` (all-or-nothing) | implemented |
+| GET | `/servers/{id}` | developer | — | 200 `Server` | implemented |
+| PATCH | `/servers/{id}` | developer | `UpdateServerRequest` `{image?, port?, env_set?, env_unset?}` | 200 `Server` | implemented |
+| DELETE | `/servers/{id}` | developer | — | 204 | implemented |
+| POST | `/servers/{id}/start` | developer | — | 202 `Job` (`server.start`) | implemented |
+| POST | `/servers/{id}/stop` | developer | — | 202 `Job` (`server.stop`) | implemented |
+| POST | `/servers/{id}/restart` | developer | — | 202 `Job` (`server.restart`) | implemented |
+| GET | `/servers/{id}/logs` | developer | query `tail=N` (1–5000, default 200), `follow=1` | 200 `text/plain` | implemented |
+| GET | `/servers/{id}/stats` | developer | — | 200 `ServerStats` | implemented |
 
-Static file names are a single segment of 1–128 characters from `[A-Za-z0-9._-]`, not starting with a dot.
+- `name`: `^[a-z0-9][a-z0-9-]{0,62}$`, unique, immutable; the container is named `golem-deploy-<name>`. `project_id` is immutable and must exist.
+- `image`: the id (`sha256:…`, full or at least 12 hex digits) or a tag of a **managed** image (labelled `dev.golemengine.deploy.managed=true`, see `GET /images`). It is resolved when the server is created or patched and stored as the immutable image id; other images are rejected with `validation_failed` (`field: image`).
+- `port`: omit to auto-assign the lowest free port of the daemon's range (`--port-range`, default `7000-7099`; browser-unsafe ports such as 6000 or 6665–6669 are skipped). An explicit port outside the range (or unsafe) is `validation_failed`; one assigned to another server is `port_in_use`, as is a full range.
+- Env keys match `^[A-Za-z_][A-Za-z0-9_]{0,127}$`, are unique ignoring case and may not be reserved names that would steer the Docker CLI (`DOCKER_*`, `BUILDKIT_*`, `PATH`, `HOME`, proxy variables, Windows system variables); values may not contain NUL; at most 128 variables and 64 KiB in total. To edit env without re-sending secrets, PATCH with `env_set` (add/overwrite) and `env_unset` (remove); unmentioned keys keep their values; a key may not be in both.
+- `desired_state` defaults to `stopped`; `running` on create also starts a `server.start` job (find it with `GET /jobs?subject_type=server&subject_id=<id>`). Start and restart set it to `running`, stop to `stopped`. When the daemon starts, servers whose desired state is `running` but whose container is not running are started again as jobs.
+- PATCH never restarts a server. When the running container was created from an older definition (image, port, env or the daemon's run settings), reads report `restart_required: true`; `POST /restart` applies the change.
+- Start (and restart) removes the server's previous managed container, ensures the `golem-deploy` network, checks that no other process holds the port (TCP and UDP), runs a new hardened container and waits a few seconds: a container that exits or restarts immediately fails the job (`detail` gives the exit code; the last output, with env values redacted, is in the job log) and is left stopped so its logs stay readable. A container named `golem-deploy-<name>` that golem-deploy did not create, or a foreign network named `golem-deploy`, fails the job instead of being touched.
+- Stop is graceful (`SIGTERM`, then `SIGKILL` after 30 s); the container is kept.
+- `DELETE` runs a `server.delete` job (serialised with the server's other jobs, so it answers `409 job_in_progress` while one is active) and waits for it: the container is stopped gracefully and removed, then the row is deleted and the port released. It answers `204`, or `503 service_unavailable` (nothing deleted) when Docker is unreachable.
+- Logs are the container's stdout and stderr interleaved, each line prefixed with an RFC 3339 timestamp. `follow=1` streams like job logs and ends when the container stops or is removed (also on restart and delete), the client disconnects or the daemon shuts down; at most 4 follow streams per account (`429 rate_limited`). Container output is shown as the game prints it. Without a container: `409 conflict`.
+- Stats are one sample of the running container (`409 conflict` when it is not running).
+- Export/import: `ServerExport` is `{format_version: 1, servers: [ServerSpec]}`, `ServerSpec` `{name, project?, image, port?, env?, desired_state}` with the project referenced by name. Import validates the whole document (names, duplicate names and ports, env, project names, that every image is a managed image on this host, ports inside the range) and then creates every server in one transaction or none. Imported servers are always created `stopped`; nothing is started. Errors name the offending entry, e.g. `field: servers[1].env`.
+- Expected errors: `validation_failed`, `name_taken`, `port_in_use`, `not_found`, `job_in_progress`, `conflict`, `service_unavailable` (Docker unreachable).
+
+### Images, static files, volumes
+
+| Method | Path | Access | Request | Response | Status |
+|--------|------|--------|---------|----------|--------|
+| GET | `/images` | developer | — | 200 `ImageList` (managed images only) | implemented |
+| DELETE | `/images/{id}` | admin | — | 204 (`conflict` if in use) | implemented |
+| GET | `/static` | developer | — | 200 `StaticFileList` | implemented |
+| POST | `/static` | developer | `multipart/form-data`, repeatable field `files`, query `replace=1`; at most 1 GiB per request and per file, 32 files | 201 `StaticFileList` (stored files) | implemented |
+| GET | `/static/{name}` | developer | — | 200 file download | implemented |
+| DELETE | `/static/{name}` | developer | — | 204 | implemented |
+| GET | `/volumes` | developer | — | 200 `VolumeList` (managed volumes only) | implemented |
+| DELETE | `/volumes/{name}` | admin | — | 204 (`conflict` if in use) | implemented |
+
+- `Image` is `{id, tags, project_id, commit, size_bytes, created_at, server_ids, in_use}`; `project_id` and `commit` come from the image's build labels (empty until the build pipeline sets them). Deleting an image that a server references or any container was created from is `409 conflict`; an image that is not managed is `404 not_found`, exactly like a missing one.
+- `Volume` is `{name, server_id, server_name, created_at, in_use}`; `server_id` is null when the labelled server no longer exists. A volume mounted by any container is `409 conflict`; unmanaged volumes are `404 not_found`. Sizes are not reported (Docker computes them only with an expensive scan).
+- Static file names are a single segment of 1–128 characters from `[A-Za-z0-9._-]`, starting with a letter or digit, not ending with a dot and not a Windows device name (`CON`, `nul.txt`, `COM1`, …); invalid names are rejected (`validation_failed`, `field: files`), never rewritten. Uploads are streamed to disk and become visible atomically once every file of the request is stored; an existing name is `409 conflict` unless `replace=1`. `StaticFile` is `{name, size_bytes, modified_at, is_zip}` (`is_zip`: `.zip` name and ZIP signature). Downloads are `application/octet-stream` with `Content-Disposition: attachment` and support `Range`.
 
 ## Agent cookbook
 
