@@ -34,10 +34,13 @@ type Job struct {
 	SubjectID   string
 	Status      JobStatus
 	Detail      string
-	CreatedBy   *int64
-	CreatedAt   time.Time
-	StartedAt   *time.Time
-	FinishedAt  *time.Time
+	// Restricted jobs were started from an admin route: only admins may
+	// read their log or cancel them.
+	Restricted bool
+	CreatedBy  *int64
+	CreatedAt  time.Time
+	StartedAt  *time.Time
+	FinishedAt *time.Time
 }
 
 // NewJob is the input of CreateJob.
@@ -46,6 +49,7 @@ type NewJob struct {
 	SubjectType string
 	SubjectID   string
 	CreatedBy   *int64
+	Restricted  bool
 }
 
 // JobFilter selects jobs in ListJobs. Empty fields match everything.
@@ -56,14 +60,14 @@ type JobFilter struct {
 	Limit int
 }
 
-const jobCols = `id, kind, subject_type, subject_id, status, detail, created_by, created_at, started_at, finished_at`
+const jobCols = `id, kind, subject_type, subject_id, status, detail, restricted, created_by, created_at, started_at, finished_at`
 
 func scanJob(r scanner) (Job, error) {
 	var j Job
 	var createdBy sql.NullInt64
 	var created string
 	var started, finished sql.NullString
-	if err := r.Scan(&j.ID, &j.Kind, &j.SubjectType, &j.SubjectID, &j.Status, &j.Detail, &createdBy, &created, &started, &finished); err != nil {
+	if err := r.Scan(&j.ID, &j.Kind, &j.SubjectType, &j.SubjectID, &j.Status, &j.Detail, &j.Restricted, &createdBy, &created, &started, &finished); err != nil {
 		return Job{}, err
 	}
 	j.CreatedBy = int64Ptr(createdBy)
@@ -83,9 +87,9 @@ func scanJob(r scanner) (Job, error) {
 // CreateJob inserts a queued job.
 func (s *Store) CreateJob(ctx context.Context, in NewJob) (Job, error) {
 	j, err := scanJob(s.db.QueryRowContext(ctx,
-		`INSERT INTO jobs (kind, subject_type, subject_id, status, created_by, created_at)
-		 VALUES (?, ?, ?, 'queued', ?, ?) RETURNING `+jobCols,
-		in.Kind, in.SubjectType, in.SubjectID, nullInt64(in.CreatedBy), formatTime(s.nowUTC())))
+		`INSERT INTO jobs (kind, subject_type, subject_id, status, restricted, created_by, created_at)
+		 VALUES (?, ?, ?, 'queued', ?, ?, ?) RETURNING `+jobCols,
+		in.Kind, in.SubjectType, in.SubjectID, in.Restricted, nullInt64(in.CreatedBy), formatTime(s.nowUTC())))
 	if err != nil {
 		return Job{}, mapErr("create job", err)
 	}

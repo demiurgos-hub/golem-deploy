@@ -78,6 +78,26 @@ func TestJobSuccessWritesLog(t *testing.T) {
 	}
 }
 
+// TestF6_RestrictedOptionPersisted: the restricted flag is stored with the
+// job; jobs are unrestricted by default.
+func TestF6_RestrictedOptionPersisted(t *testing.T) {
+	r, st := newRunner(t, 2)
+	noop := func(context.Context, io.Writer) error { return nil }
+	plain, err := r.Start(context.Background(), "project.pull", Subject{Type: "project", ID: "61"}, nil, noop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restricted, err := r.Start(context.Background(), "project.pull", Subject{Type: "project", ID: "62"}, nil, noop, Restricted(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, r, plain.ID)
+	waitDone(t, r, restricted.ID)
+	if getJob(t, st, plain.ID).Restricted || !getJob(t, st, restricted.ID).Restricted || !restricted.Restricted {
+		t.Fatal("restricted flag not persisted")
+	}
+}
+
 func TestPerSubjectExclusivity(t *testing.T) {
 	r, st := newRunner(t, 4)
 	release := make(chan struct{})
@@ -206,8 +226,9 @@ func TestErrorDetailIsSafe(t *testing.T) {
 
 func TestBoundedWorkers(t *testing.T) {
 	r, st := newRunner(t, 1)
-	block := make(chan struct{})
-	j1, _ := r.Start(context.Background(), "k", Subject{"s", "1"}, nil, func(context.Context, io.Writer) error { <-block; return nil })
+	block, running := make(chan struct{}), make(chan struct{})
+	j1, _ := r.Start(context.Background(), "k", Subject{"s", "1"}, nil, func(context.Context, io.Writer) error { close(running); <-block; return nil })
+	<-running // j1 holds the only worker
 	j2, _ := r.Start(context.Background(), "k", Subject{"s", "2"}, nil, func(context.Context, io.Writer) error { return nil })
 	time.Sleep(100 * time.Millisecond)
 	if got := getJob(t, st, j2.ID); got.Status != store.JobQueued {

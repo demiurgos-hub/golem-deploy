@@ -19,7 +19,7 @@ func (s *Server) routes() []route {
 		{method: "PATCH", path: "/settings", access: AccessAdmin, handler: s.handleUpdateSettings},
 
 		// Own account.
-		{method: "GET", path: "/account", access: AccessSession, handler: s.handleMe},
+		{method: "GET", path: "/account", access: AccessDeveloper, handler: s.handleMe},
 		{method: "POST", path: "/account/password", access: AccessSession, handler: s.handleChangePassword},
 		{method: "GET", path: "/account/tokens", access: AccessSession, handler: s.handleListTokens},
 		{method: "POST", path: "/account/tokens", access: AccessSession, handler: s.handleCreateToken},
@@ -30,6 +30,8 @@ func (s *Server) routes() []route {
 		{method: "POST", path: "/accounts", access: AccessAdmin, handler: s.handleCreateAccount},
 		{method: "PATCH", path: "/accounts/{id}", access: AccessAdmin, handler: s.handleUpdateAccount},
 		{method: "DELETE", path: "/accounts/{id}", access: AccessAdmin, handler: s.handleDeleteAccount},
+		{method: "GET", path: "/accounts/{id}/tokens", access: AccessAdmin, handler: s.handleListAccountTokens},
+		{method: "DELETE", path: "/accounts/{id}/tokens/{token_id}", access: AccessAdmin, handler: s.handleDeleteAccountToken},
 
 		// Jobs.
 		{method: "GET", path: "/jobs", access: AccessDeveloper, handler: s.handleListJobs},

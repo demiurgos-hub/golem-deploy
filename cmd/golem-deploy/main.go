@@ -44,7 +44,8 @@ const usage = `Usage:
   golem-deploy serve [flags]                 run the daemon
   golem-deploy admin create --username <u>   create an approved admin account
   golem-deploy admin reset-password --username <u>
-                                             set a new password (ends the account's sessions)
+                                             set a new password (ends the account's sessions
+                                             and deletes its API tokens)
   golem-deploy version                       print the version
 
 Run "golem-deploy <command> -h" for the flags of a command.
@@ -112,6 +113,8 @@ func cmdServe(args []string, stderr io.Writer) int {
 	tlsCert := fs.String("tls-cert", envDefault("GOLEM_DEPLOY_TLS_CERT", ""), "TLS certificate file (env GOLEM_DEPLOY_TLS_CERT)")
 	tlsKey := fs.String("tls-key", envDefault("GOLEM_DEPLOY_TLS_KEY", ""), "TLS private key file (env GOLEM_DEPLOY_TLS_KEY)")
 	insecure := fs.Bool("insecure-http", insecureDefault, "allow plaintext HTTP on a non-loopback address, e.g. behind a TLS-terminating proxy (env GOLEM_DEPLOY_INSECURE_HTTP)")
+	publicHost := fs.String("public-host", envDefault("GOLEM_DEPLOY_PUBLIC_HOST", ""), "comma-separated host names the panel is reached by, besides IP addresses and localhost; other Host headers get 421 (env GOLEM_DEPLOY_PUBLIC_HOST)")
+	trustedProxy := fs.String("trusted-proxy", envDefault("GOLEM_DEPLOY_TRUSTED_PROXY", ""), "comma-separated CIDRs of reverse proxies whose X-Forwarded-For is trusted for the client address (env GOLEM_DEPLOY_TRUSTED_PROXY)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -124,14 +127,16 @@ func cmdServe(args []string, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err = daemon.Run(ctx, daemon.Options{
-		DataDir:      *dataDir,
-		Listen:       *listen,
-		TLSCert:      *tlsCert,
-		TLSKey:       *tlsKey,
-		InsecureHTTP: *insecure,
-		Version:      buildVersion(),
-		Logger:       logger,
-		SPA:          frontend.Handler(),
+		DataDir:        *dataDir,
+		Listen:         *listen,
+		TLSCert:        *tlsCert,
+		TLSKey:         *tlsKey,
+		InsecureHTTP:   *insecure,
+		PublicHosts:    splitList(*publicHost),
+		TrustedProxies: splitList(*trustedProxy),
+		Version:        buildVersion(),
+		Logger:         logger,
+		SPA:            frontend.Handler(),
 	})
 	if err != nil {
 		logger.Error("golem-deploy failed", "err", err)
@@ -179,13 +184,25 @@ func cmdAdmin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "created admin account %q (id %d)\n", acct.Username, acct.ID)
 	case "reset-password":
-		if err := daemon.ResetPassword(ctx, *dataDir, *username, password); err != nil {
+		revoked, err := daemon.ResetPassword(ctx, *dataDir, *username, password)
+		if err != nil {
 			fmt.Fprintln(stderr, "error:", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "password updated for %q; existing sessions have been ended\n", strings.ToLower(*username))
+		fmt.Fprintf(stdout, "password updated for %q; all of its sessions have been ended and %d API token(s) deleted\n", strings.ToLower(strings.TrimSpace(*username)), revoked)
 	}
 	return 0
+}
+
+// splitList splits a comma-separated flag value, dropping empty entries.
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // readPassword reads the first line of stdin, or prompts twice on a

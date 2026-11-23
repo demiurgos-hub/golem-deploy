@@ -22,7 +22,7 @@ var expectedRoutes = map[string]Access{
 	"GET /api/v1/settings":   AccessAdmin,
 	"PATCH /api/v1/settings": AccessAdmin,
 
-	"GET /api/v1/account":                AccessSession,
+	"GET /api/v1/account":                AccessDeveloper,
 	"POST /api/v1/account/password":      AccessSession,
 	"GET /api/v1/account/tokens":         AccessSession,
 	"POST /api/v1/account/tokens":        AccessSession,
@@ -32,6 +32,9 @@ var expectedRoutes = map[string]Access{
 	"POST /api/v1/accounts":        AccessAdmin,
 	"PATCH /api/v1/accounts/{id}":  AccessAdmin,
 	"DELETE /api/v1/accounts/{id}": AccessAdmin,
+
+	"GET /api/v1/accounts/{id}/tokens":               AccessAdmin,
+	"DELETE /api/v1/accounts/{id}/tokens/{token_id}": AccessAdmin,
 
 	"GET /api/v1/jobs":              AccessDeveloper,
 	"GET /api/v1/jobs/{id}":         AccessDeveloper,
@@ -158,7 +161,7 @@ func TestRoleMatrix(t *testing.T) {
 			nil},
 	}
 	authCodes := map[apitypes.ErrorCode]bool{apitypes.ErrorCodeUnauthenticated: true, apitypes.ErrorCodeForbidden: true, apitypes.ErrorCodeSessionRequired: true}
-	pathFill := strings.NewReplacer("{id}", "999999", "{name}", "nope")
+	pathFill := strings.NewReplacer("{id}", "999999", "{name}", "nope", "{token_id}", "999999")
 
 	for _, rt := range h.srv.routes() {
 		path := "/api/v1" + pathFill.Replace(rt.path)

@@ -51,6 +51,10 @@ type Job struct {
 	// Detail is a short, user-safe outcome message for terminal jobs (empty on
 	// success). Full output is in the job log.
 	Detail string `json:"detail"`
+	// Restricted jobs were started from an admin route: only admin sessions
+	// can read their log or cancel them. Other jobs' logs are readable by any
+	// developer; they can be cancelled by their creator or an admin.
+	Restricted bool `json:"restricted"`
 	// CreatedBy is the account that started the job; null for system jobs or
 	// when that account was deleted.
 	CreatedBy  *int64     `json:"created_by" tstype:"number | null,required"`

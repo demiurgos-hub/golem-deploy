@@ -29,9 +29,15 @@ type Options struct {
 	TLSCert      string
 	TLSKey       string
 	InsecureHTTP bool
-	Version      string
-	Logger       *slog.Logger
-	SPA          http.Handler
+	// PublicHosts are host names accepted in the Host header besides IP
+	// literals and localhost (--public-host).
+	PublicHosts []string
+	// TrustedProxies are CIDRs (or addresses) of reverse proxies whose
+	// X-Forwarded-For is believed (--trusted-proxy).
+	TrustedProxies []string
+	Version        string
+	Logger         *slog.Logger
+	SPA            http.Handler
 	// Ready, if set, is called with the bound address once serving.
 	Ready func(addr net.Addr)
 
@@ -54,6 +60,14 @@ func Run(ctx context.Context, o Options) (err error) {
 		return errors.New("--tls-cert and --tls-key must be set together")
 	}
 	if err := httpapi.CheckListen(o.Listen, o.TLSCert != "", o.InsecureHTTP); err != nil {
+		return err
+	}
+	publicHosts, err := httpapi.NormalizePublicHosts(o.PublicHosts)
+	if err != nil {
+		return err
+	}
+	trusted, err := httpapi.ParseTrustedProxies(o.TrustedProxies)
+	if err != nil {
 		return err
 	}
 
@@ -118,11 +132,13 @@ func Run(ctx context.Context, o Options) (err error) {
 		probe = &dockerCLIProbe{}
 	}
 	srv, err := httpapi.New(httpapi.Config{
-		Listen:       o.Listen,
-		TLSCert:      o.TLSCert,
-		TLSKey:       o.TLSKey,
-		InsecureHTTP: o.InsecureHTTP,
-		Version:      o.Version,
+		Listen:         o.Listen,
+		TLSCert:        o.TLSCert,
+		TLSKey:         o.TLSKey,
+		InsecureHTTP:   o.InsecureHTTP,
+		Version:        o.Version,
+		PublicHosts:    publicHosts,
+		TrustedProxies: trusted,
 	}, httpapi.Deps{
 		Store:    st,
 		Sessions: sessions,

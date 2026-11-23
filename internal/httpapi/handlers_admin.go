@@ -106,9 +106,9 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) err
 	if err != nil {
 		return err
 	}
-	hash, err := s.hasher.Hash(req.Password)
+	hash, err := s.hashPassword(r.Context(), req.Password)
 	if err != nil {
-		return internal(err)
+		return err
 	}
 	acct, err := s.store.CreateAccount(r.Context(), store.NewAccount{Username: username, PasswordHash: hash, Role: role, Approved: req.Approved})
 	if errors.Is(err, store.ErrConflict) {
@@ -159,6 +159,44 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) err
 	}
 	s.logger.Info("account updated", "request_id", requestIDFrom(r.Context()), "by", actor, "account_id", acct.ID, "role", acct.Role, "approved", acct.Approved)
 	writeJSON(w, http.StatusOK, toAPIAccount(acct))
+	return nil
+}
+
+// handleListAccountTokens lists another account's API tokens (metadata
+// only; secrets and hashes are never stored or returned).
+func (s *Server) handleListAccountTokens(w http.ResponseWriter, r *http.Request) error {
+	aid, err := pathID(r, "id")
+	if err != nil {
+		return err
+	}
+	if _, err := s.store.GetAccount(r.Context(), aid); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return notFound("account")
+		}
+		return internal(err)
+	}
+	return s.writeTokenList(w, r, aid)
+}
+
+// handleDeleteAccountToken revokes one API token of another account.
+func (s *Server) handleDeleteAccountToken(w http.ResponseWriter, r *http.Request) error {
+	aid, err := pathID(r, "id")
+	if err != nil {
+		return err
+	}
+	tid, err := pathID(r, "token_id")
+	if err != nil {
+		return err
+	}
+	err = s.store.DeleteAPIToken(r.Context(), aid, tid)
+	if errors.Is(err, store.ErrNotFound) {
+		return notFound("token")
+	}
+	if err != nil {
+		return internal(err)
+	}
+	s.logger.Info("api token revoked by admin", "request_id", requestIDFrom(r.Context()), "by", identityFrom(r).Account.ID, "account_id", aid, "token_id", tid)
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
 

@@ -54,6 +54,37 @@ export interface Account {
   created_at: string /* RFC 3339, UTC */;
 }
 /**
+ * AuthKind tells how a request authenticated.
+ */
+export const AuthKindSession = "session";
+export const AuthKindAPIToken = "api_token";
+/**
+ * Authentication kinds.
+ */
+export type AuthKind = typeof AuthKindSession | typeof AuthKindAPIToken;
+/**
+ * CurrentAccount is the body of GET /api/v1/account: the caller's account
+ * plus how the caller authenticated. It is reachable with an API token, so a
+ * token can identify itself.
+ */
+export interface CurrentAccount {
+  id: number /* int64 */;
+  username: string;
+  role: Role;
+  approved: boolean;
+  created_at: string /* RFC 3339, UTC */;
+  /**
+   * Auth is "session" or "api_token". An API token always acts as
+   * developer, whatever Role says.
+   */
+  auth: AuthKind;
+  /**
+   * APIToken describes the calling token when Auth is "api_token"; null
+   * for sessions.
+   */
+  api_token: APIToken | null;
+}
+/**
  * AccountList is the body of GET /api/v1/accounts.
  */
 export interface AccountList {
@@ -61,12 +92,29 @@ export interface AccountList {
 }
 /**
  * ChangePasswordRequest is the body of POST /api/v1/account/password. On
- * success every existing session of the account is invalidated and a new
- * SessionResponse is returned.
+ * success every existing session of the account is invalidated and a
+ * ChangePasswordResponse with a new session is returned.
  */
 export interface ChangePasswordRequest {
   current_password: string;
   new_password: string;
+  /**
+   * RevokeTokens deletes every API token of the account as well. Default
+   * true; send false to keep them.
+   */
+  revoke_tokens?: boolean;
+}
+/**
+ * ChangePasswordResponse is returned by POST /api/v1/account/password: a new
+ * session (same fields as SessionResponse) and how many API tokens were
+ * deleted.
+ */
+export interface ChangePasswordResponse {
+  token: string;
+  expires_at: string /* RFC 3339, UTC */;
+  session_expires_at: string /* RFC 3339, UTC */;
+  account: Account;
+  tokens_revoked: number /* int */;
 }
 /**
  * CreateAccountRequest is the body of POST /api/v1/accounts (admin).
@@ -80,7 +128,8 @@ export interface CreateAccountRequest {
 /**
  * UpdateAccountRequest is the body of PATCH /api/v1/accounts/{id} (admin).
  * Absent fields are left unchanged. Changing the role or un-approving an
- * account ends all of its sessions.
+ * account ends all of its sessions; un-approving also deletes its API tokens
+ * (re-approval does not bring them back).
  */
 export interface UpdateAccountRequest {
   role?: Role;
@@ -103,7 +152,8 @@ export interface APIToken {
   expires_at: string | null;
 }
 /**
- * APITokenList is the body of GET /api/v1/account/tokens.
+ * APITokenList is the body of GET /api/v1/account/tokens and of
+ * GET /api/v1/accounts/{id}/tokens (admin).
  */
 export interface APITokenList {
   items: APIToken[];
@@ -111,10 +161,13 @@ export interface APITokenList {
 /**
  * CreateAPITokenRequest is the body of POST /api/v1/account/tokens.
  * Name: 1 to 64 characters. ExpiresAt, when set, must be in the future.
+ * CurrentPassword is the account's password; a wrong one gives
+ * invalid_current_password and counts against the login rate limits.
  */
 export interface CreateAPITokenRequest {
   name: string;
   expires_at?: string /* RFC 3339, UTC */;
+  current_password: string;
 }
 /**
  * CreateAPITokenResponse is returned once when a token is created. Secret is
@@ -164,7 +217,7 @@ export const ErrorCodeBadRequest = "bad_request";
 export const ErrorCodeValidationFailed = "validation_failed";
 /**
  * ErrorCodeInvalidCurrentPassword: the current password supplied to a password
- * change is wrong (400).
+ * change or API token creation is wrong (400).
  */
 export const ErrorCodeInvalidCurrentPassword = "invalid_current_password";
 /**
@@ -179,7 +232,8 @@ export const ErrorCodeUnauthenticated = "unauthenticated";
  */
 export const ErrorCodeInvalidCredentials = "invalid_credentials";
 /**
- * ErrorCodeForbidden: authenticated, but the identity's role is too low. API
+ * ErrorCodeForbidden: authenticated, but the identity's role is too low, or
+ * the resource is reserved to admins (e.g. the log of a restricted job). API
  * tokens never exceed the developer role (403).
  */
 export const ErrorCodeForbidden = "forbidden";
@@ -233,9 +287,15 @@ export const ErrorCodeJobInProgress = "job_in_progress";
 export const ErrorCodeJobNotActive = "job_not_active";
 /**
  * ErrorCodeConflict: any other state conflict, e.g. deleting something that is
- * still in use (409).
+ * still in use or the API token limit (409).
  */
 export const ErrorCodeConflict = "conflict";
+/**
+ * ErrorCodeBadHost: the Host header names neither an IP address, localhost
+ * nor a configured public host name (--public-host). Protects against DNS
+ * rebinding (421).
+ */
+export const ErrorCodeBadHost = "bad_host";
 /**
  * ErrorCodeRequestTooLarge: the request body exceeds the route's limit (413).
  */
@@ -246,8 +306,8 @@ export const ErrorCodeRequestTooLarge = "request_too_large";
  */
 export const ErrorCodeUnsupportedMediaType = "unsupported_media_type";
 /**
- * ErrorCodeRateLimited: too many attempts; the Retry-After header gives the wait
- * in seconds (429).
+ * ErrorCodeRateLimited: too many attempts or too many concurrent requests (e.g.
+ * log streams); the Retry-After header gives the wait in seconds (429).
  */
 export const ErrorCodeRateLimited = "rate_limited";
 /**
@@ -261,14 +321,15 @@ export const ErrorCodeInternal = "internal_error";
  */
 export const ErrorCodeNotImplemented = "not_implemented";
 /**
- * ErrorCodeUnavailable: a dependency (e.g. Docker) is unreachable or the daemon
- * is shutting down (503).
+ * ErrorCodeUnavailable: a dependency (e.g. Docker) is unreachable, the daemon
+ * is shutting down, or the server is too busy checking passwords; retry after
+ * the Retry-After header when present (503).
  */
 export const ErrorCodeUnavailable = "service_unavailable";
 /**
  * Error codes. The HTTP status each one is used with is noted in parentheses.
  */
-export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationFailed | typeof ErrorCodeInvalidCurrentPassword | typeof ErrorCodeUnauthenticated | typeof ErrorCodeInvalidCredentials | typeof ErrorCodeForbidden | typeof ErrorCodeSessionRequired | typeof ErrorCodeRegistrationDisabled | typeof ErrorCodeNotFound | typeof ErrorCodeMethodNotAllowed | typeof ErrorCodeUsernameTaken | typeof ErrorCodeNameTaken | typeof ErrorCodePortInUse | typeof ErrorCodeLastAdmin | typeof ErrorCodeCannotModifySelf | typeof ErrorCodeJobInProgress | typeof ErrorCodeJobNotActive | typeof ErrorCodeConflict | typeof ErrorCodeRequestTooLarge | typeof ErrorCodeUnsupportedMediaType | typeof ErrorCodeRateLimited | typeof ErrorCodeInternal | typeof ErrorCodeNotImplemented | typeof ErrorCodeUnavailable;
+export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationFailed | typeof ErrorCodeInvalidCurrentPassword | typeof ErrorCodeUnauthenticated | typeof ErrorCodeInvalidCredentials | typeof ErrorCodeForbidden | typeof ErrorCodeSessionRequired | typeof ErrorCodeRegistrationDisabled | typeof ErrorCodeNotFound | typeof ErrorCodeMethodNotAllowed | typeof ErrorCodeUsernameTaken | typeof ErrorCodeNameTaken | typeof ErrorCodePortInUse | typeof ErrorCodeLastAdmin | typeof ErrorCodeCannotModifySelf | typeof ErrorCodeJobInProgress | typeof ErrorCodeJobNotActive | typeof ErrorCodeConflict | typeof ErrorCodeBadHost | typeof ErrorCodeRequestTooLarge | typeof ErrorCodeUnsupportedMediaType | typeof ErrorCodeRateLimited | typeof ErrorCodeInternal | typeof ErrorCodeNotImplemented | typeof ErrorCodeUnavailable;
 
 //////////
 // source: host.go
@@ -398,6 +459,12 @@ export interface Job {
    * success). Full output is in the job log.
    */
   detail: string;
+  /**
+   * Restricted jobs were started from an admin route: only admin sessions
+   * can read their log or cancel them. Other jobs' logs are readable by any
+   * developer; they can be cancelled by their creator or an admin.
+   */
+  restricted: boolean;
   /**
    * CreatedBy is the account that started the job; null for system jobs or
    * when that account was deleted.
@@ -708,6 +775,8 @@ export interface StatusCounts {
 export interface Settings {
   /**
    * RegistrationEnabled allows POST /api/v1/auth/register. Default false.
+   * While it is on, anyone can learn whether a username exists (register
+   * answers username_taken); login and its rate limits do not reveal it.
    */
   registration_enabled: boolean;
 }

@@ -1,17 +1,18 @@
 ---
 description: Authentication, sessions, API tokens, roles and account administration
-globs: "{internal/auth/**/*.go,internal/httpapi/authn.go,internal/httpapi/handlers_auth.go,internal/httpapi/handlers_account.go,internal/httpapi/handlers_admin.go,internal/store/accounts.go,internal/store/tokens.go}"
+globs: "{internal/auth/**/*.go,internal/httpapi/authn.go,internal/httpapi/passwords.go,internal/httpapi/handlers_auth.go,internal/httpapi/handlers_account.go,internal/httpapi/handlers_admin.go,internal/store/accounts.go,internal/store/tokens.go,internal/daemon/admin.go}"
 alwaysApply: false
 ---
 
 # Authentication and accounts
 
-- `internal/auth` holds primitives only (no HTTP, no DB): password/username policy, bcrypt `Hasher` (cost >= 12 in production; tests use `bcrypt.MinCost`), HS256 session JWTs (`Sessions`), API token generation and hashing, the in-memory `Limiter`.
+- `internal/auth` holds primitives only (no HTTP, no DB): password/username policy, bcrypt `Hasher` (cost >= 12 in production; tests use `bcrypt.MinCost`), HS256 session JWTs (`Sessions`), API token generation and hashing, and in-memory abuse controls: `Limiter` (atomic `Reserve` before work, then `Refund`/`Reset`; never evicts live entries, untracked when full), `Slots` (bcrypt semaphore), `InFlight` (per-key concurrency cap), `KnownIPs` (addresses with a successful login per username).
 - Credentials travel only as `Authorization: Bearer`. Never introduce cookies (game servers share the hostname on other ports).
-- `httpapi.authenticate` reloads the account on every request: missing or unapproved means 401; a session's `ver` must equal `token_version`. Anything that should end sessions (password change, logout, role change, un-approval) bumps `token_version` in the store.
-- API tokens (`gdp_` + 64 hex, stored as SHA-256) authenticate with the owner's current state and are capped at the developer role: they never pass `admin` or `session` routes. `last_used_at` is written at most once a minute.
+- `httpapi.authenticate` reloads the account on every request: missing or unapproved means 401; a session's `ver` must equal `token_version`. `token_version` starts at a random non-negative 63-bit value per row (set in `store.CreateAccount`, the only account-creation path) and is incremented (wrapping, never overflowing) by anything that should end sessions: password change, logout, role change, un-approval. Ids are `AUTOINCREMENT` and never reused.
+- API tokens (`gdp_` + 64 hex, stored as SHA-256) authenticate with the owner's current state and are capped at the developer role: they never pass `admin` or `session` routes (`GET /account` is `developer` so a token can identify itself). `last_used_at` is written at most once a minute. Creating one needs the current password. Tokens are deleted on un-approval, account deletion, CLI `reset-password`, and `POST /account/password` unless `revoke_tokens:false`; the per-account cap is enforced in the store transaction (`NewAPIToken.MaxPerAccount`, `ErrLimit`).
 - Session JWTs: issuer and audience checked, `exp` 12 h, `sid_iat` bounds the absolute lifetime (30 days) across refreshes.
-- Login: identical 401 body for unknown user, wrong password and unapproved account; a bcrypt comparison on every path (`Hasher.Dummy`); per-IP and per-username failure limits keyed on the TCP peer address only. Over-long passwords are rejected, never truncated.
+- All HTTP bcrypt work goes through `internal/httpapi/passwords.go` (`hashPassword`, `comparePassword`, `login`, `verifyCurrentPassword`; a source test forbids `s.hasher.` elsewhere): a `Slots` slot (503 + `Retry-After` when none frees within ~2 s), and for password checks an attempt reserved against the per-IP (5/15 min) and per-username (20/15 min, uniform for unknown usernames; skipped for known-good addresses) limiters before bcrypt runs. Failures stay counted; success refunds the IP and resets the username; non-attempts (busy, in-flight refusals) are refunded.
+- Login: identical 401 body for unknown user, wrong password and unapproved account; a bcrypt comparison on every path (`Hasher.Dummy`); one login in flight per username, a few per address. The client address comes from `clientIP(r)` (TCP peer, or `X-Forwarded-For` behind `--trusted-proxy`). Over-long passwords are rejected, never truncated.
 - Account invariants live in the store inside one transaction: at least one approved admin remains; an admin cannot delete, demote or unapprove themselves (actor id 0 is the local CLI).
 - Never log or return passwords, hashes, JWTs, token secrets or keys.
-- Verify with `go test ./internal/auth/... ./internal/httpapi/... ./internal/store/...`.
+- Verify with `go test -race ./internal/auth/... ./internal/httpapi/... ./internal/store/... ./internal/daemon/...` (the `TestF1_`…`TestF5_` tests pin the security review's findings).

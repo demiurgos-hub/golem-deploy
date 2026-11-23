@@ -115,8 +115,8 @@ func TestLoginSuccessResetsUsernameBucket(t *testing.T) {
 		login(h, "alice", "wrong-password-123")
 	}
 	mustLogin(t, h, "alice")
-	if ok, _ := h.srv.loginUser.Check("alice"); !ok || h.srv.loginUser.Len() != 0 {
-		t.Fatal("username bucket not reset after success")
+	if h.srv.loginUser.Count("alice") != 0 || h.srv.loginIP.Count(clientIPForTests) != loginFailuresPerWindow-1 {
+		t.Fatalf("after success: username count %d, IP count %d", h.srv.loginUser.Count("alice"), h.srv.loginIP.Count(clientIPForTests))
 	}
 }
 
@@ -200,7 +200,7 @@ func TestPasswordChangeInvalidatesOldSessions(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("change: %d %s", rr.Code, rr.Body.String())
 	}
-	fresh := decode[apitypes.SessionResponse](t, rr).Token
+	fresh := decode[apitypes.ChangePasswordResponse](t, rr).Token
 	for _, old := range []string{s1, s2} {
 		errBody(t, h.do("GET", "/api/v1/account", old, nil), http.StatusUnauthorized, apitypes.ErrorCodeUnauthenticated)
 	}
@@ -368,9 +368,9 @@ func TestTokenEndpoints(t *testing.T) {
 
 	errBody(t, h.do("POST", "/api/v1/account/tokens", sess, `{"name":""}`), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
 	past := h.clock.Now().Add(-time.Minute)
-	errBody(t, h.do("POST", "/api/v1/account/tokens", sess, apitypes.CreateAPITokenRequest{Name: "x", ExpiresAt: &past}), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
+	errBody(t, h.do("POST", "/api/v1/account/tokens", sess, apitypes.CreateAPITokenRequest{Name: "x", ExpiresAt: &past, CurrentPassword: testPassword}), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
 
-	rr := h.do("POST", "/api/v1/account/tokens", sess, apitypes.CreateAPITokenRequest{Name: " ci "})
+	rr := h.do("POST", "/api/v1/account/tokens", sess, apitypes.CreateAPITokenRequest{Name: " ci ", CurrentPassword: testPassword})
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", rr.Code, rr.Body.String())
 	}

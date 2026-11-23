@@ -7,9 +7,11 @@ alwaysApply: false
 # Store
 
 - One SQLite database (`modernc.org/sqlite`) per data directory, opened by `store.Open` with WAL, `busy_timeout=5000`, foreign keys and `_txlock=immediate` (transactions take the write lock at BEGIN, so invariant checks inside `withTx` are race-free).
-- Schema changes are new files `migrations/NNNN_description.sql`, applied in order, each in its own transaction together with its `schema_migrations` row. Never edit an applied migration. A database newer than the binary is refused.
+- Schema changes are new files `migrations/NNNN_description.sql`, applied in order, each in its own transaction together with its `schema_migrations` row. Never edit an applied (shipped) migration. A database newer than the binary is refused.
+- Every id column is `INTEGER PRIMARY KEY AUTOINCREMENT`: ids are never reused (sessions, job logs, subjects and checkouts are keyed by them). `accounts.token_version` is random per row and bumped with `nextTokenVersion`.
 - Timestamps are TEXT in the fixed-width layout `2006-01-02T15:04:05.000Z` (lexically sortable); use `formatTime` and `parseTime`.
-- Methods return domain structs and the sentinels `ErrNotFound`, `ErrConflict` (UNIQUE violation), `ErrLastAdmin` and `ErrSelf`; HTTP mapping belongs to the caller. Keep SQL parameterised.
+- Methods return domain structs and the sentinels `ErrNotFound`, `ErrConflict` (UNIQUE violation), `ErrLastAdmin`, `ErrSelf` and `ErrLimit` (quota, e.g. API tokens); HTTP mapping belongs to the caller. Keep SQL parameterised; check-then-insert quotas run inside `withTx`.
+- The database file is pre-created 0600 by `datadir.Prepare` so `-wal`/`-shm` inherit the mode.
 - Encrypted columns (`projects.auth_secret`, `servers.env`) are opaque `[]byte` here. `CreateProject` and `CreateServer` take a `SealFunc` that is called with the new id inside the insert transaction, so ciphertext can be bound to the row. Fields holding secrets or hashes are tagged `json:"-"`.
 - `Reconcile` runs once at startup: active jobs become `error` "interrupted by daemon restart" and transient project statuses become `idle`. Update its status list when adding transient statuses.
 - Verify with `go test ./internal/store/...`.

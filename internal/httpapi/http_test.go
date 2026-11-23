@@ -315,7 +315,9 @@ func TestJobEndpoints(t *testing.T) {
 	tok := h.apiToken(dev, nil)
 
 	release := make(chan struct{})
-	req := httptest.NewRequest("POST", "/", nil).WithContext(context.WithValue(context.Background(), identityKey, &Identity{Account: dev, Kind: KindAPIToken}))
+	ctx := context.WithValue(context.Background(), identityKey, &Identity{Account: dev, Kind: KindAPIToken})
+	ctx = context.WithValue(ctx, routeAccessKey, AccessDeveloper)
+	req := httptest.NewRequest("POST", "/", nil).WithContext(ctx)
 	job, err := h.srv.startJob(req, apitypes.JobKindProjectPull, apitypes.SubjectTypeProject, 7, func(ctx context.Context, log io.Writer) error {
 		fmt.Fprintln(log, "step one")
 		select {
@@ -329,7 +331,7 @@ func TestJobEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.CreatedBy == nil || *job.CreatedBy != dev.ID || job.SubjectID != "7" || job.Kind != apitypes.JobKindProjectPull {
+	if job.CreatedBy == nil || *job.CreatedBy != dev.ID || job.SubjectID != "7" || job.Kind != apitypes.JobKindProjectPull || job.Restricted {
 		t.Fatalf("job %+v", job)
 	}
 	_, err = h.srv.startJob(req, apitypes.JobKindProjectPull, apitypes.SubjectTypeProject, 7, func(context.Context, io.Writer) error { return nil })
@@ -399,6 +401,7 @@ func TestJobEndpoints(t *testing.T) {
 func TestCancelJobViaHTTP(t *testing.T) {
 	h := newHarness(t)
 	dev := h.account("dev1", store.RoleDeveloper, true)
+	admin := h.account("admin1", store.RoleAdmin, true)
 	tok := h.session(dev)
 	req := httptest.NewRequest("POST", "/", nil)
 	started := make(chan struct{})
@@ -410,11 +413,13 @@ func TestCancelJobViaHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.CreatedBy != nil {
-		t.Fatal("system job has a creator")
+	if job.CreatedBy != nil || !job.Restricted {
+		t.Fatalf("system job %+v: want no creator and restricted", job)
 	}
 	<-started
-	rr := h.do("POST", "/api/v1/jobs/"+strconv.FormatInt(job.ID, 10)+"/cancel", tok, nil)
+	// A system job is restricted: developers cannot cancel it, admins can.
+	errBody(t, h.do("POST", "/api/v1/jobs/"+strconv.FormatInt(job.ID, 10)+"/cancel", tok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
+	rr := h.do("POST", "/api/v1/jobs/"+strconv.FormatInt(job.ID, 10)+"/cancel", h.session(admin), nil)
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("cancel: %d %s", rr.Code, rr.Body.String())
 	}

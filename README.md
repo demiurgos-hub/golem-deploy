@@ -58,7 +58,7 @@ Create the first admin account, then start the daemon:
 ./bin/golem-deploy serve
 ```
 
-`admin create --password-stdin` reads the password from the first line of standard input instead (for scripts). `admin reset-password --username <name>` sets a new password and ends that account's sessions. Both work while the daemon is running.
+`admin create --password-stdin` reads the password from the first line of standard input instead (for scripts). `admin reset-password --username <name>` sets a new password, ends all of that account's sessions and deletes all of its API tokens (use it to recover a compromised account). Both work while the daemon is running.
 
 `serve` options (flags, with environment fallbacks):
 
@@ -69,10 +69,16 @@ Create the first admin account, then start the daemon:
 | `--tls-cert` | `GOLEM_DEPLOY_TLS_CERT` | | TLS certificate (PEM) |
 | `--tls-key` | `GOLEM_DEPLOY_TLS_KEY` | | TLS private key (PEM) |
 | `--insecure-http` | `GOLEM_DEPLOY_INSECURE_HTTP` | `false` | Allow plaintext HTTP on a non-loopback address |
+| `--public-host` | `GOLEM_DEPLOY_PUBLIC_HOST` | | Comma-separated host names the panel is reached by (e.g. `deploy.example.com`) |
+| `--trusted-proxy` | `GOLEM_DEPLOY_TRUSTED_PROXY` | | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` is trusted |
 
-Without a TLS certificate the daemon only binds loopback addresses; to expose it on the network either configure TLS or put it behind a TLS-terminating reverse proxy and pass `--insecure-http`. It shuts down gracefully on SIGINT/SIGTERM. If no admin account exists it logs how to create one and keeps serving.
+Without a TLS certificate the daemon only binds loopback addresses (`localhost` must resolve only to loopback addresses); to expose it on the network either configure TLS or put it behind a TLS-terminating reverse proxy and pass `--insecure-http`. It shuts down gracefully on SIGINT/SIGTERM. If no admin account exists it logs how to create one and keeps serving.
 
-The data directory (created with mode 0700) contains `golem-deploy.db` (SQLite), `keys/jwt.key` and `keys/secrets.key` (0600; back up `secrets.key` with the database, without it stored credentials cannot be decrypted), `repositories/`, `static/`, `logs/jobs/` and `tmp/`.
+Requests are only served for IP addresses, `localhost` and the names given with `--public-host`; any other `Host` gets `421` (this stops DNS-rebinding attacks from web pages against a panel on loopback). If you reach the panel by a domain name, list it in `--public-host`.
+
+Behind a reverse proxy, pass its address range with `--trusted-proxy` (for example `--trusted-proxy 127.0.0.1/32` for a proxy on the same host) so that login rate limits and the access log use the real client address from `X-Forwarded-For`. Without it, forwarding headers are ignored and all clients share the proxy's address for rate limiting. Never list networks that untrusted clients can connect from.
+
+The data directory (created with mode 0700 if it does not exist; on Unix an existing one must not be accessible by group or others, and the daemon refuses to start with the `chmod` command to run instead of changing it) contains `golem-deploy.db` (SQLite, mode 0600), `keys/jwt.key` and `keys/secrets.key` (0600; back up `secrets.key` with the database, without it stored credentials cannot be decrypted), `repositories/`, `static/`, `logs/jobs/` and `tmp/`.
 
 ## License
 

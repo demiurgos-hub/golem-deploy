@@ -29,7 +29,7 @@ const (
 	// ErrorBody.Field names it (400).
 	ErrorCodeValidationFailed ErrorCode = "validation_failed"
 	// ErrorCodeInvalidCurrentPassword: the current password supplied to a password
-	// change is wrong (400).
+	// change or API token creation is wrong (400).
 	ErrorCodeInvalidCurrentPassword ErrorCode = "invalid_current_password"
 	// ErrorCodeUnauthenticated: missing, malformed, expired or revoked credentials,
 	// or the account behind them is gone or unapproved (401). Clients should
@@ -38,7 +38,8 @@ const (
 	// ErrorCodeInvalidCredentials: login failed. The same body is returned for an
 	// unknown user, a wrong password and an unapproved account (401).
 	ErrorCodeInvalidCredentials ErrorCode = "invalid_credentials"
-	// ErrorCodeForbidden: authenticated, but the identity's role is too low. API
+	// ErrorCodeForbidden: authenticated, but the identity's role is too low, or
+	// the resource is reserved to admins (e.g. the log of a restricted job). API
 	// tokens never exceed the developer role (403).
 	ErrorCodeForbidden ErrorCode = "forbidden"
 	// ErrorCodeSessionRequired: the route needs a session JWT and was called with an
@@ -68,15 +69,19 @@ const (
 	// ErrorCodeJobNotActive: the job already finished and cannot be cancelled (409).
 	ErrorCodeJobNotActive ErrorCode = "job_not_active"
 	// ErrorCodeConflict: any other state conflict, e.g. deleting something that is
-	// still in use (409).
+	// still in use or the API token limit (409).
 	ErrorCodeConflict ErrorCode = "conflict"
+	// ErrorCodeBadHost: the Host header names neither an IP address, localhost
+	// nor a configured public host name (--public-host). Protects against DNS
+	// rebinding (421).
+	ErrorCodeBadHost ErrorCode = "bad_host"
 	// ErrorCodeRequestTooLarge: the request body exceeds the route's limit (413).
 	ErrorCodeRequestTooLarge ErrorCode = "request_too_large"
 	// ErrorCodeUnsupportedMediaType: a JSON route got a body that is not
 	// application/json (415).
 	ErrorCodeUnsupportedMediaType ErrorCode = "unsupported_media_type"
-	// ErrorCodeRateLimited: too many attempts; the Retry-After header gives the wait
-	// in seconds (429).
+	// ErrorCodeRateLimited: too many attempts or too many concurrent requests (e.g.
+	// log streams); the Retry-After header gives the wait in seconds (429).
 	ErrorCodeRateLimited ErrorCode = "rate_limited"
 	// ErrorCodeInternal: unexpected server-side failure; details are in the daemon
 	// log under the request id (500).
@@ -84,7 +89,8 @@ const (
 	// ErrorCodeNotImplemented: the route is part of the contract but not built yet
 	// (501).
 	ErrorCodeNotImplemented ErrorCode = "not_implemented"
-	// ErrorCodeUnavailable: a dependency (e.g. Docker) is unreachable or the daemon
-	// is shutting down (503).
+	// ErrorCodeUnavailable: a dependency (e.g. Docker) is unreachable, the daemon
+	// is shutting down, or the server is too busy checking passwords; retry after
+	// the Retry-After header when present (503).
 	ErrorCodeUnavailable ErrorCode = "service_unavailable"
 )

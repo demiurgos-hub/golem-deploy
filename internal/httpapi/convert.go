@@ -38,6 +38,7 @@ func toAPIJob(j store.Job) apitypes.Job {
 		SubjectID:   j.SubjectID,
 		Status:      apitypes.JobStatus(j.Status),
 		Detail:      j.Detail,
+		Restricted:  j.Restricted,
 		CreatedBy:   j.CreatedBy,
 		CreatedAt:   j.CreatedAt.UTC(),
 		StartedAt:   utcPtr(j.StartedAt),

@@ -58,37 +58,40 @@ func createAdmin(ctx context.Context, dataDir, username, password string, cost i
 	return acct, err
 }
 
-// ResetPassword sets a new password for username and ends its sessions.
-func ResetPassword(ctx context.Context, dataDir, username, password string) error {
+// ResetPassword sets a new password for username, ends all of its sessions
+// and deletes all of its API tokens (it is the recovery action for a
+// compromised account). It returns the number of tokens deleted.
+func ResetPassword(ctx context.Context, dataDir, username, password string) (tokensRevoked int, err error) {
 	return resetPassword(ctx, dataDir, username, password, auth.DefaultBcryptCost)
 }
 
-func resetPassword(ctx context.Context, dataDir, username, password string, cost int) error {
+func resetPassword(ctx context.Context, dataDir, username, password string, cost int) (int, error) {
 	if err := auth.ValidatePassword(password); err != nil {
-		return err
+		return 0, err
 	}
 	h, err := auth.NewHasher(cost)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	hash, err := h.Hash(password)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	st, err := openForAdmin(ctx, dataDir)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer st.Close()
 	acct, err := st.GetAccountByUsername(ctx, auth.LoginKey(username))
 	if errors.Is(err, store.ErrNotFound) {
-		return ErrNoSuchAccount
+		return 0, ErrNoSuchAccount
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if _, err := st.SetPassword(ctx, acct.ID, hash); err != nil {
-		return fmt.Errorf("set password: %w", err)
+	_, revoked, err := st.SetPassword(ctx, acct.ID, hash, true)
+	if err != nil {
+		return 0, fmt.Errorf("set password: %w", err)
 	}
-	return nil
+	return revoked, nil
 }

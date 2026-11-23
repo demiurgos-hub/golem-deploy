@@ -133,9 +133,18 @@ func (r *Runner) LogPath(id int64) string {
 	return filepath.Join(r.logDir, strconv.FormatInt(id, 10)+".log")
 }
 
+// StartOption adjusts the job recorded by Start.
+type StartOption func(*store.NewJob)
+
+// Restricted marks the job as restricted: only admins may read its log or
+// cancel it (enforced by the HTTP layer).
+func Restricted(restricted bool) StartOption {
+	return func(j *store.NewJob) { j.Restricted = restricted }
+}
+
 // Start persists a queued job and runs fn in the background. It fails with
 // ErrSubjectBusy when the subject already has an active job.
-func (r *Runner) Start(ctx context.Context, kind string, subject Subject, createdBy *int64, fn Func) (store.Job, error) {
+func (r *Runner) Start(ctx context.Context, kind string, subject Subject, createdBy *int64, fn Func, opts ...StartOption) (store.Job, error) {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -154,7 +163,11 @@ func (r *Runner) Start(ctx context.Context, kind string, subject Subject, create
 		r.mu.Unlock()
 	}
 
-	job, err := r.store.CreateJob(ctx, store.NewJob{Kind: kind, SubjectType: subject.Type, SubjectID: subject.ID, CreatedBy: createdBy})
+	nj := store.NewJob{Kind: kind, SubjectType: subject.Type, SubjectID: subject.ID, CreatedBy: createdBy}
+	for _, o := range opts {
+		o(&nj)
+	}
+	job, err := r.store.CreateJob(ctx, nj)
 	if err != nil {
 		release()
 		return store.Job{}, err

@@ -31,6 +31,10 @@ type NewAPIToken struct {
 	TokenHash string `json:"-"`
 	Prefix    string
 	ExpiresAt *time.Time
+	// MaxPerAccount, when positive, makes CreateAPIToken fail with ErrLimit
+	// if the account already has that many tokens. The count and the insert
+	// happen in one transaction.
+	MaxPerAccount int
 }
 
 const tokenCols = `id, account_id, name, token_hash, prefix, created_at, last_used_at, expires_at`
@@ -55,15 +59,30 @@ func scanToken(r scanner) (APIToken, error) {
 	return t, nil
 }
 
-// CreateAPIToken stores a token hash. ErrNotFound is not checked here: the
-// foreign key rejects unknown accounts.
+// CreateAPIToken stores a token hash, enforcing in.MaxPerAccount
+// atomically (ErrLimit). ErrNotFound is not checked here: the foreign key
+// rejects unknown accounts.
 func (s *Store) CreateAPIToken(ctx context.Context, in NewAPIToken) (APIToken, error) {
-	t, err := scanToken(s.db.QueryRowContext(ctx,
-		`INSERT INTO api_tokens (account_id, name, token_hash, prefix, created_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?) RETURNING `+tokenCols,
-		in.AccountID, in.Name, in.TokenHash, in.Prefix, formatTime(s.nowUTC()), formatTimePtr(in.ExpiresAt)))
+	var t APIToken
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if in.MaxPerAccount > 0 {
+			var n int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM api_tokens WHERE account_id = ?`, in.AccountID).Scan(&n); err != nil {
+				return mapErr("create api token", err)
+			}
+			if n >= in.MaxPerAccount {
+				return ErrLimit
+			}
+		}
+		var err error
+		t, err = scanToken(tx.QueryRowContext(ctx,
+			`INSERT INTO api_tokens (account_id, name, token_hash, prefix, created_at, expires_at)
+			 VALUES (?, ?, ?, ?, ?, ?) RETURNING `+tokenCols,
+			in.AccountID, in.Name, in.TokenHash, in.Prefix, formatTime(s.nowUTC()), formatTimePtr(in.ExpiresAt)))
+		return mapErr("create api token", err)
+	})
 	if err != nil {
-		return APIToken{}, mapErr("create api token", err)
+		return APIToken{}, err
 	}
 	return t, nil
 }

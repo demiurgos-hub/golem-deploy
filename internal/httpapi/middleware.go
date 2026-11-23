@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"net"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -17,13 +16,21 @@ type ctxKey int
 const (
 	reqInfoKey ctxKey = iota
 	identityKey
+	routeAccessKey
 )
 
 // reqInfo is shared, mutable per-request state for the access log: the auth
-// layer fills in the account id.
+// layer fills in the account id. clientIP is resolved once by outer.
 type reqInfo struct {
 	id        string
 	accountID int64
+	clientIP  string
+}
+
+// routeAccessFrom returns the access level of the route serving r.
+func routeAccessFrom(r *http.Request) (Access, bool) {
+	a, ok := r.Context().Value(routeAccessKey).(Access)
+	return a, ok
 }
 
 func requestIDFrom(ctx context.Context) string {
@@ -74,15 +81,16 @@ func (w *statusWriter) Flush() {
 	_ = http.NewResponseController(w.ResponseWriter).Flush()
 }
 
-// outer is the middleware applied to every request: request id, access log,
-// panic recovery and security headers.
+// outer is the middleware applied to every request: request id, client
+// address resolution, access log, panic recovery, security headers and the
+// Host allowlist.
 func (s *Server) outer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		// Captured up front: downstream handlers (the SPA fallback) may
 		// rewrite r.URL.
 		method, path := r.Method, r.URL.Path
-		ri := &reqInfo{id: newRequestID()}
+		ri := &reqInfo{id: newRequestID(), clientIP: s.resolveClientIP(r)}
 		r = r.WithContext(context.WithValue(r.Context(), reqInfoKey, ri))
 		sw := &statusWriter{ResponseWriter: w}
 		sw.Header().Set("X-Request-Id", ri.id)
@@ -109,13 +117,18 @@ func (s *Server) outer(next http.Handler) http.Handler {
 				"duration_ms", time.Since(start).Milliseconds(),
 				"bytes", sw.written,
 				"request_id", ri.id,
-				"remote", clientIP(r),
+				"remote", ri.clientIP,
 			}
 			if ri.accountID != 0 {
 				attrs = append(attrs, "account_id", ri.accountID)
 			}
 			s.logger.Info("http request", attrs...)
 		}()
+		if !s.hostAllowed(r.Host) {
+			s.logBadHost(r, ri.id)
+			s.writeError(sw, r, errBadHost)
+			return
+		}
 		next.ServeHTTP(sw, r)
 	})
 }
@@ -145,20 +158,13 @@ func (s *Server) setSecurityHeaders(h http.Header, api bool) {
 
 func isAPIPath(p string) bool { return p == "/api" || strings.HasPrefix(p, "/api/") }
 
-// clientIP returns the TCP peer address used for rate limiting. Forwarded
-// headers are deliberately ignored. IPv6 peers are grouped by /64 because
-// one host commonly controls a whole /64.
+// clientIP returns the client address key used for rate limiting and the
+// access log: an IPv4 address or an IPv6 /64. It is the TCP peer, or, when
+// the peer is a trusted proxy (--trusted-proxy), the client named by
+// X-Forwarded-For (see resolveClientIP).
 func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
+	if ri, ok := r.Context().Value(reqInfoKey).(*reqInfo); ok && ri.clientIP != "" {
+		return ri.clientIP
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return host
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		return ip4.String()
-	}
-	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+	return peerKey(r.RemoteAddr)
 }

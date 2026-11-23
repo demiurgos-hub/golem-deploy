@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,14 @@ type Config struct {
 	InsecureHTTP bool
 	// Version is reported by GET /api/v1/status.
 	Version string
+	// PublicHosts are the host names (without port, case-insensitive)
+	// accepted in the Host header besides IP literals and "localhost".
+	// Anything else is refused with 421 bad_host (DNS rebinding defence).
+	PublicHosts []string
+	// TrustedProxies are the networks of reverse proxies whose
+	// X-Forwarded-For header is believed. Empty means forwarding headers are
+	// ignored and the TCP peer is the client.
+	TrustedProxies []netip.Prefix
 }
 
 func (c Config) tls() bool { return c.TLSCert != "" && c.TLSKey != "" }
@@ -55,6 +64,11 @@ type Deps struct {
 	SPA http.Handler
 	// Now overrides the clock (tests).
 	Now func() time.Time
+	// HashSlots bounds concurrent bcrypt operations (0: auth.DefaultSlotCount).
+	HashSlots int
+	// HashSlotWait is how long a request waits for a bcrypt slot before it
+	// gets 503 (0: hashSlotWait).
+	HashSlotWait time.Duration
 }
 
 // Server holds the HTTP layer's state. Create it with New.
@@ -70,9 +84,23 @@ type Server struct {
 	spa      http.Handler
 	now      func() time.Time
 
-	loginIP    *auth.Limiter
-	loginUser  *auth.Limiter
-	registerIP *auth.Limiter
+	// Password attempt limits (login, password change, token creation):
+	// failures per client IP and per submitted username, a known-good-IP
+	// exemption from the username limit, and in-flight caps.
+	loginIP       *auth.Limiter
+	loginUser     *auth.Limiter
+	registerIP    *auth.Limiter
+	knownIPs      *auth.KnownIPs
+	loginFlightIP *auth.InFlight
+	loginFlightU  *auth.InFlight
+	// hashSlots bounds concurrent bcrypt work reachable from HTTP.
+	hashSlots *auth.Slots
+	// logStreams caps concurrent following log streams per account.
+	logStreams *auth.InFlight
+
+	publicHosts    map[string]bool
+	trustedProxies []netip.Prefix
+	badHostLog     sampledLog
 
 	api     *http.ServeMux
 	handler http.Handler
@@ -83,11 +111,26 @@ type Server struct {
 
 // Rate limits (in-memory, per process).
 const (
+	// loginFailuresPerWindow is the per-client-IP password failure limit.
 	loginFailuresPerWindow = 5
-	loginWindow            = 15 * time.Minute
-	registrationsPerWindow = 5
-	registerWindow         = time.Hour
-	limiterMaxKeys         = 10000
+	// usernameFailuresPerWindow is the per-username failure limit, counted
+	// for every submitted username whether it exists or not. Addresses that
+	// logged in successfully as that user are exempt.
+	usernameFailuresPerWindow = 20
+	loginWindow               = 15 * time.Minute
+	registrationsPerWindow    = 5
+	registerWindow            = time.Hour
+	limiterMaxKeys            = 50000
+	// knownIPsPerUser and knownIPUsers bound the known-good-IP memory.
+	knownIPsPerUser = 8
+	knownIPUsers    = 10000
+	// loginsInFlightPerIP and loginsInFlightPerUser cap concurrent logins.
+	loginsInFlightPerIP   = 4
+	loginsInFlightPerUser = 1
+	// hashSlotWait is how long a request waits for a bcrypt slot.
+	hashSlotWait = 2 * time.Second
+	// logStreamsPerAccount caps concurrent ?follow=1 log streams.
+	logStreamsPerAccount = 4
 )
 
 // Body size limits.
@@ -111,6 +154,16 @@ func New(cfg Config, d Deps) (*Server, error) {
 	if d.SPA == nil {
 		d.SPA = http.NotFoundHandler()
 	}
+	if d.HashSlots <= 0 {
+		d.HashSlots = auth.DefaultSlotCount()
+	}
+	if d.HashSlotWait <= 0 {
+		d.HashSlotWait = hashSlotWait
+	}
+	hosts, err := NormalizePublicHosts(cfg.PublicHosts)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		cfg:        cfg,
 		store:      d.Store,
@@ -123,9 +176,21 @@ func New(cfg Config, d Deps) (*Server, error) {
 		spa:        d.SPA,
 		now:        d.Now,
 		loginIP:    auth.NewLimiter(loginFailuresPerWindow, loginWindow, limiterMaxKeys, d.Now),
-		loginUser:  auth.NewLimiter(loginFailuresPerWindow, loginWindow, limiterMaxKeys, d.Now),
+		loginUser:  auth.NewLimiter(usernameFailuresPerWindow, loginWindow, limiterMaxKeys, d.Now),
 		registerIP: auth.NewLimiter(registrationsPerWindow, registerWindow, limiterMaxKeys, d.Now),
-		shutdown:   make(chan struct{}),
+		knownIPs:   auth.NewKnownIPs(knownIPsPerUser, knownIPUsers),
+
+		loginFlightIP: auth.NewInFlight(loginsInFlightPerIP),
+		loginFlightU:  auth.NewInFlight(loginsInFlightPerUser),
+		hashSlots:     auth.NewSlots(d.HashSlots, d.HashSlotWait),
+		logStreams:    auth.NewInFlight(logStreamsPerAccount),
+
+		publicHosts:    map[string]bool{},
+		trustedProxies: append([]netip.Prefix(nil), cfg.TrustedProxies...),
+		shutdown:       make(chan struct{}),
+	}
+	for _, h := range hosts {
+		s.publicHosts[h] = true
 	}
 	s.api = http.NewServeMux()
 	for _, rt := range s.routes() {
@@ -161,8 +226,10 @@ func (s *Server) register(rt route) {
 		limit = defaultBodyLimit
 	}
 	h := s.authorize(rt.access, rt.handler)
+	access := rt.access
 	s.api.Handle(rt.pattern(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
+		r = r.WithContext(context.WithValue(r.Context(), routeAccessKey, access))
 		if err := h(w, r); err != nil {
 			s.writeError(w, r, err)
 		}
@@ -223,9 +290,20 @@ var ErrPlaintextNonLoopback = errors.New("refusing to serve plaintext HTTP on a 
 
 // CheckListen enforces the bind rule: without TLS, only loopback addresses
 // are allowed unless insecure is set. A missing host (":8000") means all
-// interfaces and is not loopback; host names other than "localhost" are not
-// resolved and count as non-loopback.
+// interfaces and is not loopback; "localhost" is resolved and every address
+// it resolves to must be loopback; other host names are not resolved and
+// count as non-loopback.
 func CheckListen(addr string, tlsEnabled, insecure bool) error {
+	return checkListen(addr, tlsEnabled, insecure, lookupHost)
+}
+
+func lookupHost(host string) ([]netip.Addr, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+}
+
+func checkListen(addr string, tlsEnabled, insecure bool, lookup func(string) ([]netip.Addr, error)) error {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("invalid listen address %q: %w", addr, err)
@@ -237,6 +315,15 @@ func CheckListen(addr string, tlsEnabled, insecure bool) error {
 		return nil
 	}
 	if strings.EqualFold(host, "localhost") {
+		addrs, err := lookup(host)
+		if err != nil || len(addrs) == 0 {
+			return fmt.Errorf("%w (could not resolve %q to check it)", ErrPlaintextNonLoopback, host)
+		}
+		for _, a := range addrs {
+			if !a.Unmap().IsLoopback() {
+				return fmt.Errorf("%w (%q resolves to %s)", ErrPlaintextNonLoopback, host, a)
+			}
+		}
 		return nil
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {

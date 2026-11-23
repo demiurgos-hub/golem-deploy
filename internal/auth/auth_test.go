@@ -2,6 +2,8 @@ package auth
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -245,45 +247,203 @@ func TestLimiterTripsAndRecovers(t *testing.T) {
 	c := newClock()
 	l := NewLimiter(5, 15*time.Minute, 100, c.Now)
 	for i := 0; i < 5; i++ {
-		if ok, _ := l.Check("k"); !ok {
-			t.Fatalf("blocked after %d events", i)
+		if _, _, ok := l.Reserve("k"); !ok {
+			t.Fatalf("blocked after %d attempts", i)
 		}
-		l.Add("k")
 	}
-	ok, wait := l.Check("k")
+	_, wait, ok := l.Reserve("k")
 	if ok || wait <= 0 || wait > 15*time.Minute {
-		t.Fatalf("not blocked after 5 events: %v %v", ok, wait)
+		t.Fatalf("not blocked after 5 attempts: %v %v", ok, wait)
 	}
-	if ok, _ := l.Check("other"); !ok {
+	if _, _, ok := l.Reserve("other"); !ok {
 		t.Fatal("unrelated key blocked")
 	}
 	c.Add(15 * time.Minute)
-	if ok, _ := l.Check("k"); !ok {
+	res, _, ok := l.Reserve("k")
+	if !ok {
 		t.Fatal("not recovered after window")
 	}
-	l.Add("k")
-	l.Reset("k")
-	if l.Len() != 0 {
+	res.Reset()
+	if l.Count("k") != 0 {
 		t.Fatal("reset did not forget key")
 	}
+	// Refund un-counts one attempt; settling twice has no further effect.
+	a, _, _ := l.Reserve("r")
+	b, _, _ := l.Reserve("r")
+	a.Refund()
+	a.Refund()
+	a.Reset()
+	if l.Count("r") != 1 {
+		t.Fatalf("count after refund %d, want 1", l.Count("r"))
+	}
+	// A refund from an old window does not touch the new one.
+	c.Add(15 * time.Minute)
+	if _, _, ok := l.Reserve("r"); !ok {
+		t.Fatal("new window refused")
+	}
+	b.Refund()
+	if l.Count("r") != 1 {
+		t.Fatalf("stale refund changed the new window: %d", l.Count("r"))
+	}
+	var nilRes *Reservation
+	nilRes.Refund()
+	nilRes.Reset()
 }
 
 func TestLimiterBoundedMemory(t *testing.T) {
 	c := newClock()
 	l := NewLimiter(5, time.Minute, 50, c.Now)
 	for i := 0; i < 1000; i++ {
-		l.Add("k" + strconv.Itoa(i))
+		l.Reserve("k" + strconv.Itoa(i))
 		c.Add(time.Millisecond)
 	}
 	if l.Len() > 50 {
 		t.Fatalf("limiter holds %d keys, cap 50", l.Len())
 	}
-	// Newest keys survive eviction.
+	// Once the early keys expire, new keys are tracked again.
+	c.Add(time.Minute)
 	for i := 0; i < 5; i++ {
-		l.Add("k999")
+		l.Reserve("fresh")
 	}
-	if ok, _ := l.Check("k999"); ok {
-		t.Fatal("recent key evicted")
+	if _, _, ok := l.Reserve("fresh"); ok {
+		t.Fatal("new key not tracked after expired entries were swept")
+	}
+}
+
+// TestF2_LimiterReserveIsAtomic: with many goroutines reserving the same
+// key at once, exactly max succeed.
+func TestF2_LimiterReserveIsAtomic(t *testing.T) {
+	l := NewLimiter(5, time.Minute, 100, nil)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	passed := 0
+	for i := 0; i < 300; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, ok := l.Reserve("k"); ok {
+				mu.Lock()
+				passed++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if passed != 5 {
+		t.Fatalf("%d reservations passed, want 5", passed)
+	}
+}
+
+// TestF3_FloodDoesNotEvictBlock: filling the limiter with junk keys must not
+// clear a key that is currently blocked; keys that do not fit are simply not
+// tracked.
+func TestF3_FloodDoesNotEvictBlock(t *testing.T) {
+	c := newClock()
+	l := NewLimiter(5, 15*time.Minute, 100, c.Now)
+	for i := 0; i < 5; i++ {
+		l.Reserve("victim")
+	}
+	if _, _, ok := l.Reserve("victim"); ok {
+		t.Fatal("victim not blocked")
+	}
+	for i := 0; i < 10000; i++ {
+		c.Add(10 * time.Millisecond)
+		l.Reserve("junk" + strconv.Itoa(i))
+	}
+	if l.Len() > 100 {
+		t.Fatalf("limiter holds %d keys, cap 100", l.Len())
+	}
+	if _, _, ok := l.Reserve("victim"); ok {
+		t.Fatal("flooding the limiter cleared a block")
+	}
+	// An untracked key's reservation is a harmless no-op.
+	res, _, ok := l.Reserve("untracked")
+	if !ok || l.Count("untracked") != 0 {
+		t.Fatal("untracked key")
+	}
+	res.Refund()
+	res.Reset()
+}
+
+func TestSlots(t *testing.T) {
+	s := NewSlots(2, 50*time.Millisecond)
+	r1, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := s.Acquire(context.Background()); !errors.Is(err, ErrBusy) {
+		t.Fatalf("third acquire: %v", err)
+	}
+	if time.Since(start) < 40*time.Millisecond {
+		t.Fatal("did not wait before giving up")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.Acquire(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled acquire: %v", err)
+	}
+	r1()
+	r1() // idempotent
+	r3, err := s.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2()
+	r3()
+	if s.Acquired() != 3 {
+		t.Fatalf("acquired %d", s.Acquired())
+	}
+	if DefaultSlotCount() < 2 {
+		t.Fatal("default slot count below 2")
+	}
+}
+
+func TestInFlight(t *testing.T) {
+	f := NewInFlight(1)
+	rel, ok := f.Acquire("a")
+	if !ok {
+		t.Fatal("first acquire refused")
+	}
+	if _, ok := f.Acquire("a"); ok {
+		t.Fatal("second concurrent acquire allowed")
+	}
+	if _, ok := f.Acquire("b"); !ok {
+		t.Fatal("other key refused")
+	}
+	rel()
+	rel()
+	rel2, ok := f.Acquire("a")
+	if !ok {
+		t.Fatal("not released")
+	}
+	rel2()
+	if f.Len() != 1 { // "b" is still held
+		t.Fatalf("len %d", f.Len())
+	}
+}
+
+func TestKnownIPs(t *testing.T) {
+	k := NewKnownIPs(2, 2)
+	k.Add("alice", "1.1.1.1")
+	k.Add("alice", "2.2.2.2")
+	k.Add("alice", "1.1.1.1") // refresh: 2.2.2.2 is now least recent
+	k.Add("alice", "3.3.3.3")
+	if !k.Contains("alice", "1.1.1.1") || !k.Contains("alice", "3.3.3.3") || k.Contains("alice", "2.2.2.2") {
+		t.Fatal("per-user LRU wrong")
+	}
+	if k.Contains("bob", "1.1.1.1") {
+		t.Fatal("address leaked across users")
+	}
+	k.Add("bob", "9.9.9.9")
+	k.Add("alice", "1.1.1.1") // alice most recent
+	k.Add("carol", "8.8.8.8") // evicts bob
+	if k.Contains("bob", "9.9.9.9") || !k.Contains("alice", "1.1.1.1") || !k.Contains("carol", "8.8.8.8") {
+		t.Fatal("global LRU wrong")
 	}
 }
 

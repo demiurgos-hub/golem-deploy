@@ -76,7 +76,8 @@ func newHarness(t *testing.T, mutate ...func(*Config)) *harness {
 		t.Fatal(err)
 	}
 	runner := jobs.New(st, logDir, jobs.Options{Workers: 2})
-	cfg := Config{Listen: "127.0.0.1:0", Version: "test"}
+	// httptest.NewRequest uses Host "example.com".
+	cfg := Config{Listen: "127.0.0.1:0", Version: "test", PublicHosts: []string{"example.com"}}
 	for _, m := range mutate {
 		m(&cfg)
 	}

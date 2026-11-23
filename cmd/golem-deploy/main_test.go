@@ -52,8 +52,22 @@ func TestAdminCreateFromStdin(t *testing.T) {
 	if code, _, stderr := runCLI(t, "x\n", "admin", "create", "--username", "bob", "--data-dir", dir); code != 1 || !strings.Contains(stderr, "--password-stdin") {
 		t.Fatalf("non-tty: %d %q", code, stderr)
 	}
-	if code, out, stderr := runCLI(t, "another-good-password\r\n", "admin", "reset-password", "--username", "alice", "--password-stdin", "--data-dir", dir); code != 0 || !strings.Contains(out, "password updated") {
+	if code, out, stderr := runCLI(t, "another-good-password\r\n", "admin", "reset-password", "--username", "alice", "--password-stdin", "--data-dir", dir); code != 0 || !strings.Contains(out, "all of its sessions have been ended and 0 API token(s) deleted") {
 		t.Fatalf("reset: %d %q %q", code, out, stderr)
+	}
+}
+
+func TestServeRejectsBadNetworkFlags(t *testing.T) {
+	t.Setenv("GOLEM_DEPLOY_INSECURE_HTTP", "")
+	if code, _, stderr := runCLI(t, "", "serve", "--listen", "127.0.0.1:0", "--trusted-proxy", "10.0.0.0/8,nonsense", "--data-dir", t.TempDir()); code != 1 || !strings.Contains(stderr, "invalid trusted proxy") {
+		t.Fatalf("bad trusted proxy: %d %q", code, stderr)
+	}
+	t.Setenv("GOLEM_DEPLOY_PUBLIC_HOST", "https://deploy.example.com")
+	if code, _, stderr := runCLI(t, "", "serve", "--listen", "127.0.0.1:0", "--data-dir", t.TempDir()); code != 1 || !strings.Contains(stderr, "invalid public host") {
+		t.Fatalf("bad public host from env: %d %q", code, stderr)
+	}
+	if got := splitList(" a.example, ,b.example,"); len(got) != 2 || got[0] != "a.example" || got[1] != "b.example" {
+		t.Fatalf("splitList %q", got)
 	}
 }
 

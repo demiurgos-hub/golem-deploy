@@ -5,17 +5,29 @@ import (
 	"time"
 )
 
-// Limiter counts events per key in a fixed window and blocks a key once it
-// reaches the maximum, until the window that started with its first event
-// ends. Memory is bounded: when maxKeys is reached, expired entries are
-// swept and, if still full, the entry with the oldest window is evicted.
+// Limiter counts attempts per key in a fixed window and refuses a key once
+// it has used the maximum, until the window that started with its first
+// attempt ends.
+//
+// Attempts are counted up front with Reserve, under one lock, before any
+// expensive work, so concurrent requests cannot all pass a check that only
+// one of them should have passed. The caller then settles the reservation:
+// Refund when the attempt must not count (it succeeded, or never reached the
+// password check), Reset to clear the key, or nothing to keep it counted.
+//
+// Memory is bounded by maxKeys. When full, expired entries are swept; live
+// entries are never evicted (so flooding the limiter with new keys cannot
+// clear a block), and a new key that does not fit is simply not tracked.
+// Callers therefore combine limiters (e.g. per IP and per username) so that
+// an untracked key is still covered by another one.
 type Limiter struct {
-	mu      sync.Mutex
-	max     int
-	window  time.Duration
-	maxKeys int
-	now     func() time.Time
-	entries map[string]*limitEntry
+	mu        sync.Mutex
+	max       int
+	window    time.Duration
+	maxKeys   int
+	now       func() time.Time
+	entries   map[string]*limitEntry
+	lastSweep time.Time
 }
 
 type limitEntry struct {
@@ -23,7 +35,11 @@ type limitEntry struct {
 	start time.Time
 }
 
-// NewLimiter returns a limiter allowing max events per key per window,
+// sweepInterval bounds how often a full limiter scans for expired entries,
+// so a flood of new keys cannot make every request pay for a full scan.
+const sweepInterval = time.Second
+
+// NewLimiter returns a limiter allowing max attempts per key per window,
 // tracking at most maxKeys keys. now may be nil for time.Now.
 func NewLimiter(max int, window time.Duration, maxKeys int, now func() time.Time) *Limiter {
 	if now == nil {
@@ -32,43 +48,73 @@ func NewLimiter(max int, window time.Duration, maxKeys int, now func() time.Time
 	return &Limiter{max: max, window: window, maxKeys: maxKeys, now: now, entries: map[string]*limitEntry{}}
 }
 
-// Check reports whether key may proceed and, if not, how long until it may.
-func (l *Limiter) Check(key string) (bool, time.Duration) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	e, ok := l.entries[key]
-	if !ok {
-		return true, 0
-	}
-	now := l.now()
-	end := e.start.Add(l.window)
-	if !now.Before(end) {
-		delete(l.entries, key)
-		return true, 0
-	}
-	if e.count >= l.max {
-		return false, end.Sub(now)
-	}
-	return true, 0
+// Reservation is one counted attempt. Its methods are safe to call on a nil
+// or untracked reservation and at most one of Refund and Reset takes effect.
+type Reservation struct {
+	l       *Limiter
+	key     string
+	start   time.Time
+	settled bool
 }
 
-// Add records one event for key.
-func (l *Limiter) Add(key string) {
+// Reserve atomically checks whether key may make another attempt and, if
+// so, counts it. When it may not, ok is false and wait says how long until
+// the window ends.
+func (l *Limiter) Reserve(key string) (res *Reservation, wait time.Duration, ok bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	if e, ok := l.entries[key]; ok {
-		if now.Before(e.start.Add(l.window)) {
-			e.count++
-			return
+	e := l.entries[key]
+	if e != nil && !now.Before(e.start.Add(l.window)) {
+		delete(l.entries, key)
+		e = nil
+	}
+	if e == nil {
+		if len(l.entries) >= l.maxKeys {
+			l.sweepLocked(now)
 		}
-		e.count, e.start = 1, now
+		if len(l.entries) >= l.maxKeys {
+			return &Reservation{}, 0, true // untracked; other limiters still apply
+		}
+		e = &limitEntry{start: now}
+		l.entries[key] = e
+	}
+	if e.count >= l.max {
+		return nil, e.start.Add(l.window).Sub(now), false
+	}
+	e.count++
+	return &Reservation{l: l, key: key, start: e.start}, 0, true
+}
+
+// Refund un-counts the attempt (if its window is still current).
+func (r *Reservation) Refund() {
+	if r == nil || r.l == nil || r.settled {
 		return
 	}
-	if len(l.entries) >= l.maxKeys {
-		l.evictLocked(now)
+	r.settled = true
+	l := r.l
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if e := l.entries[r.key]; e != nil && e.start.Equal(r.start) && e.count > 0 {
+		e.count--
+		if e.count == 0 {
+			delete(l.entries, r.key)
+		}
 	}
-	l.entries[key] = &limitEntry{count: 1, start: now}
+}
+
+// Reset forgets the key's attempts in the reservation's window.
+func (r *Reservation) Reset() {
+	if r == nil || r.l == nil || r.settled {
+		return
+	}
+	r.settled = true
+	l := r.l
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if e := l.entries[r.key]; e != nil && e.start.Equal(r.start) {
+		delete(l.entries, r.key)
+	}
 }
 
 // Reset forgets key.
@@ -78,6 +124,17 @@ func (l *Limiter) Reset(key string) {
 	delete(l.entries, key)
 }
 
+// Count returns the attempts counted for key in its current window.
+func (l *Limiter) Count(key string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e := l.entries[key]
+	if e == nil || !l.now().Before(e.start.Add(l.window)) {
+		return 0
+	}
+	return e.count
+}
+
 // Len returns the number of tracked keys.
 func (l *Limiter) Len() int {
 	l.mu.Lock()
@@ -85,19 +142,14 @@ func (l *Limiter) Len() int {
 	return len(l.entries)
 }
 
-func (l *Limiter) evictLocked(now time.Time) {
-	var oldestKey string
-	var oldest time.Time
+func (l *Limiter) sweepLocked(now time.Time) {
+	if !l.lastSweep.IsZero() && now.Sub(l.lastSweep) < sweepInterval && now.After(l.lastSweep) {
+		return
+	}
+	l.lastSweep = now
 	for k, e := range l.entries {
 		if !now.Before(e.start.Add(l.window)) {
 			delete(l.entries, k)
-			continue
 		}
-		if oldestKey == "" || e.start.Before(oldest) {
-			oldestKey, oldest = k, e.start
-		}
-	}
-	if len(l.entries) >= l.maxKeys && oldestKey != "" {
-		delete(l.entries, oldestKey)
 	}
 }

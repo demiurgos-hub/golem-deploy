@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -16,52 +15,73 @@ import (
 // maxTokensPerAccount bounds API tokens per account.
 const maxTokensPerAccount = 50
 
+// handleMe returns the caller's account and how it authenticated. It is
+// reachable with an API token so that a token can identify itself.
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) error {
-	writeJSON(w, http.StatusOK, toAPIAccount(identityFrom(r).Account))
+	id := identityFrom(r)
+	a := id.Account
+	out := apitypes.CurrentAccount{
+		ID:        a.ID,
+		Username:  a.Username,
+		Role:      apitypes.Role(a.Role),
+		Approved:  a.Approved,
+		CreatedAt: a.CreatedAt.UTC(),
+		Auth:      apitypes.AuthKindSession,
+	}
+	if id.Kind == KindAPIToken {
+		t := toAPIToken(id.Token)
+		out.Auth, out.APIToken = apitypes.AuthKindAPIToken, &t
+	}
+	writeJSON(w, http.StatusOK, out)
 	return nil
 }
 
-// handleChangePassword verifies the current password, stores the new one,
-// ends every session (token_version bump) and returns a fresh session.
-// Wrong current passwords count against the login rate limit for the user.
+// handleChangePassword verifies the current password (counted against the
+// login limits per IP and per username), stores the new one, ends every
+// session (token_version bump), deletes the account's API tokens unless
+// revoke_tokens is false, and returns a fresh session.
 func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) error {
 	id := identityFrom(r)
 	var req apitypes.ChangePasswordRequest
 	if err := decodeJSON(r, &req); err != nil {
 		return err
 	}
-	userKey := auth.LoginKey(id.Account.Username)
-	if err := checkLimits(func() (bool, time.Duration) { return s.loginUser.Check(userKey) }); err != nil {
-		return err
-	}
-	if !s.hasher.Verify(id.Account.PasswordHash, req.CurrentPassword) {
-		s.loginUser.Add(userKey)
-		e := newError(http.StatusBadRequest, apitypes.ErrorCodeInvalidCurrentPassword, "current password is incorrect")
-		e.field = "current_password"
-		return e
-	}
 	if err := auth.ValidatePassword(req.NewPassword); err != nil {
 		return invalidField("new_password", err.Error())
 	}
-	hash, err := s.hasher.Hash(req.NewPassword)
+	if err := s.verifyCurrentPassword(r, id.Account, req.CurrentPassword); err != nil {
+		return err
+	}
+	hash, err := s.hashPassword(r.Context(), req.NewPassword)
+	if err != nil {
+		return err
+	}
+	revoke := req.RevokeTokens == nil || *req.RevokeTokens
+	acct, revoked, err := s.store.SetPassword(r.Context(), id.Account.ID, hash, revoke)
 	if err != nil {
 		return internal(err)
 	}
-	acct, err := s.store.SetPassword(r.Context(), id.Account.ID, hash)
+	s.logger.Info("password changed", "request_id", requestIDFrom(r.Context()), "account_id", acct.ID, "tokens_revoked", revoked)
+	sess, err := s.sessionResponse(acct, s.now())
 	if err != nil {
 		return internal(err)
 	}
-	s.logger.Info("password changed", "request_id", requestIDFrom(r.Context()), "account_id", acct.ID)
-	resp, err := s.sessionResponse(acct, s.now())
-	if err != nil {
-		return internal(err)
-	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, apitypes.ChangePasswordResponse{
+		Token:            sess.Token,
+		ExpiresAt:        sess.ExpiresAt,
+		SessionExpiresAt: sess.SessionExpiresAt,
+		Account:          sess.Account,
+		TokensRevoked:    revoked,
+	})
 	return nil
 }
 
 func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) error {
-	toks, err := s.store.ListAPITokens(r.Context(), identityFrom(r).Account.ID)
+	return s.writeTokenList(w, r, identityFrom(r).Account.ID)
+}
+
+func (s *Server) writeTokenList(w http.ResponseWriter, r *http.Request, accountID int64) error {
+	toks, err := s.store.ListAPITokens(r.Context(), accountID)
 	if err != nil {
 		return internal(err)
 	}
@@ -94,12 +114,10 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) error
 	if req.ExpiresAt != nil && !req.ExpiresAt.After(s.now()) {
 		return invalidField("expires_at", "expires_at must be in the future")
 	}
-	existing, err := s.store.ListAPITokens(r.Context(), id.Account.ID)
-	if err != nil {
-		return internal(err)
-	}
-	if len(existing) >= maxTokensPerAccount {
-		return conflict(apitypes.ErrorCodeConflict, "too many API tokens; revoke unused ones first")
+	// A stolen session alone must not be enough to mint a long-lived
+	// credential.
+	if err := s.verifyCurrentPassword(r, id.Account, req.CurrentPassword); err != nil {
+		return err
 	}
 	secret, hash, prefix, err := auth.NewAPIToken()
 	if err != nil {
@@ -107,7 +125,11 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) error
 	}
 	tok, err := s.store.CreateAPIToken(r.Context(), store.NewAPIToken{
 		AccountID: id.Account.ID, Name: name, TokenHash: hash, Prefix: prefix, ExpiresAt: req.ExpiresAt,
+		MaxPerAccount: maxTokensPerAccount,
 	})
+	if errors.Is(err, store.ErrLimit) {
+		return conflict(apitypes.ErrorCodeConflict, "too many API tokens; revoke unused ones first")
+	}
 	if err != nil {
 		return internal(err)
 	}

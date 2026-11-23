@@ -58,8 +58,9 @@ const (
 type Identity struct {
 	Account store.Account
 	Kind    IdentityKind
-	Session auth.Session // valid when Kind == KindSession
-	TokenID int64        // valid when Kind == KindAPIToken
+	Session auth.Session   // valid when Kind == KindSession
+	TokenID int64          // valid when Kind == KindAPIToken
+	Token   store.APIToken // valid when Kind == KindAPIToken
 }
 
 // Role is the effective role: API tokens are capped at developer.
@@ -69,6 +70,9 @@ func (id *Identity) Role() store.Role {
 	}
 	return id.Account.Role
 }
+
+// IsAdmin reports whether the identity is an admin session.
+func (id *Identity) IsAdmin() bool { return id != nil && id.Role() == store.RoleAdmin }
 
 func identityFrom(r *http.Request) *Identity {
 	id, _ := r.Context().Value(identityKey).(*Identity)
@@ -113,7 +117,7 @@ func (s *Server) authenticate(r *http.Request) (*Identity, error) {
 				s.logger.Warn("record api token use failed", "request_id", requestIDFrom(ctx), "err", err)
 			}
 		}
-		return &Identity{Account: acct, Kind: KindAPIToken, TokenID: tok.ID}, nil
+		return &Identity{Account: acct, Kind: KindAPIToken, TokenID: tok.ID, Token: tok}, nil
 	}
 
 	sess, err := s.sessions.Parse(cred)

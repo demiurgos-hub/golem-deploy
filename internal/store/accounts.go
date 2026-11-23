@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"time"
 )
@@ -27,7 +29,9 @@ type Account struct {
 	Role         Role
 	Approved     bool
 	// TokenVersion is embedded in session JWTs; bumping it ends every
-	// session of the account.
+	// session of the account. It starts at a random non-negative 63-bit
+	// value, so a session can never match a different (e.g. recreated)
+	// account row.
 	TokenVersion int64
 	CreatedAt    time.Time
 }
@@ -67,16 +71,35 @@ func scanAccount(r scanner) (Account, error) {
 	return a, nil
 }
 
+// nextTokenVersion is the SQL expression for an incremented token_version.
+// It wraps to 0 instead of overflowing into a REAL.
+const nextTokenVersion = `(CASE WHEN token_version >= 9223372036854775807 THEN 0 ELSE token_version + 1 END)`
+
+// randomTokenVersion returns a uniformly random non-negative int64.
+func randomTokenVersion() (int64, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, fmt.Errorf("generate token version: %w", err)
+	}
+	return int64(binary.BigEndian.Uint64(b[:]) >> 1), nil
+}
+
 // CreateAccount inserts an account. ErrConflict means the username exists
-// (case-insensitively).
+// (case-insensitively). It is the only way accounts are created (HTTP admin
+// create, self-registration and the local CLI all use it), so every account
+// starts with a random token_version.
 func (s *Store) CreateAccount(ctx context.Context, in NewAccount) (Account, error) {
 	if !in.Role.Valid() {
 		return Account{}, fmt.Errorf("create account: invalid role %q", in.Role)
 	}
+	ver, err := randomTokenVersion()
+	if err != nil {
+		return Account{}, err
+	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO accounts (username, password_hash, role, approved, created_at)
-		 VALUES (?, ?, ?, ?, ?) RETURNING `+accountCols,
-		in.Username, in.PasswordHash, in.Role, in.Approved, formatTime(s.nowUTC()))
+		`INSERT INTO accounts (username, password_hash, role, approved, token_version, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?) RETURNING `+accountCols,
+		in.Username, in.PasswordHash, in.Role, in.Approved, ver, formatTime(s.nowUTC()))
 	a, err := scanAccount(row)
 	if err != nil {
 		return Account{}, mapErr("create account", err)
@@ -151,7 +174,8 @@ func countApprovedAdmins(ctx context.Context, tx *sql.Tx) (int, error) {
 // local CLI, which is not subject to the self rule). Within one transaction it
 // refuses to leave zero approved admins (ErrLastAdmin) and refuses an admin
 // demoting or unapproving themselves (ErrSelf). A role change or un-approval
-// bumps token_version, ending the account's sessions.
+// bumps token_version, ending the account's sessions; un-approval also
+// deletes the account's API tokens, so re-approval does not revive them.
 func (s *Store) UpdateAccount(ctx context.Context, actorID, id int64, upd AccountUpdate) (Account, error) {
 	if upd.Role != nil && !upd.Role.Valid() {
 		return Account{}, fmt.Errorf("update account: invalid role %q", *upd.Role)
@@ -187,14 +211,19 @@ func (s *Store) UpdateAccount(ctx context.Context, actorID, id int64, upd Accoun
 				return ErrLastAdmin
 			}
 		}
-		bump := 0
+		if unapproved {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM api_tokens WHERE account_id = ?`, id); err != nil {
+				return mapErr("update account", err)
+			}
+		}
+		ver := `token_version`
 		if roleChanged || unapproved {
-			bump = 1
+			ver = nextTokenVersion
 		}
 		out, err = scanAccount(tx.QueryRowContext(ctx,
-			`UPDATE accounts SET role = ?, approved = ?, token_version = token_version + ?
+			`UPDATE accounts SET role = ?, approved = ?, token_version = `+ver+`
 			 WHERE id = ? RETURNING `+accountCols,
-			next.Role, next.Approved, bump, id))
+			next.Role, next.Approved, id))
 		return mapErr("update account", err)
 	})
 	return out, err
@@ -230,20 +259,39 @@ func (s *Store) DeleteAccount(ctx context.Context, actorID, id int64) error {
 }
 
 // SetPassword stores a new password hash and bumps token_version, ending all
-// sessions. It returns the updated account.
-func (s *Store) SetPassword(ctx context.Context, id int64, passwordHash string) (Account, error) {
-	a, err := scanAccount(s.db.QueryRowContext(ctx,
-		`UPDATE accounts SET password_hash = ?, token_version = token_version + 1
-		 WHERE id = ? RETURNING `+accountCols, passwordHash, id))
+// sessions. With revokeTokens it also deletes every API token of the account
+// in the same transaction. It returns the updated account and the number of
+// tokens deleted.
+func (s *Store) SetPassword(ctx context.Context, id int64, passwordHash string, revokeTokens bool) (Account, int, error) {
+	var out Account
+	var revoked int64
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		out, err = scanAccount(tx.QueryRowContext(ctx,
+			`UPDATE accounts SET password_hash = ?, token_version = `+nextTokenVersion+`
+			 WHERE id = ? RETURNING `+accountCols, passwordHash, id))
+		if err != nil {
+			return mapErr("set password", err)
+		}
+		if !revokeTokens {
+			return nil
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM api_tokens WHERE account_id = ?`, id)
+		if err != nil {
+			return mapErr("set password", err)
+		}
+		revoked, err = res.RowsAffected()
+		return err
+	})
 	if err != nil {
-		return Account{}, mapErr("set password", err)
+		return Account{}, 0, err
 	}
-	return a, nil
+	return out, int(revoked), nil
 }
 
 // BumpTokenVersion ends every session of account id (logout).
 func (s *Store) BumpTokenVersion(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE accounts SET token_version = token_version + 1 WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx, `UPDATE accounts SET token_version = `+nextTokenVersion+` WHERE id = ?`, id)
 	if err != nil {
 		return mapErr("bump token version", err)
 	}

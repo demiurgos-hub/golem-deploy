@@ -23,6 +23,8 @@ type StatusCounts struct {
 // Settings is the body of GET and PATCH /api/v1/settings (admin).
 type Settings struct {
 	// RegistrationEnabled allows POST /api/v1/auth/register. Default false.
+	// While it is on, anyone can learn whether a username exists (register
+	// answers username_taken); login and its rate limits do not reveal it.
 	RegistrationEnabled bool `json:"registration_enabled"`
 }
 

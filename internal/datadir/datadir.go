@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // Layout holds absolute paths inside a data directory.
@@ -42,8 +43,14 @@ func (l Layout) JobLogs() string { return filepath.Join(l.Root, "logs", "jobs") 
 // Tmp is scratch space on the same filesystem as the other directories.
 func (l Layout) Tmp() string { return filepath.Join(l.Root, "tmp") }
 
-// Prepare resolves root to an absolute path and creates the layout's
-// directories with mode 0700 (tightening existing ones on Unix).
+// Prepare resolves root to an absolute path, creates missing directories of
+// the layout with mode 0700 and creates the database file with mode 0600 if
+// it does not exist (so SQLite's -wal and -shm files inherit that mode).
+//
+// It never changes the mode of an existing directory: the operator may have
+// pointed --data-dir at a directory they use for other things. Instead, on
+// Unix, an existing data directory that is accessible by group or others is
+// refused with the chmod command to run.
 func Prepare(root string) (Layout, error) {
 	if root == "" {
 		return Layout{}, errors.New("data directory must not be empty")
@@ -53,17 +60,61 @@ func Prepare(root string) (Layout, error) {
 		return Layout{}, fmt.Errorf("resolve data directory: %w", err)
 	}
 	l := Layout{Root: abs}
-	for _, d := range []string{l.Root, l.KeysDir(), l.Repositories(), l.Static(), filepath.Join(l.Root, "logs"), l.JobLogs(), l.Tmp()} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
+	info, err := os.Stat(abs)
+	switch {
+	case err == nil:
+		if !info.IsDir() {
+			return Layout{}, fmt.Errorf("data directory %s is not a directory", abs)
+		}
+		if err := checkPrivate(abs, info); err != nil {
+			return Layout{}, err
+		}
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.MkdirAll(abs, 0o700); err != nil {
+			return Layout{}, fmt.Errorf("create %s: %w", abs, err)
+		}
+	default:
+		return Layout{}, fmt.Errorf("stat data directory: %w", err)
+	}
+	for _, d := range []string{l.KeysDir(), l.Repositories(), l.Static(), filepath.Join(l.Root, "logs"), l.JobLogs(), l.Tmp()} {
+		if err := os.Mkdir(d, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 			return Layout{}, fmt.Errorf("create %s: %w", d, err)
 		}
-		if runtime.GOOS != "windows" {
-			if err := os.Chmod(d, 0o700); err != nil {
-				return Layout{}, fmt.Errorf("chmod %s: %w", d, err)
-			}
+	}
+	f, err := os.OpenFile(l.DB(), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	switch {
+	case err == nil:
+		if err := f.Close(); err != nil {
+			return Layout{}, fmt.Errorf("create database file: %w", err)
 		}
+	case !errors.Is(err, fs.ErrExist):
+		return Layout{}, fmt.Errorf("create database file: %w", err)
 	}
 	return l, nil
+}
+
+// checkPrivate refuses, on Unix, an existing data directory that group or
+// others can access.
+func checkPrivate(path string, info fs.FileInfo) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("data directory %s has mode %04o, which lets other users read the daemon's keys and database; "+
+			"restrict it with: chmod 700 %s (or point --data-dir at a new directory, which is created with mode 0700)",
+			path, perm, shellQuote(path))
+	}
+	return nil
+}
+
+// shellQuote quotes p for a POSIX shell when it contains anything unusual.
+func shellQuote(p string) string {
+	if p != "" && strings.IndexFunc(p, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("/._-+:", r))
+	}) < 0 {
+		return p
+	}
+	return "'" + strings.ReplaceAll(p, "'", `'\''`) + "'"
 }
 
 // LoadOrCreateKey returns the size-byte key stored raw in path, creating it

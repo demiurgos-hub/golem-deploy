@@ -107,7 +107,7 @@ func TestAccountsCRUD(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
 	a := mustAccount(t, s, "alice", RoleAdmin, true)
-	if a.ID == 0 || a.TokenVersion != 0 || a.CreatedAt.IsZero() {
+	if a.ID == 0 || a.TokenVersion < 0 || a.CreatedAt.IsZero() {
 		t.Fatalf("unexpected account %+v", a)
 	}
 	if _, err := s.CreateAccount(ctx, NewAccount{Username: "ALICE", PasswordHash: "x", Role: RoleDeveloper}); !errors.Is(err, ErrConflict) {
@@ -123,15 +123,15 @@ func TestAccountsCRUD(t *testing.T) {
 	if _, err := s.GetAccount(ctx, 999); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing account: %v", err)
 	}
-	upd, err := s.SetPassword(ctx, a.ID, "newhash")
-	if err != nil || upd.PasswordHash != "newhash" || upd.TokenVersion != 1 {
+	upd, revoked, err := s.SetPassword(ctx, a.ID, "newhash", false)
+	if err != nil || upd.PasswordHash != "newhash" || upd.TokenVersion != a.TokenVersion+1 || revoked != 0 {
 		t.Fatalf("set password: %v %+v", err, upd)
 	}
 	if err := s.BumpTokenVersion(ctx, a.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := s.GetAccount(ctx, a.ID); got.TokenVersion != 2 {
-		t.Fatalf("token version %d, want 2", got.TokenVersion)
+	if got, _ := s.GetAccount(ctx, a.ID); got.TokenVersion != a.TokenVersion+2 {
+		t.Fatalf("token version %d, want %d", got.TokenVersion, a.TokenVersion+2)
 	}
 	mustAccount(t, s, "bob", RoleDeveloper, false)
 	c, err := s.CountAccounts(ctx)
@@ -227,16 +227,17 @@ func TestAccountUpdateBumpsTokenVersion(t *testing.T) {
 	d := mustAccount(t, s, "dev", RoleDeveloper, true)
 	admin, no, yes := RoleAdmin, false, true
 
+	v0 := d.TokenVersion
 	a, err := s.UpdateAccount(ctx, 0, d.ID, AccountUpdate{Role: &admin})
-	if err != nil || a.TokenVersion != 1 {
+	if err != nil || a.TokenVersion != v0+1 {
 		t.Fatalf("role change: %v ver %d", err, a.TokenVersion)
 	}
 	a, err = s.UpdateAccount(ctx, 0, d.ID, AccountUpdate{Approved: &no})
-	if err != nil || a.TokenVersion != 2 || a.Approved {
+	if err != nil || a.TokenVersion != v0+2 || a.Approved {
 		t.Fatalf("unapprove: %v %+v", err, a)
 	}
 	a, err = s.UpdateAccount(ctx, 0, d.ID, AccountUpdate{Approved: &yes})
-	if err != nil || a.TokenVersion != 2 || !a.Approved {
+	if err != nil || a.TokenVersion != v0+2 || !a.Approved {
 		t.Fatalf("approve should not bump: %v %+v", err, a)
 	}
 }

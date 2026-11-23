@@ -40,7 +40,9 @@ func TestRunRefusesPlaintextNonLoopback(t *testing.T) {
 }
 
 func TestRunServesAndShutsDownGracefully(t *testing.T) {
-	dir := t.TempDir()
+	// A fresh path: t.TempDir() itself may be group/world-readable under the
+	// umask, which Prepare refuses on Unix.
+	dir := filepath.Join(t.TempDir(), "data")
 	// A job left running by a crashed daemon.
 	layout, err := datadir.Prepare(dir)
 	if err != nil {
@@ -148,10 +150,10 @@ func TestAdminCreateAndReset(t *testing.T) {
 	if _, err := createAdmin(ctx, dir, "other", "short", bcrypt.MinCost); err == nil {
 		t.Fatal("short password accepted")
 	}
-	if err := resetPassword(ctx, dir, "ROOT-ADMIN", "another-good-password", bcrypt.MinCost); err != nil {
+	if _, err := resetPassword(ctx, dir, "ROOT-ADMIN", "another-good-password", bcrypt.MinCost); err != nil {
 		t.Fatal(err)
 	}
-	if err := resetPassword(ctx, dir, "ghost", "another-good-password", bcrypt.MinCost); !errors.Is(err, ErrNoSuchAccount) {
+	if _, err := resetPassword(ctx, dir, "ghost", "another-good-password", bcrypt.MinCost); !errors.Is(err, ErrNoSuchAccount) {
 		t.Fatalf("missing user: %v", err)
 	}
 	layout, _ := datadir.Prepare(dir)
@@ -161,7 +163,45 @@ func TestAdminCreateAndReset(t *testing.T) {
 	}
 	defer st.Close()
 	got, _ := st.GetAccount(ctx, acct.ID)
-	if got.TokenVersion != 1 || bcrypt.CompareHashAndPassword([]byte(got.PasswordHash), []byte("another-good-password")) != nil {
+	if got.TokenVersion != acct.TokenVersion+1 || bcrypt.CompareHashAndPassword([]byte(got.PasswordHash), []byte("another-good-password")) != nil {
 		t.Fatalf("reset not applied: %+v", got)
+	}
+}
+
+// TestF5_CLIResetPasswordDeletesTokens: the local recovery action ends
+// sessions and deletes every API token of the account.
+func TestF5_CLIResetPasswordDeletesTokens(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	ctx := context.Background()
+	acct, err := createAdmin(ctx, dir, "root", "a-very-good-password", bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layout, err := datadir.Prepare(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(ctx, layout.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{"h1", "h2"} {
+		if _, err := st.CreateAPIToken(ctx, store.NewAPIToken{AccountID: acct.ID, Name: "ci", TokenHash: h, Prefix: "gdp_x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = st.Close()
+
+	n, err := resetPassword(ctx, dir, "root", "another-good-password", bcrypt.MinCost)
+	if err != nil || n != 2 {
+		t.Fatalf("reset: %d %v", n, err)
+	}
+	st, err = store.Open(ctx, layout.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if toks, _ := st.ListAPITokens(ctx, acct.ID); len(toks) != 0 {
+		t.Fatalf("tokens survived the reset: %d", len(toks))
 	}
 }

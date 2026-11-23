@@ -24,6 +24,9 @@ var (
 	// ErrSelf is returned when an admin tries to delete, demote or unapprove
 	// their own account.
 	ErrSelf = errors.New("store: cannot modify own account this way")
+	// ErrLimit is returned when a per-account quota (e.g. API tokens) is
+	// reached.
+	ErrLimit = errors.New("store: limit reached")
 )
 
 // Store is a handle to the database. It is safe for concurrent use.
