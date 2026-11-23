@@ -113,6 +113,11 @@ func parseAuth(a apitypes.ProjectAuth, kind git.Kind) (parsedAuth, error) {
 		case a.PrivateKey != "":
 			return parsedAuth{}, invalidField("auth.private_key", `private_key is not allowed with auth type "none"`)
 		}
+		// SSH remotes need a key of their own (ssh would otherwise offer
+		// the daemon user's keys).
+		if err := git.CheckAuthKind(git.AuthNone, kind); err != nil {
+			return parsedAuth{}, invalidField("auth.type", err.Error())
+		}
 		return parsedAuth{method: git.AuthNone}, nil
 	case apitypes.ProjectAuthTypeHTTPS:
 		if a.PrivateKey != "" {
@@ -271,7 +276,8 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) err
 // handleUpdateProject changes the remote URL and/or credentials. It never
 // runs git: a new URL is written to the checkout's origin remote by the
 // next pull or branch switch, which then hard-resets to whatever the new
-// remote has (no re-clone).
+// remote has (no re-clone). Stored credentials are only kept for a new URL
+// on the same scheme, host and port; otherwise auth must be sent too.
 func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) error {
 	p, err := s.loadProject(r)
 	if err != nil {
@@ -303,6 +309,9 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) err
 			return internal(err)
 		}
 		upd.Auth = &store.ProjectAuthUpdate{Type: auth.typeName(), Username: auth.username, Secret: sealed}
+	} else if req.RepoURL != nil && !git.SameOrigin(p.RepoURL, url) {
+		return invalidField("auth", "the new repository URL has a different scheme, host or port, and the stored credentials "+
+			`were set for the previous one; send auth in the same request (new credentials, or {"type":"none"} for a public https repository)`)
 	} else if err := git.CheckAuthKind(authMethodOf(p.AuthType), kind); err != nil {
 		return invalidField("repo_url", err.Error()+"; send new auth together with the URL")
 	}
