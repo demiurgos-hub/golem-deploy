@@ -1,289 +1,161 @@
-import { useState, useCallback } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiClient } from "@/api/client";
-import type { DockerImage, RunContainerRequest } from "@/api/types";
-import { DataTable, type Column } from "@/components/shared/data-table";
-import { ActionButton } from "@/components/shared/action-button";
-import { ConfirmDialog } from "@/components/shared/confirm-dialog";
-import { FormDialog } from "@/components/shared/form-dialog";
-import { RunFields } from "@/components/shared/run-fields";
-import { useDashboard } from "@/components/layout/dashboard-layout";
-import { usePersistedDefaults } from "@/hooks/use-persisted-defaults";
-import { useRunFormState } from "@/hooks/use-run-form-state";
-import { Play, Layers, Trash2 } from "lucide-react";
+import { useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
+import { Trash2 } from "lucide-react";
+import { useApi } from "@/app/services";
+import { ApiError, isApiError } from "@/api/errors";
+import { useAccount, useImages, useProjects, useServers } from "@/api/queries";
+import { qk } from "@/api/query-keys";
+import type { Image, Server } from "@/api/types.gen";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DataTable } from "@/components/ui/data-table";
+import { ConfirmDialog } from "@/components/ui/dialog";
+import { PageHeader } from "@/components/ui/page";
+import { EmptyState, ErrorState, LoadingState } from "@/components/ui/states";
+import { useToast } from "@/components/ui/toast";
+import { formatBytes, formatDateTime, formatRelative, shortImageId } from "@/lib/format";
 
-function massRunErrorDetail(err: unknown): string {
-  const raw = err instanceof Error ? err.message : "Unknown error";
-  try {
-    const parsed = JSON.parse(raw) as { detail?: string };
-    if (parsed.detail) return parsed.detail;
-  } catch {
-    // keep raw API text when it is not a JSON envelope
-  }
-  return raw;
+/** Servers whose image reference is one of the image's tags or its id. */
+function usersOf(image: Image, servers: readonly Server[]): Server[] {
+  const refs = new Set([...image.tags, image.id, shortImageId(image.id)]);
+  return servers.filter((s) => refs.has(s.image));
 }
 
-export function ImagesTab() {
-  const { activeTab, refreshKey } = useDashboard();
+export function ImagesPage() {
+  const api = useApi();
+  const toast = useToast();
   const queryClient = useQueryClient();
-  const defaults = usePersistedDefaults();
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
-  const [runImage, setRunImage] = useState<DockerImage | null>(null);
-  const [massRunImage, setMassRunImage] = useState<string | null>(null);
-  const [massRunResult, setMassRunResult] = useState<{ started: number; failures: string[] } | null>(null);
-
-  const runForm = useRunFormState();
-
-  const { data: images = [], isLoading } = useQuery({
-    queryKey: ["images", refreshKey],
-    queryFn: () => apiClient.listImages(),
-    enabled: activeTab === "images",
-    refetchInterval: activeTab === "images" ? 10000 : false,
-  });
-
-  const deleteMutation = useMutation({
-    mutationFn: (ids: string[]) => apiClient.deleteImages(ids),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["images"] });
-      setSelectedIds(new Set());
-    },
-  });
-
-  const runMutation = useMutation({
-    mutationFn: (req: RunContainerRequest) => apiClient.runContainer(req),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["containers"] });
-      setRunImage(null);
-    },
-  });
-
-  const massRunMutation = useMutation({
-    mutationFn: (imageName: string) => apiClient.executeMassRun(imageName),
-    onSuccess: (result) => {
-      queryClient.invalidateQueries({ queryKey: ["containers"] });
-      setMassRunImage(null);
-      setMassRunResult({
-        started: result.started,
-        failures: (result.failed ?? []).map((f) => `${f.name}: ${f.detail}`),
-      });
-    },
-    onError: (err) => {
-      setMassRunImage(null);
-      setMassRunResult({ started: 0, failures: [massRunErrorDetail(err)] });
-    },
-  });
-
-  const openRunDialog = useCallback(
-    (img: DockerImage) => {
-      setRunImage(img);
-      runForm.loadDefaults(defaults);
-    },
-    [defaults, runForm],
-  );
-
-  const handleRun = useCallback(() => {
-    if (!runImage) return;
-    const imageName =
-      runImage.repository === "<none>"
-        ? runImage.id
-        : `${runImage.repository}:${runImage.tag}`;
-    runForm.persistDefaults(defaults);
-    runMutation.mutate({
-      image_name: imageName,
-      ...runForm.asRunPayloadFields(),
-    });
-  }, [runImage, defaults, runMutation, runForm]);
-
-  const columns: Column<DockerImage>[] = [
-    {
-      key: "repository",
-      label: "Repository",
-      sortable: true,
-      render: (i) => <span className="font-medium">{i.repository}</span>,
-      getValue: (i) => i.repository,
-    },
-    {
-      key: "tag",
-      label: "Tag",
-      sortable: true,
-      render: (i) => i.tag,
-      getValue: (i) => i.tag,
-    },
-    {
-      key: "size",
-      label: "Size",
-      sortable: true,
-      render: (i) => i.size,
-      getValue: (i) => i.size,
-    },
-    {
-      key: "created",
-      label: "Created",
-      sortable: true,
-      render: (i) => i.created,
-      getValue: (i) => i.created,
-    },
-  ];
-
-  if (isLoading) {
-    return <p className="text-muted-foreground">Loading images...</p>;
-  }
+  const images = useImages();
+  const servers = useServers();
+  const projects = useProjects();
+  const account = useAccount();
+  const isAdmin = account.data?.role === "admin";
+  const [deleting, setDeleting] = useState<Image | null>(null);
+  const projectNames = useMemo(() => new Map((projects.data?.items ?? []).map((p) => [p.id, p.name])), [projects.data]);
+  const serverList = servers.data?.items ?? [];
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold">Images ({images.length})</h2>
-        {selectedIds.size > 0 && (
-          <ActionButton
-            variant="destructive"
-            onClick={() => setConfirmBulkDelete(true)}
-          >
-            <Trash2 className="mr-1 h-3 w-3" />
-            Delete Selected ({selectedIds.size})
-          </ActionButton>
-        )}
-      </div>
-
-      <DataTable
-        data={images}
-        columns={columns}
-        getRowId={(i) => i.id}
-        selectable
-        selectedIds={selectedIds}
-        onSelectionChange={setSelectedIds}
-        emptyMessage="No images found"
-        actions={(img) => (
-          <>
-            <ActionButton onClick={() => openRunDialog(img)} title="Run">
-              <Play className="h-3 w-3" />
-            </ActionButton>
-            <ActionButton
-              onClick={() => {
-                const name = img.repository === "<none>" ? img.id : `${img.repository}:${img.tag}`;
-                setMassRunImage(name);
-              }}
-              title="Mass Run"
-            >
-              <Layers className="h-3 w-3" />
-            </ActionButton>
-            <ActionButton
-              variant="destructive"
-              onClick={() => setConfirmDelete(img.id)}
-              title="Delete"
-            >
-              <Trash2 className="h-3 w-3" />
-            </ActionButton>
-          </>
-        )}
-      />
-
+    <>
+      <PageHeader title="Images" description="Docker images built and managed by Golem Deploy. Other images on the host are not listed." />
+      {images.isPending ? (
+        <LoadingState label="Loading images" />
+      ) : images.isError ? (
+        <ErrorState error={images.error} title="Could not load images" onRetry={() => void images.refetch()} />
+      ) : images.data.items.length === 0 ? (
+        <EmptyState title="No managed images" description="Images appear here once a project has been built." />
+      ) : (
+        <DataTable
+          label="Images"
+          data={images.data.items}
+          rowKey={(i) => i.id}
+          initialSort={{ key: "created", asc: false }}
+          columns={[
+            {
+              key: "tags",
+              header: "Tags",
+              cell: (i) =>
+                i.tags.length ? (
+                  <div className="flex flex-wrap gap-1">
+                    {i.tags.map((t) => (
+                      <code key={t} className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
+                        {t}
+                      </code>
+                    ))}
+                  </div>
+                ) : (
+                  <span className="text-muted-foreground">untagged</span>
+                ),
+            },
+            { key: "id", header: "Id", hideOnSmall: true, cell: (i) => <code className="font-mono text-xs" title={i.id}>{shortImageId(i.id)}</code> },
+            {
+              key: "project",
+              header: "Project",
+              hideOnSmall: true,
+              cell: (i) =>
+                i.project_id === null ? (
+                  <span className="text-muted-foreground">-</span>
+                ) : (
+                  <Link to="/projects/$id" params={{ id: String(i.project_id) }} className="hover:underline">
+                    {projectNames.get(i.project_id) ?? `project ${i.project_id}`}
+                  </Link>
+                ),
+            },
+            { key: "size", header: "Size", sortValue: (i) => i.size_bytes, cell: (i) => formatBytes(i.size_bytes) },
+            {
+              key: "created",
+              header: "Age",
+              sortValue: (i) => i.created_at,
+              cell: (i) => <span title={formatDateTime(i.created_at)}>{formatRelative(i.created_at)}</span>,
+            },
+            {
+              key: "used",
+              header: "Used by",
+              cell: (i) => {
+                const users = usersOf(i, serverList);
+                if (users.length) {
+                  return (
+                    <div className="flex flex-wrap gap-x-2">
+                      {users.map((s) => (
+                        <Link key={s.id} to="/servers/$id" params={{ id: String(s.id) }} className="hover:underline">
+                          {s.name}
+                        </Link>
+                      ))}
+                    </div>
+                  );
+                }
+                return i.in_use ? <Badge tone="info">In use</Badge> : <span className="text-muted-foreground">Unused</span>;
+              },
+            },
+          ]}
+          actions={
+            isAdmin
+              ? (i) => (
+                  <Button size="sm" variant="outline" aria-label={`Delete image ${i.tags[0] ?? shortImageId(i.id)}`} onClick={() => setDeleting(i)}>
+                    <Trash2 />
+                    Delete
+                  </Button>
+                )
+              : undefined
+          }
+        />
+      )}
       <ConfirmDialog
-        open={!!confirmDelete}
-        onOpenChange={() => setConfirmDelete(null)}
-        title="Delete Image"
-        description="Are you sure you want to delete this image?"
-        confirmLabel="Delete"
+        open={deleting !== null}
+        onOpenChange={(o) => !o && setDeleting(null)}
+        title="Delete image"
+        description={
+          deleting && (
+            <>
+              Delete <span className="font-medium text-foreground">{deleting.tags.join(", ") || shortImageId(deleting.id)}</span> (
+              {formatBytes(deleting.size_bytes)})? Images used by a server cannot be deleted.
+            </>
+          )
+        }
+        confirmLabel="Delete image"
         destructive
-        onConfirm={() => {
-          if (confirmDelete) deleteMutation.mutate([confirmDelete]);
-          setConfirmDelete(null);
+        onConfirm={async () => {
+          if (!deleting) return;
+          try {
+            await api.images.remove(deleting.id);
+          } catch (err) {
+            if (isApiError(err) && err.code === "conflict") {
+              const users = usersOf(deleting, serverList).map((s) => s.name);
+              throw new ApiError({
+                status: err.status,
+                code: err.code,
+                requestId: err.requestId,
+                message: users.length
+                  ? `The image is still used by ${users.join(", ")}. Delete those servers or switch them to another image first.`
+                  : "The image is still used by a server container. Delete that server or switch it to another image first.",
+              });
+            }
+            throw err;
+          }
+          toast.success("Image deleted.");
+          await queryClient.invalidateQueries({ queryKey: qk.images });
         }}
       />
-
-      <ConfirmDialog
-        open={confirmBulkDelete}
-        onOpenChange={setConfirmBulkDelete}
-        title="Delete Selected Images"
-        description={`Delete ${selectedIds.size} image(s)?`}
-        confirmLabel="Delete All"
-        destructive
-        onConfirm={() => {
-          deleteMutation.mutate(Array.from(selectedIds));
-          setConfirmBulkDelete(false);
-        }}
-      />
-
-      {/* Mass Run Confirmation */}
-      <ConfirmDialog
-        open={!!massRunImage}
-        onOpenChange={() => setMassRunImage(null)}
-        title="Mass Run Containers"
-        description={`This will start a new container using image "${massRunImage ?? ""}" for each saved Mass Run configuration. Do you want to continue?`}
-        confirmLabel={massRunMutation.isPending ? "Running..." : "Run All"}
-        onConfirm={() => {
-          if (massRunImage) massRunMutation.mutate(massRunImage);
-        }}
-      />
-
-      {/* Mass Run Result */}
-      <FormDialog
-        open={!!massRunResult}
-        onOpenChange={() => setMassRunResult(null)}
-        title="Mass Run Result"
-      >
-        {massRunResult && (
-          <div className="space-y-3">
-            <p className="text-sm text-foreground">
-              Started {massRunResult.started} container(s) successfully.
-            </p>
-            {massRunResult.failures.length > 0 && (
-              <div>
-                <p className="text-sm font-medium text-destructive mb-1">
-                  Failed ({massRunResult.failures.length}):
-                </p>
-                <div className="rounded border border-border bg-muted/30 p-2 text-xs space-y-1 max-h-40 overflow-auto">
-                  {massRunResult.failures.map((f, i) => (
-                    <div key={i} className="text-destructive">{f}</div>
-                  ))}
-                </div>
-              </div>
-            )}
-            <div className="flex justify-end">
-              <button
-                onClick={() => setMassRunResult(null)}
-                className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-              >
-                OK
-              </button>
-            </div>
-          </div>
-        )}
-      </FormDialog>
-
-      {/* Run Container Dialog */}
-      <FormDialog
-        open={!!runImage}
-        onOpenChange={() => setRunImage(null)}
-        title={`Run Container from ${runImage?.repository ?? ""}:${runImage?.tag ?? ""}`}
-      >
-        <div className="space-y-4">
-          <RunFields
-            form={runForm}
-            placeholders={{
-              containerName: "my-container",
-              port: "8080",
-              label: "default",
-            }}
-          />
-          <div className="flex justify-end gap-2 pt-2">
-            <button
-              onClick={() => setRunImage(null)}
-              className="rounded-md border border-input bg-background px-4 py-2 text-sm hover:bg-accent"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={handleRun}
-              disabled={runMutation.isPending}
-              className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-            >
-              {runMutation.isPending ? "Running..." : "Run"}
-            </button>
-          </div>
-        </div>
-      </FormDialog>
-    </div>
+    </>
   );
 }
