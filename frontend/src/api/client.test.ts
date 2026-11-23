@@ -28,6 +28,12 @@ describe("errorFromResponse", () => {
     expect(describeError(err)).toBe("Too many attempts. Try again in 42 seconds.");
   });
 
+  it("explains account administration conflicts in plain words", () => {
+    const body = (code: string) => JSON.stringify({ error: { code, message: "raw", request_id: "r" } });
+    expect(describeError(errorFromResponse(409, new Headers(), body("last_admin")))).toMatch(/no approved administrator/);
+    expect(describeError(errorFromResponse(409, new Headers(), body("cannot_modify_self")))).toMatch(/your own account/);
+  });
+
   it("never exposes a non-JSON body", () => {
     const err = errorFromResponse(502, new Headers({ "X-Request-Id": "rid" }), "<html>Bad Gateway from nginx</html>");
     expect(err.code).toBe("invalid_response");

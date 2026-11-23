@@ -54,7 +54,8 @@ export default defineConfig(({ command, mode }) => {
     },
     server: {
       proxy: {
-        "/api": "http://127.0.0.1:8000",
+        // GOLEM_DEPLOY_DEV_API points the dev server at a daemon on another address.
+        "/api": process.env.GOLEM_DEPLOY_DEV_API ?? "http://127.0.0.1:8000",
       },
     },
   };

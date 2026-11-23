@@ -59,10 +59,13 @@ export function StaticFilesPage() {
 
   function addFiles(list: FileList | null) {
     if (!list || list.length === 0) return;
+    // Copy now: the FileList is live and the input is reset right after this call,
+    // while the state updater below may run later.
+    const files = Array.from(list);
     setQueue((q) => {
       const names = new Set(q.filter((i) => i.state === "ready" || i.state === "uploading").map((i) => i.file.name));
       const added: UploadItem[] = [];
-      for (const file of Array.from(list)) {
+      for (const file of files) {
         let error = checkUploadFile(file);
         if (!error && names.has(file.name)) error = "A file with this name is already queued.";
         names.add(file.name);

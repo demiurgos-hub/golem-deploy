@@ -234,3 +234,27 @@ describe("job-returning actions", () => {
     expect(await within(inline).findByText("Succeeded", {}, { timeout: 4000 })).toBeInTheDocument();
   });
 });
+
+describe("static file uploads", () => {
+  it("queues files from separate selections and rejects bad names before uploading", async () => {
+    const { user, container } = renderApp({
+      path: "/static",
+      signedInAs: account(),
+      routes: {
+        "GET /static": () =>
+          jsonResponse(200, { items: [{ name: "maps.zip", size_bytes: 10, sha256: "ab".repeat(32), modified_at: "2026-11-01T00:00:00Z" }] }),
+      },
+    });
+    await screen.findByText("maps.zip");
+    const input = container.querySelector<HTMLInputElement>("input[type=file]");
+    if (!input) throw new Error("no file input");
+    await user.upload(input, new File(["a"], "level.bin"));
+    await user.upload(input, [new File(["b"], "maps.zip"), new File(["c"], "bad name.txt")]);
+    const queue = screen.getByRole("list", { name: "Upload queue" });
+    expect(within(queue).getByText("level.bin")).toBeInTheDocument();
+    expect(within(queue).getByText("maps.zip")).toBeInTheDocument();
+    expect(within(queue).getByText("Replaces existing")).toBeInTheDocument();
+    expect(within(queue).getByText(/may only contain letters/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Upload 2 files/ })).toBeEnabled();
+  });
+});
