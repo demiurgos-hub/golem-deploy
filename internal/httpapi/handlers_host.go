@@ -2,9 +2,11 @@ package httpapi
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
@@ -87,6 +89,20 @@ func (s *Server) needStatic() error {
 	return nil
 }
 
+// staticList renders files with the store's current usage.
+func (s *Server) staticList(files []staticfiles.File) (apitypes.StaticFileList, error) {
+	u, err := s.static.Usage()
+	if err != nil {
+		return apitypes.StaticFileList{}, err
+	}
+	out := apitypes.StaticFileList{Items: make([]apitypes.StaticFile, 0, len(files)),
+		UsedBytes: u.UsedBytes, QuotaBytes: u.QuotaBytes, FileCount: u.Files, MaxFiles: u.MaxFiles}
+	for _, f := range files {
+		out.Items = append(out.Items, toAPIStatic(f))
+	}
+	return out, nil
+}
+
 func (s *Server) handleListStatic(w http.ResponseWriter, r *http.Request) error {
 	if err := s.needStatic(); err != nil {
 		return err
@@ -95,9 +111,9 @@ func (s *Server) handleListStatic(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return internal(err)
 	}
-	out := apitypes.StaticFileList{Items: make([]apitypes.StaticFile, 0, len(files))}
-	for _, f := range files {
-		out.Items = append(out.Items, toAPIStatic(f))
+	out, err := s.staticList(files)
+	if err != nil {
+		return internal(err)
 	}
 	writeJSON(w, http.StatusOK, out)
 	return nil
@@ -126,6 +142,10 @@ func uploadError(err error) error {
 		return newError(http.StatusRequestEntityTooLarge, apitypes.ErrorCodeRequestTooLarge, "upload exceeds the request size limit")
 	case errors.Is(err, staticfiles.ErrTooLarge):
 		return newError(http.StatusRequestEntityTooLarge, apitypes.ErrorCodeRequestTooLarge, "a file exceeds the per-file size limit")
+	case errors.Is(err, staticfiles.ErrQuota):
+		return newError(http.StatusInsufficientStorage, apitypes.ErrorCodeInsufficientStorage, "the upload would exceed the static store's quota (size or number of files)")
+	case errors.Is(err, staticfiles.ErrNoSpace):
+		return newError(http.StatusInsufficientStorage, apitypes.ErrorCodeInsufficientStorage, "not enough free disk space for the upload")
 	}
 	e := badRequest("the upload was interrupted or is not valid multipart data")
 	e.cause = err
@@ -133,12 +153,21 @@ func uploadError(err error) error {
 }
 
 // handleUploadStatic streams multipart field "files" into the static store.
-// Every file is staged first; then all are committed together, refusing to
-// overwrite unless ?replace=1.
+// Every file is staged first (bounded by the per-file limit, the remaining
+// quota and the free-space reserve); then all are validated and committed
+// together, refusing to overwrite unless ?replace=1. Each account may run
+// staticfiles.DefaultUploadsPerKey uploads at once.
 func (s *Server) handleUploadStatic(w http.ResponseWriter, r *http.Request) error {
 	if err := s.needStatic(); err != nil {
 		return err
 	}
+	release, ok := s.static.BeginUpload(strconv.FormatInt(identityFrom(r).Account.ID, 10))
+	if !ok {
+		e := newError(http.StatusTooManyRequests, apitypes.ErrorCodeRateLimited, "too many uploads in progress for this account; wait for one to finish")
+		w.Header().Set("Retry-After", "5")
+		return e
+	}
+	defer release()
 	replace := false
 	switch r.URL.Query().Get("replace") {
 	case "", "0", "false":
@@ -163,6 +192,7 @@ func (s *Server) handleUploadStatic(w http.ResponseWriter, r *http.Request) erro
 		}
 	}()
 	names := map[string]bool{}
+	budget := s.static.Budget()
 	for {
 		part, err := mr.NextPart()
 		if errors.Is(err, io.EOF) {
@@ -194,10 +224,13 @@ func (s *Server) handleUploadStatic(w http.ResponseWriter, r *http.Request) erro
 			_ = part.Close()
 			return invalidField("files", "too many files in one upload")
 		}
-		st, err := s.static.Stage(name, part, staticfiles.MaxFileBytes)
+		st, err := s.static.Stage(name, part, staticfiles.MaxFileBytes, budget)
 		_ = part.Close()
 		if err != nil {
 			return uploadError(err)
+		}
+		if budget >= 0 {
+			budget -= st.Size()
 		}
 		staged = append(staged, st)
 	}
@@ -205,15 +238,20 @@ func (s *Server) handleUploadStatic(w http.ResponseWriter, r *http.Request) erro
 		return invalidField("files", "no files were uploaded")
 	}
 	files, err := s.static.Commit(staged, replace)
-	if errors.Is(err, staticfiles.ErrExists) {
+	var ne *staticfiles.NameError
+	switch {
+	case errors.Is(err, staticfiles.ErrExists):
 		return conflict(apitypes.ErrorCodeConflict, "a file with that name already exists; upload with replace=1 to overwrite it")
+	case errors.Is(err, staticfiles.ErrQuota), errors.Is(err, staticfiles.ErrNoSpace):
+		return uploadError(err)
+	case errors.As(err, &ne):
+		return invalidField("files", ne.Msg)
+	case err != nil:
+		return internal(fmt.Errorf("commit static upload: %w", err))
 	}
+	out, err := s.staticList(files)
 	if err != nil {
 		return internal(err)
-	}
-	out := apitypes.StaticFileList{Items: make([]apitypes.StaticFile, 0, len(files))}
-	for _, f := range files {
-		out.Items = append(out.Items, toAPIStatic(f))
 	}
 	s.logger.Info("static files uploaded", "request_id", requestIDFrom(r.Context()), "account_id", identityFrom(r).Account.ID, "count", len(files), "replace", replace)
 	writeJSON(w, http.StatusCreated, out)

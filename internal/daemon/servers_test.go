@@ -62,12 +62,19 @@ func TestRunReconcilesServers(t *testing.T) {
 	if _, err := st.CreateServer(context.Background(), store.Server{Name: "idle", Image: img, Port: &stopped}, nil); err != nil {
 		t.Fatal(err)
 	}
+	instance, err := st.InstanceID(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	_ = st.Close()
 
 	fake := dockertest.New()
 	fake.AddImage(dockertest.Image{ID: img, Labels: dockertest.ManagedLabels()})
 	orphan := fake.AddContainer(dockertest.Container{Name: "golem-deploy-gone", Image: img,
-		Labels: dockertest.ManagedLabels(docker.LabelServerID, "999", docker.LabelServer, "gone")})
+		Labels: dockertest.ManagedLabels(docker.LabelInstance, instance, docker.LabelServerID, "999", docker.LabelServer, "gone")})
+	// Claims to be server 1 with every label, but is not its recorded container.
+	impostor := fake.AddContainer(dockertest.Container{Name: "impostor", Image: img,
+		Labels: dockertest.ManagedLabels(docker.LabelInstance, instance, docker.LabelServerID, "1", docker.LabelServer, "arena")})
 
 	var logs bytes.Buffer
 	ctx, cancel := context.WithCancel(context.Background())
@@ -106,10 +113,24 @@ func TestRunReconcilesServers(t *testing.T) {
 	if _, ok := fake.Container("golem-deploy-idle"); ok {
 		t.Fatal("stopped server started")
 	}
-	if c, ok := fake.Container(orphan); !ok || c.State != "running" {
-		t.Fatal("orphaned managed container touched")
+	for _, id := range []string{orphan, impostor} {
+		if c, ok := fake.Container(id); !ok || c.State != "running" {
+			t.Fatal("orphaned or impostor container touched")
+		}
 	}
-	if !strings.Contains(logs.String(), "managed container has no server definition") {
-		t.Fatalf("orphan not logged:\n%s", logs.String())
+	if strings.Count(logs.String(), "is not the container recorded for any server") != 2 {
+		t.Fatalf("orphan and impostor not logged once each:\n%s", logs.String())
+	}
+	// The instance id is generated once and kept.
+	st2, err := store.Open(context.Background(), layout.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	if again, _ := st2.InstanceID(context.Background()); again != instance {
+		t.Fatalf("instance id changed: %q -> %q", instance, again)
+	}
+	if got, _ := st2.GetServer(context.Background(), sv.ID); got.ContainerID == "" || got.ContainerID == impostor {
+		t.Fatalf("recorded container %q", got.ContainerID)
 	}
 }

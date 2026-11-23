@@ -475,9 +475,9 @@ func TestServersCRUD(t *testing.T) {
 	if _, err := s.CreateServer(ctx, Server{Name: "bad", Image: "i", DesiredState: "exploded"}, nil); err == nil {
 		t.Fatal("invalid desired_state accepted")
 	}
-	sv.Image, sv.DesiredState, sv.Port = "golem/game:2", "running", nil
-	u, err := s.UpdateServer(ctx, sv)
-	if err != nil || u.Image != "golem/game:2" || u.DesiredState != "running" || u.Port != nil {
+	img2, port2 := "golem/game:2", 27016
+	u, err := s.UpdateServer(ctx, sv.ID, ServerUpdate{Image: &img2, Port: &port2})
+	if err != nil || u.Image != "golem/game:2" || u.DesiredState != "stopped" || *u.Port != port2 || string(u.Env) != "ct" {
 		t.Fatalf("update: %v %+v", err, u)
 	}
 	// Deleting the project detaches the server.

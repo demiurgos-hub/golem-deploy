@@ -82,3 +82,21 @@ func TestServeRefusesPlaintextPublicBind(t *testing.T) {
 		t.Fatalf("bad env bool: %d", code)
 	}
 }
+
+// D4/D6: servers get memory and CPU limits and the static store a quota by
+// default; 0 stays an explicit "unlimited".
+func TestD4_ServeDefaults(t *testing.T) {
+	t.Setenv("GOLEM_DEPLOY_SERVER_MEMORY_MB", "")
+	t.Setenv("GOLEM_DEPLOY_SERVER_CPUS", "")
+	t.Setenv("GOLEM_DEPLOY_STATIC_QUOTA_MB", "")
+	_, _, stderr := runCLI(t, "", "serve", "-h")
+	for _, want := range []string{"-server-memory-mb int", "(default 2048)", "-server-cpus float", "(default 2)", "-static-quota-mb int", "(default 5120)"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("serve -h lacks %q:\n%s", want, stderr)
+		}
+	}
+	t.Setenv("GOLEM_DEPLOY_SERVER_MEMORY_MB", "0")
+	if _, _, stderr := runCLI(t, "", "serve", "-h"); strings.Contains(stderr, "(default 2048)") {
+		t.Error("explicit 0 replaced by the default")
+	}
+}

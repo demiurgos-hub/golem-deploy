@@ -14,8 +14,9 @@ const (
 // ServerState is the observed state of a server's container.
 type ServerState string
 
-// Server states. "missing" means no container exists for the server;
-// "unknown" means Docker could not be queried.
+// Server states. "missing" means the server has no container (none was
+// recorded for it, or the recorded one is gone); "unknown" means it has one
+// but Docker could not be queried.
 const (
 	ServerStateCreated    ServerState = "created"
 	ServerStateRunning    ServerState = "running"
@@ -47,7 +48,9 @@ type Server struct {
 	Port         int          `json:"port"`
 	EnvKeys      []string     `json:"env_keys"`
 	DesiredState DesiredState `json:"desired_state"`
-	// Runtime fields, read from Docker on each request.
+	// Runtime fields, read from Docker on each request. ContainerID is the
+	// container the daemon created for this server; other containers are
+	// never reported, even when they carry golem-deploy labels.
 	State       ServerState `json:"state"`
 	ContainerID string      `json:"container_id"`
 	StartedAt   *time.Time  `json:"started_at" tstype:"string | null,required"`
@@ -66,12 +69,14 @@ type ServerList struct {
 }
 
 // CreateServerRequest is the body of POST /api/v1/servers. Image is the id or
-// a tag of a managed image (it is stored as the resolved image id). Port,
-// when absent, is auto-assigned from the configured port range. Env keys must
-// match ^[A-Za-z_][A-Za-z0-9_]{0,127}$, be unique ignoring case and not be
-// reserved (DOCKER_*, PATH, HOME, proxy variables, ...); at most 128
-// variables and 64 KiB in total. DesiredState defaults to "stopped";
-// "running" starts a server.start job right after creation.
+// a tag of a managed image (it is stored as the resolved image id) declaring
+// at most 8 volumes. Port, when absent, is auto-assigned from the configured
+// port range. Env keys must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$, be unique
+// ignoring case and not start with GOLEM_ (reserved for the daemon); values
+// are single-line UTF-8 (no NUL, CR or LF); at most 32 KiB per variable, 128
+// variables and 64 KiB in total. A rejected value is reported with field
+// "env.<KEY>". DesiredState defaults to "stopped"; "running" starts a
+// server.start job right after creation.
 type CreateServerRequest struct {
 	Name         string            `json:"name"`
 	ProjectID    *int64            `json:"project_id,omitempty"`
@@ -85,7 +90,8 @@ type CreateServerRequest struct {
 // are unchanged. EnvSet adds or overwrites variables, EnvUnset removes them
 // (a key may not appear in both); unmentioned variables keep their stored
 // values, so the UI never has to re-send secrets. Changes apply on the next
-// (re)start.
+// (re)start. Changing Port while the server's container is running is
+// refused with 409 conflict (stop the server first).
 type UpdateServerRequest struct {
 	Image    *string           `json:"image,omitempty"`
 	Port     *int              `json:"port,omitempty"`
@@ -120,7 +126,7 @@ type ServerSpec struct {
 
 // ServerExport is the body of GET /api/v1/servers/export and of
 // POST /api/v1/servers/import (both admin; the export contains env values in
-// plain text).
+// plain text). One import accepts at most 128 servers and 64 MiB.
 type ServerExport struct {
 	// FormatVersion is 1.
 	FormatVersion int          `json:"format_version"`

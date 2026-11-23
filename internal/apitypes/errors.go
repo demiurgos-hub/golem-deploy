@@ -83,6 +83,10 @@ const (
 	// ErrorCodeRateLimited: too many attempts or too many concurrent requests (e.g.
 	// log streams); the Retry-After header gives the wait in seconds (429).
 	ErrorCodeRateLimited ErrorCode = "rate_limited"
+	// ErrorCodeInsufficientStorage: an upload would exceed the static store's
+	// size quota or file count cap, or leave too little free disk space on
+	// the data directory's file system (507).
+	ErrorCodeInsufficientStorage ErrorCode = "insufficient_storage"
 	// ErrorCodeInternal: unexpected server-side failure; details are in the daemon
 	// log under the request id (500).
 	ErrorCodeInternal ErrorCode = "internal_error"

@@ -157,8 +157,23 @@ func cmdServe(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	memoryMB := fs.Int("server-memory-mb", memDefault, "memory limit per server container in MiB; 0 means unlimited (env GOLEM_DEPLOY_SERVER_MEMORY_MB)")
+	if os.Getenv("GOLEM_DEPLOY_SERVER_MEMORY_MB") == "" {
+		memDefault = 2048
+	}
+	if os.Getenv("GOLEM_DEPLOY_SERVER_CPUS") == "" {
+		cpuDefault = 2
+	}
+	staticQuotaDefault, err := envInt("GOLEM_DEPLOY_STATIC_QUOTA_MB")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if os.Getenv("GOLEM_DEPLOY_STATIC_QUOTA_MB") == "" {
+		staticQuotaDefault = 5120
+	}
+	memoryMB := fs.Int("server-memory-mb", memDefault, "memory limit per server container in MiB (swap is not added); 0 means unlimited (env GOLEM_DEPLOY_SERVER_MEMORY_MB)")
 	cpus := fs.Float64("server-cpus", cpuDefault, "CPU limit per server container; 0 means unlimited (env GOLEM_DEPLOY_SERVER_CPUS)")
+	staticQuota := fs.Int("static-quota-mb", staticQuotaDefault, "total size limit of the static file store in MiB; 0 means unlimited (env GOLEM_DEPLOY_STATIC_QUOTA_MB)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -182,6 +197,7 @@ func cmdServe(args []string, stderr io.Writer) int {
 		PortBindAddress: *portBind,
 		ServerMemoryMB:  *memoryMB,
 		ServerCPUs:      *cpus,
+		StaticQuotaMB:   *staticQuota,
 		Version:         buildVersion(),
 		Logger:          logger,
 		SPA:             frontend.Handler(),

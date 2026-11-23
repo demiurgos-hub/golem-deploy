@@ -39,9 +39,17 @@ type StaticFile struct {
 }
 
 // StaticFileList is the body of GET /api/v1/static and the 201 response of
-// POST /api/v1/static (the files that were stored).
+// POST /api/v1/static (Items: the files that were stored). The usage fields
+// describe the whole store after the request.
 type StaticFileList struct {
 	Items []StaticFile `json:"items"`
+	// UsedBytes is the total size of all stored files.
+	UsedBytes int64 `json:"used_bytes"`
+	// QuotaBytes is the store's size quota; 0 means unlimited.
+	QuotaBytes int64 `json:"quota_bytes"`
+	// FileCount is the number of stored files; MaxFiles caps it.
+	FileCount int `json:"file_count"`
+	MaxFiles  int `json:"max_files"`
 }
 
 // Volume is a Docker volume managed by Golem Deploy (a server's data volume).

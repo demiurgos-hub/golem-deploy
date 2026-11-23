@@ -45,15 +45,24 @@ type dockerHarness struct {
 	dev     store.Account
 	devTok  string
 	adminSs string
+	dc      *docker.Client
 }
 
+// harnessCLIEnv is the daemon environment the fake docker CLI child gets.
+var harnessCLIEnv = map[string]string{"PATH": "/usr/bin", "HOME": "/home/gd", "DOCKER_HOST": "unix:///run/docker.sock"}
+
 func newDockerHarness(t *testing.T, mutate ...func(*servers.Config)) *dockerHarness {
+	return newDockerHarnessWith(t, staticfiles.Options{}, mutate...)
+}
+
+func newDockerHarnessWith(t *testing.T, staticOpts staticfiles.Options, mutate ...func(*servers.Config)) *dockerHarness {
 	t.Helper()
 	h := newHarness(t)
 	fake := dockertest.New()
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	dc := docker.New(docker.Options{Runner: fake, Logger: logger, LookupEnv: func(string) (string, bool) { return "", false }})
+	dc := docker.New(docker.Options{Runner: fake, Logger: logger, InstanceID: dockertest.InstanceID, TempDir: t.TempDir(),
+		LookupEnv: func(k string) (string, bool) { v, ok := harnessCLIEnv[k]; return v, ok }})
 	box, err := secrets.New(bytes.Repeat([]byte{3}, secrets.KeySize))
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +78,10 @@ func newDockerHarness(t *testing.T, mutate ...func(*servers.Config)) *dockerHarn
 		m(&cfg)
 	}
 	svc := servers.New(h.st, box, dc, cfg, logger)
-	static, err := staticfiles.Open(filepath.Join(t.TempDir(), "static"))
+	if staticOpts.ReserveBytes == 0 {
+		staticOpts.ReserveBytes = -1 // the test machine's free space is not under test
+	}
+	static, err := staticfiles.Open(filepath.Join(t.TempDir(), "static"), staticOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +100,7 @@ func newDockerHarness(t *testing.T, mutate ...func(*servers.Config)) *dockerHarn
 		t.Fatal(err)
 	}
 	h.srv, h.runner = srv, runner
-	dh := &dockerHarness{harness: h, fake: fake, svc: svc, static: static, logs: logs, logDir: logDir, bodies: &syncBuffer{}}
+	dh := &dockerHarness{harness: h, fake: fake, svc: svc, static: static, logs: logs, logDir: logDir, bodies: &syncBuffer{}, dc: dc}
 	dh.admin = h.account("admin1", store.RoleAdmin, true)
 	dh.dev = h.account("dev1", store.RoleDeveloper, true)
 	dh.devTok = h.apiToken(dh.dev, nil)
@@ -176,8 +188,11 @@ func (d *dockerHarness) assertNoMarker() {
 		}
 	}
 	for _, c := range d.fake.Calls() {
-		if strings.Contains(strings.Join(c.Args, "\x00"), envMarker) {
+		if strings.Contains(strings.Join(c.Args, " "), envMarker) {
 			d.t.Fatalf("env value in docker argv %q", c.Args)
+		}
+		if strings.Contains(strings.Join(c.Env, " "), envMarker) {
+			d.t.Fatalf("env value in the docker CLI environment %q", c.Env)
 		}
 	}
 }
@@ -208,7 +223,8 @@ func TestServerLifecycle(t *testing.T) {
 		"--label dev.golemengine.deploy.server-id=" + strconv.FormatInt(created.ID, 10),
 		"--read-only", "--cap-drop ALL", "--security-opt no-new-privileges", "--pids-limit 512",
 		"--user 65532:65532", "--network golem-deploy", "--tmpfs /tmp:rw,noexec,nosuid,size=64m",
-		"--publish 7000:7777/udp", "--publish 7000:7777/tcp", "--env GAME_SECRET", "--env MODE",
+		"--publish 7000:7777/udp", "--publish 7000:7777/tcp", "--env-file ", "--init", "--no-healthcheck",
+		"--label dev.golemengine.deploy.instance=" + dockertest.InstanceID,
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("run argv lacks %q: %s", want, joined)
@@ -217,8 +233,11 @@ func TestServerLifecycle(t *testing.T) {
 	if args[len(args)-2] != "--" || args[len(args)-1] != img {
 		t.Fatalf("image not after --: %q", args)
 	}
-	if !slices.Contains(runs[0].Env, "GAME_SECRET="+envMarker) {
-		t.Fatal("env value not passed through the child environment")
+	if runs[0].EnvFile != "GAME_SECRET="+envMarker+"\nMODE=ffa\n" {
+		t.Fatalf("env file %q", runs[0].EnvFile)
+	}
+	if ct, _ := d.fake.Container("golem-deploy-arena"); ct.Env["GAME_SECRET"] != envMarker || ct.RestartPolicy != docker.RestartPolicy {
+		t.Fatalf("container %+v", ct)
 	}
 	if len(d.fake.CallsTo("network", "create")) != 1 {
 		t.Fatal("network not ensured")
@@ -314,9 +333,11 @@ func TestServerValidation(t *testing.T) {
 		{apitypes.CreateServerRequest{Name: "a", Image: "--privileged"}, "image"},
 		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Port: ptr(6999)}, "port"},
 		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Port: ptr(22)}, "port"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"DOCKER_HOST": envMarker}}, "env"},
+		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"GOLEM_ENGINE": envMarker}}, "env"},
 		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"1X": envMarker}}, "env"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"X": "a\x00" + envMarker}}, "env"},
+		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"X": "a\x00" + envMarker}}, "env.X"},
+		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"MOTD": "a\n" + envMarker}}, "env.MOTD"},
+		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"MOTD": envMarker + "\r"}}, "env.MOTD"},
 		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", ProjectID: ptr(int64(99))}, "project_id"},
 		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", DesiredState: ptr(apitypes.DesiredState("paused"))}, "desired_state"},
 	}
@@ -388,12 +409,20 @@ func TestDockerDown(t *testing.T) {
 	d := newDockerHarness(t)
 	d.managedImage(1, "game:v1")
 	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: "game:v1"})
+	if j := d.action(d.devTok, s.ID, "start"); j.Status != store.JobSuccess {
+		t.Fatalf("start %q", j.Detail)
+	}
+	// A server that never had a container is "missing" even without Docker.
+	never := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "never", Image: "game:v1"})
 	d.fake.SetDown(true)
 	list := decode[apitypes.ServerList](t, d.call("GET", "/api/v1/servers", d.devTok, nil))
-	if len(list.Items) != 1 || list.Items[0].State != apitypes.ServerStateUnknown {
+	if len(list.Items) != 2 || list.Items[0].State != apitypes.ServerStateUnknown || list.Items[1].State != apitypes.ServerStateMissing {
 		t.Fatalf("list %+v", list)
 	}
 	if got := d.getServer(d.devTok, s.ID); got.State != apitypes.ServerStateUnknown {
+		t.Fatalf("get %+v", got)
+	}
+	if got := d.getServer(d.devTok, never.ID); got.State != apitypes.ServerStateMissing {
 		t.Fatalf("get %+v", got)
 	}
 	j := d.action(d.devTok, s.ID, "start")
@@ -436,7 +465,7 @@ func TestStartRefusesForeignContainer(t *testing.T) {
 	foreign := d.fake.AddContainer(dockertest.Container{Name: "golem-deploy-arena", Image: dockertest.ImageID(9)})
 	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
 	j := d.action(d.devTok, s.ID, "start")
-	if j.Status != store.JobError || !strings.Contains(j.Detail, "not managed by golem-deploy") {
+	if j.Status != store.JobError || !strings.Contains(j.Detail, "this installation does not manage it") || !strings.Contains(j.Detail, "docker rm -f golem-deploy-arena") {
 		t.Fatalf("job %s %q", j.Status, j.Detail)
 	}
 	if c, ok := d.fake.Container(foreign); !ok || c.State != "running" {
@@ -450,7 +479,7 @@ func TestStartRefusesForeignContainer(t *testing.T) {
 	// A foreign network named golem-deploy is refused too.
 	d2 := newDockerHarness(t)
 	img2 := d2.managedImage(1)
-	d2.fake.AddNetwork(docker.NetworkName, nil)
+	d2.fake.AddNetwork(docker.NetworkName, nil, nil)
 	s2 := d2.createServer(d2.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img2})
 	if j := d2.action(d2.devTok, s2.ID, "start"); j.Status != store.JobError || !strings.Contains(j.Detail, "network") {
 		t.Fatalf("job %s %q", j.Status, j.Detail)
@@ -490,7 +519,7 @@ func TestExportImport(t *testing.T) {
 		code   apitypes.ErrorCode
 	}{
 		{apitypes.ServerExport{FormatVersion: 2, Servers: []apitypes.ServerSpec{{Name: "x", Image: img}}}, 400, apitypes.ErrorCodeValidationFailed},
-		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "ok1", Image: img}, {Name: "bad", Image: img, Env: map[string]string{"PATH": envMarker}}}}, 400, apitypes.ErrorCodeValidationFailed},
+		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "ok1", Image: img}, {Name: "bad", Image: img, Env: map[string]string{"GOLEM_X": envMarker}}}}, 400, apitypes.ErrorCodeValidationFailed},
 		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "ok1", Image: img}, {Name: "arena", Image: img}}}, 409, apitypes.ErrorCodeNameTaken},
 		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "ok1", Image: img}, {Name: "ok1", Image: img}}}, 400, apitypes.ErrorCodeValidationFailed},
 		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "ok1", Image: img}, {Name: "ok2", Image: img, Port: ptr(7000)}}}, 409, apitypes.ErrorCodePortInUse},
@@ -631,8 +660,8 @@ func TestImagesAndVolumesAPI(t *testing.T) {
 		t.Fatal("wrong images removed")
 	}
 
-	d.fake.AddVolume(dockertest.Volume{Name: "golem-deploy-arena-data", Labels: dockertest.ManagedLabels(docker.LabelServerID, strconv.FormatInt(s.ID, 10), docker.LabelServer, "arena")})
-	d.fake.AddVolume(dockertest.Volume{Name: "golem-deploy-gone-data", Labels: dockertest.ManagedLabels(docker.LabelServerID, "999", docker.LabelServer, "gone")})
+	d.fake.AddVolume(dockertest.Volume{Name: "golem-deploy-arena-data", Labels: dockertest.OurLabels(docker.LabelServerID, strconv.FormatInt(s.ID, 10), docker.LabelServer, "arena")})
+	d.fake.AddVolume(dockertest.Volume{Name: "golem-deploy-gone-data", Labels: dockertest.OurLabels(docker.LabelServerID, "999", docker.LabelServer, "gone")})
 	d.fake.AddVolume(dockertest.Volume{Name: "pixel_pgdata"})
 	d.fake.AddContainer(dockertest.Container{Name: "x", Mounts: []string{"golem-deploy-arena-data"}})
 	vols := decode[apitypes.VolumeList](t, d.call("GET", "/api/v1/volumes", d.devTok, nil))

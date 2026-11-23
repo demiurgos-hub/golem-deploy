@@ -5,12 +5,16 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Labels set on every object the daemon creates. LabelManaged=ManagedValue
-// marks an object as managed; operations refuse objects without it.
+// marks an object as managed; LabelInstance=<instance id> marks it as
+// created by this installation. Operations refuse containers, networks and
+// volumes without both (images: see Client.ManagedImage).
 const (
 	LabelManaged    = "dev.golemengine.deploy.managed"
+	LabelInstance   = "dev.golemengine.deploy.instance"
 	LabelServerID   = "dev.golemengine.deploy.server-id"
 	LabelServer     = "dev.golemengine.deploy.server"
 	LabelProjectID  = "dev.golemengine.deploy.project-id"
@@ -34,19 +38,39 @@ const (
 const (
 	MaxEnvVars  = 128
 	MaxEnvBytes = 64 << 10 // keys plus values
+	// MaxEnvVarBytes bounds one variable (key plus value). It keeps every
+	// env-file line well below the docker CLI's 64 KiB line limit.
+	MaxEnvVarBytes = 32 << 10
 )
+
+// ReservedEnvPrefix is reserved for variables the daemon injects itself
+// (the engine contract); operator variables may not use it.
+const ReservedEnvPrefix = "GOLEM_"
 
 // IsManaged reports whether labels carry the managed label.
 func IsManaged(labels map[string]string) bool { return labels[LabelManaged] == ManagedValue }
 
+var instanceIDRE = regexp.MustCompile(`^[a-f0-9]{32}$`)
+
+// ValidInstanceID reports whether id is a well-formed instance id (32
+// lower-case hex characters).
+func ValidInstanceID(id string) bool { return instanceIDRE.MatchString(id) }
+
 // ValidationError is a rejected input. Field names the offending input and
-// Msg is safe to show to users.
+// Msg is safe to show to users. Key, when set, is the (valid) name of the
+// environment variable whose value was rejected.
 type ValidationError struct {
 	Field string
+	Key   string
 	Msg   string
 }
 
-func (e *ValidationError) Error() string { return e.Field + ": " + e.Msg }
+func (e *ValidationError) Error() string {
+	if e.Key != "" {
+		return e.Field + "." + e.Key + ": " + e.Msg
+	}
+	return e.Field + ": " + e.Msg
+}
 
 func invalid(field, format string, a ...any) error {
 	return &ValidationError{Field: field, Msg: fmt.Sprintf(format, a...)}
@@ -65,52 +89,59 @@ func ValidateServerName(name string) error {
 // ContainerName is the managed container name of a server.
 func ContainerName(serverName string) string { return NamePrefix + serverName }
 
+var containerIDRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+// ValidContainerID reports whether id is a full container id.
+func ValidContainerID(id string) bool { return containerIDRE.MatchString(id) }
+
 var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 
-// reservedEnvKeys would change how the docker CLI child itself behaves if a
-// container variable with that name were placed in its environment, so they
-// cannot be used as container variable names (compared case-insensitively,
-// because Windows environments are case-insensitive).
-func reservedEnvKey(key string) bool {
-	up := strings.ToUpper(key)
-	if strings.HasPrefix(up, "DOCKER_") || strings.HasPrefix(up, "BUILDKIT_") {
-		return true
-	}
-	for _, goos := range []string{"linux", "windows"} {
-		for _, n := range childEnvNames(goos) {
-			if strings.EqualFold(n, key) {
-				return true
-			}
-		}
-	}
-	switch up {
-	case "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSH_AUTH_SOCK":
-		return true
-	}
-	return false
-}
-
-// ValidateEnvKey checks one container variable name.
+// ValidateEnvKey checks one container variable name. Names starting with
+// ReservedEnvPrefix (any case) are reserved for the daemon. Container
+// variables never reach the docker CLI's own environment (they travel in an
+// env file), so names such as PATH or LD_PRELOAD are ordinary container
+// variables.
 func ValidateEnvKey(key string) error {
 	if !envKeyRE.MatchString(key) {
 		return invalid("env", "variable names must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 	}
-	if reservedEnvKey(key) {
-		return invalid("env", "variable name %q is reserved", key)
+	if strings.HasPrefix(strings.ToUpper(key), ReservedEnvPrefix) {
+		return invalid("env", "variable names starting with %s are reserved for golem-deploy (%q)", ReservedEnvPrefix, key)
+	}
+	return nil
+}
+
+// ValidateEnvValue checks one value: valid UTF-8 without NUL, CR or LF (the
+// env-file format carries one KEY=value per line, taken literally) and at
+// most MaxEnvVarBytes together with its key. Errors never contain values.
+func ValidateEnvValue(key, value string) error {
+	bad := func(format string, a ...any) error {
+		return &ValidationError{Field: "env", Key: key, Msg: fmt.Sprintf(format, a...)}
+	}
+	switch {
+	case len(key)+len(value) > MaxEnvVarBytes:
+		return bad("the variable exceeds %d bytes", MaxEnvVarBytes)
+	case strings.IndexByte(value, 0) >= 0:
+		return bad("the value contains a NUL byte")
+	case strings.ContainsAny(value, "\r\n"):
+		return bad("the value contains a line break (values must be a single line)")
+	case !utf8.ValidString(value):
+		return bad("the value is not valid UTF-8")
 	}
 	return nil
 }
 
 // ValidateEnv checks container variables: names (unique case-insensitively
-// so the set is portable to Windows hosts), values without NUL, at most
-// MaxEnvVars entries and MaxEnvBytes in total. Errors never contain values.
+// so the set is portable to Windows hosts), values (ValidateEnvValue), at
+// most MaxEnvVars entries and MaxEnvBytes in total. Errors never contain
+// values.
 func ValidateEnv(env map[string]string) error {
 	if len(env) > MaxEnvVars {
 		return invalid("env", "at most %d variables are allowed", MaxEnvVars)
 	}
 	total := 0
 	seen := make(map[string]bool, len(env))
-	for k, v := range env {
+	for _, k := range EnvKeys(env) {
 		if err := ValidateEnvKey(k); err != nil {
 			return err
 		}
@@ -119,8 +150,9 @@ func ValidateEnv(env map[string]string) error {
 			return invalid("env", "variable names must be unique ignoring case (%q)", k)
 		}
 		seen[up] = true
-		if strings.IndexByte(v, 0) >= 0 {
-			return invalid("env", "the value of %q contains a NUL byte", k)
+		v := env[k]
+		if err := ValidateEnvValue(k, v); err != nil {
+			return err
 		}
 		total += len(k) + len(v)
 	}
