@@ -1,0 +1,16 @@
+---
+description: SQLite schemas and persistence lifecycle
+globs: "internal/database/**/*.go"
+alwaysApply: false
+---
+
+# Persistence
+
+- `database.DB` stores accounts, API tokens, repository metadata, and `repo_jobs`; `database.MassRunDB` is a separate SQLite database. Both use the pure-Go `modernc.org/sqlite` driver.
+- `repositories` columns: `id`, `name`, `url`, `branch`, `auth_type`, `username`, `password`, `ssh_key`, `last_commit`, `last_pulled`, `status`, `created_at`.
+- `repo_jobs`: `id`, `repo_id`, `kind` (pull|branch), `status` (running|success|error), `detail`, `created_at`, `finished_at`.
+- `api_tokens` stores SHA-256 hashes of `gdp_...` secrets, never plaintext. Create only for a live approved account. `DeleteAccount` removes the account's tokens in the same transaction.
+- The server must initialize and close both globals before any handler uses them.
+- There are no deployed databases to migrate yet: schema creation lives in `createTables` / `createMassRunTables`; change those directly. A few legacy add-column checks remain in `runMigrations`.
+- Keep SQL parameterized. Preserve bcrypt password hashes; repository authentication fields are sensitive even though the current schema stores them directly.
+- Database packages return domain data and wrapped errors; HTTP status and response formatting belong in handlers.

@@ -1,0 +1,15 @@
+---
+description: Toolchain versions, linting, build script, and CI workflow
+globs: "{.github/workflows/**,scripts/**,go.mod,frontend/package.json,frontend/eslint.config.js,frontend/vite.config.ts,.gitignore,.gitattributes}"
+alwaysApply: false
+---
+
+# Toolchain and CI
+
+- `go.mod` sets the minimum Go version; CI derives the Go minor version from its `go` line and installs the latest patch of that minor. `ignore ./frontend/node_modules` keeps npm-shipped Go packages out of `./...`.
+- `.github/workflows/ci.yml` runs the frontend job (`npm ci`, `npm run lint`, `npm run build`) first, then the Go job with the built `frontend/dist` artifact: `go vet`, `staticcheck`, `govulncheck`, `go test -race`. Keep local verification aligned with it.
+- ESLint uses the flat config in `frontend/eslint.config.js` (`typescript-eslint`, `eslint-plugin-react-hooks`) with `--max-warnings=0`. Disable a rule only on the specific line, with a comment explaining why.
+- `frontend/package-lock.json` must stay `npm ci`-compatible; commit it with dependency changes.
+- Vite empties `frontend/dist` on build; the `keep-dist-placeholder` plugin in `vite.config.ts` restores the committed `.gitkeep`.
+- `scripts/build.sh` builds the web client then `bin/golem-deploy`.
+- Text files use LF line endings (`.gitattributes`).

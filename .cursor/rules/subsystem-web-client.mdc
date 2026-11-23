@@ -1,0 +1,16 @@
+---
+description: Embedded React web client architecture and API integration
+globs: "{frontend/src/**/*.{ts,tsx},frontend/*.json,frontend/vite.config.ts,frontend/index.html,frontend/eslint.config.js}"
+alwaysApply: false
+---
+
+# Web client
+
+- This is the only UI: React, TypeScript, Vite, Tailwind, Radix, and TanStack Query. `@tanstack/react-router` is installed but not used yet.
+- Keep backend calls in `src/api/client.ts`, wire types in `src/api/types.ts`, pages in `src/pages`, and reusable controls in `src/components`. Tabs are declared in `src/components/layout/dashboard-layout.tsx`.
+- Use relative API URLs in production. Keep Vite proxy prefixes synchronized with backend route families for development.
+- Authentication state and token persistence are centralized in `src/hooks/use-auth.ts`; client-side JWT parsing is display gating, not authorization. Browser storage keys use the `golem_deploy_` prefix.
+- Reuse query invalidation and operation tracking instead of adding parallel request state.
+- `npm run lint` must pass with zero warnings; `npm run build` type-checks (`noUnusedLocals`) and produces `frontend/dist` for Go embedding.
+- Any backend contract change must be applied here.
+- Images-tab mass-run calls `executeMassRun(image_name)`; do not loop `runContainer` per preset.

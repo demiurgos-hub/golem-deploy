@@ -1,0 +1,13 @@
+---
+description: Static file store and static ZIP add-on extraction library
+globs: "{internal/handlers/static/**/*.go,internal/extract/**/*.go,internal/docker/static_addons*.go,internal/utils/static_addon_test.go,frontend/src/pages/static-files.tsx}"
+alwaysApply: false
+---
+
+# Static files and add-ons
+
+- The static store lives in `uploads/static` (`utils.StaticDir`). HTTP CRUD is in `internal/handlers/static`, registered at `/build/static/{upload,list,delete,download}`.
+- Store and serve files through `internal/utils`, preserving size limits and directory-containment checks.
+- `docker.ValidateStaticAddons` / `ApplyStaticAddons` and `extract.ExtractStaticAddonIntoContext` unpack static-store ZIPs under a validated relative `extract_to` inside a Docker build context; `utils.CopyStaticFilesToDir` copies loose static files and skips selected add-on archives. This library has no HTTP caller yet; a future build pipeline will use it.
+- Empty or `.` `extract_to` means the build-context root; root extraction stages entries and rejects collisions without deleting or overwriting existing files. Never trust archive entry paths. Nested archives are not expanded.
+- Verify with `go test ./internal/extract/... ./internal/utils/... ./internal/docker/...`.

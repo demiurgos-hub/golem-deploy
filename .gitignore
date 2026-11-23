@@ -1,0 +1,43 @@
+# Build output
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Runtime state created by golem-deploy in its working directory
+data/
+uploads/
+repositories/
+jwt_secret
+*.db
+config.yaml
+config.yaml.backup.*
+
+# Frontend (frontend/dist/.gitkeep is committed so go:embed works on a fresh clone)
+frontend/node_modules/
+frontend/dist/*
+!frontend/dist/.gitkeep
+
+# TLS material
+*.pem
+*.crt
+*.key
+*.csr
+*.cert
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# IDE and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

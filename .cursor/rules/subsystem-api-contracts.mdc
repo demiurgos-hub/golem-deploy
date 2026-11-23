@@ -1,0 +1,16 @@
+---
+description: Shared HTTP types, response envelopes, and filesystem validation
+globs: "{internal/api/**/*.go,internal/utils/**/*.go,frontend/src/api/**/*.ts,docs/API.md}"
+alwaysApply: false
+---
+
+# API contracts and utilities
+
+- `internal/api` holds the Go wire types. `frontend/src/api/types.ts` is a hand-maintained TypeScript mirror and `frontend/src/api/client.ts` the only web caller; update both and `docs/API.md` when wire fields or endpoint behavior change.
+- Prefer `utils.SuccessResponse`, `utils.ErrorResponse`, and `utils.WriteJSON`. The standard envelope uses `status` and error `detail`; retain legacy `message` only where a client still consumes it.
+- Upload and path safety belongs in `internal/utils` (size limits, directory containment, static-archive and `extract_to` validation). `utils.Init` creates the upload directories during startup.
+- Keep transport types free of UI-only state and avoid exposing filesystem paths, credentials, tokens, or secrets.
+- API token wire types are `APIToken`, `CreateAPITokenRequest`, `CreateAPITokenResponse`, `ListAPITokensResponse`, and `RevokeAPITokenRequest`. `POST /account/tokens` returns the plaintext secret once; list and revoke never include it.
+- Repo job wire types are `RepoJob` and `RepoJobResponse`. `GET /repo/job?job_id=` returns the job; unknown ids are 404. Pull and branch start envelopes include `job_id`.
+- Mass-run execute types are `ExecuteMassRunRequest` (`image_name`), `MassRunExecuteFailure`, and `ExecuteMassRunResponse` (`status`, `started`, `failed[]`). `POST /massrun/execute` returns 400 for a missing image or empty preset list; mixed failures stay HTTP 200.
+- `StaticAddon` (`filename` + `extract_to`) is used by the static add-on library only; no route accepts it yet.

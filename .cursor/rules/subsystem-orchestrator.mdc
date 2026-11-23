@@ -1,0 +1,15 @@
+---
+description: Server startup, route composition, and embedded SPA boundary
+globs: "{cmd/golem-deploy/**/*.go,frontend/embed.go,frontend/embed_test.go}"
+alwaysApply: false
+---
+
+# Server entry point
+
+- `cmd/golem-deploy/main.go` is the composition root: configuration, both databases, JWT middleware state, the first-admin console prompt, runtime directories, routes, TLS, and listening.
+- Keep initialization before handlers can access package globals. Close both database connections on shutdown.
+- Register every API route explicitly here. Only `/login` and `/account/create` are intentionally public; wrap other routes with `middleware.AuthMiddleware`.
+- The catch-all SPA handler must remain after API registrations.
+- HTTP and HTTPS both listen on `:8000`; TLS is enabled only when both certificate environment variables are set.
+- `frontend/embed.go` embeds `frontend/dist` (`all:dist`). `frontend/dist/.gitkeep` is committed so a fresh clone compiles; when `index.html` is missing the handler returns a plain-text 503 asking to run `npm run build`. Keep `frontend/embed_test.go` passing.
+- Changes to startup environment variables, public routes, or embedding are cross-subsystem changes: update the affected rules, `docs/API.md`, and `README.md`.

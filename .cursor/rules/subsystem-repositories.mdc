@@ -1,0 +1,16 @@
+---
+description: Git repository checkout workflow
+globs: "{internal/git/**/*.go,internal/handlers/repo/**/*.go,internal/database/repository.go,frontend/src/pages/repositories.tsx,docs/REPOSITORY_MANAGEMENT.md}"
+alwaysApply: false
+---
+
+# Repository management
+
+- Repository handlers coordinate persistence in `internal/database` with checkout operations in `internal/git` (native `git` via `os/exec`). There is no build step.
+- Local checkouts live below `repositories/`; validate names and derived paths before filesystem or command operations.
+- Git operations depend on host Git/LFS, SSH configuration, and credentials. Never expose stored authentication fields in responses or logs.
+- Pull and branch start responses include `job_id`. Agents poll `GET /repo/job?job_id=` until the job is `success` or `error`; failure `detail` is the terminal error text.
+- Persist a `repo_jobs` row as `running` before starting the goroutine. If the goroutine cannot start after insert, mark the job `error`.
+- Those operations still update `repositories.status` (`idle`, `cloning`, `pulling`, `error`) asynchronously for UI labels; preserve terminal status on every exit path.
+- Schema or status changes require checking the Repositories page, `docs/REPOSITORY_MANAGEMENT.md`, and `docs/API.md`.
+- Verify with `go test ./internal/handlers/repo/... ./internal/database/...`.

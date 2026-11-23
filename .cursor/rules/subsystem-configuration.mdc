@@ -1,0 +1,13 @@
+---
+description: Server configuration and secret-loading boundary
+globs: "internal/config/**/*.go"
+alwaysApply: false
+---
+
+# Configuration
+
+- `internal/config.Config` defines the supported YAML shape. It currently has no YAML keys; the file at `CONFIG_PATH` (default `./config.yaml`) is optional and unknown keys are ignored. If keys are added, ship a `config.example.yaml` and give every field a safe zero/default.
+- The JWT secret is loaded or generated as `jwt_secret` beside the selected config path and is excluded from YAML serialization.
+- `config.Global` is initialized once by `cmd/golem-deploy` before handlers run.
+- Other runtime settings are environment variables read in `cmd/golem-deploy/main.go` (`DB_PATH`, `MASSRUN_DB_PATH`, `TLS_CERT_FILE`, `TLS_KEY_FILE`).
+- Never commit generated secrets or add secret values to examples, logs, rules, or documentation.

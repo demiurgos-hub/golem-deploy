@@ -1,0 +1,17 @@
+---
+description: JWT authentication and account authorization contracts
+globs: "{internal/auth/**/*.go,internal/middleware/**/*.go,internal/handlers/login.go,internal/handlers/account/**/*.go,frontend/src/hooks/use-auth.ts}"
+alwaysApply: false
+---
+
+# Authentication and accounts
+
+- `internal/auth` owns JWT creation/validation and `Identity` (`Username`, `AccessLevel`, `Kind`: `session` | `api`). Session JWTs keep the account `access_level` for 24h.
+- `internal/middleware` accepts a Bearer JWT or a hashed `gdp_...` API token and stores `Identity` on the request context. Use `IdentityFromRequest`, `RequireSession`, and `RequireAdmin`.
+- API tokens always authenticate as `Kind=api` and `AccessLevel=1`. They never satisfy admin checks. Admin routes require `access_level == 0` and session kind. Create and API-token auth require a live approved account.
+- Token CRUD (`POST/GET /account/tokens`, `POST /account/tokens/revoke`) and password/refresh require a session JWT. API tokens cannot mint tokens or refresh into a session JWT.
+- Access level `0` is admin and `1` is developer. Preserve approval checks and the first-admin protections in account flows. The first admin is created on the host console at startup when the accounts table is empty.
+- Public `POST /account/create` always stores `access_level=1` and `approved=false`. Ignore client `access_level` and `approved`.
+- Account and API-token persistence belong in `internal/database`; handlers own HTTP validation and responses.
+- Use constant-time, library-backed credential/token operations. Never log passwords, JWT secrets, API token plaintext, or repository credentials.
+- When claims, identity kind, or auth responses change, update the web client, `docs/API.md`, and the API-contract rule.
