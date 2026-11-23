@@ -80,6 +80,7 @@ Create the first admin account, then start the daemon:
 | `--port-bind-address` | `GOLEM_DEPLOY_PORT_BIND_ADDRESS` | all interfaces | Host IP game ports are published on |
 | `--server-memory-mb` | `GOLEM_DEPLOY_SERVER_MEMORY_MB` | `0` (unlimited) | Memory limit per server container |
 | `--server-cpus` | `GOLEM_DEPLOY_SERVER_CPUS` | `0` (unlimited) | CPU limit per server container |
+| `--max-repo-size-mb` | `GOLEM_DEPLOY_MAX_REPO_SIZE_MB` | `10240` | Maximum size of each project checkout in MiB, enforced during clone, pull and Git LFS downloads (`0` = unlimited) |
 
 Without a TLS certificate the daemon only binds loopback addresses (`localhost` must resolve only to loopback addresses); to expose it on the network either configure TLS or put it behind a TLS-terminating reverse proxy and pass `--insecure-http`. It shuts down gracefully on SIGINT/SIGTERM. If no admin account exists it logs how to create one and keeps serving.
 
@@ -87,7 +88,7 @@ Requests are only served for IP addresses, `localhost` and the names given with 
 
 Behind a reverse proxy, pass its address range with `--trusted-proxy` (for example `--trusted-proxy 127.0.0.1/32` for a proxy on the same host) so that login rate limits and the access log use the real client address from `X-Forwarded-For`. Without it, forwarding headers are ignored and all clients share the proxy's address for rate limiting. Never list networks that untrusted clients can connect from.
 
-The data directory (created with mode 0700 if it does not exist; on Unix an existing one must not be accessible by group or others, and the daemon refuses to start with the `chmod` command to run instead of changing it) contains `golem-deploy.db` (SQLite, mode 0600), `keys/jwt.key` and `keys/secrets.key` (0600; back up `secrets.key` with the database, without it stored credentials cannot be decrypted), `repositories/` (one checkout per project id), `known_hosts` (SSH host keys of Git remotes), `static/`, `logs/jobs/` and `tmp/`.
+The data directory is dedicated to Golem Deploy, because the daemon removes leftover files below it at startup: it must not exist yet (it is then created with mode 0700), be empty, or have been initialised by Golem Deploy (it holds a `.golem-deploy-data` marker file); anything else is refused. On Unix an existing one must not be accessible by group or others, and the daemon refuses to start with the `chmod` command to run instead of changing it. Its path must not contain `"`, `$`, line breaks or (outside Windows) backslashes. Only one `serve` may use a data directory at a time (it holds a lock on `.lock`); `admin create` may initialise a new data directory, `admin reset-password` needs an initialised one. It contains `golem-deploy.db` (SQLite, mode 0600), `keys/jwt.key` and `keys/secrets.key` (0600; back up `secrets.key` with the database, without it stored credentials cannot be decrypted), `repositories/` (one checkout per project id), `known_hosts` (SSH host keys of Git remotes), `static/`, `logs/jobs/` and `tmp/`.
 
 ## License
 
