@@ -54,6 +54,12 @@ func containedCheckout(root string, id int64) (string, error) {
 // symlink at root/<id> is removed without being followed. A missing
 // checkout is not an error.
 func RemoveCheckout(root string, id int64, tempDir string) error {
+	if id <= 0 {
+		return errors.New("invalid project id")
+	}
+	if _, err := os.Lstat(root); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
 	dir, err := containedCheckout(root, id)
 	if err != nil {
 		return err

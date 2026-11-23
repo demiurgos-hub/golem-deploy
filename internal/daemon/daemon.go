@@ -16,6 +16,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
+	"github.com/demiurgos-hub/golem-deploy/internal/git"
 	"github.com/demiurgos-hub/golem-deploy/internal/httpapi"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
@@ -112,6 +113,11 @@ func Run(ctx context.Context, o Options) (err error) {
 		logger.Warn("no approved admin account exists; create one with: golem-deploy admin create --username <name> --data-dir " + layout.Root)
 	}
 
+	gitClient, err := prepareGit(ctx, st, layout, logger)
+	if err != nil {
+		return err
+	}
+
 	runner := jobs.New(st, layout.JobLogs(), jobs.Options{Logger: logger})
 	probe := o.docker
 	if probe == nil {
@@ -131,6 +137,9 @@ func Run(ctx context.Context, o Options) (err error) {
 		Jobs:     runner,
 		Logger:   logger,
 		Docker:   probe,
+		Git:      gitClient,
+		RepoDir:  layout.Repositories(),
+		TempDir:  layout.Tmp(),
 		SPA:      o.SPA,
 	})
 	if err != nil {
@@ -174,6 +183,36 @@ func Run(ctx context.Context, o Options) (err error) {
 		return serveErr
 	}
 	return jobErr
+}
+
+// prepareGit sweeps git scratch files and orphaned checkouts left by a
+// previous run and returns the git runner, or nil (project git operations
+// then answer 503) when git is not installed.
+func prepareGit(ctx context.Context, st *store.Store, layout datadir.Layout, logger *slog.Logger) (httpapi.GitClient, error) {
+	if err := git.SweepTemp(layout.Tmp()); err != nil {
+		logger.Warn("could not remove git scratch files from a previous run", "err", err)
+	}
+	projects, err := st.ListProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make(map[int64]bool, len(projects))
+	for _, p := range projects {
+		ids[p.ID] = true
+	}
+	removed, err := git.SweepCheckouts(layout.Repositories(), layout.Tmp(), func(id int64) bool { return ids[id] })
+	if len(removed) > 0 {
+		logger.Warn("removed checkouts of deleted projects", "project_ids", removed)
+	}
+	if err != nil {
+		logger.Warn("could not remove all orphaned checkouts", "err", err)
+	}
+	r, err := git.New(git.Options{TempDir: layout.Tmp(), KnownHostsFile: layout.KnownHosts()})
+	if err != nil {
+		logger.Warn("git is not available; project clone, pull and branch operations are disabled", "err", err)
+		return nil, nil
+	}
+	return r, nil
 }
 
 // dockerCLIProbe checks Docker with the docker CLI, caching the answer.
