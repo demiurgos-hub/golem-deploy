@@ -216,11 +216,19 @@ func Run(ctx context.Context, o Options) (err error) {
 	// the store is closed (deferred above) only after both have finished.
 	var wg sync.WaitGroup
 	var jobErr error
-	wg.Add(2)
+	// Startup reconciliation uses the store; it is cancelled and awaited
+	// before the store closes on every exit path.
+	recCtx, cancelRec := context.WithCancel(ctx)
+	recDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		reconcileServers(ctx, svc, runner, logger)
+		defer close(recDone)
+		reconcileServers(recCtx, svc, runner, logger)
 	}()
+	defer func() {
+		cancelRec()
+		<-recDone
+	}()
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		<-ctx.Done()
