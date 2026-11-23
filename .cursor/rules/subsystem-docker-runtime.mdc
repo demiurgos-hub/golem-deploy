@@ -1,12 +1,15 @@
 ---
-description: Docker image, container and volume library (not wired to HTTP)
-globs: "{internal/docker/**/*.go,internal/volumes/**/*.go}"
+description: Label-scoped docker CLI client, fake runner and host port range
+globs: "{internal/docker/**/*.go,internal/ports/**/*.go}"
 alwaysApply: false
 ---
 
-# Docker runtime library
+# Docker runtime
 
-- `internal/docker` (images, containers, static add-ons) and `internal/volumes` (managed volumes) shell out to the host `docker` CLI. They are legacy code kept compiling but **not wired to any HTTP route**; task C replaces them with the Docker runner behind the planned `/api/v1/servers`, `/images` and `/volumes` routes (types in `internal/apitypes/servers.go` and `host.go`).
-- Do not wire these packages to HTTP as they are: they print to stdout, return raw command output in errors and do not validate inputs. Errors from Docker must reach clients only as safe messages (see the HTTP API rule).
-- `GET /api/v1/status` checks Docker reachability with its own cached probe in `internal/daemon`, not with this package.
-- Verify with `go test ./internal/docker/... ./internal/volumes/...` (no Docker daemon required).
+- `internal/docker.Client` is the only code that runs `docker`. It takes an injectable `Runner` (real: `ExecRunner`; tests: `internal/docker/dockertest.Fake`, an in-memory CLI that records argv and child env). No shell, a timeout on every call (follow logs are bounded by ctx), `--` before positional arguments, `--format '{{json .}}'`/inspect JSON instead of text parsing. The child gets a minimal allowlisted environment (`BaseEnv`), never the daemon's.
+- Every created object carries `LabelManaged=true` (plus `server-id`, `server`, `project-id`, `config-hash` on containers). Containers are reachable only through server-id lookups (`ServerContainers`, `StopServer`, `RemoveServerContainers`, `ServerLogs`, `ServerStats`); no method takes a client-supplied container name or id. Labels are filtered by Docker **and** re-checked on the inspected object. Image/volume removal inspects and verifies the label, refuses objects used by any container (`ErrInUse`), and an unmanaged `golem-deploy` network is refused, not joined. Keep tests that prove an unmanaged object gets no destructive argv.
+- Env values never appear in argv, logs or errors: `RunSpec.Args` emits `--env KEY` and returns `KEY=value` for the child environment. Env keys that would steer the CLI child (`DOCKER_*`, `PATH`, `HOME`, proxies, Windows system variables) are reserved.
+- `RunSpec` applies the hardening on every run; its extension fields (`DaemonEnv`, `ReadOnlyBinds`, `DataVolume`, `AdminPort`, `GID`) are for the build/engine milestone. Change hardening flags only with the exact-argv test in `client_test.go` and `docs/SERVERS.md`.
+- Errors are `*CmdError` wrapping a sentinel (`ErrUnavailable`, `ErrNotFound`, `ErrConflict`, `ErrPortBusy`, ...); its `Detail` (CLI stderr) may go to daemon and job logs, never to HTTP responses. `Reachable` caches the `docker version` probe for `GET /status`.
+- `internal/ports` validates `--port-range` (1024 ≤ range < 32768, not containing the panel port, browser-unsafe ports skipped), picks the lowest free port and probes the host (TCP+UDP bind).
+- Verify with `go test ./internal/docker/... ./internal/ports/...`; with Docker available also `GOLEM_DEPLOY_DOCKER_TESTS=1 go test ./internal/docker/... ./internal/httpapi/...` (builds images from a digest-pinned busybox, cleans up; CI does not run it).

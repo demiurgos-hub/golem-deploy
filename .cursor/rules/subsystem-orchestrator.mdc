@@ -7,7 +7,7 @@ alwaysApply: false
 # Entry point and daemon assembly
 
 - `cmd/golem-deploy` parses subcommands with stdlib `flag` (`serve`, `admin create|reset-password`, `version`; no arguments prints usage and exits 2). Flags have `GOLEM_DEPLOY_*` environment fallbacks; there is no config file. Never prompt on stdin during `serve`.
-- `internal/daemon.Run` is the composition root: data directory, keys, store, `Reconcile`, job runner, `httpapi.Server`. On context cancellation HTTP shutdown and job cancellation run together and the store closes last. It refuses plaintext HTTP on non-loopback addresses before touching disk (`httpapi.CheckListen`).
+- `internal/daemon.Run` is the composition root: data directory, keys, store, `Reconcile`, static store, job runner, `docker.Client` (also the `/status` probe), `servers.Service`, `httpapi.Server`; after listening it runs `servers.Reconcile` in the background (start jobs for servers that should run). On context cancellation HTTP shutdown and job cancellation run together and the store closes last. It refuses plaintext HTTP on non-loopback addresses and invalid server settings (`--port-range`, `--port-bind-address`, `--server-memory-mb`, `--server-cpus`) before touching disk.
 - `internal/datadir` owns the data directory layout (0700 directories, 0600 key files; key files readable by group or others are refused on Unix). All runtime paths come from `datadir.Layout`; nothing is written relative to the working directory.
 - `internal/daemon/admin.go` backs the `admin` CLI and works while the daemon runs (SQLite WAL).
 - `frontend/embed.go` embeds `frontend/dist` (`all:dist`); without `index.html` it serves a plain-text 503 notice. Only paths outside `/api/` reach it.

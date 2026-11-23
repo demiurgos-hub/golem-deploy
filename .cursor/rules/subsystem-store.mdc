@@ -10,6 +10,6 @@ alwaysApply: false
 - Schema changes are new files `migrations/NNNN_description.sql`, applied in order, each in its own transaction together with its `schema_migrations` row. Never edit an applied migration. A database newer than the binary is refused.
 - Timestamps are TEXT in the fixed-width layout `2006-01-02T15:04:05.000Z` (lexically sortable); use `formatTime` and `parseTime`.
 - Methods return domain structs and the sentinels `ErrNotFound`, `ErrConflict` (UNIQUE violation), `ErrLastAdmin` and `ErrSelf`; HTTP mapping belongs to the caller. Keep SQL parameterised.
-- Encrypted columns (`projects.auth_secret`, `servers.env`) are opaque `[]byte` here. `CreateProject` and `CreateServer` take a `SealFunc` that is called with the new id inside the insert transaction, so ciphertext can be bound to the row. Fields holding secrets or hashes are tagged `json:"-"`.
+- Encrypted columns (`projects.auth_secret`, `servers.env`) are opaque `[]byte` here. `CreateProject` and `CreateServer` take a `SealFunc` that is called with the new id inside the insert transaction, so ciphertext can be bound to the row (`CreateServers`, the all-or-nothing batch used by import, takes one per index). Fields holding secrets or hashes are tagged `json:"-"`.
 - `Reconcile` runs once at startup: active jobs become `error` "interrupted by daemon restart" and transient project statuses become `idle`. Update its status list when adding transient statuses.
 - Verify with `go test ./internal/store/...`.

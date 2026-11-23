@@ -1,0 +1,15 @@
+---
+description: Game server service and the server, image, volume and static handlers
+globs: "{internal/servers/**/*.go,internal/httpapi/handlers_servers.go,internal/httpapi/handlers_host.go,internal/httpapi/servers_test.go,internal/httpapi/docker_integration_test.go,docs/SERVERS.md}"
+alwaysApply: false
+---
+
+# Servers
+
+- `internal/servers.Service` sits between the handlers and the store/docker client. Handlers stay thin: decode, call the service, map errors with `serversError` (`FieldError` → `validation_failed`, sentinels → `not_found`/`name_taken`/`port_in_use`/`conflict`, `docker.ErrUnavailable` → 503).
+- Env is a JSON object sealed with `secrets.ServerEnvPurpose(id)`; only `env_keys` leave the service. Never log env values; container output written to job logs goes through `redact`. Tests plant a marker value and grep responses, job details, job logs, daemon logs and docker argv (`assertNoMarker`); keep that coverage for new code paths.
+- Images are resolved to immutable ids of **managed** images on create/patch/import. Ports come from the configured range; auto-assignment retries on UNIQUE conflicts. `writeMu` serialises row read-modify-write in this process.
+- Start/stop/restart/delete are job bodies (`Start`, `Stop`, `Restart`, `Delete`) run via `s.startJob` with subject `server`, so one job per server runs at a time; they return `jobs.Fail` with user-safe messages. DELETE waits for its `server.delete` job. Desired state is written with `store.SetServerDesiredState` (never `UpdateServer`, which would overwrite concurrent changes).
+- Reads take runtime state from one `ManagedContainers` call per list; Docker failures yield `state: "unknown"`, not an error. `restart_required` compares the container's `config-hash` label with `configHash` (image, port, env ciphertext hash, daemon run settings).
+- `Reconcile` (called by the daemon at startup) starts servers with desired state `running` whose container is not running and only logs managed containers without a row.
+- Verify with `go test ./internal/httpapi/... ./internal/daemon/...`; `GOLEM_DEPLOY_DOCKER_TESTS=1` adds `TestIntegrationServersAPI`.

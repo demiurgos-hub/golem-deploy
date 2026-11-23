@@ -11,5 +11,6 @@ alwaysApply: false
 - `dispatch` sends `/api/...` to the mux and renders its 404 and 405 as JSON; everything else goes to the SPA handler.
 - `outer` middleware: request id (`X-Request-Id`), access log (no query strings, bodies or credentials), panic recovery, security headers (strict CSP for the SPA, `default-src 'none'` and `no-store` for the API, HSTS only with TLS).
 - `Server.Serve` uses explicit timeouts; streaming handlers extend their write deadline per chunk with `http.ResponseController` and stop on client disconnect or `s.shutdown`. Upload handlers must extend the read deadline the same way.
+- `Deps.Servers` and `Deps.Static` back the server/image/volume and static routes (see the servers rule); when nil those routes answer 503.
 - Start jobs from handlers with `s.startJob` (busy subject gives 409 `job_in_progress`, shutdown gives 503) and respond 202 with the job. Encrypted columns use `s.secrets` with `secrets.ProjectAuthPurpose(id)` or `secrets.ServerEnvPurpose(id)`.
 - Verify with `go test ./internal/httpapi/...`.
