@@ -461,7 +461,10 @@ func (s *session) run(ctx context.Context, op, dir string, o cmdOpts, args ...st
 	if err := cmd.Start(); err != nil {
 		tree.close()
 		reason := ReasonUnknown
-		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+		switch {
+		case ctx.Err() != nil:
+			reason = ReasonCancelled
+		case errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist):
 			reason = ReasonGitMissing
 		}
 		return &Error{Op: op, Reason: reason, Err: fmt.Errorf("start git: %w", err)}
