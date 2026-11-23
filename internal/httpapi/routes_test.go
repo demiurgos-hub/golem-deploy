@@ -194,6 +194,10 @@ func TestRoleMatrix(t *testing.T) {
 func TestNotImplementedRoutesUseEnvelope(t *testing.T) {
 	h := newHarness(t)
 	admin := h.account("admin1", store.RoleAdmin, true)
-	rr := h.do("GET", "/api/v1/projects", h.session(admin), nil)
+	// A route of its own, so the test does not depend on which planned
+	// routes are still unimplemented.
+	h.srv.register(route{method: "GET", path: "/test-not-implemented", access: AccessDeveloper,
+		handler: func(http.ResponseWriter, *http.Request) error { return errNotImplemented }})
+	rr := h.do("GET", "/api/v1/test-not-implemented", h.session(admin), nil)
 	errBody(t, rr, http.StatusNotImplemented, apitypes.ErrorCodeNotImplemented)
 }

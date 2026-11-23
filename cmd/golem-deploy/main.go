@@ -25,6 +25,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/frontend"
 	"github.com/demiurgos-hub/golem-deploy/internal/daemon"
+	"github.com/demiurgos-hub/golem-deploy/internal/git"
 )
 
 // version is set at build time with -ldflags "-X main.version=v1.2.3".
@@ -52,6 +53,11 @@ Run "golem-deploy <command> -h" for the flags of a command.
 `
 
 func main() {
+	// git runs this binary as its GIT_ASKPASS helper; answer before anything
+	// else (see internal/git.Askpass).
+	if code, ok := git.Askpass(os.Args, os.Getenv, os.Stdout); ok {
+		os.Exit(code)
+	}
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 

@@ -34,6 +34,9 @@ func (l Layout) SecretsKey() string { return filepath.Join(l.KeysDir(), "secrets
 // Repositories holds project checkouts.
 func (l Layout) Repositories() string { return filepath.Join(l.Root, "repositories") }
 
+// KnownHosts is the SSH known_hosts file used for Git remotes.
+func (l Layout) KnownHosts() string { return filepath.Join(l.Root, "known_hosts") }
+
 // Static is the static file store.
 func (l Layout) Static() string { return filepath.Join(l.Root, "static") }
 

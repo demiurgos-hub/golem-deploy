@@ -39,15 +39,15 @@ func (s *Server) routes() []route {
 		{method: "POST", path: "/jobs/{id}/cancel", access: AccessDeveloper, handler: s.handleCancelJob},
 		{method: "GET", path: "/jobs/{id}/log", access: AccessDeveloper, handler: s.handleJobLog},
 
-		// Projects (task B).
-		{method: "GET", path: "/projects", access: AccessDeveloper, handler: ni},
-		{method: "POST", path: "/projects", access: AccessAdmin, handler: ni},
-		{method: "GET", path: "/projects/{id}", access: AccessDeveloper, handler: ni},
-		{method: "PATCH", path: "/projects/{id}", access: AccessAdmin, handler: ni},
-		{method: "DELETE", path: "/projects/{id}", access: AccessAdmin, handler: ni},
-		{method: "POST", path: "/projects/{id}/pull", access: AccessDeveloper, handler: ni},
-		{method: "POST", path: "/projects/{id}/branch", access: AccessDeveloper, handler: ni},
-		{method: "GET", path: "/projects/{id}/branches", access: AccessDeveloper, handler: ni},
+		// Projects.
+		{method: "GET", path: "/projects", access: AccessDeveloper, handler: s.handleListProjects},
+		{method: "POST", path: "/projects", access: AccessAdmin, handler: s.handleCreateProject},
+		{method: "GET", path: "/projects/{id}", access: AccessDeveloper, handler: s.handleGetProject},
+		{method: "PATCH", path: "/projects/{id}", access: AccessAdmin, handler: s.handleUpdateProject},
+		{method: "DELETE", path: "/projects/{id}", access: AccessAdmin, handler: s.handleDeleteProject},
+		{method: "POST", path: "/projects/{id}/pull", access: AccessDeveloper, handler: s.handlePullProject},
+		{method: "POST", path: "/projects/{id}/branch", access: AccessDeveloper, handler: s.handleSwitchBranch},
+		{method: "GET", path: "/projects/{id}/branches", access: AccessDeveloper, handler: s.handleListBranches},
 
 		// Servers (task C).
 		{method: "GET", path: "/servers", access: AccessDeveloper, handler: ni},

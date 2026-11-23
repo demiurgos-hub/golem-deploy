@@ -60,6 +60,12 @@ type Deps struct {
 	Jobs     *jobs.Runner
 	Logger   *slog.Logger
 	Docker   DockerProbe
+	// Git runs project checkouts; nil makes project git operations answer
+	// 503. RepoDir holds the checkouts (<RepoDir>/<project id>) and TempDir
+	// is scratch space on the same filesystem.
+	Git     GitClient
+	RepoDir string
+	TempDir string
 	// SPA serves non-API paths (the embedded web client). Nil serves 404.
 	SPA http.Handler
 	// Now overrides the clock (tests).
@@ -83,6 +89,7 @@ type Server struct {
 	docker   DockerProbe
 	spa      http.Handler
 	now      func() time.Time
+	proj     *projectState
 
 	// Password attempt limits (login, password change, token creation):
 	// failures per client IP and per submitted username, a known-good-IP
@@ -175,6 +182,7 @@ func New(cfg Config, d Deps) (*Server, error) {
 		docker:     d.Docker,
 		spa:        d.SPA,
 		now:        d.Now,
+		proj:       newProjectState(d),
 		loginIP:    auth.NewLimiter(loginFailuresPerWindow, loginWindow, limiterMaxKeys, d.Now),
 		loginUser:  auth.NewLimiter(usernameFailuresPerWindow, loginWindow, limiterMaxKeys, d.Now),
 		registerIP: auth.NewLimiter(registrationsPerWindow, registerWindow, limiterMaxKeys, d.Now),

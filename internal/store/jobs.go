@@ -178,13 +178,12 @@ type ReconcileResult struct {
 	Projects int64
 }
 
-// TransientProjectStatuses are reset to idle by Reconcile.
-var transientProjectStatuses = []string{"cloning", "pulling", "switching_branch"}
-
 // Reconcile repairs state left behind by a daemon that stopped abruptly:
 // active jobs become error/"interrupted by daemon restart" and projects in a
-// transient status return to idle. Call it once at startup, before the job
-// runner starts.
+// transient status (cloning, pulling, switching_branch) become error,
+// because the interrupted git operation may have left no checkout or a
+// partially updated one; pulling the project repairs it. Call it once at
+// startup, before the job runner starts.
 func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	var out ReconcileResult
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
@@ -199,8 +198,8 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 			return err
 		}
 		res, err = tx.ExecContext(ctx,
-			`UPDATE projects SET status = 'idle', updated_at = ? WHERE status IN (?, ?, ?)`,
-			now, transientProjectStatuses[0], transientProjectStatuses[1], transientProjectStatuses[2])
+			`UPDATE projects SET status = 'error', updated_at = ? WHERE status IN ('cloning', 'pulling', 'switching_branch')`,
+			now)
 		if err != nil {
 			return mapErr("reconcile projects", err)
 		}

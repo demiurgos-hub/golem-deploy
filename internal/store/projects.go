@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 )
 
@@ -152,6 +153,65 @@ func (s *Store) UpdateProject(ctx context.Context, p Project) (Project, error) {
 		p.LastCommit, formatTimePtr(p.LastPulledAt), p.Status, formatTime(s.nowUTC()), p.ID))
 	if err != nil {
 		return Project{}, mapErr("update project", err)
+	}
+	return out, nil
+}
+
+// ProjectCheckout is the checkout state a project job records.
+type ProjectCheckout struct {
+	Branch       string
+	LastCommit   string
+	LastPulledAt *time.Time
+	Status       string
+}
+
+// SetProjectCheckout updates only the checkout columns (branch,
+// last_commit, last_pulled_at, status), so a job finishing concurrently
+// with an UpdateProjectRemote never overwrites the other's columns.
+func (s *Store) SetProjectCheckout(ctx context.Context, id int64, c ProjectCheckout) (Project, error) {
+	out, err := scanProject(s.db.QueryRowContext(ctx,
+		`UPDATE projects SET branch = ?, last_commit = ?, last_pulled_at = ?, status = ?, updated_at = ?
+		 WHERE id = ? RETURNING `+projectCols,
+		c.Branch, c.LastCommit, formatTimePtr(c.LastPulledAt), c.Status, formatTime(s.nowUTC()), id))
+	if err != nil {
+		return Project{}, mapErr("set project checkout", err)
+	}
+	return out, nil
+}
+
+// ProjectRemoteUpdate changes how a project's remote is reached. Nil
+// fields are unchanged.
+type ProjectRemoteUpdate struct {
+	RepoURL *string
+	Auth    *ProjectAuthUpdate
+}
+
+// ProjectAuthUpdate replaces a project's credentials. Secret must already
+// be sealed for the project's id (nil stores NULL).
+type ProjectAuthUpdate struct {
+	Type     string
+	Username string
+	Secret   []byte
+}
+
+// UpdateProjectRemote updates only the remote columns (repo_url and the
+// auth columns) of project id and returns the stored row.
+func (s *Store) UpdateProjectRemote(ctx context.Context, id int64, u ProjectRemoteUpdate) (Project, error) {
+	sets := []string{"updated_at = ?"}
+	args := []any{formatTime(s.nowUTC())}
+	if u.RepoURL != nil {
+		sets = append(sets, "repo_url = ?")
+		args = append(args, *u.RepoURL)
+	}
+	if u.Auth != nil {
+		sets = append(sets, "auth_type = ?", "auth_username = ?", "auth_secret = ?")
+		args = append(args, u.Auth.Type, u.Auth.Username, blobArg(u.Auth.Secret))
+	}
+	args = append(args, id)
+	out, err := scanProject(s.db.QueryRowContext(ctx,
+		`UPDATE projects SET `+strings.Join(sets, ", ")+` WHERE id = ? RETURNING `+projectCols, args...))
+	if err != nil {
+		return Project{}, mapErr("update project remote", err)
 	}
 	return out, nil
 }

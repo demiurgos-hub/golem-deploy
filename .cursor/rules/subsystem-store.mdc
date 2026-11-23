@@ -13,5 +13,5 @@ alwaysApply: false
 - Methods return domain structs and the sentinels `ErrNotFound`, `ErrConflict` (UNIQUE violation), `ErrLastAdmin`, `ErrSelf` and `ErrLimit` (quota, e.g. API tokens); HTTP mapping belongs to the caller. Keep SQL parameterised; check-then-insert quotas run inside `withTx`.
 - The database file is pre-created 0600 by `datadir.Prepare` so `-wal`/`-shm` inherit the mode.
 - Encrypted columns (`projects.auth_secret`, `servers.env`) are opaque `[]byte` here. `CreateProject` and `CreateServer` take a `SealFunc` that is called with the new id inside the insert transaction, so ciphertext can be bound to the row. Fields holding secrets or hashes are tagged `json:"-"`.
-- `Reconcile` runs once at startup: active jobs become `error` "interrupted by daemon restart" and transient project statuses become `idle`. Update its status list when adding transient statuses.
+- `Reconcile` runs once at startup: active jobs become `error` "interrupted by daemon restart" and transient project statuses (`cloning`, `pulling`, `switching_branch`) become `error`. Update its status list when adding transient statuses. Project jobs and PATCH write disjoint columns (`SetProjectCheckout`, `UpdateProjectRemote`) so they cannot overwrite each other.
 - Verify with `go test ./internal/store/...`.

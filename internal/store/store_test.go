@@ -401,7 +401,7 @@ func TestJobsAndReconcile(t *testing.T) {
 	if j, _ := s.GetJob(ctx, j3.ID); j.Status != JobSuccess {
 		t.Fatalf("finished job touched: %+v", j)
 	}
-	if got, _ := s.GetProject(ctx, p.ID); got.Status != "idle" {
+	if got, _ := s.GetProject(ctx, p.ID); got.Status != "error" {
 		t.Fatalf("project status %q", got.Status)
 	}
 	if got, _ := s.GetProject(ctx, pIdle.ID); got.Status != "error" {

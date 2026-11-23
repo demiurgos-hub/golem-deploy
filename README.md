@@ -14,6 +14,7 @@ A single `golem-deploy` binary serves a versioned HTTP API under `/api/v1` and t
 - **Sessions and tokens:** short-lived session JWTs re-validated against the database on every request, revocable API tokens (`gdp_...`) that never exceed the developer role, login rate limiting.
 - **Jobs:** background operations with persisted status, per-job logs that can be streamed, cancellation and per-subject serialisation.
 - **Secrets at rest:** Git credentials and server environment values are stored AES-256-GCM encrypted.
+- **Projects:** Git repositories cloned over HTTPS or SSH into the data directory, with pull, branch switching and remote branch listing as jobs, encrypted credentials and hardened, non-interactive git. See [docs/REPOSITORIES.md](docs/REPOSITORIES.md).
 
 The HTTP contract, including the planned routes, is documented in [docs/API.md](docs/API.md).
 
@@ -78,7 +79,7 @@ Requests are only served for IP addresses, `localhost` and the names given with 
 
 Behind a reverse proxy, pass its address range with `--trusted-proxy` (for example `--trusted-proxy 127.0.0.1/32` for a proxy on the same host) so that login rate limits and the access log use the real client address from `X-Forwarded-For`. Without it, forwarding headers are ignored and all clients share the proxy's address for rate limiting. Never list networks that untrusted clients can connect from.
 
-The data directory (created with mode 0700 if it does not exist; on Unix an existing one must not be accessible by group or others, and the daemon refuses to start with the `chmod` command to run instead of changing it) contains `golem-deploy.db` (SQLite, mode 0600), `keys/jwt.key` and `keys/secrets.key` (0600; back up `secrets.key` with the database, without it stored credentials cannot be decrypted), `repositories/`, `static/`, `logs/jobs/` and `tmp/`.
+The data directory (created with mode 0700 if it does not exist; on Unix an existing one must not be accessible by group or others, and the daemon refuses to start with the `chmod` command to run instead of changing it) contains `golem-deploy.db` (SQLite, mode 0600), `keys/jwt.key` and `keys/secrets.key` (0600; back up `secrets.key` with the database, without it stored credentials cannot be decrypted), `repositories/` (one checkout per project id), `known_hosts` (SSH host keys of Git remotes), `static/`, `logs/jobs/` and `tmp/`.
 
 ## License
 
