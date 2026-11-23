@@ -323,3 +323,54 @@ func TestRestartReconciliation(t *testing.T) {
 		t.Fatalf("crashed job %+v", got)
 	}
 }
+
+// TestG3_JobLogCap: a job that writes far more than the cap keeps running
+// to completion; the log holds the first MaxLogBytes, one truncation
+// marker and the runner's final error line.
+func TestG3_JobLogCap(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	const limit = 1 << 20
+	r := New(st, dir, Options{MaxLogBytes: limit})
+	defer func() { _ = r.Shutdown(context.Background()) }()
+	chunk := []byte(strings.Repeat("x", 999) + "\n")
+	written := 0
+	j, err := r.Start(context.Background(), "project.pull", subj, nil, func(ctx context.Context, log io.Writer) error {
+		for written < 5*limit {
+			n, err := log.Write(chunk)
+			if err != nil || n != len(chunk) {
+				return fmt.Errorf("write: %d %v", n, err)
+			}
+			written += n
+		}
+		return Fail("boom", nil)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, r, j.ID)
+	if got := getJob(t, st, j.ID); got.Status != store.JobError || got.Detail != "boom" {
+		t.Fatalf("job %+v", got)
+	}
+	data, err := os.ReadFile(r.LogPath(j.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(data)
+	if strings.Count(log, "[log truncated") != 1 || !strings.Contains(log, "limit of 1 MiB") {
+		t.Fatalf("marker missing or repeated")
+	}
+	if !strings.HasSuffix(log, "\nerror: boom\n") {
+		t.Fatalf("final error line missing: ...%q", log[len(log)-120:])
+	}
+	if len(data) > limit+256 {
+		t.Fatalf("log is %d bytes, cap %d", len(data), limit)
+	}
+	if !strings.HasPrefix(log, string(chunk)) {
+		t.Fatal("head of the log not kept")
+	}
+}
