@@ -17,7 +17,7 @@ Golem Deploy is an open-source tool for self-hosting games built on Golem Engine
 - Run `docker` only through `internal/docker`, and only against objects labelled `dev.golemengine.deploy.managed=true` (containers are found by server id, never by a client-supplied name or id). Container env values never go into argv, logs, errors or responses.
 - Treat `frontend/dist` (except its committed `.gitkeep`), `frontend/node_modules`, `bin`, `data` (the default data directory, including its keys), and other secrets as generated or runtime state.
 - Build the web client before the binary because `frontend/embed.go` embeds `frontend/dist`. Without a build, the binary serves a plain-text "web client not built" notice instead of the SPA.
-- Before finishing, run what CI runs: `npm run lint` and `npm run build` in `frontend/`, then `scripts/gen-types.sh` (the generated file must not change), `go vet ./...`, `staticcheck ./...`, `govulncheck ./...`, and `go test -race ./...` from the root (see `.github/workflows/ci.yml`).
+- Before finishing, run what CI runs: `npm run lint`, `npm test` and `npm run build` in `frontend/`, then `scripts/gen-types.sh` (the generated file must not change), `go vet ./...`, `staticcheck ./...`, `govulncheck ./...`, and `go test -race ./...` from the root (see `.github/workflows/ci.yml`).
 - With Docker available, changes to Docker or server code also need `GOLEM_DEPLOY_DOCKER_TESTS=1 go test ./internal/docker/... ./internal/httpapi/...` (CI does not run it).
 
 ## Required rule maintenance

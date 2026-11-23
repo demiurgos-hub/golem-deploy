@@ -58,10 +58,13 @@ type Job struct {
 	Restricted bool `json:"restricted"`
 	// CreatedBy is the account that started the job; null for system jobs or
 	// when that account was deleted.
-	CreatedBy  *int64     `json:"created_by" tstype:"number | null,required"`
-	CreatedAt  time.Time  `json:"created_at"`
-	StartedAt  *time.Time `json:"started_at" tstype:"string | null,required"`
-	FinishedAt *time.Time `json:"finished_at" tstype:"string | null,required"`
+	CreatedBy *int64 `json:"created_by" tstype:"number | null,required"`
+	// CreatedByUsername is the creator's username when the job is read;
+	// null when CreatedBy is null.
+	CreatedByUsername *string    `json:"created_by_username" tstype:"string | null,required"`
+	CreatedAt         time.Time  `json:"created_at"`
+	StartedAt         *time.Time `json:"started_at" tstype:"string | null,required"`
+	FinishedAt        *time.Time `json:"finished_at" tstype:"string | null,required"`
 }
 
 // JobList is the body of GET /api/v1/jobs, newest first.

@@ -32,6 +32,16 @@ export interface RegisterRequest {
   password: string;
 }
 /**
+ * AuthOptions is the body of GET /api/v1/auth/options (public): what the
+ * login page needs to know before anyone has signed in.
+ */
+export interface AuthOptions {
+  /**
+   * RegistrationEnabled reports whether POST /api/v1/auth/register is open.
+   */
+  registration_enabled: boolean;
+}
+/**
  * SessionResponse is returned by login, refresh and password change. Send the
  * token as "Authorization: Bearer <token>". Refresh before ExpiresAt; after
  * SessionExpiresAt (the absolute session lifetime) a fresh login is required.
@@ -485,6 +495,11 @@ export interface Job {
    * when that account was deleted.
    */
   created_by: number | null;
+  /**
+   * CreatedByUsername is the creator's username when the job is read;
+   * null when CreatedBy is null.
+   */
+  created_by_username: string | null;
   created_at: string /* RFC 3339, UTC */;
   started_at: string | null;
   finished_at: string | null;

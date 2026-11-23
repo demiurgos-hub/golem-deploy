@@ -93,7 +93,7 @@ func (s *Server) hostAllowed(host string) bool {
 }
 
 var errBadHost = newError(http.StatusMisdirectedRequest, apitypes.ErrorCodeBadHost,
-	"this host name is not served here; use the address configured with --public-host")
+	"this host name is not served here; open the panel by IP address, by localhost or by a name configured with --public-host")
 
 // sampledLog emits at most one line per interval and counts the rest.
 type sampledLog struct {

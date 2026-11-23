@@ -38,9 +38,12 @@ type Job struct {
 	// read their log or cancel them.
 	Restricted bool
 	CreatedBy  *int64
-	CreatedAt  time.Time
-	StartedAt  *time.Time
-	FinishedAt *time.Time
+	// CreatedByUsername is the creator's current username, read with the
+	// job; nil when CreatedBy is nil.
+	CreatedByUsername *string
+	CreatedAt         time.Time
+	StartedAt         *time.Time
+	FinishedAt        *time.Time
 }
 
 // NewJob is the input of CreateJob.
@@ -60,17 +63,27 @@ type JobFilter struct {
 	Limit int
 }
 
-const jobCols = `id, kind, subject_type, subject_id, status, detail, restricted, created_by, created_at, started_at, finished_at`
+// jobCols and jobFrom read jobs together with their creator's username in
+// one query.
+const (
+	jobCols = `jobs.id, jobs.kind, jobs.subject_type, jobs.subject_id, jobs.status, jobs.detail, jobs.restricted, jobs.created_by, jobs.created_at, jobs.started_at, jobs.finished_at, accounts.username`
+	jobFrom = ` FROM jobs LEFT JOIN accounts ON accounts.id = jobs.created_by`
+	// jobReturning is jobCols for INSERT ... RETURNING, which cannot join.
+	jobReturning = `id, kind, subject_type, subject_id, status, detail, restricted, created_by, created_at, started_at, finished_at, (SELECT username FROM accounts WHERE accounts.id = jobs.created_by)`
+)
 
 func scanJob(r scanner) (Job, error) {
 	var j Job
 	var createdBy sql.NullInt64
 	var created string
-	var started, finished sql.NullString
-	if err := r.Scan(&j.ID, &j.Kind, &j.SubjectType, &j.SubjectID, &j.Status, &j.Detail, &j.Restricted, &createdBy, &created, &started, &finished); err != nil {
+	var started, finished, creator sql.NullString
+	if err := r.Scan(&j.ID, &j.Kind, &j.SubjectType, &j.SubjectID, &j.Status, &j.Detail, &j.Restricted, &createdBy, &created, &started, &finished, &creator); err != nil {
 		return Job{}, err
 	}
 	j.CreatedBy = int64Ptr(createdBy)
+	if creator.Valid && j.CreatedBy != nil {
+		j.CreatedByUsername = &creator.String
+	}
 	var err error
 	if j.CreatedAt, err = parseTime(created); err != nil {
 		return Job{}, err
@@ -88,7 +101,7 @@ func scanJob(r scanner) (Job, error) {
 func (s *Store) CreateJob(ctx context.Context, in NewJob) (Job, error) {
 	j, err := scanJob(s.db.QueryRowContext(ctx,
 		`INSERT INTO jobs (kind, subject_type, subject_id, status, restricted, created_by, created_at)
-		 VALUES (?, ?, ?, 'queued', ?, ?, ?) RETURNING `+jobCols,
+		 VALUES (?, ?, ?, 'queued', ?, ?, ?) RETURNING `+jobReturning,
 		in.Kind, in.SubjectType, in.SubjectID, in.Restricted, nullInt64(in.CreatedBy), formatTime(s.nowUTC())))
 	if err != nil {
 		return Job{}, mapErr("create job", err)
@@ -98,7 +111,7 @@ func (s *Store) CreateJob(ctx context.Context, in NewJob) (Job, error) {
 
 // GetJob returns job id, or ErrNotFound.
 func (s *Store) GetJob(ctx context.Context, id int64) (Job, error) {
-	j, err := scanJob(s.db.QueryRowContext(ctx, `SELECT `+jobCols+` FROM jobs WHERE id = ?`, id))
+	j, err := scanJob(s.db.QueryRowContext(ctx, `SELECT `+jobCols+jobFrom+` WHERE jobs.id = ?`, id))
 	if err != nil {
 		return Job{}, mapErr("get job", err)
 	}
@@ -114,17 +127,17 @@ func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 	if limit > 500 {
 		limit = 500
 	}
-	q := `SELECT ` + jobCols + ` FROM jobs WHERE 1=1`
+	q := `SELECT ` + jobCols + jobFrom + ` WHERE 1=1`
 	var args []any
 	if f.SubjectType != "" {
-		q += ` AND subject_type = ?`
+		q += ` AND jobs.subject_type = ?`
 		args = append(args, f.SubjectType)
 	}
 	if f.SubjectID != "" {
-		q += ` AND subject_id = ?`
+		q += ` AND jobs.subject_id = ?`
 		args = append(args, f.SubjectID)
 	}
-	q += ` ORDER BY id DESC LIMIT ?`
+	q += ` ORDER BY jobs.id DESC LIMIT ?`
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {

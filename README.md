@@ -2,7 +2,7 @@
 
 Golem Deploy is an open-source tool for self-hosting games built on [Golem Engine](https://golemengine.dev), the Go engine for server-authoritative multiplayer games. It runs on a Linux host next to Docker and is managed through an embedded web client.
 
-**Status: early development.** Golem Deploy is not yet usable in production. APIs, storage formats and configuration will change without migration paths until a first release. The daemon core (accounts, sessions, API tokens, jobs, encrypted secrets), projects, the Docker runner, servers, images, static files and volumes have been rebuilt. There is no build pipeline yet, so no managed images exist on a host until one is labelled by hand. The web client still targets the previous API and does not work against this daemon yet.
+**Status: early development.** Golem Deploy is not yet usable in production. APIs, storage formats and configuration will change without migration paths until a first release. The daemon core (accounts, sessions, API tokens, jobs, encrypted secrets), projects, the Docker runner, servers, images, static files and volumes have been rebuilt. There is no build pipeline yet, so no managed images exist on a host until one is labelled by hand. The web client covers every API v1 route and has been exercised end to end against the daemon with real git and Docker.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -17,8 +17,9 @@ A single `golem-deploy` binary serves a versioned HTTP API under `/api/v1` and t
 - **Projects:** Git repositories cloned over HTTPS or SSH into the data directory, with pull, branch switching and remote branch listing as jobs, encrypted credentials and hardened, non-interactive git. See [docs/REPOSITORIES.md](docs/REPOSITORIES.md).
 - **Game servers:** hardened containers from managed images, one host port per server published as UDP and TCP, start/stop/restart jobs, streamed logs, stats, export/import, and restart of servers that should be running when the daemon starts. Only objects labelled `dev.golemengine.deploy.managed=true` are ever touched; see [docs/SERVERS.md](docs/SERVERS.md) for the container hardening, the port model and firewall notes.
 - **Images, volumes, static files:** managed images and volumes can be listed and deleted; a static file store accepts uploads (streamed, never overwritten unless asked) for later builds.
+- **Web client:** sign-in (with a registration link only when registration is on), account (password change with optional token revocation, API tokens created with the current password and shown once), account administration including other accounts' API tokens, settings, projects (create, live clone/pull/branch job logs, edit credentials, repair a failed clone by pulling), servers (create from managed images, start/stop/restart/delete jobs, live logs with follow, stats, environment editing with a restart-required notice, JSON export/import), images, static files (upload with confirmed replacement, download, delete) and volumes. Job logs and cancel buttons follow the daemon's rules for restricted jobs and job ownership.
 
-The HTTP contract, including the planned routes, is documented in [docs/API.md](docs/API.md).
+The HTTP contract is documented in [docs/API.md](docs/API.md).
 
 ## Requirements
 
@@ -45,7 +46,7 @@ After changing `internal/apitypes`, regenerate the web client's types with `scri
 Run the checks used in CI:
 
 ```sh
-(cd frontend && npm run lint && npm run build)
+(cd frontend && npm run lint && npm test && npm run build)
 go vet ./...
 go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
@@ -53,6 +54,17 @@ go test -race ./...
 ```
 
 Tests against a real Docker daemon are opt-in: `GOLEM_DEPLOY_DOCKER_TESTS=1 go test ./internal/docker/... ./internal/httpapi/...` (they build small labelled images from a pinned busybox and clean up after themselves).
+
+## Develop the web client
+
+```sh
+cd frontend
+npm run dev                       # Vite on :5173, proxies /api to the daemon on 127.0.0.1:8000
+VITE_API_MOCK=1 npm run dev       # simulates the git- and Docker-backed routes in the browser
+npm test                          # Vitest + Testing Library
+```
+
+`GOLEM_DEPLOY_DEV_API=http://127.0.0.1:18080 npm run dev` points the proxy at a daemon on another address. The mock still needs a daemon for sign-in, accounts and settings; it simulates projects, servers, images, static files and volumes following the API v1 contract, for work without git or Docker. It is development-only: a production build refuses `VITE_API_MOCK` and fails if the mock code ends up in the bundle.
 
 ## Run
 

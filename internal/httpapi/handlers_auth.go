@@ -23,6 +23,17 @@ func (s *Server) sessionResponse(acct store.Account, loginAt time.Time) (apitype
 	}, nil
 }
 
+// handleAuthOptions tells the login page whether self-registration is open.
+// It is public and reveals nothing else.
+func (s *Server) handleAuthOptions(w http.ResponseWriter, r *http.Request) error {
+	settings, err := s.store.GetSettings(r.Context())
+	if err != nil {
+		return internal(err)
+	}
+	writeJSON(w, http.StatusOK, apitypes.AuthOptions{RegistrationEnabled: settings.RegistrationEnabled})
+	return nil
+}
+
 // handleLogin: identical 401 for unknown user, wrong password and unapproved
 // account, with a bcrypt comparison on every path. Attempts are counted
 // against the client IP and the submitted username before the password is

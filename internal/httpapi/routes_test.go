@@ -13,6 +13,7 @@ import (
 // expectedRoutes is the access contract documented in docs/API.md. A route
 // added, removed or re-levelled without updating this table fails the test.
 var expectedRoutes = map[string]Access{
+	"GET /api/v1/auth/options":   AccessPublic,
 	"POST /api/v1/auth/login":    AccessPublic,
 	"POST /api/v1/auth/register": AccessPublic,
 	"POST /api/v1/auth/logout":   AccessSession,

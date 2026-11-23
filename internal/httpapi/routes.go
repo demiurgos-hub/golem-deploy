@@ -5,6 +5,7 @@ package httpapi
 func (s *Server) routes() []route {
 	return []route{
 		// Auth.
+		{method: "GET", path: "/auth/options", access: AccessPublic, handler: s.handleAuthOptions},
 		{method: "POST", path: "/auth/login", access: AccessPublic, handler: s.handleLogin},
 		{method: "POST", path: "/auth/register", access: AccessPublic, handler: s.handleRegister},
 		{method: "POST", path: "/auth/logout", access: AccessSession, handler: s.handleLogout},

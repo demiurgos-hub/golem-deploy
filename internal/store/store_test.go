@@ -254,6 +254,15 @@ func TestDeleteAccountCascadesAndNullsJobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if j.CreatedByUsername == nil || *j.CreatedByUsername != "dev" {
+		t.Fatalf("created job creator name %v", j.CreatedByUsername)
+	}
+	if got, err := s.GetJob(ctx, j.ID); err != nil || got.CreatedByUsername == nil || *got.CreatedByUsername != "dev" {
+		t.Fatalf("get job creator name: %v %+v", err, got)
+	}
+	if list, err := s.ListJobs(ctx, JobFilter{}); err != nil || len(list) != 1 || list[0].CreatedByUsername == nil || *list[0].CreatedByUsername != "dev" {
+		t.Fatalf("list job creator name: %v %+v", err, list)
+	}
 	if err := s.DeleteAccount(ctx, admin.ID, d.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +270,7 @@ func TestDeleteAccountCascadesAndNullsJobs(t *testing.T) {
 		t.Fatalf("token survived account deletion: %v", err)
 	}
 	j2, err := s.GetJob(ctx, j.ID)
-	if err != nil || j2.CreatedBy != nil {
+	if err != nil || j2.CreatedBy != nil || j2.CreatedByUsername != nil {
 		t.Fatalf("job creator not nulled: %v %+v", err, j2)
 	}
 }
@@ -354,7 +363,7 @@ func TestJobsAndReconcile(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
 	j1, err := s.CreateJob(ctx, NewJob{Kind: "project.pull", SubjectType: "project", SubjectID: "1"})
-	if err != nil || j1.Status != JobQueued {
+	if err != nil || j1.Status != JobQueued || j1.CreatedByUsername != nil {
 		t.Fatalf("create: %v %+v", err, j1)
 	}
 	if err := s.MarkJobRunning(ctx, j1.ID); err != nil {

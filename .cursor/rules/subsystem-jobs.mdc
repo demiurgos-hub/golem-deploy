@@ -11,5 +11,6 @@ alwaysApply: false
 - Status transitions are persisted (`queued`, `running`, then `success`, `error` or `cancelled`); final writes use a background context so they survive shutdown.
 - `Done(id)` closes when the job leaves this process; the log follow endpoint uses it to end streams.
 - Access: `restricted` jobs (set by `httpapi.startJob` for admin routes) expose status and detail to developers but only admin sessions may read their log or cancel them; other logs are readable by any developer identity and cancellable by the creator or an admin (`httpapi.authorizeJob`). `?follow=1` streams are capped per account.
+- `Job.created_by_username` is read with the job in one `LEFT JOIN accounts` query (`store.jobCols`/`jobFrom`; `INSERT ... RETURNING` uses a scalar subquery); it is null whenever `created_by` is. Never resolve creators per row.
 - Job kinds and subject types are listed in `internal/apitypes/jobs.go`; add new ones there.
 - Verify with `go test ./internal/jobs/... ./internal/httpapi/...`.

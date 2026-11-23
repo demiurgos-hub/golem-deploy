@@ -32,17 +32,18 @@ func toAPIToken(t store.APIToken) apitypes.APIToken {
 
 func toAPIJob(j store.Job) apitypes.Job {
 	return apitypes.Job{
-		ID:          j.ID,
-		Kind:        apitypes.JobKind(j.Kind),
-		SubjectType: apitypes.SubjectType(j.SubjectType),
-		SubjectID:   j.SubjectID,
-		Status:      apitypes.JobStatus(j.Status),
-		Detail:      j.Detail,
-		Restricted:  j.Restricted,
-		CreatedBy:   j.CreatedBy,
-		CreatedAt:   j.CreatedAt.UTC(),
-		StartedAt:   utcPtr(j.StartedAt),
-		FinishedAt:  utcPtr(j.FinishedAt),
+		ID:                j.ID,
+		Kind:              apitypes.JobKind(j.Kind),
+		SubjectType:       apitypes.SubjectType(j.SubjectType),
+		SubjectID:         j.SubjectID,
+		Status:            apitypes.JobStatus(j.Status),
+		Detail:            j.Detail,
+		Restricted:        j.Restricted,
+		CreatedBy:         j.CreatedBy,
+		CreatedByUsername: j.CreatedByUsername,
+		CreatedAt:         j.CreatedAt.UTC(),
+		StartedAt:         utcPtr(j.StartedAt),
+		FinishedAt:        utcPtr(j.FinishedAt),
 	}
 }
 

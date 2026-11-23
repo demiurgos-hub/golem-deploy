@@ -303,6 +303,20 @@ func TestStatusAndSettings(t *testing.T) {
 	if s := decode[apitypes.Settings](t, h.do("GET", "/api/v1/settings", tok, nil)); s.RegistrationEnabled {
 		t.Fatal("registration enabled by default")
 	}
+	// The public auth options follow the setting and reveal nothing else.
+	opts := h.do("GET", "/api/v1/auth/options", "", nil)
+	if opts.Code != http.StatusOK || strings.TrimSpace(opts.Body.String()) != `{"registration_enabled":false}` {
+		t.Fatalf("auth options %d %s", opts.Code, opts.Body.String())
+	}
+	if s := decode[apitypes.Settings](t, h.do("PATCH", "/api/v1/settings", tok, `{"registration_enabled":true}`)); !s.RegistrationEnabled {
+		t.Fatal("enable registration")
+	}
+	if o := decode[apitypes.AuthOptions](t, h.do("GET", "/api/v1/auth/options", "", nil)); !o.RegistrationEnabled {
+		t.Fatal("auth options did not follow the setting")
+	}
+	if s := decode[apitypes.Settings](t, h.do("PATCH", "/api/v1/settings", tok, `{"registration_enabled":false}`)); s.RegistrationEnabled {
+		t.Fatal("disable registration")
+	}
 	errBody(t, h.do("PATCH", "/api/v1/settings", tok, `{"registration_enabled":"yes"}`), http.StatusBadRequest, apitypes.ErrorCodeBadRequest)
 	if s := decode[apitypes.Settings](t, h.do("PATCH", "/api/v1/settings", tok, `{}`)); s.RegistrationEnabled {
 		t.Fatal("empty patch changed settings")
@@ -331,7 +345,7 @@ func TestJobEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.CreatedBy == nil || *job.CreatedBy != dev.ID || job.SubjectID != "7" || job.Kind != apitypes.JobKindProjectPull || job.Restricted {
+	if job.CreatedBy == nil || *job.CreatedBy != dev.ID || job.CreatedByUsername == nil || *job.CreatedByUsername != "dev1" || job.SubjectID != "7" || job.Kind != apitypes.JobKindProjectPull || job.Restricted {
 		t.Fatalf("job %+v", job)
 	}
 	_, err = h.srv.startJob(req, apitypes.JobKindProjectPull, apitypes.SubjectTypeProject, 7, func(context.Context, io.Writer) error { return nil })
@@ -346,7 +360,7 @@ func TestJobEndpoints(t *testing.T) {
 		t.Fatalf("get %+v", got)
 	}
 	list := decode[apitypes.JobList](t, h.do("GET", "/api/v1/jobs?subject_type=project&subject_id=7&limit=10", tok, nil))
-	if len(list.Items) != 1 {
+	if len(list.Items) != 1 || list.Items[0].CreatedByUsername == nil || *list.Items[0].CreatedByUsername != "dev1" {
 		t.Fatalf("list %+v", list)
 	}
 	errBody(t, h.do("GET", "/api/v1/jobs?limit=0", tok, nil), http.StatusBadRequest, apitypes.ErrorCodeBadRequest)
@@ -413,7 +427,7 @@ func TestCancelJobViaHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.CreatedBy != nil || !job.Restricted {
+	if job.CreatedBy != nil || job.CreatedByUsername != nil || !job.Restricted {
 		t.Fatalf("system job %+v: want no creator and restricted", job)
 	}
 	<-started

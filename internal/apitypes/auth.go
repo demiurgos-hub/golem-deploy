@@ -27,6 +27,13 @@ type RegisterRequest struct {
 	Password string `json:"password"`
 }
 
+// AuthOptions is the body of GET /api/v1/auth/options (public): what the
+// login page needs to know before anyone has signed in.
+type AuthOptions struct {
+	// RegistrationEnabled reports whether POST /api/v1/auth/register is open.
+	RegistrationEnabled bool `json:"registration_enabled"`
+}
+
 // SessionResponse is returned by login, refresh and password change. Send the
 // token as "Authorization: Bearer <token>". Refresh before ExpiresAt; after
 // SessionExpiresAt (the absolute session lifetime) a fresh login is required.
