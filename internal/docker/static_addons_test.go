@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	apiTypes "github.com/demiurgos-hub/golem-deploy/internal/api"
 	"github.com/demiurgos-hub/golem-deploy/internal/utils"
 )
 
@@ -47,7 +46,7 @@ func TestValidateStaticAddons(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cleaned, paths, err := ValidateStaticAddons([]apiTypes.StaticAddon{
+	cleaned, paths, err := ValidateStaticAddons([]StaticAddon{
 		{Filename: "a.zip", ExtractTo: "secondary-server"},
 		{Filename: "b.zip", ExtractTo: "addons/extra"},
 	})
@@ -61,26 +60,26 @@ func TestValidateStaticAddons(t *testing.T) {
 		t.Fatalf("expected cleaned nested path, got %q", cleaned[1].ExtractTo)
 	}
 
-	if _, _, err := ValidateStaticAddons([]apiTypes.StaticAddon{
+	if _, _, err := ValidateStaticAddons([]StaticAddon{
 		{Filename: "missing.zip", ExtractTo: "x"},
 	}); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("expected missing archive error, got %v", err)
 	}
 
-	if _, _, err := ValidateStaticAddons([]apiTypes.StaticAddon{
+	if _, _, err := ValidateStaticAddons([]StaticAddon{
 		{Filename: "readme.txt", ExtractTo: "x"},
 	}); err == nil || !strings.Contains(err.Error(), ".zip") {
 		t.Fatalf("expected non-zip error, got %v", err)
 	}
 
-	if _, _, err := ValidateStaticAddons([]apiTypes.StaticAddon{
+	if _, _, err := ValidateStaticAddons([]StaticAddon{
 		{Filename: "a.zip", ExtractTo: "same"},
 		{Filename: "b.zip", ExtractTo: "same"},
 	}); err == nil || !strings.Contains(err.Error(), "duplicate extract_to") {
 		t.Fatalf("expected duplicate extract_to error, got %v", err)
 	}
 
-	rootAddons, _, err := ValidateStaticAddons([]apiTypes.StaticAddon{
+	rootAddons, _, err := ValidateStaticAddons([]StaticAddon{
 		{Filename: "a.zip", ExtractTo: ""},
 		{Filename: "b.zip", ExtractTo: "."},
 	})
@@ -91,14 +90,14 @@ func TestValidateStaticAddons(t *testing.T) {
 		t.Fatalf("root destinations should normalize to dot: %+v", rootAddons)
 	}
 
-	if _, _, err := ValidateStaticAddons([]apiTypes.StaticAddon{
+	if _, _, err := ValidateStaticAddons([]StaticAddon{
 		{Filename: "a.zip", ExtractTo: "one"},
 		{Filename: "a.zip", ExtractTo: "two"},
 	}); err == nil || !strings.Contains(err.Error(), "duplicate archive") {
 		t.Fatalf("expected duplicate archive error, got %v", err)
 	}
 
-	if _, _, err := ValidateStaticAddons([]apiTypes.StaticAddon{
+	if _, _, err := ValidateStaticAddons([]StaticAddon{
 		{Filename: "a.zip", ExtractTo: "foo"},
 		{Filename: "b.zip", ExtractTo: filepath.Join("foo", "bar")},
 	}); err == nil || !strings.Contains(err.Error(), "nested") {
@@ -107,7 +106,7 @@ func TestValidateStaticAddons(t *testing.T) {
 }
 
 func TestStaticAddonFilenames(t *testing.T) {
-	addons := []apiTypes.StaticAddon{
+	addons := []StaticAddon{
 		{Filename: "unity.zip", ExtractTo: "secondary-server"},
 		{Filename: ""},
 	}

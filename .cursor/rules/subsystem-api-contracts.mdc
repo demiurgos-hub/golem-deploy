@@ -1,16 +1,14 @@
 ---
-description: Shared HTTP types, response envelopes, and filesystem validation
-globs: "{internal/api/**/*.go,internal/utils/**/*.go,frontend/src/api/**/*.ts,docs/API.md}"
+description: HTTP wire types, generated TypeScript types and the API document
+globs: "{internal/apitypes/**/*.go,docs/API.md,tygo.yaml,scripts/gen-types.sh,frontend/src/api/types.gen.ts}"
 alwaysApply: false
 ---
 
-# API contracts and utilities
+# API contracts
 
-- `internal/api` holds the Go wire types. `frontend/src/api/types.ts` is a hand-maintained TypeScript mirror and `frontend/src/api/client.ts` the only web caller; update both and `docs/API.md` when wire fields or endpoint behavior change.
-- Prefer `utils.SuccessResponse`, `utils.ErrorResponse`, and `utils.WriteJSON`. The standard envelope uses `status` and error `detail`; retain legacy `message` only where a client still consumes it.
-- Upload and path safety belongs in `internal/utils` (size limits, directory containment, static-archive and `extract_to` validation). `utils.Init` creates the upload directories during startup.
-- Keep transport types free of UI-only state and avoid exposing filesystem paths, credentials, tokens, or secrets.
-- API token wire types are `APIToken`, `CreateAPITokenRequest`, `CreateAPITokenResponse`, `ListAPITokensResponse`, and `RevokeAPITokenRequest`. `POST /account/tokens` returns the plaintext secret once; list and revoke never include it.
-- Repo job wire types are `RepoJob` and `RepoJobResponse`. `GET /repo/job?job_id=` returns the job; unknown ids are 404. Pull and branch start envelopes include `job_id`.
-- Mass-run execute types are `ExecuteMassRunRequest` (`image_name`), `MassRunExecuteFailure`, and `ExecuteMassRunResponse` (`status`, `started`, `failed[]`). `POST /massrun/execute` returns 400 for a missing image or empty preset list; mixed failures stay HTTP 200.
-- `StaticAddon` (`filename` + `extract_to`) is used by the static add-on library only; no route accepts it yet.
+- `internal/apitypes` is the contract: wire types only, standard library only, doc comments on everything (they are copied into the TypeScript). `frontend/src/api/types.gen.ts` is generated from it by `scripts/gen-types.sh` (tygo, version pinned in the script, config in `tygo.yaml`); CI fails if it is stale. Never edit the generated file.
+- Enum-like constants must be named `<TypeName><Value>` (e.g. `ErrorCodeNotFound`, `JobStatusQueued`) so tygo emits TypeScript unions.
+- Pointer fields: with `omitempty` they are optional request fields; without it they are nullable response fields and need `tstype:"T | null,required"` (`TestNullableFieldsAreTyped` enforces this).
+- Conventions (see `docs/API.md`): resources returned bare, collections as `{items: []}` and never null, RFC 3339 UTC timestamps, one error envelope `{error:{code,message,request_id,field?}}` with stable snake_case `ErrorCode`s. A new error code goes here, in the API doc table, and into the regenerated file.
+- No type may carry a stored secret (password hash, token hash, Git credential, env value) back to clients. Write-only secret inputs (`ProjectAuth`, server env) never appear in responses.
+- Routes not built yet are documented as "planned (task B/C)"; when implementing one, keep the existing type shapes or update the doc, types and generated file together.

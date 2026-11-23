@@ -59,6 +59,11 @@ jobs:
           check-latest: true
           cache-dependency-path: go.sum
 
+      - name: Generated TypeScript types are up to date
+        run: |
+          sh scripts/gen-types.sh
+          git diff --exit-code -- frontend/src/api/types.gen.ts
+
       - name: go vet
         run: go vet ./...
 

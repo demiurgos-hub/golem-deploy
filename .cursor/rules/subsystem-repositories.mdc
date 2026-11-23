@@ -1,16 +1,13 @@
 ---
-description: Git repository checkout workflow
-globs: "{internal/git/**/*.go,internal/handlers/repo/**/*.go,internal/database/repository.go,frontend/src/pages/repositories.tsx,docs/REPOSITORY_MANAGEMENT.md}"
+description: Git checkout library and the planned projects API
+globs: "{internal/git/**/*.go,internal/store/projects.go}"
 alwaysApply: false
 ---
 
-# Repository management
+# Repositories and projects
 
-- Repository handlers coordinate persistence in `internal/database` with checkout operations in `internal/git` (native `git` via `os/exec`). There is no build step.
-- Local checkouts live below `repositories/`; validate names and derived paths before filesystem or command operations.
-- Git operations depend on host Git/LFS, SSH configuration, and credentials. Never expose stored authentication fields in responses or logs.
-- Pull and branch start responses include `job_id`. Agents poll `GET /repo/job?job_id=` until the job is `success` or `error`; failure `detail` is the terminal error text.
-- Persist a `repo_jobs` row as `running` before starting the goroutine. If the goroutine cannot start after insert, mark the job `error`.
-- Those operations still update `repositories.status` (`idle`, `cloning`, `pulling`, `error`) asynchronously for UI labels; preserve terminal status on every exit path.
-- Schema or status changes require checking the Repositories page, `docs/REPOSITORY_MANAGEMENT.md`, and `docs/API.md`.
-- Verify with `go test ./internal/handlers/repo/... ./internal/database/...`.
+- `internal/git` (clone, pull, branch via the host `git` binary) is legacy code kept compiling but **not wired to any HTTP route**; task B hardens it and implements the planned `/api/v1/projects` routes (types in `internal/apitypes/projects.go`, table `projects`, store methods in `internal/store/projects.go`).
+- Checkouts belong under the data directory's `repositories/` (`datadir.Layout.Repositories()`), never relative to the working directory. Validate names and derived paths before filesystem or command operations.
+- Clone, pull and branch switches run as jobs (`project.clone`, `project.pull`, `project.branch`) with subject `("project", id)`; update the project's transient status (`cloning`, `pulling`, `switching_branch`) and restore a terminal one on every exit path.
+- Credentials are stored encrypted in `projects.auth_secret` (purpose `secrets.ProjectAuthPurpose(id)`) and never returned, logged or written to job logs; responses expose only `auth_type`, `auth_username` and `has_secret`.
+- Verify with `go test ./internal/git/... ./internal/store/...`.

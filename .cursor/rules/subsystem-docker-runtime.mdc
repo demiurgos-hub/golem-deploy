@@ -1,15 +1,12 @@
 ---
-description: Docker image, container, and volume integration
-globs: "{internal/docker/**/*.go,internal/volumes/**/*.go,internal/handlers/docker/**/*.go,internal/handlers/status.go}"
+description: Docker image, container and volume library (not wired to HTTP)
+globs: "{internal/docker/**/*.go,internal/volumes/**/*.go}"
 alwaysApply: false
 ---
 
-# Docker runtime
+# Docker runtime library
 
-- Docker operations shell out to the host `docker` CLI; there is no Docker SDK abstraction. `docker.CheckDockerInstalled` is the only host check; Golem Deploy never installs Docker.
-- `internal/docker` owns image listing/deletion and container lifecycle; `internal/volumes` owns managed volumes. HTTP translation belongs under `internal/handlers/docker`.
-- Containers get the label `docker.LabelKey` (`dev.golemengine.deploy.label`, default `default`). `container.RunFromRequest` wraps `docker.RunContainer` and is shared by `POST /docker/container/run` and `POST /massrun/execute`. Containers currently run without a volume.
-- Managed volumes are named `golem-deploy-<container>-data` and labelled `dev.golemengine.deploy.container` / `.created`; volume routes only see volumes with the container label. `volumes.CreateVolume` has no caller yet.
-- `static_addons.go` validates and extracts static-store ZIP add-ons into a build context (see the static add-ons rule). No image-build route exists yet.
-- Container request or response changes must be reflected in shared API types, mass-run presets, the web client, and `docs/API.md`.
-- Verify with `go test ./internal/docker/...` (no Docker daemon required for unit tests).
+- `internal/docker` (images, containers, static add-ons) and `internal/volumes` (managed volumes) shell out to the host `docker` CLI. They are legacy code kept compiling but **not wired to any HTTP route**; task C replaces them with the Docker runner behind the planned `/api/v1/servers`, `/images` and `/volumes` routes (types in `internal/apitypes/servers.go` and `host.go`).
+- Do not wire these packages to HTTP as they are: they print to stdout, return raw command output in errors and do not validate inputs. Errors from Docker must reach clients only as safe messages (see the HTTP API rule).
+- `GET /api/v1/status` checks Docker reachability with its own cached probe in `internal/daemon`, not with this package.
+- Verify with `go test ./internal/docker/... ./internal/volumes/...` (no Docker daemon required).

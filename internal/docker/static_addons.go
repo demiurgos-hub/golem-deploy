@@ -5,19 +5,18 @@ import (
 	"os"
 	"strings"
 
-	apiTypes "github.com/demiurgos-hub/golem-deploy/internal/api"
 	"github.com/demiurgos-hub/golem-deploy/internal/extract"
 	"github.com/demiurgos-hub/golem-deploy/internal/utils"
 )
 
 // ValidateStaticAddons validates static archive add-ons for an image build request.
 // It returns cleaned add-ons (normalized extract_to) and the resolved ZIP paths.
-func ValidateStaticAddons(addons []apiTypes.StaticAddon) ([]apiTypes.StaticAddon, []string, error) {
+func ValidateStaticAddons(addons []StaticAddon) ([]StaticAddon, []string, error) {
 	if len(addons) == 0 {
 		return nil, nil, nil
 	}
 
-	cleaned := make([]apiTypes.StaticAddon, 0, len(addons))
+	cleaned := make([]StaticAddon, 0, len(addons))
 	zipPaths := make([]string, 0, len(addons))
 	seenFiles := make(map[string]struct{}, len(addons))
 	seenDests := make(map[string]struct{}, len(addons))
@@ -47,7 +46,7 @@ func ValidateStaticAddons(addons []apiTypes.StaticAddon) ([]apiTypes.StaticAddon
 		seenFiles[filename] = struct{}{}
 		seenDests[extractTo] = struct{}{}
 
-		cleaned = append(cleaned, apiTypes.StaticAddon{
+		cleaned = append(cleaned, StaticAddon{
 			Filename:  filename,
 			ExtractTo: extractTo,
 		})
@@ -77,7 +76,7 @@ func ValidateStaticAddons(addons []apiTypes.StaticAddon) ([]apiTypes.StaticAddon
 
 // ApplyStaticAddons extracts validated static ZIP add-ons into the build context.
 // Archives are read from the static store and are not left in the context.
-func ApplyStaticAddons(contextDir string, addons []apiTypes.StaticAddon, zipPaths []string) error {
+func ApplyStaticAddons(contextDir string, addons []StaticAddon, zipPaths []string) error {
 	if len(addons) == 0 {
 		return nil
 	}
@@ -94,7 +93,7 @@ func ApplyStaticAddons(contextDir string, addons []apiTypes.StaticAddon, zipPath
 }
 
 // StaticAddonFilenames returns the archive filenames for exclusion from loose static copies.
-func StaticAddonFilenames(addons []apiTypes.StaticAddon) []string {
+func StaticAddonFilenames(addons []StaticAddon) []string {
 	if len(addons) == 0 {
 		return nil
 	}

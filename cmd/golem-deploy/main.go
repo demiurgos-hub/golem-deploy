@@ -1,228 +1,221 @@
+// Command golem-deploy is the Golem Deploy daemon and its local admin CLI.
+//
+//	golem-deploy serve [flags]
+//	golem-deploy admin create --username <u> [--password-stdin] [--data-dir <dir>]
+//	golem-deploy admin reset-password --username <u> [--password-stdin] [--data-dir <dir>]
+//	golem-deploy version
 package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
+	"flag"
 	"fmt"
-	"log"
-	"net/http"
+	"io"
+	"log/slog"
 	"os"
+	"os/signal"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/demiurgos-hub/golem-deploy/frontend"
-	"github.com/demiurgos-hub/golem-deploy/internal/config"
-	"github.com/demiurgos-hub/golem-deploy/internal/database"
-	"github.com/demiurgos-hub/golem-deploy/internal/handlers"
-	"github.com/demiurgos-hub/golem-deploy/internal/handlers/account"
-	"github.com/demiurgos-hub/golem-deploy/internal/handlers/docker/container"
-	"github.com/demiurgos-hub/golem-deploy/internal/handlers/docker/image"
-	"github.com/demiurgos-hub/golem-deploy/internal/handlers/docker/volume"
-	"github.com/demiurgos-hub/golem-deploy/internal/handlers/massrun"
-	"github.com/demiurgos-hub/golem-deploy/internal/handlers/repo"
-	"github.com/demiurgos-hub/golem-deploy/internal/handlers/static"
-	"github.com/demiurgos-hub/golem-deploy/internal/middleware"
-	"github.com/demiurgos-hub/golem-deploy/internal/utils"
-
 	"golang.org/x/term"
+
+	"github.com/demiurgos-hub/golem-deploy/frontend"
+	"github.com/demiurgos-hub/golem-deploy/internal/daemon"
 )
 
+// version is set at build time with -ldflags "-X main.version=v1.2.3".
+var version = ""
+
+func buildVersion() string {
+	if version != "" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return "dev"
+}
+
+const usage = `Usage:
+  golem-deploy serve [flags]                 run the daemon
+  golem-deploy admin create --username <u>   create an approved admin account
+  golem-deploy admin reset-password --username <u>
+                                             set a new password (ends the account's sessions)
+  golem-deploy version                       print the version
+
+Run "golem-deploy <command> -h" for the flags of a command.
+`
+
 func main() {
-	// Load configuration
-	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = "./config.yaml"
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprint(stderr, usage)
+		return 2
 	}
-	if err := config.Init(configPath); err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
-	}
-
-	// Initialize database
-	dbPath := os.Getenv("DB_PATH")
-	if dbPath == "" {
-		dbPath = "./data/accounts.db"
-	}
-	if err := database.Init(dbPath); err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
-	}
-	defer database.Close()
-
-	// Initialize mass run database
-	massRunDBPath := os.Getenv("MASSRUN_DB_PATH")
-	if massRunDBPath == "" {
-		massRunDBPath = "./data/massrun.db"
-	}
-	if err := database.InitMassRun(massRunDBPath); err != nil {
-		log.Fatalf("Failed to initialize mass run database: %v", err)
-	}
-	defer database.CloseMassRun()
-
-	// Set JWT secret from config
-	middleware.SetJWTSecret(config.Global.JWTSecret)
-
-	// Check if any accounts exist, if not, prompt for admin account creation
-	hasAccounts, err := database.HasAccounts()
-	if err != nil {
-		log.Fatalf("Failed to check accounts: %v", err)
-	}
-	if !hasAccounts {
-		fmt.Println("\033[33m=== First Time Setup ===\033[0m")
-		fmt.Println("No accounts found. Create your first admin account now.")
-		fmt.Println()
-		if err := promptCreateAdminAccount(); err != nil {
-			log.Fatalf("Failed to create admin account: %v", err)
-		}
-		fmt.Println("\033[32m✓ Admin account created successfully!\033[0m")
-		fmt.Println()
-	}
-
-	// Initialize the uploads directory (static file store)
-	if err := utils.Init(); err != nil {
-		log.Fatalf("Failed to initialize: %v", err)
-	}
-
-	// Register HTTP handlers
-	// Public endpoints (no authentication required)
-	http.HandleFunc("/login", handlers.LoginHandler)
-
-	// Protected endpoints (authentication required)
-	http.HandleFunc("/status", middleware.AuthMiddleware(handlers.StatusHandler))
-
-	// Public account endpoints
-	http.HandleFunc("/account/create", account.CreateHandler)
-
-	// Protected account endpoints
-	http.HandleFunc("/account/refresh", middleware.AuthMiddleware(account.RefreshHandler))
-	http.HandleFunc("/account/password", middleware.AuthMiddleware(account.PasswordHandler))
-	http.HandleFunc("/account/delete", middleware.AuthMiddleware(account.DeleteHandler))
-	http.HandleFunc("/account/approve", middleware.AuthMiddleware(account.ApproveHandler))
-	http.HandleFunc("/account/unapproved", middleware.AuthMiddleware(account.ListUnapprovedHandler))
-	http.HandleFunc("/account/list", middleware.AuthMiddleware(account.ListAllHandler))
-	http.HandleFunc("/account/tokens", middleware.AuthMiddleware(account.TokensHandler))
-	http.HandleFunc("/account/tokens/revoke", middleware.AuthMiddleware(account.RevokeTokenHandler))
-
-	// Static file endpoints
-	http.HandleFunc("/build/static/upload", middleware.AuthMiddleware(static.UploadHandler))
-	http.HandleFunc("/build/static/list", middleware.AuthMiddleware(static.ListHandler))
-	http.HandleFunc("/build/static/delete", middleware.AuthMiddleware(static.DeleteHandler))
-	http.HandleFunc("/build/static/download", middleware.AuthMiddleware(static.DownloadHandler))
-
-	http.HandleFunc("/docker/image/list", middleware.AuthMiddleware(image.ListHandler))
-	http.HandleFunc("/docker/image/delete", middleware.AuthMiddleware(image.DeleteHandler))
-
-	http.HandleFunc("/docker/container/run", middleware.AuthMiddleware(container.RunHandler))
-	http.HandleFunc("/docker/container/start", middleware.AuthMiddleware(container.StartHandler))
-	http.HandleFunc("/docker/container/stop", middleware.AuthMiddleware(container.StopHandler))
-	http.HandleFunc("/docker/container/delete", middleware.AuthMiddleware(container.DeleteHandler))
-	http.HandleFunc("/docker/container/list", middleware.AuthMiddleware(container.ListHandler))
-	http.HandleFunc("/docker/container/logs", middleware.AuthMiddleware(container.LogsHandler))
-	http.HandleFunc("/docker/container/processes", middleware.AuthMiddleware(container.ProcessesHandler))
-
-	http.HandleFunc("/docker/volume/list", middleware.AuthMiddleware(volume.ListHandler))
-	http.HandleFunc("/docker/volume/orphaned", middleware.AuthMiddleware(volume.OrphanedHandler))
-	http.HandleFunc("/docker/volume/delete", middleware.AuthMiddleware(volume.DeleteHandler))
-	http.HandleFunc("/docker/volume/info", middleware.AuthMiddleware(volume.InfoHandler))
-
-	http.HandleFunc("/massrun/add", middleware.AuthMiddleware(massrun.AddHandler))
-	http.HandleFunc("/massrun/edit", middleware.AuthMiddleware(massrun.EditHandler))
-	http.HandleFunc("/massrun/list", middleware.AuthMiddleware(massrun.ListHandler))
-	http.HandleFunc("/massrun/delete", middleware.AuthMiddleware(massrun.DeleteHandler))
-	http.HandleFunc("/massrun/replace", middleware.AuthMiddleware(massrun.ReplaceHandler))
-	http.HandleFunc("/massrun/execute", middleware.AuthMiddleware(massrun.ExecuteHandler))
-
-	// Repository endpoints
-	http.HandleFunc("/repo/add", middleware.AuthMiddleware(repo.AddHandler))
-	http.HandleFunc("/repo/list", middleware.AuthMiddleware(repo.ListHandler))
-	http.HandleFunc("/repo/pull", middleware.AuthMiddleware(repo.PullHandler))
-	http.HandleFunc("/repo/delete", middleware.AuthMiddleware(repo.DeleteHandler))
-	http.HandleFunc("/repo/branch", middleware.AuthMiddleware(repo.BranchHandler))
-	http.HandleFunc("/repo/job", middleware.AuthMiddleware(repo.JobHandler))
-
-	// Serve the embedded frontend for all other routes (SPA fallback)
-	http.Handle("/", frontend.Handler())
-
-	// Get certificate paths from environment variables
-	certFile := os.Getenv("TLS_CERT_FILE")
-	keyFile := os.Getenv("TLS_KEY_FILE")
-
-	// If certificates are not provided, fall back to HTTP (for development only)
-	if certFile == "" || keyFile == "" {
-		log.Println("\033[31mWARNING: TLS certificates not configured. Running in HTTP mode (NOT RECOMMENDED FOR PRODUCTION)\033[0m")
-		log.Println("\033[31mSet TLS_CERT_FILE and TLS_KEY_FILE environment variables to enable HTTPS\033[0m")
-
-		// Listen on all interfaces on port 8000
-		fmt.Println("Listening on :8000 (HTTP)")
-
-		if err := http.ListenAndServe(":8000", nil); err != nil {
-			log.Fatalf("Failed to start server: %v", err)
-		}
-	} else {
-		// Verify certificate files exist
-		if _, err := os.Stat(certFile); os.IsNotExist(err) {
-			log.Fatalf("TLS certificate file not found: %s", certFile)
-		}
-		if _, err := os.Stat(keyFile); os.IsNotExist(err) {
-			log.Fatalf("TLS key file not found: %s", keyFile)
-		}
-
-		// Listen on HTTPS (port 8000)
-		fmt.Println("Listening on :8000 (HTTPS)")
-		fmt.Printf("Using TLS certificate: %s\n", certFile)
-		fmt.Printf("Using TLS key: %s\n", keyFile)
-
-		if err := http.ListenAndServeTLS(":8000", certFile, keyFile, nil); err != nil {
-			log.Fatalf("Failed to start HTTPS server: %v", err)
-		}
+	switch args[0] {
+	case "serve":
+		return cmdServe(args[1:], stderr)
+	case "admin":
+		return cmdAdmin(args[1:], stdin, stdout, stderr)
+	case "version", "--version":
+		fmt.Fprintln(stdout, buildVersion())
+		return 0
+	case "help", "-h", "--help":
+		fmt.Fprint(stdout, usage)
+		return 0
+	default:
+		fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], usage)
+		return 2
 	}
 }
 
-// promptCreateAdminAccount interactively prompts the user to create an admin account
-func promptCreateAdminAccount() error {
-	reader := bufio.NewReader(os.Stdin)
+func envDefault(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return def
+}
 
-	// Prompt for username
-	fmt.Print("Enter admin username: ")
-	username, err := reader.ReadString('\n')
+func envBool(key string) (bool, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
 	if err != nil {
-		return fmt.Errorf("failed to read username: %w", err)
+		return false, fmt.Errorf("%s: invalid boolean %q", key, v)
 	}
-	username = strings.TrimSpace(username)
+	return b, nil
+}
 
-	if username == "" {
-		return fmt.Errorf("username cannot be empty")
-	}
+func dataDirFlag(fs *flag.FlagSet) *string {
+	return fs.String("data-dir", envDefault("GOLEM_DEPLOY_DATA_DIR", "./data"), "data directory (env GOLEM_DEPLOY_DATA_DIR)")
+}
 
-	// Prompt for password (hidden)
-	fmt.Print("Enter password (min 8 characters): ")
-	passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
+func cmdServe(args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	insecureDefault, err := envBool("GOLEM_DEPLOY_INSECURE_HTTP")
 	if err != nil {
-		return fmt.Errorf("failed to read password: %w", err)
+		fmt.Fprintln(stderr, err)
+		return 2
 	}
-	password := string(passwordBytes)
-	fmt.Println() // New line after password input
-
-	// Validate password length
-	if len(password) < 8 {
-		return fmt.Errorf("password must be at least 8 characters long")
+	dataDir := dataDirFlag(fs)
+	listen := fs.String("listen", envDefault("GOLEM_DEPLOY_LISTEN", "127.0.0.1:8000"), "listen address (env GOLEM_DEPLOY_LISTEN)")
+	tlsCert := fs.String("tls-cert", envDefault("GOLEM_DEPLOY_TLS_CERT", ""), "TLS certificate file (env GOLEM_DEPLOY_TLS_CERT)")
+	tlsKey := fs.String("tls-key", envDefault("GOLEM_DEPLOY_TLS_KEY", ""), "TLS private key file (env GOLEM_DEPLOY_TLS_KEY)")
+	insecure := fs.Bool("insecure-http", insecureDefault, "allow plaintext HTTP on a non-loopback address, e.g. behind a TLS-terminating proxy (env GOLEM_DEPLOY_INSECURE_HTTP)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "serve: unexpected arguments %q\n", fs.Args())
+		return 2
 	}
 
-	// Prompt for password confirmation
-	fmt.Print("Confirm password: ")
-	confirmBytes, err := term.ReadPassword(int(syscall.Stdin))
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	err = daemon.Run(ctx, daemon.Options{
+		DataDir:      *dataDir,
+		Listen:       *listen,
+		TLSCert:      *tlsCert,
+		TLSKey:       *tlsKey,
+		InsecureHTTP: *insecure,
+		Version:      buildVersion(),
+		Logger:       logger,
+		SPA:          frontend.Handler(),
+	})
 	if err != nil {
-		return fmt.Errorf("failed to read password confirmation: %w", err)
+		logger.Error("golem-deploy failed", "err", err)
+		return 1
 	}
-	confirm := string(confirmBytes)
-	fmt.Println() // New line after password input
+	return 0
+}
 
-	// Check if passwords match
-	if password != confirm {
-		return fmt.Errorf("passwords do not match")
+func cmdAdmin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprint(stderr, usage)
+		return 2
+	}
+	sub := args[0]
+	if sub != "create" && sub != "reset-password" {
+		fmt.Fprintf(stderr, "unknown admin command %q\n\n%s", sub, usage)
+		return 2
+	}
+	fs := flag.NewFlagSet("admin "+sub, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dataDir := dataDirFlag(fs)
+	username := fs.String("username", "", "account username (required)")
+	fromStdin := fs.Bool("password-stdin", false, "read the password from the first line of standard input instead of prompting")
+	if err := fs.Parse(args[1:]); err != nil {
+		return 2
+	}
+	if *username == "" || fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "admin %s: --username is required and no positional arguments are accepted\n", sub)
+		fs.Usage()
+		return 2
+	}
+	password, err := readPassword(stdin, stderr, *fromStdin)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
 	}
 
-	// Add account to database as admin (access_level=0) and approved
-	if err := database.AddAccount(username, password, 0, true); err != nil {
-		return fmt.Errorf("failed to add account: %w", err)
+	ctx := context.Background()
+	switch sub {
+	case "create":
+		acct, err := daemon.CreateAdmin(ctx, *dataDir, *username, password)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "created admin account %q (id %d)\n", acct.Username, acct.ID)
+	case "reset-password":
+		if err := daemon.ResetPassword(ctx, *dataDir, *username, password); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "password updated for %q; existing sessions have been ended\n", strings.ToLower(*username))
 	}
+	return 0
+}
 
-	return nil
+// readPassword reads the first line of stdin, or prompts twice on a
+// terminal.
+func readPassword(stdin io.Reader, stderr io.Writer, fromStdin bool) (string, error) {
+	if fromStdin {
+		line, err := bufio.NewReader(stdin).ReadString('\n')
+		if err != nil && !(errors.Is(err, io.EOF) && line != "") {
+			return "", errors.New("could not read a password from standard input")
+		}
+		return strings.TrimRight(line, "\r\n"), nil
+	}
+	f, ok := stdin.(*os.File)
+	if !ok || !term.IsTerminal(int(f.Fd())) {
+		return "", errors.New("standard input is not a terminal; use --password-stdin to pipe the password")
+	}
+	fmt.Fprint(stderr, "Password: ")
+	p1, err := term.ReadPassword(int(f.Fd()))
+	fmt.Fprintln(stderr)
+	if err != nil {
+		return "", fmt.Errorf("read password: %w", err)
+	}
+	fmt.Fprint(stderr, "Confirm password: ")
+	p2, err := term.ReadPassword(int(f.Fd()))
+	fmt.Fprintln(stderr)
+	if err != nil {
+		return "", fmt.Errorf("read password: %w", err)
+	}
+	if string(p1) != string(p2) {
+		return "", errors.New("passwords do not match")
+	}
+	return string(p1), nil
 }

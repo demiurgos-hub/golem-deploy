@@ -6,8 +6,6 @@ import (
 	"os/exec"
 	"strings"
 	"time"
-
-	"github.com/demiurgos-hub/golem-deploy/internal/api"
 )
 
 // Docker labels set on managed volumes. Listing is scoped to ContainerLabel.
@@ -68,7 +66,7 @@ func VolumeExists(volumeName string) bool {
 }
 
 // ListAllVolumes lists all Golem Deploy managed volumes
-func ListAllVolumes() ([]api.VolumeInfo, error) {
+func ListAllVolumes() ([]VolumeInfo, error) {
 	// Get all volumes carrying the managed container label
 	cmd := exec.Command("docker", "volume", "ls",
 		"--filter", "label="+ContainerLabel,
@@ -81,11 +79,11 @@ func ListAllVolumes() ([]api.VolumeInfo, error) {
 
 	outputStr := strings.TrimSpace(string(output))
 	if outputStr == "" {
-		return []api.VolumeInfo{}, nil
+		return []VolumeInfo{}, nil
 	}
 
 	lines := strings.Split(outputStr, "\n")
-	volumes := make([]api.VolumeInfo, 0, len(lines))
+	volumes := make([]VolumeInfo, 0, len(lines))
 
 	for _, line := range lines {
 		if line == "" {
@@ -116,11 +114,11 @@ func ListAllVolumes() ([]api.VolumeInfo, error) {
 }
 
 // getVolumeDetails retrieves detailed information about a volume
-func getVolumeDetails(volumeName string) (api.VolumeInfo, error) {
+func getVolumeDetails(volumeName string) (VolumeInfo, error) {
 	cmd := exec.Command("docker", "volume", "inspect", volumeName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return api.VolumeInfo{}, fmt.Errorf("failed to inspect volume: %w", err)
+		return VolumeInfo{}, fmt.Errorf("failed to inspect volume: %w", err)
 	}
 
 	// Parse JSON output (docker volume inspect returns an array)
@@ -133,11 +131,11 @@ func getVolumeDetails(volumeName string) (api.VolumeInfo, error) {
 	}
 
 	if err := json.Unmarshal(output, &inspectData); err != nil {
-		return api.VolumeInfo{}, fmt.Errorf("failed to parse volume inspect output: %w", err)
+		return VolumeInfo{}, fmt.Errorf("failed to parse volume inspect output: %w", err)
 	}
 
 	if len(inspectData) == 0 {
-		return api.VolumeInfo{}, fmt.Errorf("volume not found: %s", volumeName)
+		return VolumeInfo{}, fmt.Errorf("volume not found: %s", volumeName)
 	}
 
 	vol := inspectData[0]
@@ -152,7 +150,7 @@ func getVolumeDetails(volumeName string) (api.VolumeInfo, error) {
 		createdAt, _ = time.Parse(time.RFC3339, vol.Labels[CreatedLabel])
 	}
 
-	return api.VolumeInfo{
+	return VolumeInfo{
 		Name:          vol.Name,
 		Driver:        vol.Driver,
 		ContainerName: vol.Labels[ContainerLabel],
@@ -162,7 +160,7 @@ func getVolumeDetails(volumeName string) (api.VolumeInfo, error) {
 }
 
 // ListOrphanedVolumes lists volumes that don't have an associated running or stopped container
-func ListOrphanedVolumes() ([]api.VolumeInfo, error) {
+func ListOrphanedVolumes() ([]VolumeInfo, error) {
 	allVolumes, err := ListAllVolumes()
 	if err != nil {
 		return nil, err
@@ -185,7 +183,7 @@ func ListOrphanedVolumes() ([]api.VolumeInfo, error) {
 	}
 
 	// Filter volumes without associated containers
-	orphanedVolumes := make([]api.VolumeInfo, 0)
+	orphanedVolumes := make([]VolumeInfo, 0)
 	for _, vol := range allVolumes {
 		if !containerNames[vol.ContainerName] {
 			orphanedVolumes = append(orphanedVolumes, vol)
@@ -196,7 +194,7 @@ func ListOrphanedVolumes() ([]api.VolumeInfo, error) {
 }
 
 // GetVolumeInfo returns detailed information about a specific volume
-func GetVolumeInfo(volumeName string) (api.VolumeInfo, error) {
+func GetVolumeInfo(volumeName string) (VolumeInfo, error) {
 	info, err := getVolumeDetails(volumeName)
 	if err != nil {
 		return info, err

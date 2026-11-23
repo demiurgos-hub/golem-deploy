@@ -26,13 +26,7 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/login": "http://localhost:8000",
-      "/status": "http://localhost:8000",
-      "/account": "http://localhost:8000",
-      "/build": "http://localhost:8000",
-      "/docker": "http://localhost:8000",
-      "/massrun": "http://localhost:8000",
-      "/repo": "http://localhost:8000",
+      "/api": "http://127.0.0.1:8000",
     },
   },
 });

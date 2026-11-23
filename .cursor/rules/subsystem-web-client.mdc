@@ -7,10 +7,11 @@ alwaysApply: false
 # Web client
 
 - This is the only UI: React, TypeScript, Vite, Tailwind, Radix, and TanStack Query. `@tanstack/react-router` is installed but not used yet.
-- Keep backend calls in `src/api/client.ts`, wire types in `src/api/types.ts`, pages in `src/pages`, and reusable controls in `src/components`. Tabs are declared in `src/components/layout/dashboard-layout.tsx`.
-- Use relative API URLs in production. Keep Vite proxy prefixes synchronized with backend route families for development.
+- The daemon API is `/api/v1` (see `docs/API.md`). Wire types come from the generated `src/api/types.gen.ts` (do not edit; run `scripts/gen-types.sh`). The existing pages, `src/api/client.ts` and the hand-written `src/api/types.ts` still target the removed pre-v1 API and are broken at runtime until the frontend rewrite (task D) replaces them.
+- Use relative API URLs in production. The Vite dev server proxies `/api` to the daemon on `127.0.0.1:8000`.
+- Send credentials only as `Authorization: Bearer`; never rely on cookies. Stream job and server logs with `fetch` + `ReadableStream` (bearer header), not `EventSource`. Switch on `error.code` from the error envelope; on `unauthenticated` drop the token.
+- The daemon serves the SPA with a strict CSP (`script-src 'self'`, no inline scripts, `connect-src 'self'`); keep the build free of inline scripts and external origins.
 - Authentication state and token persistence are centralized in `src/hooks/use-auth.ts`; client-side JWT parsing is display gating, not authorization. Browser storage keys use the `golem_deploy_` prefix.
 - Reuse query invalidation and operation tracking instead of adding parallel request state.
 - `npm run lint` must pass with zero warnings; `npm run build` type-checks (`noUnusedLocals`) and produces `frontend/dist` for Go embedding.
 - Any backend contract change must be applied here.
-- Images-tab mass-run calls `executeMassRun(image_name)`; do not loop `runContainer` per preset.

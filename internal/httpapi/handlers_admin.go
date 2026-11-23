@@ -1,0 +1,177 @@
+package httpapi
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/auth"
+	"github.com/demiurgos-hub/golem-deploy/internal/store"
+)
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	settings, err := s.store.GetSettings(ctx)
+	if err != nil {
+		return internal(err)
+	}
+	projects, err := s.store.CountProjects(ctx)
+	if err != nil {
+		return internal(err)
+	}
+	servers, err := s.store.CountServers(ctx)
+	if err != nil {
+		return internal(err)
+	}
+	active, err := s.store.CountActiveJobs(ctx)
+	if err != nil {
+		return internal(err)
+	}
+	accts, err := s.store.CountAccounts(ctx)
+	if err != nil {
+		return internal(err)
+	}
+	reachable := s.docker != nil && s.docker.Reachable(ctx)
+	writeJSON(w, http.StatusOK, apitypes.Status{
+		Version:             s.cfg.Version,
+		DockerReachable:     reachable,
+		RegistrationEnabled: settings.RegistrationEnabled,
+		Counts: apitypes.StatusCounts{
+			Projects:        projects,
+			Servers:         servers,
+			ActiveJobs:      active,
+			PendingAccounts: accts.Pending,
+		},
+	})
+	return nil
+}
+
+func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) error {
+	st, err := s.store.GetSettings(r.Context())
+	if err != nil {
+		return internal(err)
+	}
+	writeJSON(w, http.StatusOK, apitypes.Settings{RegistrationEnabled: st.RegistrationEnabled})
+	return nil
+}
+
+func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) error {
+	var req apitypes.UpdateSettingsRequest
+	if err := decodeJSON(r, &req); err != nil {
+		return err
+	}
+	st, err := s.store.UpdateSettings(r.Context(), store.SettingsUpdate{RegistrationEnabled: req.RegistrationEnabled})
+	if err != nil {
+		return internal(err)
+	}
+	s.logger.Info("settings updated", "request_id", requestIDFrom(r.Context()), "account_id", identityFrom(r).Account.ID)
+	writeJSON(w, http.StatusOK, apitypes.Settings{RegistrationEnabled: st.RegistrationEnabled})
+	return nil
+}
+
+func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) error {
+	accts, err := s.store.ListAccounts(r.Context())
+	if err != nil {
+		return internal(err)
+	}
+	out := apitypes.AccountList{Items: make([]apitypes.Account, 0, len(accts))}
+	for _, a := range accts {
+		out.Items = append(out.Items, toAPIAccount(a))
+	}
+	writeJSON(w, http.StatusOK, out)
+	return nil
+}
+
+func parseRole(field string, r apitypes.Role) (store.Role, error) {
+	role := store.Role(r)
+	if !role.Valid() {
+		return "", invalidField(field, `role must be "admin" or "developer"`)
+	}
+	return role, nil
+}
+
+func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) error {
+	var req apitypes.CreateAccountRequest
+	if err := decodeJSON(r, &req); err != nil {
+		return err
+	}
+	username, err := auth.NormalizeUsername(req.Username)
+	if err != nil {
+		return invalidField("username", err.Error())
+	}
+	if err := auth.ValidatePassword(req.Password); err != nil {
+		return invalidField("password", err.Error())
+	}
+	role, err := parseRole("role", req.Role)
+	if err != nil {
+		return err
+	}
+	hash, err := s.hasher.Hash(req.Password)
+	if err != nil {
+		return internal(err)
+	}
+	acct, err := s.store.CreateAccount(r.Context(), store.NewAccount{Username: username, PasswordHash: hash, Role: role, Approved: req.Approved})
+	if errors.Is(err, store.ErrConflict) {
+		return conflict(apitypes.ErrorCodeUsernameTaken, "username is already taken")
+	}
+	if err != nil {
+		return internal(err)
+	}
+	s.logger.Info("account created", "request_id", requestIDFrom(r.Context()), "by", identityFrom(r).Account.ID, "account_id", acct.ID, "role", acct.Role)
+	writeJSON(w, http.StatusCreated, toAPIAccount(acct))
+	return nil
+}
+
+func accountChangeError(err error) error {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return notFound("account")
+	case errors.Is(err, store.ErrLastAdmin):
+		return conflict(apitypes.ErrorCodeLastAdmin, "at least one approved admin account must remain")
+	case errors.Is(err, store.ErrSelf):
+		return conflict(apitypes.ErrorCodeCannotModifySelf, "you cannot delete, demote or unapprove your own account")
+	}
+	return internal(err)
+}
+
+func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) error {
+	aid, err := pathID(r, "id")
+	if err != nil {
+		return err
+	}
+	var req apitypes.UpdateAccountRequest
+	if err := decodeJSON(r, &req); err != nil {
+		return err
+	}
+	var upd store.AccountUpdate
+	if req.Role != nil {
+		role, err := parseRole("role", *req.Role)
+		if err != nil {
+			return err
+		}
+		upd.Role = &role
+	}
+	upd.Approved = req.Approved
+	actor := identityFrom(r).Account.ID
+	acct, err := s.store.UpdateAccount(r.Context(), actor, aid, upd)
+	if err != nil {
+		return accountChangeError(err)
+	}
+	s.logger.Info("account updated", "request_id", requestIDFrom(r.Context()), "by", actor, "account_id", acct.ID, "role", acct.Role, "approved", acct.Approved)
+	writeJSON(w, http.StatusOK, toAPIAccount(acct))
+	return nil
+}
+
+func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) error {
+	aid, err := pathID(r, "id")
+	if err != nil {
+		return err
+	}
+	actor := identityFrom(r).Account.ID
+	if err := s.store.DeleteAccount(r.Context(), actor, aid); err != nil {
+		return accountChangeError(err)
+	}
+	s.logger.Info("account deleted", "request_id", requestIDFrom(r.Context()), "by", actor, "account_id", aid)
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}

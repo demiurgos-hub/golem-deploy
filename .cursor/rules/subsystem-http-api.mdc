@@ -1,0 +1,15 @@
+---
+description: HTTP server, route table, middleware and error envelope
+globs: "internal/httpapi/**/*.go"
+alwaysApply: false
+---
+
+# HTTP API layer
+
+- `routes.go` is the only place routes are declared: method, path under `/api/v1`, access level (`AccessPublic`, `AccessDeveloper`, `AccessSession`, `AccessAdmin`), handler and optional `maxBody`. `register` panics on a missing level; `routes_test.go` pins every route's level (`expectedRoutes`) and runs the identity-by-route matrix. Handlers never check roles.
+- Handlers have the signature `func(w, r) error` and return `*apiError` values (`respond.go`) or plain errors, which become 500 `internal_error` with the cause logged under the request id and never sent. Decode bodies with `decodeJSON` (strict, media type checked, body limit gives 413).
+- `dispatch` sends `/api/...` to the mux and renders its 404 and 405 as JSON; everything else goes to the SPA handler.
+- `outer` middleware: request id (`X-Request-Id`), access log (no query strings, bodies or credentials), panic recovery, security headers (strict CSP for the SPA, `default-src 'none'` and `no-store` for the API, HSTS only with TLS).
+- `Server.Serve` uses explicit timeouts; streaming handlers extend their write deadline per chunk with `http.ResponseController` and stop on client disconnect or `s.shutdown`. Upload handlers must extend the read deadline the same way.
+- Start jobs from handlers with `s.startJob` (busy subject gives 409 `job_in_progress`, shutdown gives 503) and respond 202 with the job. Encrypted columns use `s.secrets` with `secrets.ProjectAuthPurpose(id)` or `secrets.ServerEnvPurpose(id)`.
+- Verify with `go test ./internal/httpapi/...`.

@@ -4,12 +4,10 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
-
-	apiTypes "github.com/demiurgos-hub/golem-deploy/internal/api"
 )
 
 // ListDockerImages returns a list of all Docker images
-func ListDockerImages() ([]apiTypes.DockerImage, error) {
+func ListDockerImages() ([]DockerImage, error) {
 	// Use --format to get parseable output
 	cmd := exec.Command("docker", "images", "--format", "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}")
 	output, err := cmd.CombinedOutput()
@@ -20,11 +18,11 @@ func ListDockerImages() ([]apiTypes.DockerImage, error) {
 	outputStr := strings.TrimSpace(string(output))
 	if outputStr == "" {
 		// No images found
-		return []apiTypes.DockerImage{}, nil
+		return []DockerImage{}, nil
 	}
 
 	lines := strings.Split(outputStr, "\n")
-	images := make([]apiTypes.DockerImage, 0, len(lines))
+	images := make([]DockerImage, 0, len(lines))
 
 	for _, line := range lines {
 		if line == "" {
@@ -37,7 +35,7 @@ func ListDockerImages() ([]apiTypes.DockerImage, error) {
 				fields = append(fields, "")
 			}
 		}
-		images = append(images, apiTypes.DockerImage{
+		images = append(images, DockerImage{
 			Repository: fields[0],
 			Tag:        fields[1],
 			ID:         fields[2],

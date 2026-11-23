@@ -1,15 +1,15 @@
 ---
-description: Server startup, route composition, and embedded SPA boundary
-globs: "{cmd/golem-deploy/**/*.go,frontend/embed.go,frontend/embed_test.go}"
+description: Process entry point, CLI, data directory and daemon assembly
+globs: "{cmd/golem-deploy/**/*.go,internal/daemon/**/*.go,internal/datadir/**/*.go,frontend/embed.go,frontend/embed_test.go}"
 alwaysApply: false
 ---
 
-# Server entry point
+# Entry point and daemon assembly
 
-- `cmd/golem-deploy/main.go` is the composition root: configuration, both databases, JWT middleware state, the first-admin console prompt, runtime directories, routes, TLS, and listening.
-- Keep initialization before handlers can access package globals. Close both database connections on shutdown.
-- Register every API route explicitly here. Only `/login` and `/account/create` are intentionally public; wrap other routes with `middleware.AuthMiddleware`.
-- The catch-all SPA handler must remain after API registrations.
-- HTTP and HTTPS both listen on `:8000`; TLS is enabled only when both certificate environment variables are set.
-- `frontend/embed.go` embeds `frontend/dist` (`all:dist`). `frontend/dist/.gitkeep` is committed so a fresh clone compiles; when `index.html` is missing the handler returns a plain-text 503 asking to run `npm run build`. Keep `frontend/embed_test.go` passing.
-- Changes to startup environment variables, public routes, or embedding are cross-subsystem changes: update the affected rules, `docs/API.md`, and `README.md`.
+- `cmd/golem-deploy` parses subcommands with stdlib `flag` (`serve`, `admin create|reset-password`, `version`; no arguments prints usage and exits 2). Flags have `GOLEM_DEPLOY_*` environment fallbacks; there is no config file. Never prompt on stdin during `serve`.
+- `internal/daemon.Run` is the composition root: data directory, keys, store, `Reconcile`, job runner, `httpapi.Server`. On context cancellation HTTP shutdown and job cancellation run together and the store closes last. It refuses plaintext HTTP on non-loopback addresses before touching disk (`httpapi.CheckListen`).
+- `internal/datadir` owns the data directory layout (0700 directories, 0600 key files; key files readable by group or others are refused on Unix). All runtime paths come from `datadir.Layout`; nothing is written relative to the working directory.
+- `internal/daemon/admin.go` backs the `admin` CLI and works while the daemon runs (SQLite WAL).
+- `frontend/embed.go` embeds `frontend/dist` (`all:dist`); without `index.html` it serves a plain-text 503 notice. Only paths outside `/api/` reach it.
+- Changes to flags, environment variables or the data directory layout must update `README.md`.
+- Verify with `go test ./cmd/... ./internal/daemon/... ./internal/datadir/... ./frontend/...`.

@@ -7,14 +7,11 @@ bin/
 *.test
 *.out
 
-# Runtime state created by golem-deploy in its working directory
+# Default data directory of golem-deploy (--data-dir) and stray databases
 data/
-uploads/
-repositories/
-jwt_secret
 *.db
-config.yaml
-config.yaml.backup.*
+*.db-wal
+*.db-shm
 
 # Frontend (frontend/dist/.gitkeep is committed so go:embed works on a fresh clone)
 frontend/node_modules/
