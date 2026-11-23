@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,13 +15,18 @@ import (
 	"time"
 )
 
-// Default timeouts.
+// Default timeouts and limits.
 const (
 	DefaultNetworkTimeout = 15 * time.Minute
 	DefaultLocalTimeout   = 60 * time.Second
+	// DefaultMinFreeSpace is the free space a clone, pull or branch switch
+	// requires on the data filesystem before it starts.
+	DefaultMinFreeSpace = 512 << 20
 	// waitDelay bounds how long Wait waits for output pipes held open by
 	// grandchildren after git itself exited or was killed.
 	waitDelay = 5 * time.Second
+	// sizeCheckInterval is how often the size watchdog samples a checkout.
+	sizeCheckInterval = 2 * time.Second
 )
 
 // Options configures a Runner.
@@ -31,12 +37,13 @@ type Options struct {
 	// Askpass at startup. Default: os.Executable() (the golem-deploy binary).
 	AskpassPath string
 	// TempDir holds per-operation scratch directories (private HOME, SSH
-	// key, clone staging). It must be on the same filesystem as the
-	// checkouts so a finished clone can be renamed into place. Required.
+	// key and config, clone staging). It must be on the same filesystem as
+	// the checkouts so a finished clone can be renamed into place. Required;
+	// its absolute path must pass CheckSSHConfigPath.
 	TempDir string
 	// KnownHostsFile is the SSH known_hosts file (StrictHostKeyChecking is
 	// accept-new: unknown hosts are recorded on first use, changed keys are
-	// rejected). Required.
+	// rejected). Required; its absolute path must pass CheckSSHConfigPath.
 	KnownHostsFile string
 	// NetworkTimeout bounds each command that talks to a remote (clone,
 	// fetch, ls-remote, lfs pull). Default DefaultNetworkTimeout.
@@ -46,6 +53,20 @@ type Options struct {
 	// Environ is the environment the allowlisted variables are taken from.
 	// Default os.Environ().
 	Environ []string
+	// MaxRepoSize bounds, in bytes, the size of a checkout (working tree
+	// and .git, LFS content included) while clone, fetch, checkout and
+	// "git lfs pull" write it: a watchdog samples the directory every few
+	// seconds and after each of these commands, and fails the operation
+	// with ReasonSizeLimit. 0 means unlimited.
+	MaxRepoSize int64
+	// MinFreeSpace is the free space, in bytes, the TempDir filesystem must
+	// have before a clone, pull or branch switch starts (ReasonDiskSpace
+	// otherwise). 0 means DefaultMinFreeSpace; negative disables the check.
+	MinFreeSpace int64
+
+	sizeInterval       time.Duration // tests only; 0 means sizeCheckInterval
+	skipLFSConfigCheck bool          // tests only: exercise the LFS endpoint pin alone
+	noLFSPin           bool          // tests only: negative control for the pin
 }
 
 // Runner runs hardened, non-interactive git commands. It is safe for
@@ -58,6 +79,11 @@ type Runner struct {
 	networkTimeout time.Duration
 	localTimeout   time.Duration
 	baseEnv        []string
+	maxSize        int64
+	minFree        int64
+	sizeInterval   time.Duration
+	skipLFSCheck   bool
+	noLFSPin       bool
 
 	lfsOnce sync.Once
 	lfsOK   bool
@@ -67,6 +93,22 @@ type Runner struct {
 func New(o Options) (*Runner, error) {
 	if o.TempDir == "" || o.KnownHostsFile == "" {
 		return nil, errors.New("git: TempDir and KnownHostsFile are required")
+	}
+	if o.MaxRepoSize < 0 {
+		return nil, errors.New("git: MaxRepoSize must not be negative")
+	}
+	tmp, err := filepath.Abs(o.TempDir)
+	if err != nil {
+		return nil, fmt.Errorf("git: temp dir: %w", err)
+	}
+	kh, err := filepath.Abs(o.KnownHostsFile)
+	if err != nil {
+		return nil, fmt.Errorf("git: known_hosts: %w", err)
+	}
+	for _, p := range []string{tmp, kh} {
+		if err := CheckSSHConfigPath(p); err != nil {
+			return nil, fmt.Errorf("git: %s cannot be used in the SSH configuration: %w", p, err)
+		}
 	}
 	if o.GitPath == "" {
 		p, err := exec.LookPath("git")
@@ -91,13 +133,11 @@ func New(o Options) (*Runner, error) {
 	if o.Environ == nil {
 		o.Environ = os.Environ()
 	}
-	tmp, err := filepath.Abs(o.TempDir)
-	if err != nil {
-		return nil, fmt.Errorf("git: temp dir: %w", err)
+	if o.MinFreeSpace == 0 {
+		o.MinFreeSpace = DefaultMinFreeSpace
 	}
-	kh, err := filepath.Abs(o.KnownHostsFile)
-	if err != nil {
-		return nil, fmt.Errorf("git: known_hosts: %w", err)
+	if o.sizeInterval <= 0 {
+		o.sizeInterval = sizeCheckInterval
 	}
 	return &Runner{
 		git:            o.GitPath,
@@ -107,6 +147,11 @@ func New(o Options) (*Runner, error) {
 		networkTimeout: o.NetworkTimeout,
 		localTimeout:   o.LocalTimeout,
 		baseEnv:        filterEnv(o.Environ, runtime.GOOS == "windows"),
+		maxSize:        o.MaxRepoSize,
+		minFree:        o.MinFreeSpace,
+		sizeInterval:   o.sizeInterval,
+		skipLFSCheck:   o.skipLFSConfigCheck,
+		noLFSPin:       o.noLFSPin,
 	}, nil
 }
 
@@ -141,11 +186,27 @@ func lfsFilter() []string {
 	}
 }
 
-// argv returns the arguments after the git executable for args.
-func (r *Runner) argv(args []string) []string {
+// lfsPin pins the Git LFS endpoint. Command-line config outranks both the
+// repository's .lfsconfig and .git/config, and git-lfs consults lfs.url
+// before remote.<name>.lfsurl; both are set so that neither key from any
+// other source can redirect LFS traffic.
+func lfsPin(endpoint string) []string {
+	return []string{
+		"-c", "lfs.url=" + endpoint,
+		"-c", "remote.origin.lfsurl=" + endpoint,
+	}
+}
+
+// argv returns the arguments after the git executable for args. A non-empty
+// lfsEndpoint is pinned (see lfsPin) when Git LFS is available, so every
+// git-lfs process git starts (filter-process, lfs pull) uses it.
+func (r *Runner) argv(lfsEndpoint string, args []string) []string {
 	out := hardening()
 	if r.lfsAvailable() {
 		out = append(out, lfsFilter()...)
+		if lfsEndpoint != "" && !r.noLFSPin {
+			out = append(out, lfsPin(lfsEndpoint)...)
+		}
 	}
 	return append(out, args...)
 }
@@ -208,33 +269,80 @@ func filterEnv(src []string, windows bool) []string {
 // shQuote quotes s for the POSIX shell git uses to run GIT_SSH_COMMAND.
 func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// sshPath converts a path for the ssh command line (forward slashes work
-// for both native and MSYS ssh on Windows).
+// sshPath converts a path for ssh (forward slashes work for both native and
+// MSYS ssh on Windows).
 func sshPath(p string) string { return filepath.ToSlash(p) }
 
-// sshCommand returns GIT_SSH_COMMAND. keyFile may be empty.
-func sshCommand(knownHosts, keyFile string) string {
-	parts := []string{
-		"ssh", "-F", "none",
-		"-o", "BatchMode=yes",
-		"-o", "IdentitiesOnly=yes",
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", shQuote("UserKnownHostsFile=" + sshPath(knownHosts)),
-		"-o", "ConnectTimeout=30",
-	}
-	if keyFile != "" {
-		parts = append(parts, "-i", shQuote(sshPath(keyFile)))
-	}
-	return strings.Join(parts, " ")
+// sshCommand returns GIT_SSH_COMMAND: ssh with the per-operation config
+// file as its only configuration (-F also skips ~/.ssh/config and the
+// system-wide file). The path is a single shell word; every option lives
+// in the file, because ssh splits -o values on whitespace and expands
+// tokens in them.
+func sshCommand(configFile string) string {
+	return "ssh -F " + shQuote(sshPath(configFile))
 }
 
-// session is the per-operation state: a private scratch directory (HOME
-// and SSH key), the environment and the scrubbing log writer.
+// sshConfigQuote renders path p as an ssh_config(5) argument: double
+// quoted (spaces) with '%' doubled (IdentityFile and UserKnownHostsFile
+// expand % tokens). p must pass CheckSSHConfigPath.
+func sshConfigQuote(p string) string {
+	return `"` + strings.ReplaceAll(sshPath(p), "%", "%%") + `"`
+}
+
+// sshConfig returns the per-operation ssh_config. keyFile may be empty:
+// then no public key is offered at all, never the daemon user's own.
+func sshConfig(knownHosts, keyFile string) string {
+	identity, pubkey := "none", "no"
+	if keyFile != "" {
+		identity, pubkey = sshConfigQuote(keyFile), "yes"
+	}
+	opts := [][2]string{
+		{"BatchMode", "yes"},
+		{"IdentitiesOnly", "yes"},
+		// An explicit IdentityFile also keeps ssh from adding the default
+		// ~/.ssh/id_* identities (found through the passwd entry).
+		{"IdentityFile", identity},
+		{"IdentityAgent", "none"},
+		{"PubkeyAuthentication", pubkey},
+		{"PasswordAuthentication", "no"},
+		{"KbdInteractiveAuthentication", "no"},
+		{"HostbasedAuthentication", "no"},
+		{"StrictHostKeyChecking", "accept-new"},
+		{"UserKnownHostsFile", sshConfigQuote(knownHosts)},
+		{"GlobalKnownHostsFile", "none"},
+		{"UpdateHostKeys", "no"},
+		{"CheckHostIP", "no"},
+		{"HashKnownHosts", "no"},
+		{"ConnectTimeout", "30"},
+		{"ForwardAgent", "no"},
+		{"ForwardX11", "no"},
+		{"ClearAllForwardings", "yes"},
+		{"ProxyCommand", "none"},
+		{"PermitLocalCommand", "no"},
+		{"ControlMaster", "no"},
+		{"ControlPath", "none"},
+		// Clear SendEnv, then allow only the variable git uses to request
+		// protocol v2 (git passes -o SendEnv=GIT_PROTOCOL itself).
+		{"SendEnv", "-*"},
+		{"SendEnv", "GIT_PROTOCOL"},
+	}
+	var b strings.Builder
+	b.WriteString("# Written by golem-deploy for one git operation and removed when it ends.\n")
+	for _, o := range opts {
+		b.WriteString(o[0] + " " + o[1] + "\n")
+	}
+	return b.String()
+}
+
+// session is the per-operation state: a private scratch directory (HOME,
+// SSH key and SSH config), the environment and the scrubbing log writer.
 type session struct {
 	r   *Runner
 	dir string
 	env []string
 	log *scrubber
+	// lfsEndpoint is the pinned Git LFS endpoint ("" without a remote).
+	lfsEndpoint string
 }
 
 // begin creates the session for remote, writing output to log.
@@ -245,11 +353,14 @@ func (r *Runner) begin(remote Remote, log io.Writer) (*session, error) {
 	if err := os.MkdirAll(r.tmp, 0o700); err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)
 	}
-	dir, err := os.MkdirTemp(r.tmp, "git-")
+	dir, err := os.MkdirTemp(r.tmp, sessionPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("create session dir: %w", err)
 	}
 	s := &session{r: r, dir: dir, log: newScrubber(log, remote.Auth.secrets())}
+	if remote.URL != "" {
+		s.lfsEndpoint = LFSEndpoint(remote.URL)
+	}
 	keyFile := ""
 	if remote.Auth.Method == AuthSSH && len(remote.Auth.PrivateKey) > 0 {
 		keyFile = filepath.Join(dir, "id_key")
@@ -258,6 +369,11 @@ func (r *Runner) begin(remote Remote, log io.Writer) (*session, error) {
 			return nil, fmt.Errorf("write ssh key: %w", err)
 		}
 	}
+	sshConfigFile := filepath.Join(dir, "ssh_config")
+	if err := os.WriteFile(sshConfigFile, []byte(sshConfig(r.knownHosts, keyFile)), 0o600); err != nil {
+		s.close()
+		return nil, fmt.Errorf("write ssh config: %w", err)
+	}
 	env := append([]string{}, r.baseEnv...)
 	env = append(env,
 		"HOME="+dir,
@@ -265,7 +381,7 @@ func (r *Runner) begin(remote Remote, log io.Writer) (*session, error) {
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL="+os.DevNull,
-		"GIT_SSH_COMMAND="+sshCommand(r.knownHosts, keyFile),
+		"GIT_SSH_COMMAND="+sshCommand(sshConfigFile),
 		"GIT_SSH_VARIANT=ssh",
 	)
 	if runtime.GOOS == "windows" {
@@ -301,7 +417,13 @@ type cmdOpts struct {
 	quiet bool
 	// lfsSmudge lets the LFS filter download content (only "git lfs pull").
 	lfsSmudge bool
+	// watch is the directory the command writes the checkout into; with
+	// Options.MaxRepoSize set, its size is bounded while the command runs.
+	watch string
 }
+
+// errSizeLimit is the cancellation cause set by the size watchdog.
+var errSizeLimit = errors.New("checkout size limit exceeded")
 
 // run executes git args in dir. Failures are *Error with a Reason derived
 // from the context and the command's (scrubbed) output.
@@ -312,13 +434,17 @@ func (s *session) run(ctx context.Context, op, dir string, o cmdOpts, args ...st
 	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// wctx is additionally cancelled by the size watchdog (errSizeLimit).
+	wctx, stop := context.WithCancelCause(cctx)
+	defer stop(nil)
+	watch := o.watch != "" && s.r.maxSize > 0
 
 	if !o.quiet {
 		s.log.println("$ git " + strings.Join(args, " "))
 	}
 	s.log.resetTail()
 
-	cmd := exec.CommandContext(cctx, s.r.git, s.r.argv(args)...)
+	cmd := exec.CommandContext(wctx, s.r.git, s.r.argv(s.lfsEndpoint, args)...)
 	cmd.Dir = dir
 	env := s.env
 	if !o.lfsSmudge {
@@ -341,9 +467,29 @@ func (s *session) run(ctx context.Context, op, dir string, o cmdOpts, args ...st
 		return &Error{Op: op, Reason: reason, Err: fmt.Errorf("start git: %w", err)}
 	}
 	tree.started(cmd)
+	stopWatch := func() {}
+	var watchDone chan struct{}
+	if watch {
+		var watchCtx context.Context
+		watchCtx, stopWatch = context.WithCancel(wctx)
+		watchDone = make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			s.r.watchSize(watchCtx, o.watch, func() { stop(errSizeLimit) })
+		}()
+	}
 	err := cmd.Wait()
 	tree.close()
+	stopWatch()
+	if watchDone != nil {
+		<-watchDone
+	}
 	s.log.Flush()
+	if err == nil && watch && ctx.Err() == nil && dirExceeds(ctx, o.watch, s.r.maxSize) {
+		// The command finished between two samples.
+		stop(errSizeLimit)
+		err = errSizeLimit
+	}
 	if err == nil {
 		return nil
 	}
@@ -351,13 +497,18 @@ func (s *session) run(ctx context.Context, op, dir string, o cmdOpts, args ...st
 	switch {
 	case ctx.Err() != nil:
 		reason = ReasonCancelled
+	case errors.Is(context.Cause(wctx), errSizeLimit):
+		reason = ReasonSizeLimit
+		s.log.println(fmt.Sprintf("error: the checkout exceeds the size limit of %d MiB set on the host", s.r.maxSize>>20))
 	case errors.Is(cctx.Err(), context.DeadlineExceeded):
 		reason = ReasonTimeout
 	}
 	var ee *exec.ExitError
-	if errors.As(err, &ee) {
+	switch {
+	case errors.As(err, &ee):
 		err = fmt.Errorf("git %s exited with status %d", firstNonOption(args), ee.ExitCode())
-	} else {
+	case errors.Is(err, errSizeLimit):
+	default:
 		err = errors.New(s.log.scrubString(err.Error()))
 	}
 	return &Error{Op: op, Reason: reason, Err: err}
@@ -370,4 +521,74 @@ func firstNonOption(args []string) string {
 		}
 	}
 	return ""
+}
+
+// watchSize samples the size of dir until ctx is done and calls exceeded
+// (once) when it grows beyond the runner's MaxRepoSize. The interval grows
+// with the cost of a walk, so sampling a huge tree never dominates.
+func (r *Runner) watchSize(ctx context.Context, dir string, exceeded func()) {
+	t := time.NewTimer(r.sizeInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		start := time.Now()
+		if dirExceeds(ctx, dir, r.maxSize) {
+			exceeded()
+			return
+		}
+		t.Reset(max(r.sizeInterval, 4*time.Since(start)))
+	}
+}
+
+// dirExceeds reports whether the files below dir (symlinks not followed)
+// total more than limit bytes. The walk stops as soon as the limit is
+// passed or ctx is done; entries that vanish meanwhile are skipped.
+func dirExceeds(ctx context.Context, dir string, limit int64) bool {
+	var total int64
+	over := false
+	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return fs.SkipAll
+		}
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		total += info.Size()
+		if total > limit {
+			over = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return over
+}
+
+// checkFreeSpace refuses to start an operation that writes a checkout when
+// the data filesystem has less than MinFreeSpace available. When free space
+// cannot be determined the operation proceeds (the size limit still
+// applies).
+func (r *Runner) checkFreeSpace(op string) error {
+	if r.minFree < 0 {
+		return nil
+	}
+	if err := os.MkdirAll(r.tmp, 0o700); err != nil {
+		return &Error{Op: op, Reason: ReasonLocal, Unchanged: true, Err: fmt.Errorf("create temp dir: %w", err)}
+	}
+	free, err := freeSpace(r.tmp)
+	if err != nil {
+		return nil
+	}
+	if free < uint64(r.minFree) {
+		return &Error{Op: op, Reason: ReasonDiskSpace, Unchanged: true,
+			Err: fmt.Errorf("%d MiB free on the data filesystem, at least %d MiB required", free>>20, r.minFree>>20)}
+	}
+	return nil
 }
