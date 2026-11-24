@@ -68,6 +68,10 @@ const (
 	ErrorCodeJobInProgress ErrorCode = "job_in_progress"
 	// ErrorCodeJobNotActive: the job already finished and cannot be cancelled (409).
 	ErrorCodeJobNotActive ErrorCode = "job_not_active"
+	// ErrorCodeSchemaMismatch: the backup's schema fingerprint differs from
+	// the fingerprint of the server's build, so the server would not load
+	// it; repeat the restore with force to do it anyway (409).
+	ErrorCodeSchemaMismatch ErrorCode = "schema_mismatch"
 	// ErrorCodeConflict: any other state conflict, e.g. deleting something that is
 	// still in use or the API token limit (409).
 	ErrorCodeConflict ErrorCode = "conflict"

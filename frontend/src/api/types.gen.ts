@@ -189,6 +189,192 @@ export interface CreateAPITokenResponse {
 }
 
 //////////
+// source: backups.go
+
+/**
+ * BackupKind says why a backup was taken.
+ */
+/**
+ * BackupKindManual: POST /api/v1/servers/{id}/backups.
+ */
+export const BackupKindManual = "manual";
+/**
+ * BackupKindScheduled: taken by the server's backup schedule.
+ */
+export const BackupKindScheduled = "scheduled";
+/**
+ * BackupKindPreRestore and BackupKindPreReset are the safety backups the
+ * daemon takes of a server's current data before a restore replaces it
+ * or a reset discards it.
+ */
+export const BackupKindPreRestore = "pre_restore";
+export const BackupKindPreReset = "pre_reset";
+/**
+ * Backup kinds. Only scheduled backups are removed by a server's retention
+ * setting; the others stay until an admin deletes them.
+ */
+export type BackupKind = typeof BackupKindManual | typeof BackupKindScheduled | typeof BackupKindPreRestore | typeof BackupKindPreReset;
+/**
+ * Backup is a stored copy of a server's data directory (the entity snapshot
+ * plus whatever else the game keeps next to it). Backups outlive their
+ * server: after the server is deleted they can still be downloaded and
+ * restored into another server.
+ * A backup holds what the game wrote, so it is untrusted data. The daemon
+ * stores regular files and directories only (links, devices and pipes are
+ * left out) and never interprets the content beyond the snapshot header.
+ */
+export interface Backup {
+  id: number /* int64 */;
+  kind: BackupKind;
+  /**
+   * ServerID is the server the backup was taken from; null once that
+   * server was deleted. ServerName is its name at the time.
+   */
+  server_id: number | null;
+  server_name: string;
+  /**
+   * ProjectID and ProjectName, BuildID, Commit and EngineVersion describe
+   * the build the server was assigned when the backup was taken (ids are
+   * null once the project or build was deleted).
+   */
+  project_id: number | null;
+  project_name: string;
+  build_id: number | null;
+  commit: string;
+  engine_version: string;
+  /**
+   * SchemaFingerprint is the schema fingerprint stored in the backup's
+   * entity snapshot (world.snapshot); "" when the backup has no snapshot
+   * or its header could not be read. A server can only load a snapshot
+   * whose fingerprint equals its build's.
+   */
+  schema_fingerprint: string;
+  /**
+   * Live is true when the game was running and wrote a fresh snapshot for
+   * this backup; false when the files were copied as they were (a stopped
+   * server, or a game without the snapshot endpoint).
+   */
+  live: boolean;
+  /**
+   * Note is the operator's label (at most 200 characters).
+   */
+  note: string;
+  /**
+   * SizeBytes is the size of the stored archive, ContentBytes the total
+   * size of the files in it and FileCount their number.
+   */
+  size_bytes: number /* int64 */;
+  content_bytes: number /* int64 */;
+  file_count: number /* int */;
+  /**
+   * SHA256 is the lower-case hex SHA-256 of the archive
+   * (GET /api/v1/backups/{id}/download returns exactly these bytes).
+   */
+  sha256: string;
+  /**
+   * JobID is the job that took the backup; null when that job record is
+   * gone.
+   */
+  job_id: number | null;
+  /**
+   * CreatedBy is the account that asked for the backup; null for scheduled
+   * backups or when that account was deleted.
+   */
+  created_by: number | null;
+  created_by_username: string | null;
+  created_at: string /* RFC 3339, UTC */;
+}
+/**
+ * BackupList is the body of GET /api/v1/backups, newest first.
+ */
+export interface BackupList {
+  items: Backup[];
+  /**
+   * TotalBytes is the size of every stored backup of the installation
+   * (not only of the listed ones). MaxContentBytes is the largest data
+   * directory a backup accepts (--backup-max-mb).
+   */
+  total_bytes: number /* int64 */;
+  max_content_bytes: number /* int64 */;
+}
+/**
+ * CreateBackupRequest is the body of POST /api/v1/servers/{id}/backups. The
+ * body may be empty. Note is an optional single-line label of at most 200
+ * characters.
+ */
+export interface CreateBackupRequest {
+  note?: string;
+}
+/**
+ * RestoreServerRequest is the body of POST /api/v1/servers/{id}/restore. The
+ * restore stops the server, takes a safety backup of its current data
+ * (kind "pre_restore"; skipped when there is none), replaces the data with
+ * the backup's and starts the server again if it was meant to run.
+ * Force is required when the backup's schema fingerprint and the
+ * fingerprint of the server's build are both known and differ (409
+ * schema_mismatch otherwise): such a server will not load the snapshot.
+ * SkipSafetyBackup restores even though the current data is not backed up
+ * first.
+ */
+export interface RestoreServerRequest {
+  backup_id: number /* int64 */;
+  force?: boolean;
+  skip_safety_backup?: boolean;
+}
+/**
+ * ResetServerDataRequest is the body of POST /api/v1/servers/{id}/data/reset
+ * (the body may be empty). The reset stops the server, takes a safety
+ * backup of its data (kind "pre_reset"; skipped when there is none or with
+ * SkipSafetyBackup), discards the data and starts the server again with an
+ * empty world if it was meant to run.
+ */
+export interface ResetServerDataRequest {
+  skip_safety_backup?: boolean;
+}
+/**
+ * BackupSchedule is a server's automatic backup setting. IntervalHours 0
+ * turns it off; otherwise it is 1 to 720. A scheduled backup is taken while
+ * the server is running, IntervalHours after the server's previous backup of
+ * any kind. Keep (1 to 100) is how many scheduled backups of the server are
+ * kept; older ones are deleted after each scheduled backup.
+ */
+export interface BackupSchedule {
+  interval_hours: number /* int */;
+  keep: number /* int */;
+}
+/**
+ * ServerData describes a server's saved data: the directory the game keeps
+ * its entity snapshot in, on a Docker volume of its own.
+ */
+export interface ServerData {
+  /**
+   * Volume is the Docker volume holding the data; "" until the server has
+   * been started once (or after a reset).
+   */
+  volume: string;
+  /**
+   * SchemaFingerprint is the schema fingerprint of the saved world as far
+   * as the daemon knows: what the game last reported when it became
+   * ready, or the fingerprint of the backup restored since. "" when there
+   * is no data or it is unknown.
+   */
+  schema_fingerprint: string;
+  /**
+   * SchemaMismatch is true when SchemaFingerprint and the fingerprint of
+   * the server's build are both known and differ. Starting or restarting
+   * the server is refused then, before its running container is touched:
+   * assign a build with the saved schema, restore a matching backup or
+   * reset the data.
+   */
+  schema_mismatch: boolean;
+  /**
+   * LastBackupAt is when the server's newest backup was taken; null
+   * without one.
+   */
+  last_backup_at: string | null;
+}
+
+//////////
 // source: builds.go
 
 /**
@@ -238,8 +424,10 @@ export interface Build {
    */
   engine_version: string;
   /**
-   * SchemaFingerprint is the game's schema fingerprint; empty until a
-   * server running this build has become ready once.
+   * SchemaFingerprint is the game's schema fingerprint: read from the
+   * repository's committed generated code when the build has it, and
+   * replaced by what the game reports once a server running this build
+   * has become ready. Empty while neither is known.
    */
   schema_fingerprint: string;
   /**
@@ -680,6 +868,12 @@ export const ErrorCodeJobInProgress = "job_in_progress";
  */
 export const ErrorCodeJobNotActive = "job_not_active";
 /**
+ * ErrorCodeSchemaMismatch: the backup's schema fingerprint differs from
+ * the fingerprint of the server's build, so the server would not load
+ * it; repeat the restore with force to do it anyway (409).
+ */
+export const ErrorCodeSchemaMismatch = "schema_mismatch";
+/**
  * ErrorCodeConflict: any other state conflict, e.g. deleting something that is
  * still in use or the API token limit (409).
  */
@@ -729,7 +923,7 @@ export const ErrorCodeUnavailable = "service_unavailable";
 /**
  * Error codes. The HTTP status each one is used with is noted in parentheses.
  */
-export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationFailed | typeof ErrorCodeInvalidCurrentPassword | typeof ErrorCodeUnauthenticated | typeof ErrorCodeInvalidCredentials | typeof ErrorCodeForbidden | typeof ErrorCodeSessionRequired | typeof ErrorCodeRegistrationDisabled | typeof ErrorCodeNotFound | typeof ErrorCodeMethodNotAllowed | typeof ErrorCodeUsernameTaken | typeof ErrorCodeNameTaken | typeof ErrorCodePortInUse | typeof ErrorCodeLastAdmin | typeof ErrorCodeCannotModifySelf | typeof ErrorCodeJobInProgress | typeof ErrorCodeJobNotActive | typeof ErrorCodeConflict | typeof ErrorCodeBadHost | typeof ErrorCodeRequestTooLarge | typeof ErrorCodeUnsupportedMediaType | typeof ErrorCodeRateLimited | typeof ErrorCodeInsufficientStorage | typeof ErrorCodeInternal | typeof ErrorCodeNotImplemented | typeof ErrorCodeUnavailable;
+export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationFailed | typeof ErrorCodeInvalidCurrentPassword | typeof ErrorCodeUnauthenticated | typeof ErrorCodeInvalidCredentials | typeof ErrorCodeForbidden | typeof ErrorCodeSessionRequired | typeof ErrorCodeRegistrationDisabled | typeof ErrorCodeNotFound | typeof ErrorCodeMethodNotAllowed | typeof ErrorCodeUsernameTaken | typeof ErrorCodeNameTaken | typeof ErrorCodePortInUse | typeof ErrorCodeLastAdmin | typeof ErrorCodeCannotModifySelf | typeof ErrorCodeJobInProgress | typeof ErrorCodeJobNotActive | typeof ErrorCodeSchemaMismatch | typeof ErrorCodeConflict | typeof ErrorCodeBadHost | typeof ErrorCodeRequestTooLarge | typeof ErrorCodeUnsupportedMediaType | typeof ErrorCodeRateLimited | typeof ErrorCodeInsufficientStorage | typeof ErrorCodeInternal | typeof ErrorCodeNotImplemented | typeof ErrorCodeUnavailable;
 
 //////////
 // source: host.go
@@ -811,16 +1005,21 @@ export interface StaticFileList {
   max_files: number /* int */;
 }
 /**
- * Volume is a Docker volume managed by Golem Deploy (a server's data volume).
+ * Volume is a Docker volume managed by Golem Deploy (a server's data
+ * volume). Deleting a server deletes its volume; a restore or reset
+ * replaces it. A volume that is not the current data volume of a server is
+ * a leftover that an admin can delete.
  */
 export interface Volume {
   name: string;
   /**
    * ServerID is the owning server; null when that server was deleted
-   * (an orphaned volume).
+   * (an orphaned volume). Current is true when the volume is that
+   * server's current data volume.
    */
   server_id: number | null;
   server_name: string;
+  current: boolean;
   created_at: string /* RFC 3339, UTC */;
   /**
    * InUse reports whether a container currently mounts the volume; such
@@ -879,6 +1078,15 @@ export const JobKindServerStop = "server.stop";
 export const JobKindServerRestart = "server.restart";
 export const JobKindServerDelete = "server.delete";
 /**
+ * JobKindServerBackup copies a server's data into a new backup.
+ * JobKindServerRestore replaces a server's data with a backup's and
+ * JobKindServerDataReset discards it; both stop the server, start it
+ * again if it was meant to run, and are restricted (admin).
+ */
+export const JobKindServerBackup = "server.backup";
+export const JobKindServerRestore = "server.restore";
+export const JobKindServerDataReset = "server.data_reset";
+/**
  * JobKindCertificateIssue obtains the certificates a mode change to
  * "acme" needs and then commits that change; JobKindCertificateRenew
  * replaces every managed certificate now. Both are restricted (admin).
@@ -888,7 +1096,7 @@ export const JobKindCertificateRenew = "certificate.renew";
 /**
  * Job kinds.
  */
-export type JobKind = typeof JobKindProjectClone | typeof JobKindProjectPull | typeof JobKindProjectBranch | typeof JobKindProjectBuild | typeof JobKindServerStart | typeof JobKindServerStop | typeof JobKindServerRestart | typeof JobKindServerDelete | typeof JobKindCertificateIssue | typeof JobKindCertificateRenew;
+export type JobKind = typeof JobKindProjectClone | typeof JobKindProjectPull | typeof JobKindProjectBranch | typeof JobKindProjectBuild | typeof JobKindServerStart | typeof JobKindServerStop | typeof JobKindServerRestart | typeof JobKindServerDelete | typeof JobKindServerBackup | typeof JobKindServerRestore | typeof JobKindServerDataReset | typeof JobKindCertificateIssue | typeof JobKindCertificateRenew;
 /**
  * Job is a long-running operation. Routes that start one respond 202 with the
  * Job; poll GET /api/v1/jobs/{id} or stream GET /api/v1/jobs/{id}/log?follow=1.
@@ -1180,6 +1388,22 @@ export interface Server {
    * (a self-signed certificate is created on the first start).
    */
   certificate: CertificateInfo | null;
+  /**
+   * Data describes the server's saved data and whether the assigned
+   * build can load it.
+   */
+  data: ServerData;
+  /**
+   * SnapshotIntervalSeconds is how often the running game saves its
+   * entity snapshot on its own (0: only when it stops and for backups).
+   * Default 300.
+   */
+  snapshot_interval_seconds: number /* int */;
+  /**
+   * BackupSchedule is the server's automatic backup setting (off by
+   * default: interval_hours 0, keep 7).
+   */
+  backup_schedule: BackupSchedule;
   created_at: string /* RFC 3339, UTC */;
   updated_at: string /* RFC 3339, UTC */;
 }
@@ -1200,6 +1424,8 @@ export interface ServerList {
  * or LF); at most 32 KiB per variable, 128 variables and 64 KiB in total. A
  * rejected value is reported with field "env.<KEY>". DesiredState defaults
  * to "stopped"; "running" starts a server.start job right after creation.
+ * SnapshotIntervalSeconds is 0 or 10 to 86400 (default 300); BackupSchedule
+ * defaults to off (see BackupSchedule for its ranges).
  */
 export interface CreateServerRequest {
   name: string;
@@ -1208,6 +1434,8 @@ export interface CreateServerRequest {
   allowed_origins?: string[];
   env?: { [key: string]: string};
   desired_state?: DesiredState;
+  snapshot_interval_seconds?: number /* int */;
+  backup_schedule?: BackupSchedule;
 }
 /**
  * UpdateServerRequest is the body of PATCH /api/v1/servers/{id}. Absent fields
@@ -1217,7 +1445,8 @@ export interface CreateServerRequest {
  * both); unmentioned variables keep their stored values, so the UI never has
  * to re-send secrets. Changes apply on the next (re)start. Changing Port
  * while the server's container is running is refused with 409 conflict
- * (stop the server first).
+ * (stop the server first). SnapshotIntervalSeconds applies on the next
+ * (re)start; BackupSchedule applies at once and never needs a restart.
  */
 export interface UpdateServerRequest {
   build_id?: number /* int64 */;
@@ -1225,6 +1454,8 @@ export interface UpdateServerRequest {
   allowed_origins?: string[];
   env_set?: { [key: string]: string};
   env_unset?: string[];
+  snapshot_interval_seconds?: number /* int */;
+  backup_schedule?: BackupSchedule;
 }
 /**
  * ServerStats is the body of GET /api/v1/servers/{id}/stats: a single sample
@@ -1255,6 +1486,13 @@ export interface ServerSpec {
   allowed_origins?: string[];
   env?: { [key: string]: string};
   desired_state: DesiredState;
+  /**
+   * SnapshotIntervalSeconds and BackupSchedule are optional; an import
+   * without them uses the defaults. Saved data and backups are not part
+   * of an export.
+   */
+  snapshot_interval_seconds?: number /* int */;
+  backup_schedule?: BackupSchedule;
 }
 /**
  * ServerExport is the body of GET /api/v1/servers/export and of

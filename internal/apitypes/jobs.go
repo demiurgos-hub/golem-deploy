@@ -42,6 +42,13 @@ const (
 	JobKindServerStop    JobKind = "server.stop"
 	JobKindServerRestart JobKind = "server.restart"
 	JobKindServerDelete  JobKind = "server.delete"
+	// JobKindServerBackup copies a server's data into a new backup.
+	// JobKindServerRestore replaces a server's data with a backup's and
+	// JobKindServerDataReset discards it; both stop the server, start it
+	// again if it was meant to run, and are restricted (admin).
+	JobKindServerBackup    JobKind = "server.backup"
+	JobKindServerRestore   JobKind = "server.restore"
+	JobKindServerDataReset JobKind = "server.data_reset"
 	// JobKindCertificateIssue obtains the certificates a mode change to
 	// "acme" needs and then commits that change; JobKindCertificateRenew
 	// replaces every managed certificate now. Both are restricted (admin).

@@ -273,6 +273,28 @@ Game servers use TLS for WebTransport and HTTPS. See [CERTIFICATES.md](CERTIFICA
 - Invalid mode, input PEM, or contact email returns 400 `validation_failed` on `mode`, `certificate_pem`, `private_key_pem` or `email`. Supplying PEM in game `acme` or `self_signed` mode is a validation error on `certificate_pem`. Starting an ACME job without agreement, a host, an enabled challenge, or an eligible public identifier returns 400 `validation_failed` on `terms_agreed`, `game_host`, or `mode` (challenge or eligibility). A configured directory override bypasses the public-identifier check.
 - Panel PUT in `none` or `files`, changing staging or clearing agreement to the subscriber terms with either service in ACME mode, and renewal with no managed identifiers return 409 `conflict`. Conflicting certificate operations return 409 `job_in_progress`. Shutdown or a missing certificate service returns 503 `service_unavailable`. Standard admin authentication and JSON-decoding errors also apply.
 
+### Saved data and backups
+
+| Method | Path | Access | Request | Response | Status |
+|--------|------|--------|---------|----------|--------|
+| GET | `/backups` | developer | query `server_id` (optional) | 200 `BackupList` | planned |
+| GET | `/backups/{id}` | developer | — | 200 `Backup` | planned |
+| GET | `/backups/{id}/download` | developer | — | 200 file download (`application/gzip`) | planned |
+| DELETE | `/backups/{id}` | admin | — | 204 | planned |
+| POST | `/servers/{id}/backups` | developer | `CreateBackupRequest` `{note?}` (body optional) | 202 `Job` (`server.backup`) | planned |
+| POST | `/servers/{id}/restore` | admin | `RestoreServerRequest` `{backup_id, force?, skip_safety_backup?}` | 202 `Job` (`server.restore`, restricted) | planned |
+| POST | `/servers/{id}/data/reset` | admin | `ResetServerDataRequest` `{skip_safety_backup?}` (body optional) | 202 `Job` (`server.data_reset`, restricted) | planned |
+
+Every server keeps its game's data directory on a Docker volume of its own, so the world survives restarts and new builds. See [BACKUPS.md](BACKUPS.md) for how backups are taken, stored and restored.
+
+- `Server.data` is `{volume, schema_fingerprint, schema_mismatch, last_backup_at}`. `Server.snapshot_interval_seconds` (0, or 10 to 86400; default 300) is the game's autosave period and applies on the next start. `Server.backup_schedule` is `{interval_hours, keep}` (`interval_hours` 0 for off, or 1 to 720; `keep` 1 to 100, default 7) and applies at once. Both can be set on create and with `PATCH /servers/{id}`; an invalid value is `validation_failed` on `snapshot_interval_seconds`, `backup_schedule.interval_hours` or `backup_schedule.keep`.
+- `Backup` is `{id, kind, server_id, server_name, project_id, project_name, build_id, commit, engine_version, schema_fingerprint, live, note, size_bytes, content_bytes, file_count, sha256, job_id, created_by, created_by_username, created_at}`. `kind` is `manual`, `scheduled`, `pre_restore` or `pre_reset`. `BackupList` is `{items, total_bytes, max_content_bytes}`, newest first; `server_id` filters by the server the backup was taken from. Backups of deleted servers stay listed with `server_id: null`.
+- A backup job asks the running game for a fresh snapshot, copies the data directory and stores it as one archive. The new backup carries the job's id in `job_id`. A server without saved data, a data directory over the size limit (`--backup-max-mb`) and a game that fails to write its snapshot fail the job with a detail that says so.
+- A restore is refused with 409 `schema_mismatch` when the backup's fingerprint and the fingerprint of the server's build are both known and differ, unless `force` is true. An unknown fingerprint on either side is allowed. `backup_id` naming no backup is `validation_failed` on `backup_id`; a server without a successful build is 409 `conflict`.
+- Starting or restarting a server whose saved data has another schema than its build (`data.schema_mismatch`) fails the job at once, before the running container is touched.
+- Deleting a server deletes its data volume and keeps its backups. Deleting a backup that a running job reads is 409 `conflict`.
+- Server jobs are serialised per server: a backup, restore or reset while another job of the server is active is 409 `job_in_progress`.
+
 ### Images, static files, volumes
 
 | Method | Path | Access | Request | Response | Status |

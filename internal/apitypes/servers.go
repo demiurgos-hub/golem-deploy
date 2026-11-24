@@ -75,8 +75,18 @@ type Server struct {
 	// self-signed one, or the shared custom one. Null when it has none yet
 	// (a self-signed certificate is created on the first start).
 	Certificate *CertificateInfo `json:"certificate" tstype:"CertificateInfo | null,required"`
-	CreatedAt   time.Time        `json:"created_at"`
-	UpdatedAt   time.Time        `json:"updated_at"`
+	// Data describes the server's saved data and whether the assigned
+	// build can load it.
+	Data ServerData `json:"data"`
+	// SnapshotIntervalSeconds is how often the running game saves its
+	// entity snapshot on its own (0: only when it stops and for backups).
+	// Default 300.
+	SnapshotIntervalSeconds int `json:"snapshot_interval_seconds"`
+	// BackupSchedule is the server's automatic backup setting (off by
+	// default: interval_hours 0, keep 7).
+	BackupSchedule BackupSchedule `json:"backup_schedule"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
 }
 
 // ServerList is the body of GET /api/v1/servers.
@@ -94,13 +104,17 @@ type ServerList struct {
 // or LF); at most 32 KiB per variable, 128 variables and 64 KiB in total. A
 // rejected value is reported with field "env.<KEY>". DesiredState defaults
 // to "stopped"; "running" starts a server.start job right after creation.
+// SnapshotIntervalSeconds is 0 or 10 to 86400 (default 300); BackupSchedule
+// defaults to off (see BackupSchedule for its ranges).
 type CreateServerRequest struct {
-	Name           string            `json:"name"`
-	BuildID        int64             `json:"build_id"`
-	Port           *int              `json:"port,omitempty"`
-	AllowedOrigins []string          `json:"allowed_origins,omitempty"`
-	Env            map[string]string `json:"env,omitempty"`
-	DesiredState   *DesiredState     `json:"desired_state,omitempty"`
+	Name                    string            `json:"name"`
+	BuildID                 int64             `json:"build_id"`
+	Port                    *int              `json:"port,omitempty"`
+	AllowedOrigins          []string          `json:"allowed_origins,omitempty"`
+	Env                     map[string]string `json:"env,omitempty"`
+	DesiredState            *DesiredState     `json:"desired_state,omitempty"`
+	SnapshotIntervalSeconds *int              `json:"snapshot_interval_seconds,omitempty"`
+	BackupSchedule          *BackupSchedule   `json:"backup_schedule,omitempty"`
 }
 
 // UpdateServerRequest is the body of PATCH /api/v1/servers/{id}. Absent fields
@@ -110,13 +124,16 @@ type CreateServerRequest struct {
 // both); unmentioned variables keep their stored values, so the UI never has
 // to re-send secrets. Changes apply on the next (re)start. Changing Port
 // while the server's container is running is refused with 409 conflict
-// (stop the server first).
+// (stop the server first). SnapshotIntervalSeconds applies on the next
+// (re)start; BackupSchedule applies at once and never needs a restart.
 type UpdateServerRequest struct {
-	BuildID        *int64            `json:"build_id,omitempty"`
-	Port           *int              `json:"port,omitempty"`
-	AllowedOrigins *[]string         `json:"allowed_origins,omitempty"`
-	EnvSet         map[string]string `json:"env_set,omitempty"`
-	EnvUnset       []string          `json:"env_unset,omitempty"`
+	BuildID                 *int64            `json:"build_id,omitempty"`
+	Port                    *int              `json:"port,omitempty"`
+	AllowedOrigins          *[]string         `json:"allowed_origins,omitempty"`
+	EnvSet                  map[string]string `json:"env_set,omitempty"`
+	EnvUnset                []string          `json:"env_unset,omitempty"`
+	SnapshotIntervalSeconds *int              `json:"snapshot_interval_seconds,omitempty"`
+	BackupSchedule          *BackupSchedule   `json:"backup_schedule,omitempty"`
 }
 
 // ServerStats is the body of GET /api/v1/servers/{id}/stats: a single sample
@@ -145,6 +162,11 @@ type ServerSpec struct {
 	AllowedOrigins []string          `json:"allowed_origins,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	DesiredState   DesiredState      `json:"desired_state"`
+	// SnapshotIntervalSeconds and BackupSchedule are optional; an import
+	// without them uses the defaults. Saved data and backups are not part
+	// of an export.
+	SnapshotIntervalSeconds *int            `json:"snapshot_interval_seconds,omitempty"`
+	BackupSchedule          *BackupSchedule `json:"backup_schedule,omitempty"`
 }
 
 // ServerExport is the body of GET /api/v1/servers/export and of

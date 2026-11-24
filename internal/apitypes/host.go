@@ -56,13 +56,18 @@ type StaticFileList struct {
 	MaxFiles  int `json:"max_files"`
 }
 
-// Volume is a Docker volume managed by Golem Deploy (a server's data volume).
+// Volume is a Docker volume managed by Golem Deploy (a server's data
+// volume). Deleting a server deletes its volume; a restore or reset
+// replaces it. A volume that is not the current data volume of a server is
+// a leftover that an admin can delete.
 type Volume struct {
 	Name string `json:"name"`
 	// ServerID is the owning server; null when that server was deleted
-	// (an orphaned volume).
+	// (an orphaned volume). Current is true when the volume is that
+	// server's current data volume.
 	ServerID   *int64    `json:"server_id" tstype:"number | null,required"`
 	ServerName string    `json:"server_name"`
+	Current    bool      `json:"current"`
 	CreatedAt  time.Time `json:"created_at"`
 	// InUse reports whether a container currently mounts the volume; such
 	// volumes cannot be deleted (409 conflict).
