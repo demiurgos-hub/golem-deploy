@@ -306,12 +306,10 @@ export const CertificateModeCustom = "custom";
  */
 export type CertificateMode = typeof CertificateModeSelfSigned | typeof CertificateModeCustom;
 /**
- * GameCertificate is the body of GET and PUT /api/v1/certificates/game
- * (admin): the TLS certificate every game server serves for WebTransport
- * and HTTPS. The private key is never returned.
+ * CertificateInfo describes a TLS certificate a game server serves for
+ * WebTransport and HTTPS. The private key is never returned.
  */
-export interface GameCertificate {
-  mode: CertificateMode;
+export interface CertificateInfo {
   /**
    * Subject and Issuer are the leaf certificate's distinguished names.
    */
@@ -335,16 +333,32 @@ export interface GameCertificate {
    */
   chain_length: number /* int */;
   /**
-   * GameHost is the effective game host; CoversGameHost reports whether
-   * the certificate is valid for it.
+   * CoversGameHost reports whether the certificate is valid for the
+   * effective game host.
    */
-  game_host: string;
   covers_game_host: boolean;
 }
 /**
+ * GameCertificate is the body of GET and PUT /api/v1/certificates/game
+ * (admin): how game servers get their TLS certificate.
+ * In mode "self_signed" every server has its own short-lived certificate and
+ * private key, generated and rotated by the daemon, so no game holds another
+ * game's key; Certificate is null and each server's certificate is
+ * Server.Certificate. In mode "custom" all servers share the uploaded
+ * certificate, described by Certificate (null while none is installed).
+ */
+export interface GameCertificate {
+  mode: CertificateMode;
+  /**
+   * GameHost is the effective game host.
+   */
+  game_host: string;
+  certificate: CertificateInfo | null;
+}
+/**
  * UpdateGameCertificateRequest is the body of PUT /api/v1/certificates/game.
- * Mode "self_signed" (no PEM fields) generates a new self-signed
- * certificate; mode "custom" installs CertificatePEM (the chain, leaf first,
+ * Mode "self_signed" (no PEM fields) switches to per-server self-signed
+ * certificates and regenerates them; mode "custom" installs CertificatePEM (the chain, leaf first,
  * at most 8 certificates and 64 KiB) and PrivateKeyPEM (unencrypted PKCS#8,
  * PKCS#1 or SEC 1; RSA of at least 2048 bits or ECDSA P-256/P-384/P-521; at
  * most 16 KiB), which must match, be currently valid and be usable for TLS
@@ -778,6 +792,13 @@ export interface Project {
    * built, in order (never null).
    */
   static_addons: StaticAddon[];
+  /**
+   * AllowCustomDockerfile lets builds use the Dockerfile the repository
+   * names in golem-deploy.yaml instead of the generated one. Default
+   * false: a custom Dockerfile shares the build cache and builder with
+   * other projects, so an admin must trust the repository.
+   */
+  allow_custom_dockerfile: boolean;
   created_at: string /* RFC 3339, UTC */;
   updated_at: string /* RFC 3339, UTC */;
 }
@@ -833,6 +854,10 @@ export interface UpdateProjectRequest {
   repo_url?: string;
   auth?: ProjectAuth;
   static_addons?: StaticAddon[];
+  /**
+   * AllowCustomDockerfile: see Project.
+   */
+  allow_custom_dockerfile?: boolean;
 }
 /**
  * SwitchBranchRequest is the body of POST /api/v1/projects/{id}/branch.
@@ -936,6 +961,12 @@ export interface Server {
    * without a restart.
    */
   restart_required: boolean;
+  /**
+   * Certificate is the TLS certificate the server serves: its own
+   * self-signed one, or the shared custom one. Null when it has none yet
+   * (a self-signed certificate is created on the first start).
+   */
+  certificate: CertificateInfo | null;
   created_at: string /* RFC 3339, UTC */;
   updated_at: string /* RFC 3339, UTC */;
 }

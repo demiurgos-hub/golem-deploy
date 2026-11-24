@@ -70,9 +70,13 @@ type Server struct {
 	// mode or daemon run settings changed since it was started). Changes
 	// never restart a server implicitly. A renewed certificate is picked up
 	// without a restart.
-	RestartRequired bool      `json:"restart_required"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	RestartRequired bool `json:"restart_required"`
+	// Certificate is the TLS certificate the server serves: its own
+	// self-signed one, or the shared custom one. Null when it has none yet
+	// (a self-signed certificate is created on the first start).
+	Certificate *CertificateInfo `json:"certificate" tstype:"CertificateInfo | null,required"`
+	CreatedAt   time.Time        `json:"created_at"`
+	UpdatedAt   time.Time        `json:"updated_at"`
 }
 
 // ServerList is the body of GET /api/v1/servers.

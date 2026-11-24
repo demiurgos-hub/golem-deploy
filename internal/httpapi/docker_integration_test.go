@@ -240,11 +240,11 @@ func TestIntegrationServersAPI(t *testing.T) {
 	}
 	rr = h.do("PUT", "/api/v1/certificates/game", tok, apitypes.UpdateGameCertificateRequest{Mode: apitypes.CertificateModeSelfSigned})
 	after := decode[apitypes.GameCertificate](t, rr)
-	if after.FingerprintSHA256 == before.Fingerprint || !after.CoversGameHost {
+	if after.Certificate.FingerprintSHA256 == before.Fingerprint || !after.Certificate.CoversGameHost {
 		t.Fatalf("%+v", after)
 	}
 	deadline := time.Now().Add(30 * time.Second)
-	for served(lo) != after.FingerprintSHA256 {
+	for served(lo) != after.Certificate.FingerprintSHA256 {
 		if time.Now().After(deadline) {
 			t.Fatal("replaced certificate not picked up by the running game")
 		}

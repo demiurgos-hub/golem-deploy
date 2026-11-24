@@ -62,8 +62,13 @@ type Project struct {
 	// StaticAddons are extracted into the game root when the project is
 	// built, in order (never null).
 	StaticAddons []StaticAddon `json:"static_addons"`
-	CreatedAt    time.Time     `json:"created_at"`
-	UpdatedAt    time.Time     `json:"updated_at"`
+	// AllowCustomDockerfile lets builds use the Dockerfile the repository
+	// names in golem-deploy.yaml instead of the generated one. Default
+	// false: a custom Dockerfile shares the build cache and builder with
+	// other projects, so an admin must trust the repository.
+	AllowCustomDockerfile bool      `json:"allow_custom_dockerfile"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 // StaticAddon is a ZIP file of the static store that a build extracts into
@@ -112,6 +117,8 @@ type UpdateProjectRequest struct {
 	RepoURL      *string        `json:"repo_url,omitempty"`
 	Auth         *ProjectAuth   `json:"auth,omitempty"`
 	StaticAddons *[]StaticAddon `json:"static_addons,omitempty"`
+	// AllowCustomDockerfile: see Project.
+	AllowCustomDockerfile *bool `json:"allow_custom_dockerfile,omitempty"`
 }
 
 // SwitchBranchRequest is the body of POST /api/v1/projects/{id}/branch.

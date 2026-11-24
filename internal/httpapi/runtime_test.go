@@ -99,8 +99,8 @@ func testCertPEM(t *testing.T, host string, notAfter time.Time) (string, string)
 func TestGameCertificateRoutes(t *testing.T) {
 	d := newDockerHarness(t)
 	got := decode[apitypes.GameCertificate](t, d.call("GET", "/api/v1/certificates/game", d.adminSs, nil))
-	if got.Mode != apitypes.CertificateModeSelfSigned || !got.SelfSigned || !got.CoversGameHost || got.GameHost != "play.example.com" ||
-		len(got.FingerprintSHA256) != 64 || got.NotAfter.Sub(got.NotBefore) > 14*24*time.Hour {
+	if got.Mode != apitypes.CertificateModeSelfSigned || !got.Certificate.SelfSigned || !got.Certificate.CoversGameHost || got.GameHost != "play.example.com" ||
+		len(got.Certificate.FingerprintSHA256) != 64 || got.Certificate.NotAfter.Sub(got.Certificate.NotBefore) > 14*24*time.Hour {
 		t.Fatalf("%+v", got)
 	}
 	errBody(t, d.call("GET", "/api/v1/certificates/game", d.devTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
@@ -108,7 +108,7 @@ func TestGameCertificateRoutes(t *testing.T) {
 	certPEM, keyPEM := testCertPEM(t, "play.example.com", time.Now().Add(60*24*time.Hour))
 	rr := d.call("PUT", "/api/v1/certificates/game", d.adminSs, apitypes.UpdateGameCertificateRequest{Mode: "custom", CertificatePEM: certPEM, PrivateKeyPEM: keyPEM})
 	custom := decode[apitypes.GameCertificate](t, rr)
-	if custom.Mode != apitypes.CertificateModeCustom || !custom.CoversGameHost || custom.FingerprintSHA256 == got.FingerprintSHA256 {
+	if custom.Mode != apitypes.CertificateModeCustom || !custom.Certificate.CoversGameHost || custom.Certificate.FingerprintSHA256 == got.Certificate.FingerprintSHA256 {
 		t.Fatalf("%+v", custom)
 	}
 	keyBody := strings.Split(keyPEM, "\n")[1]
@@ -148,11 +148,11 @@ func TestGameCertificateRoutes(t *testing.T) {
 		t.Fatalf("%+v", set)
 	}
 	now := decode[apitypes.GameCertificate](t, d.call("GET", "/api/v1/certificates/game", d.adminSs, nil))
-	if now.FingerprintSHA256 != custom.FingerprintSHA256 || now.CoversGameHost {
+	if now.Certificate.FingerprintSHA256 != custom.Certificate.FingerprintSHA256 || now.Certificate.CoversGameHost {
 		t.Fatalf("%+v", now)
 	}
 	back := decode[apitypes.GameCertificate](t, d.call("PUT", "/api/v1/certificates/game", d.adminSs, apitypes.UpdateGameCertificateRequest{Mode: "self_signed"}))
-	if back.Mode != apitypes.CertificateModeSelfSigned || !back.CoversGameHost {
+	if back.Mode != apitypes.CertificateModeSelfSigned || !back.Certificate.CoversGameHost {
 		t.Fatalf("%+v", back)
 	}
 	if got := d.getServer(d.devTok, s.ID); !got.RestartRequired {
@@ -179,7 +179,7 @@ func TestGameHostSetting(t *testing.T) {
 	}
 	// The self-signed certificate follows the game host.
 	regen := decode[apitypes.GameCertificate](t, d.call("GET", "/api/v1/certificates/game", d.adminSs, nil))
-	if regen.FingerprintSHA256 == first.FingerprintSHA256 || !regen.CoversGameHost || regen.GameHost != "game.example.com" {
+	if regen.Certificate.FingerprintSHA256 == first.Certificate.FingerprintSHA256 || !regen.Certificate.CoversGameHost || regen.GameHost != "game.example.com" {
 		t.Fatalf("%+v", regen)
 	}
 	// Clearing it falls back to --public-host.

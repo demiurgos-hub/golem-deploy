@@ -24,20 +24,24 @@ func (s *Server) gameCertificate(r *http.Request, info certs.Info) (apitypes.Gam
 	if err != nil {
 		return apitypes.GameCertificate{}, internal(err)
 	}
-	return apitypes.GameCertificate{
-		Mode:              apitypes.CertificateMode(info.Mode),
-		Subject:           info.Subject,
-		Issuer:            info.Issuer,
-		DNSNames:          append([]string{}, info.DNSNames...),
-		IPAddresses:       append([]string{}, info.IPAddresses...),
-		NotBefore:         info.NotBefore.UTC(),
-		NotAfter:          info.NotAfter.UTC(),
-		FingerprintSHA256: info.Fingerprint,
-		SelfSigned:        info.SelfSigned,
-		ChainLength:       info.ChainLength,
-		GameHost:          host,
-		CoversGameHost:    info.Covers(host),
-	}, nil
+	out := apitypes.GameCertificate{Mode: apitypes.CertificateMode(info.Mode), GameHost: host}
+	// Interim: the certificate is still shared in both modes. With per-server
+	// self-signed certificates, Certificate is set only in custom mode.
+	if info.Fingerprint != "" {
+		out.Certificate = &apitypes.CertificateInfo{
+			Subject:           info.Subject,
+			Issuer:            info.Issuer,
+			DNSNames:          append([]string{}, info.DNSNames...),
+			IPAddresses:       append([]string{}, info.IPAddresses...),
+			NotBefore:         info.NotBefore.UTC(),
+			NotAfter:          info.NotAfter.UTC(),
+			FingerprintSHA256: info.Fingerprint,
+			SelfSigned:        info.SelfSigned,
+			ChainLength:       info.ChainLength,
+			CoversGameHost:    info.Covers(host),
+		}
+	}
+	return out, nil
 }
 
 func (s *Server) handleGetGameCertificate(w http.ResponseWriter, r *http.Request) error {
