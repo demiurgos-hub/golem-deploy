@@ -2,6 +2,7 @@ import { useState, type ComponentType } from "react";
 import { Link, Outlet } from "@tanstack/react-router";
 import {
   Boxes,
+  DatabaseBackup,
   FileArchive,
   FolderGit2,
   HardDrive,
@@ -24,7 +25,7 @@ import { Notice } from "@/components/ui/states";
 import { cn } from "@/lib/utils";
 
 interface NavItem {
-  to: "/projects" | "/servers" | "/images" | "/static" | "/volumes" | "/admin/accounts" | "/admin/settings";
+  to: "/projects" | "/servers" | "/backups" | "/images" | "/static" | "/volumes" | "/admin/accounts" | "/admin/settings";
   label: string;
   icon: ComponentType<{ className?: string }>;
 }
@@ -32,6 +33,7 @@ interface NavItem {
 const MAIN_NAV: NavItem[] = [
   { to: "/projects", label: "Projects", icon: FolderGit2 },
   { to: "/servers", label: "Servers", icon: Server },
+  { to: "/backups", label: "Backups", icon: DatabaseBackup },
   { to: "/images", label: "Images", icon: Boxes },
   { to: "/static", label: "Static files", icon: FileArchive },
   { to: "/volumes", label: "Volumes", icon: HardDrive },
