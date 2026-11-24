@@ -13,6 +13,12 @@ const real: Transport = {
     throw new Error("unexpected real upload");
   },
 };
+/** A daemon that knows the caller as another account with `role`. */
+const realAs = (role: string): Transport => ({
+  ...real,
+  fetch: async (url) =>
+    String(url).endsWith("/account") ? jsonResponse(200, { ...admin, id: 2, username: "dev", role }) : new Response("unexpected", { status: 599 }),
+});
 const auth = { Authorization: "Bearer t", "Content-Type": "application/json" };
 
 async function call(t: Transport, method: string, path: string, body?: unknown) {
@@ -164,6 +170,8 @@ describe("mock transport: saved data and backups", () => {
     const restore = await call(t, "POST", "/servers/12/restore", { backup_id: 5 });
     expect(restore).toMatchObject({ status: 202, body: { kind: "server.restore", restricted: true } });
     expect(await call(t, "POST", "/servers/12/backups", {})).toMatchObject({ status: 409, body: { error: { code: "job_in_progress" } } });
+    // A running restore protects the backup it reads.
+    expect(await running(t, restore.body.id)).toMatchObject({ status: "running" });
     expect(await call(t, "DELETE", "/backups/5")).toMatchObject({ status: 409, body: { error: { code: "conflict" } } });
     expect(await finished(t, restore.body.id)).toMatchObject({ status: "success" });
     expect((await call(t, "GET", "/servers/12")).body).toMatchObject({ state: "running", data: { schema_mismatch: false, schema_fingerprint: "a0c3d9e1f2b47c55" } });
@@ -193,4 +201,87 @@ describe("mock transport: saved data and backups", () => {
     expect(backups.total_bytes).toBeGreaterThan(0);
     expect((await call(t, "GET", "/volumes")).body.items.some((v: { name: string }) => v.name === "golem-deploy-data-11-1")).toBe(false);
   }, 20_000);
+
+  async function running(t: Transport, id: number) {
+    let j = (await call(t, "GET", `/jobs/${id}`)).body;
+    for (let i = 0; i < 40 && j.status === "queued"; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      j = (await call(t, "GET", `/jobs/${id}`)).body;
+    }
+    return j;
+  }
+
+  it("protects a backup only while a restore that reads it runs", async () => {
+    const t = createMockTransport(real);
+    // Queued: the backup can still be deleted, and the restore then fails without replacing anything.
+    const volume = (await call(t, "GET", "/servers/12")).body.data.volume;
+    const queued = await call(t, "POST", "/servers/12/restore", { backup_id: 5 });
+    expect((await call(t, "DELETE", "/backups/5")).status).toBe(204);
+    expect(await finished(t, queued.body.id)).toMatchObject({ status: "error", detail: expect.stringContaining("no longer exists") });
+    expect((await call(t, "GET", "/servers/12")).body.data.volume).toBe(volume);
+  }, 30_000);
+
+  it("leaves a server without a container after a reset or a forced restore it cannot load", async () => {
+    const t = createMockTransport(real);
+    // "staging" is stopped: after a reset it has no container until its next start.
+    const reset = await call(t, "POST", "/servers/12/data/reset", {});
+    expect(await finished(t, reset.body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", "/servers/12")).body).toMatchObject({ state: "missing", container_id: "", data: { volume: "" } });
+    expect((await call(t, "GET", "/backups?server_id=12")).body.items[0]).toMatchObject({ kind: "pre_reset" });
+    // "eu-arena" is meant to run, but backup 4 has the old schema: it stays without a container.
+    const forced = await call(t, "POST", "/servers/11/restore", { backup_id: 4, force: true });
+    expect(await finished(t, forced.body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", "/servers/11")).body).toMatchObject({ state: "missing", container_id: "", data: { schema_mismatch: true } });
+  }, 30_000);
+
+  it("stores a last backup before deleting a server and lets only admins skip it", async () => {
+    const dev = createMockTransport(realAs("developer"));
+    expect(await call(dev, "DELETE", "/servers/16?skip_safety_backup=1")).toMatchObject({ status: 403, body: { error: { code: "forbidden" } } });
+    expect((await call(dev, "GET", "/servers/16")).status).toBe(200);
+    const t = createMockTransport(real);
+    expect((await call(t, "DELETE", "/servers/15")).status).toBe(204);
+    expect((await call(t, "GET", "/backups")).body.items[0]).toMatchObject({ kind: "pre_delete", server_id: null, server_name: "kart-eu", omitted_entries: 0 });
+    // A server without saved data has nothing to back up.
+    const before = (await call(t, "GET", "/backups")).body.items.length;
+    expect((await call(t, "DELETE", "/servers/16")).status).toBe(204);
+    expect((await call(t, "GET", "/backups")).body.items).toHaveLength(before);
+  }, 30_000);
+
+  it("stops a deletion, reset or restore whose safety backup leaves entries out, unless it is skipped", async () => {
+    const t = createMockTransport(real);
+    // "flood-test" keeps entries in its data directory that a backup cannot hold.
+    const seeded = (await call(t, "GET", "/backups?server_id=14")).body.items[0];
+    expect(seeded).toMatchObject({ omitted_entries: 2 });
+    const del = await call(t, "DELETE", "/servers/14");
+    expect(del).toMatchObject({ status: 409, body: { error: { code: "conflict", message: expect.stringContaining("skip_safety_backup=1") } } });
+    expect((await call(t, "GET", "/servers/14")).status).toBe(200);
+    expect((await call(t, "GET", "/backups?server_id=14")).body.items[0]).toMatchObject({ kind: "pre_delete", omitted_entries: 2 });
+
+    const volume = (await call(t, "GET", "/servers/14")).body.data.volume;
+    const reset = await call(t, "POST", "/servers/14/data/reset", {});
+    expect(await finished(t, reset.body.id)).toMatchObject({ status: "error", detail: expect.stringContaining("nothing was replaced") });
+    expect((await call(t, "GET", "/servers/14")).body.data.volume).toBe(volume);
+    expect((await call(t, "GET", "/backups?server_id=14")).body.items[0]).toMatchObject({ kind: "pre_reset", omitted_entries: 2 });
+    const restore = await call(t, "POST", "/servers/14/restore", { backup_id: seeded.id });
+    expect(await finished(t, restore.body.id)).toMatchObject({ status: "error", detail: expect.stringContaining("skip_safety_backup") });
+
+    const skipped = await call(t, "POST", "/servers/14/data/reset", { skip_safety_backup: true });
+    expect(await finished(t, skipped.body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", "/servers/14")).body.data.volume).not.toBe(volume);
+    expect((await call(t, "DELETE", "/servers/14?skip_safety_backup=1")).status).toBe(204);
+  }, 40_000);
+
+  it("checks backup notes like the daemon and stores them trimmed", async () => {
+    const t = createMockTransport(real);
+    for (const bad of [0x09, 0x7f, 0x85, 0x2028, 0x202e, 0x2067]) {
+      expect(await call(t, "POST", "/servers/11/backups", { note: `a${String.fromCodePoint(bad)}b` }), `U+${bad.toString(16)}`).toMatchObject({
+        status: 400,
+        body: { error: { field: "note" } },
+      });
+    }
+    expect(await call(t, "POST", "/servers/11/backups", { note: "x".repeat(201) })).toMatchObject({ status: 400, body: { error: { field: "note" } } });
+    const ok = await call(t, "POST", "/servers/11/backups", { note: "  before the patch \n" });
+    expect(await finished(t, ok.body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", "/backups?server_id=11")).body.items[0]).toMatchObject({ kind: "manual", note: "before the patch" });
+  }, 30_000);
 });

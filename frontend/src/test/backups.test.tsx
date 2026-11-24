@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import type { Backup, Server, Volume } from "@/api/types.gen";
-import { schemaMatch } from "@/components/backups";
+import { OMITTED_HINT, backupKindLabel, schemaMatch } from "@/components/backups";
 import { jobKindLabel } from "@/components/jobs";
+import { formatDurationWords } from "@/lib/format";
 import { checkServerImport } from "@/lib/server-import";
-import { validateBackupInterval, validateBackupKeep, validateBackupNote, validateSnapshotInterval } from "@/lib/validators";
+import { trimBackupNote, validateBackupInterval, validateBackupKeep, validateBackupNote, validateSnapshotInterval } from "@/lib/validators";
 import { serverFilterOptions } from "@/pages/backups";
 import { account, errorResponse, job, jsonResponse, streamResponse, type Handler } from "@/test/fake-api";
 import { COMMIT, FINGERPRINT, backupFixture, backupList, buildFixture, projectFixture, runtimeFixture, serverFixture } from "@/test/fixtures";
@@ -181,7 +182,7 @@ describe("server page: saved data", () => {
     const snapshot = within(form).getByLabelText("Autosave period (seconds)");
     await user.clear(snapshot);
     await user.type(snapshot, "60");
-    expect(within(form).getByText(/Saves every 1m 0s/)).toBeInTheDocument();
+    expect(within(form).getByText(/Saves every 1 minute\./)).toBeInTheDocument();
     await user.click(within(form).getByRole("button", { name: "Save settings" }));
     expect(await within(form).findByText("Snapshot_interval_seconds must be 0 or 10 to 86400.")).toBeInTheDocument();
     await user.click(within(form).getByRole("button", { name: "Save settings" }));
@@ -394,11 +395,14 @@ describe("resetting data and the schema warning", () => {
     await waitFor(() => expect(calls.find((c) => c.method === "PATCH")?.body).toEqual({ build_id: 14 }));
   });
 
-  it("says in the delete confirmation that the world goes and backups stay", async () => {
+  it("says in the delete confirmation that a last backup is stored and kept, then the world goes", async () => {
     const { user } = renderApp({ path: "/servers/3", signedInAs: account(), routes: pageRoutes(serverFixture(), []) });
     await user.click(await screen.findByRole("button", { name: "Delete" }));
     const confirm = await screen.findByRole("alertdialog", { name: "Delete server" });
-    expect(within(confirm).getByText(/Its saved world is deleted with it\. Its backups are kept/)).toBeInTheDocument();
+    expect(
+      within(confirm).getByText(/A last backup of its saved world is stored first \(a backup of kind “before a deletion”\) and kept on the Backups page; then the world is deleted with the server\./),
+    ).toBeInTheDocument();
+    expect(within(confirm).getByText(/Its backups are kept/)).toBeInTheDocument();
   });
 
   it("downloads a backup with the bearer header under the daemon's file name", async () => {
@@ -585,6 +589,300 @@ describe("saved data rules mirrored in the client", () => {
       { value: "server:9", label: "zeta" },
       { value: "deleted:gone", label: "gone (deleted)" },
     ]);
+  });
+});
+
+describe("incomplete and pre-delete backups", () => {
+  it("labels backups taken before a deletion and says how many entries a backup leaves out", async () => {
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: account(),
+      routes: pageRoutes(serverFixture(), [
+        backupFixture({ id: 44, kind: "pre_delete", omitted_entries: 3, note: "" }),
+        backupFixture({ id: 43, omitted_entries: 1, live: false, note: "" }),
+        backupFixture({ id: 40 }),
+      ]),
+    });
+    const section = await dataSection();
+    const table = await within(section).findByRole("table", { name: "Backups of this server" });
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(within(rows[0]).getByText("Before a deletion")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("3 entries left out")).toHaveAttribute("title", OMITTED_HINT);
+    expect(within(rows[1]).getByText("1 entry left out")).toBeInTheDocument();
+    // Files copied without a fresh save: a short second line, with the explanation in its title.
+    expect(within(rows[1]).getByText("No fresh save")).toHaveAttribute("title", expect.stringContaining("copied as they were"));
+    expect(within(rows[2]).queryByText(/left out/)).toBeNull();
+    expect(backupKindLabel("pre_delete")).toBe("Before a deletion");
+
+    await user.click(within(section).getByRole("button", { name: "Restore backup 44" }));
+    const dialog = await screen.findByRole("dialog", { name: "Restore a backup into echo" });
+    expect(within(dialog).getByText("This backup is incomplete: 3 entries left out")).toBeInTheDocument();
+    expect(within(dialog).getByText(OMITTED_HINT)).toBeInTheDocument();
+    expect(within(dialog).getByText(/Backup of echo taken .* \(before a deletion,/)).toBeInTheDocument();
+  });
+
+  it("keeps the taken and kind values on one line so that they do not wrap word by word", async () => {
+    renderApp({ path: "/backups", signedInAs: developer, routes: { "GET /backups": () => jsonResponse(200, backupList([backupFixture({ kind: "pre_restore" })])) } });
+    const table = await screen.findByRole("table", { name: "Backups" });
+    expect(within(table).getByText("Before a restore").parentElement).toHaveClass("whitespace-nowrap");
+    expect(within(table).getByText("by alice").parentElement).toHaveClass("whitespace-nowrap");
+  });
+
+  it("warns before downloading a large backup in the browser and shows the curl alternative", async () => {
+    const names: string[] = [];
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      names.push(this.download);
+    });
+    const urls = { create: URL.createObjectURL, revoke: URL.revokeObjectURL };
+    URL.createObjectURL = () => "blob:backup";
+    URL.revokeObjectURL = () => {};
+    try {
+      const { user, calls } = renderApp({
+        path: "/servers/3",
+        signedInAs: developer,
+        routes: pageRoutes(serverFixture(), [backupFixture({ size_bytes: 600 * 1024 * 1024 })], {
+          "GET /backups/{id}/download": () =>
+            new Response(new Blob([new Uint8Array([0x1f, 0x8b])]), {
+              status: 200,
+              headers: { "Content-Type": "application/gzip", "Content-Disposition": 'attachment; filename="echo-backup-40.tar.gz"' },
+            }),
+        }),
+      });
+      await user.click(await screen.findByRole("button", { name: "Download backup 40" }));
+      const confirm = await screen.findByRole("alertdialog", { name: "Download a large backup" });
+      expect(within(confirm).getByText(/This archive is 600 MiB\..*may fail in the browser/)).toBeInTheDocument();
+      expect(within(confirm).getByText(/curl -fL -H "Authorization: Bearer \$TOKEN" .*\/api\/v1\/backups\/40\/download/)).toBeInTheDocument();
+      expect(calls.some((c) => c.path === "/backups/40/download")).toBe(false);
+      await user.click(within(confirm).getByRole("button", { name: "Download in the browser" }));
+      await waitFor(() => expect(names).toEqual(["echo-backup-40.tar.gz"]));
+    } finally {
+      click.mockRestore();
+      URL.createObjectURL = urls.create;
+      URL.revokeObjectURL = urls.revoke;
+    }
+  });
+});
+
+describe("restore dialog consent", () => {
+  const OTHER_FP = "b".repeat(16);
+  const twoServers = [serverFixture(), serverFixture({ id: 4, name: "kart-eu", project_id: 6, build_id: 13, port: 7811 })];
+  const builds = [buildFixture({ schema_fingerprint: FINGERPRINT }), buildFixture({ id: 13, project_id: 6, schema_fingerprint: OTHER_FP })];
+
+  it("clears the force and skip ticks when the admin picks another server", async () => {
+    const { user, calls } = renderApp({
+      path: "/backups",
+      signedInAs: account(),
+      routes: {
+        "GET /backups": () => jsonResponse(200, backupList([backupFixture({ id: 52, schema_fingerprint: OLD_FP })])),
+        "GET /servers": () => jsonResponse(200, { items: twoServers }),
+        "GET /builds": () => jsonResponse(200, { items: builds }),
+      },
+    });
+    await user.click(await screen.findByRole("button", { name: "Restore backup 52" }));
+    const dialog = await screen.findByRole("dialog", { name: "Restore a backup" });
+    const target = await within(dialog).findByLabelText("Restore into");
+    expect(target).toHaveValue("3");
+    await within(dialog).findByText("The build of echo cannot load this backup");
+    await user.click(within(dialog).getByLabelText("Restore anyway: I will deploy a build that can load it"));
+    await user.click(within(dialog).getByText("More options"));
+    await user.click(within(dialog).getByLabelText("Skip the safety backup"));
+    expect(within(dialog).getByRole("button", { name: "Restore anyway" })).toBeEnabled();
+
+    await user.selectOptions(target, "4");
+    expect(await within(dialog).findByText("The build of kart-eu cannot load this backup")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Restore anyway: I will deploy a build that can load it")).not.toBeChecked();
+    expect(within(dialog).getByLabelText("Skip the safety backup")).not.toBeChecked();
+    expect(within(dialog).getByRole("button", { name: "Restore anyway" })).toBeDisabled();
+
+    // Back to the first server: the earlier ticks do not come back either.
+    await user.selectOptions(target, "3");
+    expect(within(dialog).getByLabelText("Restore anyway: I will deploy a build that can load it")).not.toBeChecked();
+    expect(within(dialog).getByLabelText("Skip the safety backup")).not.toBeChecked();
+    expect(calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
+  it("says the server stays stopped when the schemas are known to differ", async () => {
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: account(),
+      routes: pageRoutes(serverFixture(), [backupFixture({ schema_fingerprint: OLD_FP })]),
+    });
+    const section = await dataSection();
+    await user.click(await within(section).findByRole("button", { name: "Restore backup 40" }));
+    const dialog = await screen.findByRole("dialog", { name: "Restore a backup into echo" });
+    expect(await within(dialog).findByText("The server stays stopped until a build with the backup's schema is assigned to it.")).toBeInTheDocument();
+    expect(within(dialog).queryByText(/starts again/)).toBeNull();
+  });
+
+  it("clears the ticks when the target's build fingerprint changes while the dialog is open", async () => {
+    let buildFp = FINGERPRINT;
+    const { user, services } = renderApp({
+      path: "/servers/3",
+      signedInAs: account(),
+      routes: pageRoutes(serverFixture(), [backupFixture({ schema_fingerprint: OLD_FP })], {
+        "GET /builds": () => jsonResponse(200, { items: [buildFixture({ schema_fingerprint: buildFp })] }),
+      }),
+    });
+    const section = await dataSection();
+    await user.click(await within(section).findByRole("button", { name: "Restore backup 40" }));
+    const dialog = await screen.findByRole("dialog", { name: "Restore a backup into echo" });
+    await within(dialog).findByText("The build of echo cannot load this backup");
+    await user.click(within(dialog).getByLabelText("Restore anyway: I will deploy a build that can load it"));
+    await user.click(within(dialog).getByText("More options"));
+    await user.click(within(dialog).getByLabelText("Skip the safety backup"));
+    expect(within(dialog).getByRole("button", { name: "Restore anyway" })).toBeEnabled();
+
+    buildFp = OTHER_FP;
+    await act(() => services.queryClient.invalidateQueries());
+    await waitFor(() => expect(within(dialog).getByText(OTHER_FP.slice(0, 12))).toBeInTheDocument());
+    expect(within(dialog).getByLabelText("Restore anyway: I will deploy a build that can load it")).not.toBeChecked();
+    expect(within(dialog).getByLabelText("Skip the safety backup")).not.toBeChecked();
+    expect(within(dialog).getByRole("button", { name: "Restore anyway" })).toBeDisabled();
+  });
+
+  it("requires choosing again when the chosen server disappears, without falling back to another one", async () => {
+    let servers = twoServers;
+    const { user, services, calls } = renderApp({
+      path: "/backups",
+      signedInAs: account(),
+      routes: {
+        "GET /backups": () => jsonResponse(200, backupList([backupFixture({ id: 52, schema_fingerprint: "" })])),
+        "GET /servers": () => jsonResponse(200, { items: servers }),
+        "GET /builds": () => jsonResponse(200, { items: builds }),
+      },
+    });
+    await user.click(await screen.findByRole("button", { name: "Restore backup 52" }));
+    const dialog = await screen.findByRole("dialog", { name: "Restore a backup" });
+    const target = await within(dialog).findByLabelText("Restore into");
+    expect(target).toHaveValue("3");
+    await user.click(within(dialog).getByText("More options"));
+    await user.click(within(dialog).getByLabelText("Skip the safety backup"));
+
+    servers = [twoServers[1]];
+    await act(() => services.queryClient.invalidateQueries({ queryKey: ["servers"] }));
+    expect(await within(dialog).findByText("The chosen server is no longer listed")).toBeInTheDocument();
+    expect(target).toHaveValue("");
+    expect(within(dialog).queryByLabelText("Skip the safety backup")).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "Restore backup" })).toBeDisabled();
+
+    await user.selectOptions(target, "4");
+    expect(within(dialog).queryByText("The chosen server is no longer listed")).toBeNull();
+    expect(within(dialog).getByLabelText("Skip the safety backup")).not.toBeChecked();
+    await user.click(within(dialog).getByRole("button", { name: "Restore backup" }));
+    await waitFor(() => expect(calls.find((c) => c.method === "POST")?.path).toBe("/servers/4/restore"));
+  });
+});
+
+describe("deleting a server", () => {
+  const refusal = "the last backup of the saved data would leave 2 entries of the data directory out; nothing was deleted. An administrator can delete the server anyway with skip_safety_backup=1";
+  const failedDelete = job({ id: 61, kind: "server.delete", subject_type: "server", subject_id: "3", status: "error", detail: refusal, finished_at: "2026-11-24T10:00:00Z" });
+
+  it("lets an admin skip the last backup as a secondary option", async () => {
+    const { user, calls } = renderApp({
+      path: "/servers/3",
+      signedInAs: account(),
+      routes: pageRoutes(serverFixture(), [], { "DELETE /servers/{id}": () => jsonResponse(204, null), "GET /servers": () => jsonResponse(200, { items: [] }) }),
+    });
+    await user.click(await screen.findByRole("button", { name: "Delete" }));
+    const confirm = await screen.findByRole("alertdialog", { name: "Delete server" });
+    await user.click(within(confirm).getByText("More options"));
+    await user.click(within(confirm).getByLabelText("Skip the last backup"));
+    expect(within(confirm).getByText(/Its saved world is not backed up: it is deleted with the server and cannot be brought back\./)).toBeInTheDocument();
+    await user.click(within(confirm).getByRole("button", { name: "Delete server" }));
+    await waitFor(() => expect(calls.find((c) => c.method === "DELETE")?.query.get("skip_safety_backup")).toBe("1"));
+    expect(await screen.findByText(/Server echo deleted: .* Its backups are kept\./)).toBeInTheDocument();
+  });
+
+  it("offers developers no way to skip the last backup and sends none", async () => {
+    const { user, calls } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: pageRoutes(serverFixture(), [], { "DELETE /servers/{id}": () => jsonResponse(204, null), "GET /servers": () => jsonResponse(200, { items: [] }) }),
+    });
+    await user.click(await screen.findByRole("button", { name: "Delete" }));
+    const confirm = await screen.findByRole("alertdialog", { name: "Delete server" });
+    expect(within(confirm).queryByText("More options")).toBeNull();
+    expect(within(confirm).queryByLabelText("Skip the last backup")).toBeNull();
+    await user.click(within(confirm).getByRole("button", { name: "Delete server" }));
+    await waitFor(() => expect(calls.find((c) => c.method === "DELETE")?.path).toBe("/servers/3"));
+    expect(calls.find((c) => c.method === "DELETE")?.query.has("skip_safety_backup")).toBe(false);
+  });
+
+  it("keeps the dialog open on a refused last backup, shows the daemon's message and the admin's way out", async () => {
+    let n = 0;
+    const { user, calls } = renderApp({
+      path: "/servers/3",
+      signedInAs: account(),
+      routes: pageRoutes(serverFixture(), [], {
+        "DELETE /servers/{id}": () => (++n === 1 ? errorResponse(409, "conflict", refusal) : jsonResponse(204, null)),
+        "GET /jobs": (req) => jsonResponse(200, { items: req.query.get("limit") === "5" ? [failedDelete] : [] }),
+        "GET /jobs/{id}": () => jsonResponse(200, failedDelete),
+        "GET /servers": () => jsonResponse(200, { items: [] }),
+      }),
+    });
+    await user.click(await screen.findByRole("button", { name: "Delete" }));
+    const confirm = await screen.findByRole("alertdialog", { name: "Delete server" });
+    await user.click(within(confirm).getByRole("button", { name: "Delete server" }));
+    expect(
+      await within(confirm).findByText(
+        "The last backup of the saved data would leave 2 entries of the data directory out; nothing was deleted. An administrator can delete the server anyway with skip_safety_backup=1.",
+      ),
+    ).toBeInTheDocument();
+    expect(within(confirm).getByText(/To delete the server anyway, tick “Skip the last backup” under More options/)).toBeInTheDocument();
+    // The failed job is shown on the page as before.
+    expect(await screen.findByLabelText("Job 61")).toBeInTheDocument();
+    await user.click(within(confirm).getByLabelText("Skip the last backup"));
+    await user.click(within(confirm).getByRole("button", { name: "Delete server" }));
+    await waitFor(() => expect(calls.filter((c) => c.method === "DELETE").map((c) => c.query.get("skip_safety_backup"))).toEqual([null, "1"]));
+  });
+
+  it("tells a developer that an administrator can delete without the last backup", async () => {
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: pageRoutes(serverFixture(), [], { "DELETE /servers/{id}": () => errorResponse(409, "conflict", refusal) }),
+    });
+    await user.click(await screen.findByRole("button", { name: "Delete" }));
+    const confirm = await screen.findByRole("alertdialog", { name: "Delete server" });
+    await user.click(within(confirm).getByRole("button", { name: "Delete server" }));
+    expect(await within(confirm).findByText(/An administrator can delete the server without the last backup\./)).toBeInTheDocument();
+    expect(within(confirm).queryByLabelText("Skip the last backup")).toBeNull();
+  });
+});
+
+describe("notes and durations", () => {
+  const cp = (n: number) => String.fromCodePoint(n);
+
+  it("refuses the characters the daemon refuses in a note and trims surrounding space like it", () => {
+    for (const bad of [0x00, 0x09, 0x1b, 0x7f, 0x85, 0x9f, 0x202a, 0x202e, 0x2066, 0x2069]) {
+      expect(validateBackupNote(`a${cp(bad)}b`), `U+${bad.toString(16)}`).not.toBeNull();
+    }
+    expect(validateBackupNote(`a${cp(0x2028)}b`)).toBe("Use a single line.");
+    expect(validateBackupNote(`a${cp(0x2029)}b`)).toBe("Use a single line.");
+    expect(validateBackupNote(`a${cp(0x200b)}b ${cp(0xe9)}`)).toBeNull();
+    // Surrounding space is removed first, as Go's strings.TrimSpace does, also a trailing newline.
+    expect(trimBackupNote(`${cp(0xa0)} \tnote${cp(0x3000)}\n`)).toBe("note");
+    expect(validateBackupNote(` ${"x".repeat(200)} \n`)).toBeNull();
+  });
+
+  it("checks the note before sending it", async () => {
+    const { user, calls } = renderApp({ path: "/servers/3", signedInAs: developer, routes: pageRoutes(serverFixture(), []) });
+    const section = await dataSection();
+    await user.type(within(section).getByLabelText("Note (optional)"), `left${cp(0x202e)}right`);
+    await user.click(within(section).getByRole("button", { name: "Back up now" }));
+    expect(within(section).getByText("Remove the control characters and text direction marks.")).toBeInTheDocument();
+    expect(calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
+  it("writes durations in words without zero parts", () => {
+    expect(formatDurationWords(300)).toBe("5 minutes");
+    expect(formatDurationWords(90)).toBe("90 seconds");
+    expect(formatDurationWords(5400)).toBe("1 hour 30 minutes");
+    expect(formatDurationWords(60)).toBe("1 minute");
+    expect(formatDurationWords(10)).toBe("10 seconds");
+    expect(formatDurationWords(150)).toBe("2 minutes 30 seconds");
+    expect(formatDurationWords(86400)).toBe("1 day");
+    expect(formatDurationWords(3601)).toBe("1 hour 1 second");
   });
 });
 

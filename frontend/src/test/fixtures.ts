@@ -133,6 +133,7 @@ export function backupFixture(overrides: Partial<Backup> = {}): Backup {
     size_bytes: 3_500_000,
     content_bytes: 9_000_000,
     file_count: 4,
+    omitted_entries: 0,
     sha256: "5e".repeat(32),
     job_id: 500,
     created_by: 1,
