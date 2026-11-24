@@ -18,7 +18,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/caddyserver/certmagic"
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
@@ -39,13 +38,14 @@ type accountSettings struct {
 }
 
 func (s accountSettings) account(override string) ACMEAccount {
+	account := ACMEAccount{Directory: override, Email: s.Email, DirectoryOverride: override != ""}
 	if override == "" {
-		override = certmagic.LetsEncryptProductionCA
+		account.Directory = letsEncryptProduction
 		if s.Staging {
-			override = certmagic.LetsEncryptStagingCA
+			account.Directory = letsEncryptStaging
 		}
 	}
-	return ACMEAccount{Directory: override, Email: s.Email}
+	return account
 }
 
 // AutomationOptions wires the ACME client and the panel's startup TLS mode.
@@ -375,7 +375,7 @@ func publicIdentifier(host string) bool {
 	_, err := ValidateHost(host)
 	tld := host[strings.LastIndexByte(host, '.')+1:]
 	return err == nil && tld != host && tld != "test" && tld != "invalid" && tld != "example" &&
-		certmagic.SubjectQualifiesForPublicCert(host)
+		tld != "localhost" && tld != "local" && tld != "internal" && !strings.HasSuffix(host, ".home.arpa")
 }
 
 type Action int

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/mholt/acmez/v3/acme"
 	"github.com/miekg/dns"
 )
 
@@ -173,17 +174,29 @@ func TestPebbleCertificates(t *testing.T) {
 	if err := os.Mkdir(storage, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	hclient := NewACMEClient(storage, roots, logger, ACMEListeners{HTTP: hln.Addr().String()})
-	tclient := NewACMEClient(storage, roots, logger, ACMEListeners{ALPN: tln.Addr().String()})
-	ip := "127.0.0.1"
-	// Pebble randomly picks from its configured profiles when the order
-	// omits a profile. Assert the issuer configuration as well as the IP
-	// lifetime so the random choice cannot make an incorrect request pass.
-	for _, tc := range []struct{ name, profile string }{{ip, "shortlived"}, {"panel.example.test", ""}} {
-		if got := profileFor(tc.name); got != tc.profile {
-			t.Fatalf("profile for %s was %q, want %q", tc.name, got, tc.profile)
+	hclient := NewACMEClient(storage, roots, logger, ACMEListeners{HTTP: hln.Addr().String()}).(*acmeClient)
+	tclient := NewACMEClient(storage, roots, logger, ACMEListeners{ALPN: tln.Addr().String()}).(*acmeClient)
+	var ordersMu sync.Mutex
+	var orders []acme.Order
+	for _, client := range []*acmeClient{hclient, tclient} {
+		original := client.newTransport
+		client.newTransport = func() (http.RoundTripper, func()) {
+			base, stop := original()
+			return acmeRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/order-plz" {
+					var order acme.Order
+					if err := readACMEPayload(r, &order); err != nil {
+						return nil, err
+					}
+					ordersMu.Lock()
+					orders = append(orders, order)
+					ordersMu.Unlock()
+				}
+				return base.RoundTrip(r)
+			}), stop
 		}
 	}
+	ip := "127.0.0.1"
 	a := NewAutomation(AutomationOptions{Game: game, GameHost: fixedHost(ip), PanelMode: apitypes.PanelCertificateModeNone,
 		Directory: directory, Client: hclient, HTTP01: true})
 	if err := a.Initialize(ctx); err != nil {
@@ -254,6 +267,19 @@ func TestPebbleCertificates(t *testing.T) {
 	current, err := game.Current(ctx, 0)
 	if err != nil || panel.panel.Load().issued[ip].info.Fingerprint != current.Fingerprint {
 		t.Fatal("game and panel did not share the certificate for the IP")
+	}
+	ordersMu.Lock()
+	submitted := slices.Clone(orders)
+	ordersMu.Unlock()
+	profiles := make(map[string][]string)
+	for _, order := range submitted {
+		if len(order.Identifiers) == 1 {
+			name := order.Identifiers[0].Value
+			profiles[name] = append(profiles[name], order.Profile)
+		}
+	}
+	if !slices.Equal(profiles[ip], []string{"shortlived", "shortlived"}) || !slices.Equal(profiles[host], []string{""}) {
+		t.Fatalf("unexpected profiles in submitted newOrder requests: %v", profiles)
 	}
 	if _, err := panel.UsePanelSelfSigned(ctx); err != nil {
 		t.Fatal(err)

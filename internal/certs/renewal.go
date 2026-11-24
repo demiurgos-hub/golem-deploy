@@ -45,17 +45,7 @@ func summarizeACME(err error) *acmeFailure {
 		failure := &acmeFailure{message: msg}
 		switch {
 		case problem.Status == http.StatusTooManyRequests || problem.Type == acme.ProblemTypeRateLimited:
-			for _, field := range strings.Fields(detail) {
-				if t, e := time.Parse(time.RFC3339, strings.Trim(field, ".,()[]")); e == nil {
-					failure.retry = t
-					break
-				}
-			}
-			if failure.retry.IsZero() {
-				failure.message += " The CA rate limited this request. Wait before retrying."
-			} else {
-				failure.message += " Retry after " + failure.retry.UTC().Format(time.RFC3339) + "."
-			}
+			failure.message += " The CA rate limited this request."
 		case problem.Type == acme.ProblemTypeDNS:
 			failure.message += " Check that DNS points to this host."
 		case problem.Type == acme.ProblemTypeConnection || problem.Type == acme.ProblemTypeUnauthorized ||
@@ -75,14 +65,7 @@ func (a *Automation) loadACME(ctx context.Context, account ACMEAccount, host str
 	if err != nil {
 		return nil, err
 	}
-	pair, err := parsePair(chain, key)
-	if err == nil && (!pair.info.Covers(host) || a.now().Before(pair.info.NotBefore) || !a.now().Before(pair.info.NotAfter)) {
-		err = ErrNoCertificate
-	}
-	if err != nil {
-		return nil, err
-	}
-	return pair, nil
+	return validateACMEPair(chain, key, host, a.now())
 }
 
 func (a *Automation) obtain(ctx context.Context, account ACMEAccount, host string, force bool, log io.Writer) (*certificatePair, error) {
@@ -121,10 +104,14 @@ func (a *Automation) recordFailure(ctx context.Context, account ACMEAccount, hos
 	count := min(last.Failures+1, 7)
 	// Leave room for repeated attempts even in the minimum 12-hour margin.
 	wait := min(time.Minute<<(count-1), 30*time.Minute)
-	next := a.now().Add(wait)
+	now := a.now()
+	next := now.Add(wait)
 	var failure *acmeFailure
 	if errors.As(err, &failure) && failure.retry.After(next) {
 		next = failure.retry
+		if latest := now.Add(24 * time.Hour); next.After(latest) {
+			next = latest
+		}
 	}
 	message := operationError(err)
 	a.record(ctx, account, host, attemptState{At: &at, Detail: message, Failures: count, Retry: next, Install: install, BlockReason: last.BlockReason})
@@ -155,9 +142,11 @@ func (a *Automation) run(ctx context.Context, action Action, requested []string,
 			}
 		}
 		var pending *PublicationError
-		if errors.As(err, &pending) && ctx.Err() != nil {
-			fmt.Fprintln(log, pending.Error())
-			return nil // The committed install survives cancellation.
+		if ctx.Err() != nil {
+			if errors.As(err, &pending) {
+				fmt.Fprintf(log, "%s: %s\n", host, pending.Error())
+			}
+			return ctx.Err()
 		}
 		if err != nil {
 			if action != RenewAll {
@@ -177,6 +166,9 @@ func (a *Automation) run(ctx context.Context, action Action, requested []string,
 		}
 	}
 	if action == RenewAll {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return failures
 	}
 
@@ -242,26 +234,36 @@ func (a *Automation) installManaged(ctx context.Context, host string, pair *cert
 		return false, errHostsChanged
 	}
 	changed := false
+	var pending *PublicationError
 	if slices.Contains(uses, apitypes.ACMECertificateUseGame) {
 		old, err := a.Game.Current(ctx, 0)
 		if err != nil {
 			return false, err
 		}
 		if pair.info.Fingerprint != old.Fingerprint && (!newerOnly || newer(pair.info, old, host)) {
-			if _, err := a.Game.useShared(ctx, ModeACME, pair.chain, pair.key); err != nil {
+			if _, err := a.Game.useShared(ctx, ModeACME, pair.chain, pair.key); err != nil && !errors.As(err, &pending) {
 				return false, err
 			}
 			changed = true
 		}
 	}
+	if ctx.Err() != nil && pending != nil {
+		return changed, pending
+	}
 	if slices.Contains(uses, apitypes.ACMECertificateUsePanel) {
 		old := state.panel.issued[host]
 		if old == nil || (pair.info.Fingerprint != old.info.Fingerprint && (!newerOnly || newer(pair.info, old.info, host))) {
 			if err := a.setPanelPair(host, pair); err != nil {
+				if pending != nil {
+					return changed, errors.Join(pending, err)
+				}
 				return changed, err
 			}
 			changed = true
 		}
+	}
+	if pending != nil {
+		return changed, pending
 	}
 	return changed, nil
 }
@@ -271,18 +273,21 @@ func newer(pair, installed Info, host string) bool {
 }
 
 func (a *Automation) Maintain(ctx context.Context) {
+	publicationDone := make(chan struct{})
+	go func() {
+		defer close(publicationDone)
+		a.maintainPublication(ctx)
+	}()
+	defer func() { <-publicationDone }()
 	hourly := time.NewTicker(CheckInterval)
 	defer hourly.Stop()
 	retry := time.NewTicker(time.Minute)
 	defer retry.Stop()
-	var publicationRetry <-chan time.Time
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if publicationRetry == nil {
-			a.maintainOnce(ctx)
-		}
+		a.maintainOnce(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -290,19 +295,27 @@ func (a *Automation) Maintain(ctx context.Context) {
 			a.Game.Check(ctx, a.GameHost)
 		case <-retry.C:
 		case <-a.wake:
-		case <-a.Game.publicationWake:
-			publicationRetry = a.retryPublication(ctx)
-		case <-publicationRetry:
-			publicationRetry = a.retryPublication(ctx)
 		}
 	}
 }
 
-func (a *Automation) retryPublication(ctx context.Context) <-chan time.Time {
-	if _, err := a.Game.Mode(ctx); err != nil && ctx.Err() == nil {
-		return time.After(time.Second)
+func (a *Automation) maintainPublication(ctx context.Context) {
+	var retry <-chan time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.Game.publicationWake:
+		case <-retry:
+		}
+		retry = nil
+		a.Game.mu.Lock()
+		err := a.Game.finishPublication(ctx)
+		a.Game.mu.Unlock()
+		if err != nil && !errors.Is(err, errMountHeld) && ctx.Err() == nil {
+			retry = time.After(time.Second)
+		}
 	}
-	return nil
 }
 
 func (a *Automation) maintainOnce(ctx context.Context) {
@@ -450,6 +463,9 @@ func (a *Automation) renewalDue(ctx context.Context, account ACMEAccount, host s
 		}
 		if refresh.Before(now.Add(time.Hour)) {
 			refresh = now.Add(time.Hour)
+		}
+		if latest := now.Add(24 * time.Hour); refresh.After(latest) {
+			refresh = latest
 		}
 		schedule = renewalSchedule{fingerprint: info.Fingerprint, when: when, refresh: refresh}
 		a.schedules[host] = schedule

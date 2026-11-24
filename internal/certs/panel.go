@@ -1,6 +1,7 @@
 package certs
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -39,6 +41,30 @@ func parsePair(chain, key []byte) (*certificatePair, error) {
 		}
 	}
 	return &certificatePair{chain: chain, key: key, tls: &pair, info: describe(pair.Leaf, len(pair.Certificate))}, nil
+}
+
+func validateACMEPair(chain, key []byte, host string, now time.Time) (*certificatePair, error) {
+	rejected := &acmeFailure{message: "The CA did not provide a usable certificate for " + host + "."}
+	chain, key, err := ValidateCustom(chain, key, now)
+	if err != nil {
+		return nil, rejected
+	}
+	pair, err := parsePair(chain, key)
+	if err != nil {
+		return nil, rejected
+	}
+	leaf := pair.info.leaf
+	if len(leaf.EmailAddresses)+len(leaf.URIs) != 0 {
+		return nil, rejected
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if len(leaf.IPAddresses) != 1 || !leaf.IPAddresses[0].Equal(ip) || len(leaf.DNSNames) != 0 {
+			return nil, rejected
+		}
+	} else if len(leaf.DNSNames) != 1 || !strings.EqualFold(leaf.DNSNames[0], host) || len(leaf.IPAddresses) != 0 {
+		return nil, rejected
+	}
+	return pair, nil
 }
 
 type panelState struct {
@@ -108,7 +134,7 @@ func (a *Automation) Initialize(ctx context.Context) error {
 		if apitypes.PanelCertificateMode(mode) == apitypes.PanelCertificateModeACME {
 			p.mode = apitypes.PanelCertificateModeACME
 			for _, name := range p.hosts {
-				pair, err := a.readPanelPair(panelPairName(name))
+				pair, err := a.readIssuedPanelPair(name)
 				switch {
 				case err == nil:
 					p.issued[name] = pair
@@ -145,6 +171,22 @@ func (a *Automation) readPanelPair(name string) (*certificatePair, error) {
 		return nil, err
 	}
 	return parsePair(data, data)
+}
+
+func (a *Automation) readIssuedPanelPair(host string) (*certificatePair, error) {
+	data, err := os.ReadFile(filepath.Join(a.PanelDir, panelPairName(host)))
+	if err != nil {
+		return nil, err
+	}
+	i := bytes.LastIndex(data, []byte("-----BEGIN PRIVATE KEY-----"))
+	if i < 0 {
+		return nil, ErrNoCertificate
+	}
+	pair, err := validateACMEPair(data[:i], data[i:], host, a.now())
+	if err != nil {
+		return nil, ErrNoCertificate
+	}
+	return pair, nil
 }
 
 func (a *Automation) writePanelPair(name string, pair *certificatePair) error {
@@ -194,18 +236,22 @@ func (p *panelState) selectPair(now time.Time, name, localIP string) *certificat
 			if pair := p.usable(now, localIP); pair != nil {
 				return pair
 			}
-			var ipHost string
+			var soleIP *certificatePair
 			for _, host := range p.hosts {
-				if _, err := netip.ParseAddr(host); err == nil && p.issued[host] != nil {
-					if ipHost != "" {
-						ipHost = ""
+				if _, err := netip.ParseAddr(host); err == nil {
+					pair := p.usable(now, host)
+					if pair == nil {
+						continue
+					}
+					if soleIP != nil {
+						soleIP = nil
 						break
 					}
-					ipHost = host
+					soleIP = pair
 				}
 			}
-			if pair := p.usable(now, ipHost); pair != nil {
-				return pair
+			if soleIP != nil {
+				return soleIP
 			}
 			if len(p.hosts) != 0 {
 				if pair := p.usable(now, p.hosts[0]); pair != nil {

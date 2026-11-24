@@ -193,14 +193,6 @@ func TestCommittedGameChangeReportsPartialPublicationAndConverges(t *testing.T) 
 	if err := os.WriteFile(mount, []byte("block second mount"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		h.srv.automation.Maintain(ctx)
-	}()
-	defer func() { cancel(); <-done }()
-
 	resp := h.call("PUT", "/api/v1/certificates/game", h.adminSs,
 		apitypes.UpdateGameCertificateRequest{Mode: "custom", CertificatePEM: chain, PrivateKeyPEM: key})
 	report := errBody(t, resp, http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
@@ -211,9 +203,20 @@ func TestCommittedGameChangeReportsPartialPublicationAndConverges(t *testing.T) 
 	if err != nil || first.Leaf == nil || first.Leaf.Subject.CommonName != "play.example.com" {
 		t.Fatalf("first mount was not published: %v", err)
 	}
+	active := decode[apitypes.GameCertificate](t, h.call("GET", "/api/v1/certificates/game", h.adminSs, nil))
+	if active.Mode != "custom" || active.Certificate == nil {
+		t.Fatalf("publication failure hid the committed certificate: %+v", active)
+	}
 	if err := os.Remove(mount); err != nil {
 		t.Fatal(err)
 	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.srv.automation.Maintain(ctx)
+	}()
+	defer func() { cancel(); <-done }()
 	// Observe the filesystem directly so the test does not trigger recovery.
 	deadline := time.Now().Add(5 * time.Second)
 	for {

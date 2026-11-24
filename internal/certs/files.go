@@ -1,6 +1,7 @@
 package certs
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -24,6 +25,8 @@ const (
 	pendingCert = CertFile + ".new"
 	pendingKey  = KeyFile + ".new"
 )
+
+var errMountHeld = errors.New("a game server is loading its certificate")
 
 // generate creates a new self-signed pair for host.
 func (m *Manager) generate(host string, otherHosts ...string) ([]byte, []byte, Info, error) {
@@ -84,7 +87,7 @@ func (m *Manager) generate(host string, otherHosts ...string) ([]byte, []byte, I
 // is completed by recoverPending on the next start.
 func (m *Manager) install(dir string, certPEM, keyPEM []byte) error {
 	if m.starting[dir] {
-		return errors.New("a game server is loading its certificate")
+		return errMountHeld
 	}
 	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
 		return fmt.Errorf("certs: refusing to install an invalid pair: %w", err)
@@ -124,6 +127,10 @@ func (m *Manager) install(dir string, certPEM, keyPEM []byte) error {
 // writeFile writes name in the directory through a uniquely named
 // temporary file and renames it to name.
 func (m *Manager) writeFile(dir, name string, data []byte, mode os.FileMode) error {
+	return writeFile(dir, name, data, mode, m.fileGID)
+}
+
+func writeFile(dir, name string, data []byte, mode os.FileMode, gid int) error {
 	f, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return fmt.Errorf("write %s: %w", name, err)
@@ -136,7 +143,10 @@ func (m *Manager) writeFile(dir, name string, data []byte, mode os.FileMode) err
 			_ = os.Remove(tmp)
 		}
 	}()
-	if err := m.setPermFile(f, mode); err != nil {
+	if err := f.Chmod(mode); err != nil {
+		return err
+	}
+	if err := chownGroup(f.Name(), gid); err != nil {
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
@@ -237,6 +247,11 @@ func (m *Manager) copyPair(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	currentChain, certErr := os.ReadFile(filepath.Join(dst, CertFile))
+	currentKey, keyErr := os.ReadFile(filepath.Join(dst, KeyFile))
+	if certErr == nil && keyErr == nil && bytes.Equal(chain, currentChain) && bytes.Equal(key, currentKey) {
+		return syncDir(dst)
+	}
 	return m.install(dst, chain, key)
 }
 
@@ -246,11 +261,4 @@ func (m *Manager) setPerm(path string, mode os.FileMode) error {
 		return fmt.Errorf("set mode of %s: %w", path, err)
 	}
 	return chownGroup(path, m.fileGID)
-}
-
-func (m *Manager) setPermFile(f *os.File, mode os.FileMode) error {
-	if err := f.Chmod(mode); err != nil {
-		return fmt.Errorf("set mode of %s: %w", f.Name(), err)
-	}
-	return chownGroup(f.Name(), m.fileGID)
 }

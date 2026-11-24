@@ -60,13 +60,14 @@ func ValidateCustom(chainPEM, keyPEM []byte, now time.Time) (chainOut, keyOut []
 		return nil, nil, invalid(FieldPrivateKey, "the private key is larger than %d KiB", MaxKeyBytes>>10)
 	}
 	var chain []*x509.Certificate
-	rest := chainPEM
-	for {
-		var b *pem.Block
-		b, rest = pem.Decode(rest)
-		if b == nil {
-			break
+	rest := bytes.TrimSpace(chainPEM)
+	for len(rest) != 0 {
+		b, next := pem.Decode(rest)
+		if b == nil || !bytes.HasPrefix(rest, []byte("-----BEGIN ")) ||
+			bytes.Count(rest[:len(rest)-len(next)], []byte("-----BEGIN ")) != 1 {
+			return nil, nil, invalid(FieldCertificate, "the chain contains data that is not a PEM block")
 		}
+		rest = bytes.TrimSpace(next)
 		if b.Type != "CERTIFICATE" {
 			return nil, nil, invalid(FieldCertificate, "the chain may only contain CERTIFICATE blocks (found %q)", clean(b.Type, 40))
 		}
@@ -78,9 +79,6 @@ func ValidateCustom(chainPEM, keyPEM []byte, now time.Time) (chainOut, keyOut []
 			return nil, nil, invalid(FieldCertificate, "certificate %d of the chain cannot be parsed", len(chain)+1)
 		}
 		chain = append(chain, c)
-	}
-	if len(bytes.TrimSpace(rest)) != 0 {
-		return nil, nil, invalid(FieldCertificate, "the chain contains data that is not a PEM block")
 	}
 	if len(chain) == 0 {
 		return nil, nil, invalid(FieldCertificate, "no PEM CERTIFICATE block found")
@@ -112,7 +110,7 @@ func ValidateCustom(chainPEM, keyPEM []byte, now time.Time) (chainOut, keyOut []
 	case now.Before(leaf.NotBefore):
 		return nil, nil, invalid(FieldCertificate, "the certificate is not valid before %s", leaf.NotBefore.UTC().Format(time.RFC3339))
 	}
-	if len(leaf.ExtKeyUsage) > 0 && !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageServerAuth) &&
+	if len(leaf.ExtKeyUsage)+len(leaf.UnknownExtKeyUsage) > 0 && !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageServerAuth) &&
 		!slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageAny) {
 		return nil, nil, invalid(FieldCertificate, "the certificate is not valid for TLS servers (extended key usage)")
 	}

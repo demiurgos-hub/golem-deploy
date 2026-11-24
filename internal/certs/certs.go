@@ -207,11 +207,12 @@ func (m *Manager) serversDir() string {
 // read the files (nil when none are needed, e.g. on Windows hosts).
 func (m *Manager) GroupAdd() []int { return slices.Clone(m.groupAdd) }
 
-// Mode returns the configured mode after completing any committed change.
+// Mode returns the committed mode even while mount publication is pending.
 func (m *Manager) Mode(ctx context.Context) (Mode, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.state(ctx)
+	mode, _, err := m.committedMode(ctx)
+	return mode, err
 }
 
 // Current returns certificate metadata for the configured mode. Pass 0 for
@@ -219,7 +220,7 @@ func (m *Manager) Mode(ctx context.Context) (Mode, error) {
 func (m *Manager) Current(ctx context.Context, id int64) (Info, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	mode, err := m.state(ctx)
+	mode, generation, err := m.committedMode(ctx)
 	if err != nil {
 		return Info{}, err
 	}
@@ -229,6 +230,8 @@ func (m *Manager) Current(ctx context.Context, id int64) (Info, error) {
 			return Info{Mode: mode}, nil
 		}
 		dir = m.ServerDir(id)
+	} else if stage, err := m.committedStage(generation); err == nil && stage != "" {
+		dir = filepath.Join(stage, "custom")
 	}
 	info, err := load(dir)
 	info.Mode = mode
@@ -243,7 +246,7 @@ func (m *Manager) Current(ctx context.Context, id int64) (Info, error) {
 func (m *Manager) Ensure(ctx context.Context, id int64, gameHost func(context.Context) (string, error)) (Info, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	mode, err := m.state(ctx)
+	mode, generation, err := m.committedMode(ctx)
 	if err != nil {
 		return Info{}, err
 	}
@@ -252,8 +255,16 @@ func (m *Manager) Ensure(ctx context.Context, id int64, gameHost func(context.Co
 		return Info{}, err
 	}
 	dir := m.ServerDir(id)
+	stage, err := m.committedStage(generation)
+	if err != nil {
+		return Info{}, err
+	}
 	if mode != ModeSelfSigned {
-		info, err := load(m.dir)
+		src := m.dir
+		if stage != "" {
+			src = filepath.Join(stage, "custom")
+		}
+		info, err := load(src)
 		info.Mode = mode
 		if err != nil {
 			return info, err
@@ -264,10 +275,18 @@ func (m *Manager) Ensure(ctx context.Context, id int64, gameHost func(context.Co
 		if m.now().Before(info.NotBefore) {
 			return info, ErrNoCertificate
 		}
-		if current, err := load(dir); err == nil && current.Fingerprint == info.Fingerprint {
-			return info, nil
+		if copied, err := m.publishServer(stage, id, mode); copied || err != nil {
+			return info, err
 		}
-		return info, m.copyPair(m.dir, dir)
+		return info, m.copyPair(src, dir)
+	}
+	if _, err := m.publishServer(stage, id, mode); err != nil {
+		return Info{}, err
+	}
+	if stage != "" {
+		if err := syncDir(stage); err != nil {
+			return Info{}, err
+		}
 	}
 	return m.ensureSelfSigned(dir, host)
 }
@@ -277,7 +296,7 @@ func (m *Manager) Ensure(ctx context.Context, id int64, gameHost func(context.Co
 func (m *Manager) HoldForStart(ctx context.Context, id int64, prepared Mode) (func(), error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	mode, err := m.state(ctx)
+	mode, generation, err := m.committedMode(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -285,6 +304,22 @@ func (m *Manager) HoldForStart(ctx context.Context, id int64, prepared Mode) (fu
 		return nil, errors.New("game certificate pinning changed while preparing the server")
 	}
 	dir := m.ServerDir(id)
+	if m.starting[dir] {
+		return nil, errMountHeld
+	}
+	stage, err := m.committedStage(generation)
+	if err != nil {
+		return nil, err
+	}
+	copied, err := m.publishServer(stage, id, mode)
+	if err != nil {
+		return nil, err
+	}
+	if !copied && stage != "" && mode != ModeSelfSigned {
+		if err := m.copyPair(filepath.Join(stage, "custom"), dir); err != nil {
+			return nil, err
+		}
+	}
 	if err := m.recoverPending(dir); err != nil {
 		return nil, err
 	}
@@ -295,15 +330,19 @@ func (m *Manager) HoldForStart(ctx context.Context, id int64, prepared Mode) (fu
 	if !m.now().Before(info.NotAfter) {
 		return nil, ErrExpired
 	}
+	if m.now().Before(info.NotBefore) {
+		return nil, ErrNoCertificate
+	}
 	if m.starting == nil {
 		m.starting = make(map[string]bool)
 	}
 	m.starting[dir] = true
-	return func() {
+	return sync.OnceFunc(func() {
 		m.mu.Lock()
 		delete(m.starting, dir)
 		m.mu.Unlock()
-	}, nil
+		m.wakePublisher()
+	}), nil
 }
 
 func (m *Manager) ensureSelfSigned(dir, host string) (Info, error) {
@@ -387,7 +426,7 @@ func (m *Manager) useShared(ctx context.Context, mode Mode, chain, key []byte) (
 func (m *Manager) RemoveServer(ctx context.Context, id int64, deleteRow func() error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, err := m.state(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := os.RemoveAll(m.ServerDir(id)); err != nil {
@@ -424,7 +463,7 @@ func (m *Manager) Check(ctx context.Context, host func(context.Context) (string,
 }
 
 func (m *Manager) check(ctx context.Context, host func(context.Context) (string, error)) error {
-	mode, err := m.state(ctx)
+	mode, generation, err := m.committedMode(ctx)
 	if err != nil {
 		return err
 	}
@@ -452,6 +491,15 @@ func (m *Manager) check(ctx context.Context, host func(context.Context) (string,
 		return err
 	}
 	var failures error
+	stage, err := m.committedStage(generation)
+	if err != nil {
+		return err
+	}
+	if stage != "" {
+		if err := syncDir(stage); err != nil {
+			return err
+		}
+	}
 	for _, id := range ids {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -462,6 +510,10 @@ func (m *Manager) check(ctx context.Context, host func(context.Context) (string,
 		}
 		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 			continue // first start or an explicit regeneration creates it
+		}
+		if _, err := m.publishServer(stage, id, mode); err != nil {
+			failures = errors.Join(failures, err)
+			continue
 		}
 		if _, err := m.ensureSelfSigned(dir, h); err != nil {
 			failures = errors.Join(failures, err)
