@@ -20,6 +20,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
+	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
@@ -68,6 +69,12 @@ type Options struct {
 	// StartTimeout bounds how long a server start waits for the game to
 	// report ready (--start-timeout; 0 means servers.DefaultStartTimeout).
 	StartTimeout time.Duration
+	// BuildTimeout bounds one build (--build-timeout; 0 means
+	// build.DefaultTimeout) and BuildRetention is how many successful
+	// builds are kept per project (--build-retention; 0 means
+	// build.DefaultRetention).
+	BuildTimeout   time.Duration
+	BuildRetention int
 	// Ready, if set, is called with the bound address once serving.
 	Ready func(addr net.Addr)
 
@@ -157,6 +164,18 @@ func Run(ctx context.Context, o Options) (err error) {
 	if o.MaxRepoSizeMB < 0 {
 		return errors.New("--max-repo-size-mb must be 0 (unlimited) or positive")
 	}
+	if o.BuildTimeout == 0 {
+		o.BuildTimeout = build.DefaultTimeout
+	}
+	if o.BuildTimeout < time.Minute || o.BuildTimeout > 24*time.Hour {
+		return errors.New("--build-timeout must be between 1m and 24h")
+	}
+	if o.BuildRetention == 0 {
+		o.BuildRetention = build.DefaultRetention
+	}
+	if o.BuildRetention < 1 || o.BuildRetention > 100 {
+		return errors.New("--build-retention must be between 1 and 100")
+	}
 	if err := checkDataDirPath(o.DataDir); err != nil {
 		return err
 	}
@@ -216,6 +235,11 @@ func Run(ctx context.Context, o Options) (err error) {
 	if rec.Jobs > 0 || rec.Projects > 0 {
 		logger.Warn("reconciled state from previous run", "interrupted_jobs", rec.Jobs, "reset_projects", rec.Projects)
 	}
+	if n, err := st.ReconcileBuilds(ctx); err != nil {
+		return err
+	} else if n > 0 {
+		logger.Warn("builds interrupted by the previous run were marked as failed", "builds", n)
+	}
 	counts, err := st.CountAccounts(ctx)
 	if err != nil {
 		return err
@@ -233,13 +257,18 @@ func Run(ctx context.Context, o Options) (err error) {
 	if err != nil {
 		return err
 	}
-	runner := jobs.New(st, layout.JobLogs(), jobs.Options{Logger: logger})
+	// Waiting builds hold a worker (build.MaxActiveBuilds at most), so
+	// there are enough workers left for server and project jobs.
+	runner := jobs.New(st, layout.JobLogs(), jobs.Options{Logger: logger, Workers: 4 + build.MaxActiveBuilds})
 	instanceID, err := st.InstanceID(ctx)
 	if err != nil {
 		return err
 	}
 	if err := docker.SweepEnvFiles(layout.Tmp()); err != nil {
 		logger.Warn("could not remove env files left by a previous run", "err", err)
+	}
+	if err := build.SweepTemp(layout.Tmp()); err != nil {
+		logger.Warn("could not remove build directories left by a previous run", "err", err)
 	}
 	dockerClient := docker.New(docker.Options{Runner: o.dockerCLI, Logger: logger, InstanceID: instanceID, TempDir: layout.Tmp()})
 	if err := docker.ValidateBindSource(layout.GameCerts()); err != nil {
@@ -254,6 +283,17 @@ func Run(ctx context.Context, o Options) (err error) {
 		logger.Warn("the game server port range overlaps the host's ephemeral port range; outgoing connections and Docker can take those ports at any time: "+
 			"choose another --port-range or raise net.ipv4.ip_local_port_range", "port_range", srvCfg.Ports.String(), "ephemeral_range", eph.String())
 	}
+	builds := build.New(build.Options{
+		Store:      st,
+		Docker:     dockerClient,
+		InstanceID: instanceID,
+		RepoDir:    layout.Repositories(),
+		TempDir:    layout.Tmp(),
+		StaticDir:  static.Dir(),
+		Timeout:    o.BuildTimeout,
+		Retention:  o.BuildRetention,
+		Logger:     logger,
+	})
 	svc := servers.New(st, box, dockerClient, srvCfg, logger)
 	certMgr.Check(ctx, svc.GameHost)
 	var probe httpapi.DockerProbe = dockerClient
@@ -282,6 +322,7 @@ func Run(ctx context.Context, o Options) (err error) {
 		Servers:  svc,
 		Static:   static,
 		Certs:    certMgr,
+		Builds:   builds,
 		SPA:      o.SPA,
 	})
 	if err != nil {

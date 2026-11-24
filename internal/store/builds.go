@@ -205,6 +205,76 @@ func (s *Store) CountBuildsWithImage(ctx context.Context, imageID string, except
 	return n, mapErr("count builds with image", err)
 }
 
+// DeleteBuildUnused removes build id in one transaction unless it is
+// active (ErrActive) or a server is configured with it (ErrInUse); it
+// returns the deleted row. ErrNotFound when it does not exist.
+func (s *Store) DeleteBuildUnused(ctx context.Context, id int64) (Build, error) {
+	var b Build
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		b, err = scanBuild(tx.QueryRowContext(ctx, `SELECT `+buildCols+` FROM builds WHERE id = ?`, id))
+		if err != nil {
+			return mapErr("delete build", err)
+		}
+		if b.Status == BuildStatusQueued || b.Status == BuildStatusRunning {
+			return ErrActive
+		}
+		ids, err := queryIDs(ctx, tx, "delete build", `SELECT id FROM servers WHERE build_id = ? LIMIT 1`, id)
+		if err != nil {
+			return err
+		}
+		if len(ids) > 0 {
+			return ErrInUse
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM builds WHERE id = ?`, id)
+		if err != nil {
+			return mapErr("delete build", err)
+		}
+		return checkAffected("delete build", res)
+	})
+	return b, err
+}
+
+// AssignServerBuild sets the build server serverID is configured with
+// (nil clears it). ErrNotFound when the server does not exist.
+func (s *Store) AssignServerBuild(ctx context.Context, serverID int64, buildID *int64) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE servers SET build_id = ?, updated_at = ? WHERE id = ?`,
+		nullInt64(buildID), formatTime(s.nowUTC()), serverID)
+	if err != nil {
+		return mapErr("assign server build", err)
+	}
+	return checkAffected("assign server build", res)
+}
+
+// BuildServerIDs returns the ids of the servers configured with build id
+// (sorted).
+func (s *Store) BuildServerIDs(ctx context.Context, id int64) ([]int64, error) {
+	return queryIDs(ctx, s.db, "build servers", `SELECT id FROM servers WHERE build_id = ? ORDER BY id`, id)
+}
+
+// queryer is *sql.DB or *sql.Tx.
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// queryIDs runs a query returning one integer column.
+func queryIDs(ctx context.Context, q queryer, op, query string, args ...any) ([]int64, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, mapErr(op, err)
+	}
+	defer rows.Close()
+	ids := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, mapErr(op, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, mapErr(op, rows.Err())
+}
+
 // DeleteBuild removes build id, or returns ErrNotFound.
 func (s *Store) DeleteBuild(ctx context.Context, id int64) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM builds WHERE id = ?`, id)

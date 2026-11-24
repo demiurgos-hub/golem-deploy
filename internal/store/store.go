@@ -27,6 +27,12 @@ var (
 	// ErrLimit is returned when a per-account quota (e.g. API tokens) is
 	// reached.
 	ErrLimit = errors.New("store: limit reached")
+	// ErrInUse means the row is referenced: a build, or a project with a
+	// build, that a server is configured with.
+	ErrInUse = errors.New("store: in use")
+	// ErrActive means the row belongs to an operation that is still queued
+	// or running (an active build).
+	ErrActive = errors.New("store: still active")
 )
 
 // Store is a handle to the database. It is safe for concurrent use.

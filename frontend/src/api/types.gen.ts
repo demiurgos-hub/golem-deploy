@@ -763,8 +763,26 @@ export interface Project {
   last_commit: string;
   last_pulled_at: string | null;
   status: ProjectStatus;
+  /**
+   * StaticAddons are extracted into the game root when the project is
+   * built, in order (never null).
+   */
+  static_addons: StaticAddon[];
   created_at: string /* RFC 3339, UTC */;
   updated_at: string /* RFC 3339, UTC */;
+}
+/**
+ * StaticAddon is a ZIP file of the static store that a build extracts into
+ * the game. Name is the static file's name (it must end in .zip; a static
+ * file referenced by a project cannot be deleted). Target is a relative
+ * path below the game root where the archive's contents appear, in the
+ * build stage before the web build and at the same path below /app in the
+ * image: segments of letters, digits, '.', '_' and '-' separated by '/', no
+ * '..' or .git; "." or empty means the game root (stored as ".").
+ */
+export interface StaticAddon {
+  name: string;
+  target: string;
 }
 /**
  * ProjectList is the body of GET /api/v1/projects.
@@ -797,11 +815,14 @@ export interface CreateProjectResponse {
  * Absent fields are unchanged. Auth replaces the stored credentials entirely;
  * to keep the stored secret, omit Auth; {"type":"none"} clears it. A new
  * RepoURL is applied to the checkout by the next pull (no re-clone). Use
- * POST .../branch to change branch.
+ * POST .../branch to change branch. StaticAddons replaces the project's
+ * add-ons entirely (at most 16; [] removes them); every named file must
+ * exist in the static store and be a ZIP archive.
  */
 export interface UpdateProjectRequest {
   repo_url?: string;
   auth?: ProjectAuth;
+  static_addons?: StaticAddon[];
 }
 /**
  * SwitchBranchRequest is the body of POST /api/v1/projects/{id}/branch.

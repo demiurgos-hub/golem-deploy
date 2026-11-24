@@ -18,6 +18,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
+	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
@@ -76,6 +77,9 @@ type Deps struct {
 	// Certs manages the game certificate; nil makes the certificate routes
 	// answer 503.
 	Certs *certs.Manager
+	// Builds runs project builds; when nil the build routes that need it
+	// answer 503 (listing and reading build records still works).
+	Builds *build.Service
 	// SPA serves non-API paths (the embedded web client). Nil serves 404.
 	SPA http.Handler
 	// Now overrides the clock (tests).
@@ -100,6 +104,7 @@ type Server struct {
 	servers  *servers.Service
 	static   *staticfiles.Store
 	certs    *certs.Manager
+	builds   *build.Service
 	spa      http.Handler
 	now      func() time.Time
 	proj     *projectState
@@ -196,6 +201,7 @@ func New(cfg Config, d Deps) (*Server, error) {
 		servers:    d.Servers,
 		static:     d.Static,
 		certs:      d.Certs,
+		builds:     d.Builds,
 		spa:        d.SPA,
 		now:        d.Now,
 		proj:       newProjectState(d),

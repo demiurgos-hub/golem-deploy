@@ -250,6 +250,12 @@ func (b *capBuffer) Write(p []byte) (int, error) {
 // inherited by the child (the runner closes them). stdout may be nil to
 // discard. When stderr is nil, it is captured for error classification.
 func (c *Client) exec(ctx context.Context, timeout time.Duration, args []string, extra []*os.File, stdout, stderr io.Writer) error {
+	return c.execEnv(ctx, timeout, args, nil, extra, stdout, stderr)
+}
+
+// execEnv is exec with fixed extra variables appended to the base
+// environment (constants of this package, never request-derived).
+func (c *Client) execEnv(ctx context.Context, timeout time.Duration, args, env []string, extra []*os.File, stdout, stderr io.Writer) error {
 	if c.binErr != nil {
 		closeFiles(extra)
 		return &CmdError{Op: opName(args), Kind: ErrUnavailable, Detail: "docker CLI not found"}
@@ -268,7 +274,8 @@ func (c *Client) exec(ctx context.Context, timeout time.Duration, args []string,
 		stdout = io.Discard
 	}
 	c.logger.Debug("docker", "op", opName(args))
-	err := c.runner.Run(ctx, c.bin, Cmd{Args: args, Env: slices.Clone(c.baseEnv), ExtraFiles: extra, Stdout: stdout, Stderr: stderr})
+	childEnv := append(slices.Clone(c.baseEnv), env...)
+	err := c.runner.Run(ctx, c.bin, Cmd{Args: args, Env: childEnv, ExtraFiles: extra, Stdout: stdout, Stderr: stderr})
 	if err == nil {
 		return nil
 	}

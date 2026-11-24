@@ -1,0 +1,3 @@
+world: Arena
+fields:
+  title: { type: string }
