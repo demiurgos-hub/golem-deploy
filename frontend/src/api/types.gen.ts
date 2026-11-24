@@ -321,6 +321,12 @@ export const ErrorCodeUnsupportedMediaType = "unsupported_media_type";
  */
 export const ErrorCodeRateLimited = "rate_limited";
 /**
+ * ErrorCodeInsufficientStorage: an upload would exceed the static store's
+ * size quota or file count cap, or leave too little free disk space on
+ * the data directory's file system (507).
+ */
+export const ErrorCodeInsufficientStorage = "insufficient_storage";
+/**
  * ErrorCodeInternal: unexpected server-side failure; details are in the daemon
  * log under the request id (500).
  */
@@ -339,7 +345,7 @@ export const ErrorCodeUnavailable = "service_unavailable";
 /**
  * Error codes. The HTTP status each one is used with is noted in parentheses.
  */
-export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationFailed | typeof ErrorCodeInvalidCurrentPassword | typeof ErrorCodeUnauthenticated | typeof ErrorCodeInvalidCredentials | typeof ErrorCodeForbidden | typeof ErrorCodeSessionRequired | typeof ErrorCodeRegistrationDisabled | typeof ErrorCodeNotFound | typeof ErrorCodeMethodNotAllowed | typeof ErrorCodeUsernameTaken | typeof ErrorCodeNameTaken | typeof ErrorCodePortInUse | typeof ErrorCodeLastAdmin | typeof ErrorCodeCannotModifySelf | typeof ErrorCodeJobInProgress | typeof ErrorCodeJobNotActive | typeof ErrorCodeConflict | typeof ErrorCodeBadHost | typeof ErrorCodeRequestTooLarge | typeof ErrorCodeUnsupportedMediaType | typeof ErrorCodeRateLimited | typeof ErrorCodeInternal | typeof ErrorCodeNotImplemented | typeof ErrorCodeUnavailable;
+export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationFailed | typeof ErrorCodeInvalidCurrentPassword | typeof ErrorCodeUnauthenticated | typeof ErrorCodeInvalidCredentials | typeof ErrorCodeForbidden | typeof ErrorCodeSessionRequired | typeof ErrorCodeRegistrationDisabled | typeof ErrorCodeNotFound | typeof ErrorCodeMethodNotAllowed | typeof ErrorCodeUsernameTaken | typeof ErrorCodeNameTaken | typeof ErrorCodePortInUse | typeof ErrorCodeLastAdmin | typeof ErrorCodeCannotModifySelf | typeof ErrorCodeJobInProgress | typeof ErrorCodeJobNotActive | typeof ErrorCodeConflict | typeof ErrorCodeBadHost | typeof ErrorCodeRequestTooLarge | typeof ErrorCodeUnsupportedMediaType | typeof ErrorCodeRateLimited | typeof ErrorCodeInsufficientStorage | typeof ErrorCodeInternal | typeof ErrorCodeNotImplemented | typeof ErrorCodeUnavailable;
 
 //////////
 // source: host.go
@@ -395,10 +401,24 @@ export interface StaticFile {
 }
 /**
  * StaticFileList is the body of GET /api/v1/static and the 201 response of
- * POST /api/v1/static (the files that were stored).
+ * POST /api/v1/static (Items: the files that were stored). The usage fields
+ * describe the whole store after the request.
  */
 export interface StaticFileList {
   items: StaticFile[];
+  /**
+   * UsedBytes is the total size of all stored files.
+   */
+  used_bytes: number /* int64 */;
+  /**
+   * QuotaBytes is the store's size quota; 0 means unlimited.
+   */
+  quota_bytes: number /* int64 */;
+  /**
+   * FileCount is the number of stored files; MaxFiles caps it.
+   */
+  file_count: number /* int */;
+  max_files: number /* int */;
 }
 /**
  * Volume is a Docker volume managed by Golem Deploy (a server's data volume).
@@ -656,8 +676,9 @@ export const ServerStateDead = "dead";
 export const ServerStateMissing = "missing";
 export const ServerStateUnknown = "unknown";
 /**
- * Server states. "missing" means no container exists for the server;
- * "unknown" means Docker could not be queried.
+ * Server states. "missing" means the server has no container (none was
+ * recorded for it, or the recorded one is gone); "unknown" means it has one
+ * but Docker could not be queried.
  */
 export type ServerState = typeof ServerStateCreated | typeof ServerStateRunning | typeof ServerStateRestarting | typeof ServerStateExited | typeof ServerStatePaused | typeof ServerStateDead | typeof ServerStateMissing | typeof ServerStateUnknown;
 /**
@@ -688,7 +709,9 @@ export interface Server {
   env_keys: string[];
   desired_state: DesiredState;
   /**
-   * Runtime fields, read from Docker on each request.
+   * Runtime fields, read from Docker on each request. ContainerID is the
+   * container the daemon created for this server; other containers are
+   * never reported, even when they carry golem-deploy labels.
    */
   state: ServerState;
   container_id: string;
@@ -711,12 +734,14 @@ export interface ServerList {
 }
 /**
  * CreateServerRequest is the body of POST /api/v1/servers. Image is the id or
- * a tag of a managed image (it is stored as the resolved image id). Port,
- * when absent, is auto-assigned from the configured port range. Env keys must
- * match ^[A-Za-z_][A-Za-z0-9_]{0,127}$, be unique ignoring case and not be
- * reserved (DOCKER_*, PATH, HOME, proxy variables, ...); at most 128
- * variables and 64 KiB in total. DesiredState defaults to "stopped";
- * "running" starts a server.start job right after creation.
+ * a tag of a managed image (it is stored as the resolved image id) declaring
+ * at most 8 volumes. Port, when absent, is auto-assigned from the configured
+ * port range. Env keys must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$, be unique
+ * ignoring case and not start with GOLEM_ (reserved for the daemon); values
+ * are single-line UTF-8 (no NUL, CR or LF); at most 32 KiB per variable, 128
+ * variables and 64 KiB in total. A rejected value is reported with field
+ * "env.<KEY>". DesiredState defaults to "stopped"; "running" starts a
+ * server.start job right after creation.
  */
 export interface CreateServerRequest {
   name: string;
@@ -731,7 +756,8 @@ export interface CreateServerRequest {
  * are unchanged. EnvSet adds or overwrites variables, EnvUnset removes them
  * (a key may not appear in both); unmentioned variables keep their stored
  * values, so the UI never has to re-send secrets. Changes apply on the next
- * (re)start.
+ * (re)start. Changing Port while the server's container is running is
+ * refused with 409 conflict (stop the server first).
  */
 export interface UpdateServerRequest {
   image?: string;
@@ -769,7 +795,7 @@ export interface ServerSpec {
 /**
  * ServerExport is the body of GET /api/v1/servers/export and of
  * POST /api/v1/servers/import (both admin; the export contains env values in
- * plain text).
+ * plain text). One import accepts at most 128 servers and 64 MiB.
  */
 export interface ServerExport {
   /**

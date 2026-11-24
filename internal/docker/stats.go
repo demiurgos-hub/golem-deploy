@@ -26,8 +26,8 @@ type statsJSON struct {
 }
 
 // ServerStats samples the server's running container once.
-func (c *Client) ServerStats(ctx context.Context, serverID int64) (Stats, error) {
-	ct, err := c.ServerContainer(ctx, serverID)
+func (c *Client) ServerStats(ctx context.Context, ref ServerRef) (Stats, error) {
+	ct, err := c.ServerContainer(ctx, ref)
 	if err != nil {
 		return Stats{}, err
 	}

@@ -1,8 +1,10 @@
 // Package dockertest provides an in-memory fake of the docker CLI that
 // implements docker.Runner. It understands exactly the argv shapes the
 // docker package emits, keeps containers, images, volumes and networks in
-// memory, applies label filters like Docker does and records every call
-// (argv and child environment) so tests can assert on them.
+// memory, applies label filters like Docker does, reads "--env-file" like
+// the real CLI (including "/dev/fd/N" pipes passed as extra files) and
+// records every call (argv, child environment and env-file content) so tests
+// can assert on them.
 package dockertest
 
 import (
@@ -10,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,6 +21,14 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 )
+
+// InstanceID is a valid instance id for tests.
+const InstanceID = "0123456789abcdef0123456789abcdef"
+
+// IntegrationInstanceID is the instance id of tests against a real Docker
+// daemon (GOLEM_DEPLOY_DOCKER_TESTS=1). It is shared by every package so
+// they all accept the golem-deploy network one of them created.
+const IntegrationInstanceID = "9d2c1e0f5a7b4c3d8e6f0a1b2c3d4e5f"
 
 // ExitError is returned for a failing command, like *exec.ExitError.
 type ExitError struct{ Code int }
@@ -31,23 +42,29 @@ func (e *ExitError) ExitCode() int { return e.Code }
 type Call struct {
 	Args []string
 	Env  []string
+	// EnvFile is the content of the --env-file the call passed (read the
+	// way the CLI reads it), empty when none.
+	EnvFile string
 }
 
 // Container is a fake container.
 type Container struct {
-	ID           string
-	Name         string
-	Image        string // image id
-	Labels       map[string]string
-	State        string
-	ExitCode     int
-	RestartCount int
-	Created      time.Time
-	StartedAt    time.Time
-	Ports        []string // --publish values
-	Mounts       []string // volume names
-	Env          map[string]string
-	Logs         []string
+	ID            string
+	Name          string
+	Image         string // image id
+	Labels        map[string]string
+	State         string
+	ExitCode      int
+	RestartCount  int
+	RestartPolicy string
+	Created       time.Time
+	StartedAt     time.Time
+	Ports         []string // --publish values
+	Mounts        []string // volume names
+	Tmpfs         []string // --tmpfs values
+	Network       string
+	Env           map[string]string
+	Logs          []string
 }
 
 // Image is a fake image.
@@ -56,6 +73,8 @@ type Image struct {
 	Tags   []string
 	Labels map[string]string
 	Size   int64
+	// Volumes are the image's VOLUME declarations.
+	Volumes []string
 	// ExitOnRun makes containers from this image exit immediately with the
 	// given code instead of running.
 	ExitOnRun *int
@@ -69,6 +88,12 @@ type Volume struct {
 	Labels map[string]string
 }
 
+// Network is a fake network.
+type Network struct {
+	Labels  map[string]string
+	Options map[string]string
+}
+
 // Fake is the fake docker CLI. The zero value is not usable; call New.
 type Fake struct {
 	mu         sync.Mutex
@@ -76,7 +101,7 @@ type Fake struct {
 	containers map[string]*Container
 	images     map[string]*Image
 	volumes    map[string]*Volume
-	networks   map[string]map[string]string
+	networks   map[string]*Network
 	seq        int
 	clock      time.Time
 	down       bool
@@ -92,7 +117,7 @@ func New() *Fake {
 		containers: map[string]*Container{},
 		images:     map[string]*Image{},
 		volumes:    map[string]*Volume{},
-		networks:   map[string]map[string]string{"bridge": {}},
+		networks:   map[string]*Network{"bridge": {Labels: map[string]string{}, Options: map[string]string{}}},
 		clock:      time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
 }
@@ -107,6 +132,13 @@ func ManagedLabels(kv ...string) map[string]string {
 		m[kv[i]] = kv[i+1]
 	}
 	return m
+}
+
+// OurLabels returns the managed label, the instance label (InstanceID) and
+// extra key/value pairs: what objects created by the tested installation
+// carry.
+func OurLabels(kv ...string) map[string]string {
+	return ManagedLabels(append([]string{docker.LabelInstance, InstanceID}, kv...)...)
 }
 
 // SetDown makes every command fail as if the daemon were unreachable.
@@ -135,14 +167,28 @@ func (f *Fake) AddVolume(v Volume) {
 	f.volumes[v.Name] = &v
 }
 
-// AddNetwork adds a network with labels.
-func (f *Fake) AddNetwork(name string, labels map[string]string) {
+// AddNetwork adds a network with labels and driver options.
+func (f *Fake) AddNetwork(name string, labels, options map[string]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	f.networks[name] = labels
+	if options == nil {
+		options = map[string]string{}
+	}
+	f.networks[name] = &Network{Labels: labels, Options: options}
+}
+
+// Network returns a copy of a network.
+func (f *Fake) Network(name string) (Network, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n, ok := f.networks[name]
+	if !ok {
+		return Network{}, false
+	}
+	return *n, true
 }
 
 // AddContainer adds a container as if created outside golem-deploy (or by
@@ -195,6 +241,15 @@ func (f *Fake) SetContainerState(ref, state string, exitCode int) {
 	defer f.mu.Unlock()
 	if c := f.findContainer(ref); c != nil {
 		c.State, c.ExitCode = state, exitCode
+	}
+}
+
+// RemoveContainer deletes a container (as if removed outside the daemon).
+func (f *Fake) RemoveContainer(ref string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.findContainer(ref); c != nil {
+		delete(f.containers, c.ID)
 	}
 }
 
@@ -292,10 +347,34 @@ func fail(code int, format string, a ...any) *failure {
 	return &failure{code: code, msg: fmt.Sprintf(format, a...)}
 }
 
+// readEnvFile reads the --env-file argument like the CLI: "/dev/fd/N" from
+// the inherited extra file N-3, anything else from the file system.
+func readEnvFile(path string, extra []*os.File) ([]byte, error) {
+	if n, ok := strings.CutPrefix(path, "/dev/fd/"); ok {
+		fd, err := strconv.Atoi(n)
+		if err != nil || fd < 3 || fd-3 >= len(extra) {
+			return nil, fmt.Errorf("open %s: no such file or directory", path)
+		}
+		return io.ReadAll(extra[fd-3])
+	}
+	return os.ReadFile(path)
+}
+
 // Run implements docker.Runner.
 func (f *Fake) Run(ctx context.Context, _ string, cmd docker.Cmd) error {
+	defer func() {
+		for _, x := range cmd.ExtraFiles {
+			_ = x.Close()
+		}
+	}()
+	call := Call{Args: slices.Clone(cmd.Args), Env: slices.Clone(cmd.Env)}
+	var envFileErr error
+	if p := flagValues(cmd.Args, "--env-file"); len(p) > 0 {
+		b, err := readEnvFile(p[0], cmd.ExtraFiles)
+		call.EnvFile, envFileErr = string(b), err
+	}
 	f.mu.Lock()
-	f.calls = append(f.calls, Call{Args: slices.Clone(cmd.Args), Env: slices.Clone(cmd.Env)})
+	f.calls = append(f.calls, call)
 	down := f.down
 	f.mu.Unlock()
 	stdout, stderr := cmd.Stdout, cmd.Stderr
@@ -309,6 +388,10 @@ func (f *Fake) Run(ctx context.Context, _ string, cmd docker.Cmd) error {
 		fmt.Fprintln(stderr, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?")
 		return &ExitError{Code: 1}
 	}
+	if envFileErr != nil {
+		fmt.Fprintln(stderr, "docker: "+envFileErr.Error())
+		return &ExitError{Code: 125}
+	}
 	a := cmd.Args
 	var ferr *failure
 	switch {
@@ -319,7 +402,9 @@ func (f *Fake) Run(ctx context.Context, _ string, cmd docker.Cmd) error {
 	case has(a, "container", "inspect"):
 		ferr = f.inspectContainers(positional(a), stdout)
 	case has(a, "run"):
-		ferr = f.run(a, cmd.Env, stdout)
+		ferr = f.run(a, call.EnvFile, cmd.Env, stdout)
+	case has(a, "update"):
+		ferr = f.update(a)
 	case has(a, "stop"):
 		ferr = f.stop(positional(a))
 	case has(a, "rm"):
@@ -333,7 +418,7 @@ func (f *Fake) Run(ctx context.Context, _ string, cmd docker.Cmd) error {
 	case has(a, "image", "inspect"):
 		ferr = f.imageInspect(positional(a), stdout)
 	case has(a, "image", "rm"):
-		ferr = f.imageRm(positional(a))
+		ferr = f.imageRm(a)
 	case has(a, "volume", "ls"):
 		ferr = f.volumeLs(a, stdout)
 	case has(a, "volume", "inspect"):
@@ -344,6 +429,8 @@ func (f *Fake) Run(ctx context.Context, _ string, cmd docker.Cmd) error {
 		ferr = f.networkInspect(positional(a), stdout)
 	case has(a, "network", "create"):
 		ferr = f.networkCreate(a)
+	case has(a, "network", "rm"):
+		ferr = f.networkRm(positional(a))
 	default:
 		ferr = fail(125, "fake docker: unsupported command %q", a)
 	}
@@ -490,15 +577,21 @@ func hostPort(publish string) string {
 	return parts[len(parts)-2] + "/" + proto
 }
 
-func (f *Fake) run(a []string, env []string, w io.Writer) *failure {
+func (f *Fake) run(a []string, envFile string, cliEnv []string, w io.Writer) *failure {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	pos := positional(a)
 	if len(pos) == 0 {
 		return fail(125, "\"docker run\" requires at least 1 argument")
 	}
+	if len(flagValues(a, "--env")) > 0 {
+		return fail(125, "fake docker: --env is never used by golem-deploy")
+	}
 	img := f.findImage(pos[0])
 	if img == nil {
+		if v := flagValues(a, "--pull"); len(v) > 0 && v[0] == "never" {
+			return fail(125, "docker: Error response from daemon: No such image: %s", pos[0])
+		}
 		return fail(125, "Unable to find image '%s' locally", pos[0])
 	}
 	name := ""
@@ -521,20 +614,32 @@ func (f *Fake) run(a []string, env []string, w io.Writer) *failure {
 			}
 		}
 	}
+	// Image labels are inherited; --label values override them.
 	labels := map[string]string{}
+	for k, v := range img.Labels {
+		labels[k] = v
+	}
 	for _, l := range flagValues(a, "--label") {
 		k, v, _ := strings.Cut(l, "=")
 		labels[k] = v
 	}
 	envVals := map[string]string{}
-	for _, k := range flagValues(a, "--env") {
-		if strings.Contains(k, "=") {
-			return fail(125, "fake docker: env value in argv")
-		}
-		for _, kv := range env {
-			if ek, ev, _ := strings.Cut(kv, "="); ek == k {
-				envVals[k] = ev
+	if envFile != "" {
+		lookup := func(k string) (string, bool) {
+			for _, kv := range cliEnv {
+				if ek, ev, _ := strings.Cut(kv, "="); ek == k {
+					return ev, true
+				}
 			}
+			return "", false
+		}
+		lines, err := ParseEnvFile([]byte(envFile), lookup)
+		if err != nil {
+			return fail(125, "docker: %v", err)
+		}
+		for _, l := range lines {
+			k, v, _ := strings.Cut(l, "=")
+			envVals[k] = v
 		}
 	}
 	var mounts []string
@@ -545,9 +650,21 @@ func (f *Fake) run(a []string, env []string, w io.Writer) *failure {
 			}
 		}
 	}
+	network := ""
+	if v := flagValues(a, "--network"); len(v) > 0 {
+		network = v[0]
+		if _, ok := f.networks[network]; !ok {
+			return fail(125, "docker: Error response from daemon: network %s not found", network)
+		}
+	}
+	restart := "no"
+	if v := flagValues(a, "--restart"); len(v) > 0 {
+		restart = v[0]
+	}
 	c := &Container{
-		ID: f.nextID(), Name: name, Image: img.ID, Labels: labels, State: "running",
-		Created: f.tick(), Ports: ports, Mounts: mounts, Env: envVals, Logs: slices.Clone(img.Logs),
+		ID: f.nextID(), Name: name, Image: img.ID, Labels: labels, State: "running", RestartPolicy: restart,
+		Created: f.tick(), Ports: ports, Mounts: mounts, Tmpfs: flagValues(a, "--tmpfs"), Network: network,
+		Env: envVals, Logs: slices.Clone(img.Logs),
 	}
 	c.StartedAt = c.Created
 	if img.ExitOnRun != nil {
@@ -555,6 +672,19 @@ func (f *Fake) run(a []string, env []string, w io.Writer) *failure {
 	}
 	f.containers[c.ID] = c
 	fmt.Fprintln(w, c.ID)
+	return nil
+}
+
+func (f *Fake) update(a []string) *failure {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := f.findContainer(firstOr(positional(a)))
+	if c == nil {
+		return fail(1, "Error response from daemon: No such container: %s", firstOr(positional(a)))
+	}
+	if v := flagValues(a, "--restart"); len(v) > 0 {
+		c.RestartPolicy = v[0]
+	}
 	return nil
 }
 
@@ -687,9 +817,16 @@ func (f *Fake) imageInspect(refs []string, w io.Writer) *failure {
 			missing = append(missing, ref)
 			continue
 		}
+		var vols map[string]any
+		if len(img.Volumes) > 0 {
+			vols = map[string]any{}
+			for _, v := range img.Volumes {
+				vols[v] = map[string]any{}
+			}
+		}
 		out = append(out, map[string]any{
 			"Id": img.ID, "RepoTags": img.Tags, "Created": "2026-01-01T00:00:00Z", "Size": img.Size,
-			"Config": map[string]any{"Labels": img.Labels},
+			"Config": map[string]any{"Labels": img.Labels, "Volumes": vols},
 		})
 	}
 	writeArray(w, out)
@@ -699,16 +836,21 @@ func (f *Fake) imageInspect(refs []string, w io.Writer) *failure {
 	return nil
 }
 
-func (f *Fake) imageRm(refs []string) *failure {
+func (f *Fake) imageRm(a []string) *failure {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, ref := range refs {
+	end := slices.Index(a, "--")
+	if end < 0 {
+		end = len(a)
+	}
+	force := slices.Contains(a[:end], "--force")
+	for _, ref := range positional(a) {
 		img := f.findImage(ref)
 		if img == nil {
 			return fail(1, "Error response from daemon: No such image: %s", ref)
 		}
 		for _, c := range f.containers {
-			if c.Image == img.ID {
+			if c.Image == img.ID && (!force || c.State == "running") {
 				return fail(1, "Error response from daemon: conflict: unable to delete %s - image is being used by container", ref)
 			}
 		}
@@ -717,7 +859,7 @@ func (f *Fake) imageRm(refs []string) *failure {
 			if len(img.Tags) > 0 {
 				continue
 			}
-		} else if len(img.Tags) > 1 {
+		} else if len(img.Tags) > 1 && !force {
 			return fail(1, "Error response from daemon: conflict: unable to delete %s (must be forced) - image is referenced in multiple repositories", ref)
 		}
 		delete(f.images, img.ID)
@@ -788,15 +930,26 @@ func (f *Fake) volumeRm(names []string) *failure {
 	return nil
 }
 
+func (f *Fake) attached(network string) map[string]any {
+	out := map[string]any{}
+	for _, c := range f.containers {
+		if c.Network == network && c.State == "running" {
+			out[c.ID] = map[string]any{"Name": c.Name}
+		}
+	}
+	return out
+}
+
 func (f *Fake) networkInspect(names []string, w io.Writer) *failure {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	labels, ok := f.networks[firstOr(names)]
+	name := firstOr(names)
+	n, ok := f.networks[name]
 	if !ok {
 		fmt.Fprintln(w, "[]")
-		return fail(1, "Error response from daemon: network %s not found", firstOr(names))
+		return fail(1, "Error response from daemon: network %s not found", name)
 	}
-	writeArray(w, []map[string]any{{"Name": firstOr(names), "Labels": labels}})
+	writeArray(w, []map[string]any{{"Name": name, "Labels": n.Labels, "Options": n.Options, "Containers": f.attached(name)}})
 	return nil
 }
 
@@ -807,11 +960,30 @@ func (f *Fake) networkCreate(a []string) *failure {
 	if _, ok := f.networks[name]; ok {
 		return fail(1, "Error response from daemon: network with name %s already exists", name)
 	}
-	labels := map[string]string{}
+	n := &Network{Labels: map[string]string{}, Options: map[string]string{}}
 	for _, l := range flagValues(a, "--label") {
 		k, v, _ := strings.Cut(l, "=")
-		labels[k] = v
+		n.Labels[k] = v
 	}
-	f.networks[name] = labels
+	for _, o := range flagValues(a, "--opt") {
+		k, v, _ := strings.Cut(o, "=")
+		n.Options[k] = v
+	}
+	f.networks[name] = n
+	return nil
+}
+
+func (f *Fake) networkRm(names []string) *failure {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, name := range names {
+		if _, ok := f.networks[name]; !ok {
+			return fail(1, "Error response from daemon: network %s not found", name)
+		}
+		if len(f.attached(name)) > 0 {
+			return fail(1, "Error response from daemon: error while removing network: network %s has active endpoints", name)
+		}
+		delete(f.networks, name)
+	}
 	return nil
 }

@@ -1,14 +1,18 @@
 // Package docker is a typed, label-scoped wrapper around the docker CLI.
 //
 // Every object the daemon creates carries the managed label
-// (LabelManaged=true) and every operation on an existing object first proves
-// the object is managed: containers are resolved by label from a server id,
-// never from a client-supplied name or id, and images and volumes are
-// inspected and their label checked before they are removed. Commands run
-// without a shell, with a timeout, with "--" before positional arguments and
-// with JSON output. Environment values for containers are never placed in
-// argv: "docker run" gets "--env KEY" and the value travels in the CLI child
-// process environment.
+// (LabelManaged=true) and this installation's instance label
+// (LabelInstance=<instance id>), and every operation on an existing object
+// first proves the object is ours: a server's container is reached only
+// through the container id recorded when it was created (ServerRef), never
+// through a client-supplied name or id and never through labels alone (an
+// image can carry any label and containers inherit image labels), and its
+// labels are verified on inspect as a second check; images, volumes and
+// networks are inspected and their labels checked before they are changed.
+// Commands run without a shell, with a timeout, with "--" before positional
+// arguments and with JSON output. Container environment values are never
+// placed in argv or in the CLI's own environment: they travel in an env file
+// (see envfile.go).
 package docker
 
 import (
@@ -23,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -32,8 +37,14 @@ import (
 type Cmd struct {
 	// Args follow the binary (argv[1:]).
 	Args []string
-	// Env is the complete child environment (never inherited).
+	// Env is the complete child environment (never inherited). It is always
+	// the fixed allowlist taken from the daemon's own environment (BaseEnv);
+	// nothing derived from a request is ever added.
 	Env []string
+	// ExtraFiles are inherited by the child as fds 3, 4, ... (the env-file
+	// pipe). The runner owns them: it closes them once the child has
+	// started, or when starting it fails.
+	ExtraFiles []*os.File
 	// Stdout and Stderr receive the output. They may be the same writer.
 	Stdout io.Writer
 	Stderr io.Writer
@@ -55,10 +66,24 @@ func (ExecRunner) Run(ctx context.Context, path string, c Cmd) error {
 	if cmd.Env == nil {
 		cmd.Env = []string{}
 	}
+	cmd.ExtraFiles = c.ExtraFiles
 	cmd.Stdout = c.Stdout
 	cmd.Stderr = c.Stderr
 	cmd.WaitDelay = 5 * time.Second
-	return cmd.Run()
+	err := cmd.Start()
+	// The child holds its own copies now. Closing ours means a pipe writer
+	// gets EPIPE instead of blocking if the child exits without reading.
+	closeFiles(c.ExtraFiles)
+	if err != nil {
+		return err
+	}
+	return cmd.Wait()
+}
+
+func closeFiles(files []*os.File) {
+	for _, f := range files {
+		_ = f.Close()
+	}
 }
 
 // Options configures New.
@@ -72,18 +97,29 @@ type Options struct {
 	// LookupEnv reads the daemon's environment for the child's base
 	// environment (default os.LookupEnv).
 	LookupEnv func(string) (string, bool)
+	// InstanceID is this installation's id (32 lower-case hex characters,
+	// store.InstanceID). Every created object is labelled with it, and only
+	// objects carrying it are listed or acted on. Without a valid id every
+	// call that lists, creates or changes containers, networks or volumes
+	// fails.
+	InstanceID string
+	// TempDir holds env files on platforms without the pipe mechanism
+	// (the data directory's tmp/; default os.TempDir()).
+	TempDir string
 	// Now overrides the clock (tests).
 	Now func() time.Time
 }
 
 // Client talks to Docker through the CLI. It is safe for concurrent use.
 type Client struct {
-	bin     string
-	binErr  error
-	runner  Runner
-	logger  *slog.Logger
-	baseEnv []string
-	now     func() time.Time
+	bin      string
+	binErr   error
+	runner   Runner
+	logger   *slog.Logger
+	baseEnv  []string
+	now      func() time.Time
+	instance string
+	envFile  envFileFunc
 
 	probeMu sync.Mutex
 	probeAt time.Time
@@ -124,7 +160,8 @@ func New(o Options) *Client {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	c := &Client{runner: o.Runner, logger: o.Logger, now: o.Now, bin: o.Binary}
+	c := &Client{runner: o.Runner, logger: o.Logger, now: o.Now, bin: o.Binary, instance: o.InstanceID,
+		envFile: newEnvFileFunc(runtime.GOOS, o.TempDir)}
 	if _, real := o.Runner.(ExecRunner); real && !strings.ContainsAny(o.Binary, `/\`) {
 		// Resolve once so later PATH changes cannot swap the binary.
 		// exec.LookPath never returns a path relative to the working
@@ -138,6 +175,23 @@ func New(o Options) *Client {
 	}
 	c.baseEnv = BaseEnv(o.LookupEnv, runtime.GOOS)
 	return c
+}
+
+// errNoInstance is returned by calls that need the instance id when the
+// client was created without a valid one.
+var errNoInstance = errors.New("docker: client has no valid instance id")
+
+func (c *Client) needInstance() error {
+	if !ValidInstanceID(c.instance) {
+		return errNoInstance
+	}
+	return nil
+}
+
+// ours reports whether labels mark an object as created by this
+// installation (managed label and our instance id).
+func (c *Client) ours(labels map[string]string) bool {
+	return IsManaged(labels) && c.instance != "" && labels[LabelInstance] == c.instance
 }
 
 // childEnvNames are the daemon environment variables passed to the docker
@@ -160,7 +214,8 @@ func childEnvNames(goos string) []string {
 	return names
 }
 
-// BaseEnv returns the minimal environment for the docker CLI child process.
+// BaseEnv returns the minimal environment for the docker CLI child process:
+// a fixed allowlist read from the daemon's own environment.
 func BaseEnv(lookup func(string) (string, bool), goos string) []string {
 	var env []string
 	for _, k := range childEnvNames(goos) {
@@ -191,11 +246,12 @@ func (b *capBuffer) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// exec runs one CLI call. secretEnv entries (KEY=value) are appended to the
-// child environment only; they are never logged. stdout may be nil to
+// exec runs one CLI call with the fixed base environment. extra files are
+// inherited by the child (the runner closes them). stdout may be nil to
 // discard. When stderr is nil, it is captured for error classification.
-func (c *Client) exec(ctx context.Context, timeout time.Duration, args []string, secretEnv []string, stdout, stderr io.Writer) error {
+func (c *Client) exec(ctx context.Context, timeout time.Duration, args []string, extra []*os.File, stdout, stderr io.Writer) error {
 	if c.binErr != nil {
+		closeFiles(extra)
 		return &CmdError{Op: opName(args), Kind: ErrUnavailable, Detail: "docker CLI not found"}
 	}
 	if timeout > 0 {
@@ -203,9 +259,6 @@ func (c *Client) exec(ctx context.Context, timeout time.Duration, args []string,
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	env := make([]string, 0, len(c.baseEnv)+len(secretEnv))
-	env = append(env, c.baseEnv...)
-	env = append(env, secretEnv...)
 	var errBuf *capBuffer
 	if stderr == nil {
 		errBuf = &capBuffer{max: maxStderr}
@@ -215,7 +268,7 @@ func (c *Client) exec(ctx context.Context, timeout time.Duration, args []string,
 		stdout = io.Discard
 	}
 	c.logger.Debug("docker", "op", opName(args))
-	err := c.runner.Run(ctx, c.bin, Cmd{Args: args, Env: env, Stdout: stdout, Stderr: stderr})
+	err := c.runner.Run(ctx, c.bin, Cmd{Args: args, Env: slices.Clone(c.baseEnv), ExtraFiles: extra, Stdout: stdout, Stderr: stderr})
 	if err == nil {
 		return nil
 	}
@@ -271,6 +324,8 @@ func classify(ctx context.Context, args []string, err error, stderr string) erro
 		"is the docker daemon running", "docker daemon is not running",
 		"permission denied while trying to connect", "failed to connect to the docker api"):
 		ce.Kind = ErrUnavailable
+	case len(args) > 0 && args[0] == "run" && containsAny(low, "no such image", "unable to find image"):
+		ce.Kind = ErrImageMissing
 	case containsAny(low, "no such container", "no such image", "no such volume",
 		"no such network", "no such object", "not found"):
 		ce.Kind = ErrNotFound

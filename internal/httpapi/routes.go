@@ -1,5 +1,7 @@
 package httpapi
 
+import "github.com/demiurgos-hub/golem-deploy/internal/servers"
+
 // routes is the single place where API routes and their access levels are
 // declared. Paths are relative to /api/v1. Handlers never re-check roles.
 func (s *Server) routes() []route {
@@ -51,7 +53,7 @@ func (s *Server) routes() []route {
 		{method: "GET", path: "/servers", access: AccessDeveloper, handler: s.handleListServers},
 		{method: "POST", path: "/servers", access: AccessDeveloper, handler: s.handleCreateServer},
 		{method: "GET", path: "/servers/export", access: AccessAdmin, handler: s.handleExportServers},
-		{method: "POST", path: "/servers/import", access: AccessAdmin, handler: s.handleImportServers},
+		{method: "POST", path: "/servers/import", access: AccessAdmin, handler: s.handleImportServers, maxBody: servers.MaxImportBytes},
 		{method: "GET", path: "/servers/{id}", access: AccessDeveloper, handler: s.handleGetServer},
 		{method: "PATCH", path: "/servers/{id}", access: AccessDeveloper, handler: s.handleUpdateServer},
 		{method: "DELETE", path: "/servers/{id}", access: AccessDeveloper, handler: s.handleDeleteServer},

@@ -91,9 +91,13 @@ func (c *Client) mountedVolumes(ctx context.Context, filters ...string) (map[str
 	return used, nil
 }
 
-// ListVolumes returns the managed volumes with their attachment state.
+// ListVolumes returns the volumes carrying the managed label and this
+// installation's instance id, with their attachment state.
 func (c *Client) ListVolumes(ctx context.Context) ([]Volume, error) {
-	out, err := c.output(ctx, quickTimeout, "volume", "ls", "--filter", managedFilter(), "--format", "{{json .}}")
+	if err := c.needInstance(); err != nil {
+		return nil, err
+	}
+	out, err := c.output(ctx, quickTimeout, "volume", "ls", "--filter", managedFilter(), "--filter", c.instanceFilter(), "--format", "{{json .}}")
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +123,7 @@ func (c *Client) ListVolumes(ctx context.Context) ([]Volume, error) {
 	}
 	res := make([]Volume, 0, len(all))
 	for _, v := range all {
-		if IsManaged(v.Labels) {
+		if c.ours(v.Labels) {
 			v.InUse = used[v.Name]
 			res = append(res, v)
 		}
@@ -128,9 +132,13 @@ func (c *Client) ListVolumes(ctx context.Context) ([]Volume, error) {
 	return res, nil
 }
 
-// RemoveVolume deletes a managed volume. It refuses unmanaged volumes
-// (ErrNotManaged) and volumes mounted by any container (ErrInUse).
+// RemoveVolume deletes a volume of this installation. It refuses
+// unmanaged volumes (ErrNotManaged), managed volumes of another
+// installation (ErrNotOurs) and volumes mounted by any container (ErrInUse).
 func (c *Client) RemoveVolume(ctx context.Context, name string) error {
+	if err := c.needInstance(); err != nil {
+		return err
+	}
 	if err := ValidateVolumeName(name); err != nil {
 		return err
 	}
@@ -143,6 +151,9 @@ func (c *Client) RemoveVolume(ctx context.Context, name string) error {
 	}
 	if !IsManaged(list[0].Labels) {
 		return ErrNotManaged
+	}
+	if !c.ours(list[0].Labels) {
+		return ErrNotOurs
 	}
 	used, err := c.mountedVolumes(ctx, "volume="+name)
 	if err != nil {

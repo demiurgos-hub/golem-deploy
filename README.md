@@ -53,7 +53,7 @@ go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 go test -race ./...
 ```
 
-Tests against a real Docker daemon are opt-in: `GOLEM_DEPLOY_DOCKER_TESTS=1 go test ./internal/docker/... ./internal/httpapi/...` (they build small labelled images from a pinned busybox and clean up after themselves).
+Tests against a real Docker daemon are opt-in: `GOLEM_DEPLOY_DOCKER_TESTS=1 go test -p 1 ./internal/docker/... ./internal/httpapi/... ./internal/servers/...` (they build small labelled `gdm2h-*` images from a pinned busybox, share the `golem-deploy` network, hence `-p 1`, and clean up after themselves).
 
 ## Develop the web client
 
@@ -90,9 +90,10 @@ Create the first admin account, then start the daemon:
 | `--trusted-proxy` | `GOLEM_DEPLOY_TRUSTED_PROXY` | | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` is trusted |
 | `--port-range` | `GOLEM_DEPLOY_PORT_RANGE` | `7000-7099` | Host ports for game servers (within 1024–32767, not the listen port) |
 | `--port-bind-address` | `GOLEM_DEPLOY_PORT_BIND_ADDRESS` | all interfaces | Host IP game ports are published on |
-| `--server-memory-mb` | `GOLEM_DEPLOY_SERVER_MEMORY_MB` | `0` (unlimited) | Memory limit per server container |
-| `--server-cpus` | `GOLEM_DEPLOY_SERVER_CPUS` | `0` (unlimited) | CPU limit per server container |
+| `--server-memory-mb` | `GOLEM_DEPLOY_SERVER_MEMORY_MB` | `2048` | Memory limit per server container in MiB, without extra swap (`0`: unlimited) |
+| `--server-cpus` | `GOLEM_DEPLOY_SERVER_CPUS` | `2` | CPU limit per server container (`0`: unlimited) |
 | `--max-repo-size-mb` | `GOLEM_DEPLOY_MAX_REPO_SIZE_MB` | `10240` | Maximum size of each project checkout in MiB, enforced during clone, pull and Git LFS downloads (`0` = unlimited) |
+| `--static-quota-mb` | `GOLEM_DEPLOY_STATIC_QUOTA_MB` | `5120` | Total size limit of the static file store in MiB (`0`: unlimited) |
 
 Without a TLS certificate the daemon only binds loopback addresses (`localhost` must resolve only to loopback addresses); to expose it on the network either configure TLS or put it behind a TLS-terminating reverse proxy and pass `--insecure-http`. It shuts down gracefully on SIGINT/SIGTERM. If no admin account exists it logs how to create one and keeps serving.
 

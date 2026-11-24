@@ -15,8 +15,13 @@ import (
 // accepts.
 const ExportFormatVersion = 1
 
-// MaxImportServers bounds one import document.
-const MaxImportServers = 500
+// MaxImportServers bounds one import document. With MaxEnvBytes of env per
+// server the largest possible document stays below MaxImportBytes even
+// when every env byte needs a six-byte JSON escape.
+const MaxImportServers = 128
+
+// MaxImportBytes is the request body limit of the import route.
+const MaxImportBytes = 64 << 20
 
 // Export returns every server definition including env values in plain
 // text (admin only).
@@ -66,6 +71,15 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 	}
 	if len(doc.Servers) > MaxImportServers {
 		return nil, fieldErr("servers", "at most %d servers can be imported at once", MaxImportServers)
+	}
+	// Resolve and verify every image before taking the write lock (each is
+	// a docker call).
+	images := make([]string, len(doc.Servers))
+	for i, sp := range doc.Servers {
+		var err error
+		if images[i], err = s.resolveImage(ctx, fmt.Sprintf("servers[%d].image", i), sp.Image); err != nil {
+			return nil, err
+		}
 	}
 
 	s.writeMu.Lock()
@@ -139,9 +153,7 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 			docPorts[p] = true
 			row.Port = &p
 		}
-		if row.Image, err = s.resolveImage(ctx, f("image"), sp.Image); err != nil {
-			return nil, err
-		}
+		row.Image = images[i]
 		rows[i] = row
 		envs[i] = sp.Env
 	}
@@ -152,6 +164,9 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 	for i := range rows {
 		if rows[i].Port != nil {
 			continue
+		}
+		if s.cfg.PanelPort != 0 {
+			used[s.cfg.PanelPort] = true
 		}
 		p, err := s.cfg.Ports.Lowest(used)
 		if err != nil {

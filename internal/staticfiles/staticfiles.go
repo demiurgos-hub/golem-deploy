@@ -1,7 +1,10 @@
 // Package staticfiles is the static file store (datadir static/): files
 // uploaded by developers for later builds, such as ZIP add-ons. Uploads are
-// streamed to a temporary file in the same directory and moved into place
-// atomically; existing files are never overwritten unless asked.
+// streamed to temporary files in the same directory (Stage), then checked
+// and moved into place together (Commit): every file of one upload becomes
+// visible, or none does. The store enforces a total size quota, a file
+// count cap and a free-space reserve on the data directory's file system,
+// always against the bytes actually received.
 package staticfiles
 
 import (
@@ -15,6 +18,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,7 +28,15 @@ const (
 	MaxFileBytes = 1 << 30
 	// MaxFilesPerUpload bounds the files of one upload request.
 	MaxFilesPerUpload = 32
-	tempPrefix        = ".upload-"
+	// DefaultMaxFiles caps the number of stored files.
+	DefaultMaxFiles = 2000
+	// DefaultReserveBytes is the free space uploads must leave on the
+	// file system that holds the store.
+	DefaultReserveBytes = 1 << 30
+	// DefaultUploadsPerKey caps concurrent uploads per account.
+	DefaultUploadsPerKey = 2
+	tempPrefix           = ".upload-"
+	backupPrefix         = ".upload-replaced-"
 )
 
 // Errors.
@@ -32,6 +44,12 @@ var (
 	ErrNotFound = errors.New("staticfiles: not found")
 	ErrExists   = errors.New("staticfiles: file exists")
 	ErrTooLarge = errors.New("staticfiles: file too large")
+	// ErrQuota: the upload would exceed the store's size quota or file
+	// count cap.
+	ErrQuota = errors.New("staticfiles: quota exceeded")
+	// ErrNoSpace: the upload would leave less than the reserve free on the
+	// data directory's file system.
+	ErrNoSpace = errors.New("staticfiles: not enough free disk space")
 )
 
 // NameError is an invalid file name; it is safe to show to users.
@@ -79,14 +97,67 @@ type File struct {
 	IsZip      bool
 }
 
+// Usage is the store's current consumption and limits.
+type Usage struct {
+	UsedBytes  int64
+	QuotaBytes int64 // 0: unlimited
+	Files      int
+	MaxFiles   int
+}
+
+// Options configures Open.
+type Options struct {
+	// QuotaBytes caps the total size of stored files (0: unlimited).
+	QuotaBytes int64
+	// MaxFiles caps the number of stored files (0: DefaultMaxFiles).
+	MaxFiles int
+	// ReserveBytes is the free space to keep on the file system (0:
+	// DefaultReserveBytes; negative: no check).
+	ReserveBytes int64
+	// UploadsPerKey caps concurrent uploads per key, e.g. per account
+	// (0: DefaultUploadsPerKey).
+	UploadsPerKey int
+	// FreeSpace reports the bytes available to the daemon on the file
+	// system holding dir, or a negative value when unknown (tests; default
+	// the operating system's answer).
+	FreeSpace func(dir string) (int64, error)
+}
+
 // Store is the static file store rooted at one directory.
 type Store struct {
 	dir string
+	opt Options
+
+	// commitMu serialises commits and removals, so quota checks are exact
+	// and a commit's rollback only ever touches files that commit placed.
+	commitMu sync.Mutex
+
+	uploadsMu sync.Mutex
+	uploads   map[string]int
 }
 
 // Open returns the store at dir (created 0700 if missing) and removes
 // temporary files left by interrupted uploads.
-func Open(dir string) (*Store, error) {
+func Open(dir string, opts ...Options) (*Store, error) {
+	var o Options
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	if o.MaxFiles <= 0 {
+		o.MaxFiles = DefaultMaxFiles
+	}
+	if o.ReserveBytes == 0 {
+		o.ReserveBytes = DefaultReserveBytes
+	}
+	if o.UploadsPerKey <= 0 {
+		o.UploadsPerKey = DefaultUploadsPerKey
+	}
+	if o.FreeSpace == nil {
+		o.FreeSpace = freeSpace
+	}
+	if o.QuotaBytes < 0 {
+		return nil, errors.New("static quota must not be negative")
+	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -99,15 +170,39 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	for _, e := range entries {
+		// Backups are extra hard links of files that are still in place
+		// (see Commit), so removing them never loses data.
 		if strings.HasPrefix(e.Name(), tempPrefix) {
 			_ = os.Remove(filepath.Join(abs, e.Name()))
 		}
 	}
-	return &Store{dir: abs}, nil
+	return &Store{dir: abs, opt: o, uploads: map[string]int{}}, nil
 }
 
 // Dir returns the store directory.
 func (s *Store) Dir() string { return s.dir }
+
+// BeginUpload reserves one of key's concurrent upload slots; ok is false
+// when key already has the maximum in progress. release must be called
+// when the upload ends.
+func (s *Store) BeginUpload(key string) (release func(), ok bool) {
+	s.uploadsMu.Lock()
+	defer s.uploadsMu.Unlock()
+	if s.uploads[key] >= s.opt.UploadsPerKey {
+		return nil, false
+	}
+	s.uploads[key]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.uploadsMu.Lock()
+			defer s.uploadsMu.Unlock()
+			if s.uploads[key]--; s.uploads[key] <= 0 {
+				delete(s.uploads, key)
+			}
+		})
+	}, true
+}
 
 // path validates name and returns its absolute path inside the store.
 func (s *Store) path(name string) (string, error) {
@@ -142,6 +237,26 @@ func (s *Store) describe(name string, info fs.FileInfo) File {
 	return File{Name: name, SizeBytes: info.Size(), ModifiedAt: info.ModTime().UTC(), IsZip: isZip(filepath.Join(s.dir, name), name)}
 }
 
+// sizes returns the size of every stored regular file with a valid name.
+func (s *Store) sizes() (map[string]int64, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(entries))
+	for _, e := range entries {
+		if !e.Type().IsRegular() || ValidateName(e.Name()) != nil {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue // removed meanwhile
+		}
+		out[e.Name()] = info.Size()
+	}
+	return out, nil
+}
+
 // List returns the stored regular files with valid names, sorted by name.
 func (s *Store) List() ([]File, error) {
 	entries, err := os.ReadDir(s.dir)
@@ -161,6 +276,19 @@ func (s *Store) List() ([]File, error) {
 	}
 	slices.SortFunc(out, func(a, b File) int { return strings.Compare(a.Name, b.Name) })
 	return out, nil
+}
+
+// Usage reports the bytes and files stored and the limits.
+func (s *Store) Usage() (Usage, error) {
+	sizes, err := s.sizes()
+	if err != nil {
+		return Usage{}, err
+	}
+	u := Usage{QuotaBytes: s.opt.QuotaBytes, Files: len(sizes), MaxFiles: s.opt.MaxFiles}
+	for _, n := range sizes {
+		u.UsedBytes += n
+	}
+	return u, nil
 }
 
 // OpenFile opens a stored regular file for reading.
@@ -192,6 +320,8 @@ func (s *Store) Remove(name string) error {
 	if err != nil {
 		return err
 	}
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
 	info, err := os.Lstat(p)
 	if errors.Is(err, fs.ErrNotExist) || (err == nil && !info.Mode().IsRegular()) {
 		return ErrNotFound
@@ -208,6 +338,33 @@ func (s *Store) Remove(name string) error {
 	return nil
 }
 
+// checkFree fails with ErrNoSpace when fewer than need+reserve bytes are
+// free (when the free space is known and the reserve enabled).
+func (s *Store) checkFree(need int64) error {
+	if s.opt.ReserveBytes < 0 {
+		return nil
+	}
+	free, err := s.opt.FreeSpace(s.dir)
+	if err != nil || free < 0 {
+		return nil // unknown: the quota still bounds the store
+	}
+	if free-need < s.opt.ReserveBytes {
+		return ErrNoSpace
+	}
+	return nil
+}
+
+// Budget returns how many bytes one upload may stage in total before it
+// is certain to exceed the quota: the whole quota (an upload may replace
+// every stored file), or -1 when unlimited. It only cuts streaming short;
+// Commit checks the exact figure against what is stored.
+func (s *Store) Budget() int64 {
+	if s.opt.QuotaBytes == 0 {
+		return -1
+	}
+	return s.opt.QuotaBytes
+}
+
 // Staged is an upload written to a temporary file, not yet visible.
 type Staged struct {
 	Name string
@@ -215,10 +372,21 @@ type Staged struct {
 	size int64
 }
 
+// Size is the number of bytes received.
+func (st *Staged) Size() int64 { return st.size }
+
+// spaceCheckEvery is how often (in bytes) staging re-checks free space.
+const spaceCheckEvery = 64 << 20
+
 // Stage streams r into a temporary file in the store directory. More than
-// max bytes yields ErrTooLarge. The caller must Commit or Discard.
-func (s *Store) Stage(name string, r io.Reader, max int64) (*Staged, error) {
+// max bytes yields ErrTooLarge, more than limit (the remaining quota
+// budget, or -1 for none) ErrQuota, and running below the free-space
+// reserve ErrNoSpace. The caller must Commit or Discard.
+func (s *Store) Stage(name string, r io.Reader, maxBytes int64, limit ...int64) (*Staged, error) {
 	if _, err := s.path(name); err != nil {
+		return nil, err
+	}
+	if err := s.checkFree(0); err != nil {
 		return nil, err
 	}
 	f, err := os.CreateTemp(s.dir, tempPrefix+"*")
@@ -226,9 +394,40 @@ func (s *Store) Stage(name string, r io.Reader, max int64) (*Staged, error) {
 		return nil, err
 	}
 	st := &Staged{Name: name, tmp: f.Name()}
-	n, err := io.Copy(f, io.LimitReader(r, max+1))
-	if err == nil && n > max {
-		err = ErrTooLarge
+	quota := int64(-1)
+	if len(limit) > 0 {
+		quota = limit[0]
+	}
+	var n int64
+	buf := make([]byte, 256<<10)
+	for err == nil {
+		var k int
+		k, err = r.Read(buf)
+		if k > 0 {
+			if n+int64(k) > maxBytes {
+				err = ErrTooLarge
+				break
+			}
+			if quota >= 0 && n+int64(k) > quota {
+				err = ErrQuota
+				break
+			}
+			if _, werr := f.Write(buf[:k]); werr != nil {
+				err = werr
+				break
+			}
+			before := n
+			n += int64(k)
+			if before/spaceCheckEvery != n/spaceCheckEvery {
+				if cerr := s.checkFree(0); cerr != nil {
+					err = cerr
+					break
+				}
+			}
+		}
+	}
+	if errors.Is(err, io.EOF) {
+		err = nil
 	}
 	if err == nil {
 		err = f.Sync()
@@ -251,50 +450,160 @@ func (st *Staged) Discard() {
 	}
 }
 
-// Commit moves staged uploads into place. Without replace, an existing
-// file of the same name (checked atomically with a hard link) fails the
-// whole commit with ErrExists and files committed by this call are removed
-// again. With replace, files are atomically renamed over existing ones.
+// Commit makes every staged upload of one request visible, or none.
+//
+// Under the store's commit lock it first validates everything: names,
+// conflicts (an existing name fails the whole commit with ErrExists unless
+// replace), the file count cap and the size quota (ErrQuota, computed from
+// the bytes actually received, minus the files being replaced) and the
+// free-space reserve (ErrNoSpace). Nothing has changed when any check
+// fails. It then keeps a hard link of every file about to be replaced and
+// moves the uploads into place (rename over an existing file; hard link
+// for a new name, which also refuses a file created behind the store's
+// back). If a step fails midway, the files already placed are removed and
+// replaced files are restored from their links, so the store is as before;
+// only if that restoration itself fails can part of the upload remain, and
+// the error then says so. Commits are serialised, so a rollback never
+// touches a file placed by another request.
 func (s *Store) Commit(staged []*Staged, replace bool) ([]File, error) {
-	var placed []string
-	rollback := func() {
-		if !replace {
-			for _, p := range placed {
-				_ = os.Remove(p)
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+
+	finals := make([]string, len(staged))
+	seen := map[string]bool{}
+	var received int64
+	for i, st := range staged {
+		p, err := s.path(st.Name)
+		if err != nil {
+			return nil, err
+		}
+		if seen[st.Name] {
+			return nil, &NameError{Msg: "the same file name appears twice in the upload"}
+		}
+		seen[st.Name] = true
+		finals[i] = p
+		received += st.size
+	}
+	current, err := s.sizes()
+	if err != nil {
+		return nil, err
+	}
+	var used, replaced int64
+	for _, n := range current {
+		used += n
+	}
+	files := len(current)
+	for _, st := range staged {
+		old, exists := current[st.Name]
+		switch {
+		case exists && !replace:
+			return nil, fmt.Errorf("%w: %s", ErrExists, st.Name)
+		case exists:
+			replaced += old
+		default:
+			files++
+		}
+	}
+	if files > s.opt.MaxFiles {
+		return nil, fmt.Errorf("%w: more than %d files", ErrQuota, s.opt.MaxFiles)
+	}
+	if s.opt.QuotaBytes > 0 && used-replaced+received > s.opt.QuotaBytes {
+		return nil, fmt.Errorf("%w: %d bytes", ErrQuota, s.opt.QuotaBytes)
+	}
+	// The uploads are already on disk; replacing frees the old bytes only
+	// at the end, so require the reserve now.
+	if err := s.checkFree(0); err != nil {
+		return nil, err
+	}
+
+	// Keep a link to every file that will be replaced.
+	backups := make([]string, len(staged))
+	cleanupBackups := func() {
+		for _, b := range backups {
+			if b != "" {
+				_ = os.Remove(b)
 			}
 		}
 	}
-	for _, st := range staged {
-		final, err := s.path(st.Name)
-		if err != nil {
-			rollback()
-			return nil, err
+	for i, st := range staged {
+		if _, exists := current[st.Name]; !exists {
+			continue
 		}
-		if replace {
-			err = os.Rename(st.tmp, final)
+		b, err := s.backupPath()
+		if err == nil {
+			err = os.Link(finals[i], b)
+		}
+		if err != nil {
+			cleanupBackups()
+			return nil, fmt.Errorf("prepare replacing %s: %w", st.Name, err)
+		}
+		backups[i] = b
+	}
+
+	placed := 0
+	var commitErr error
+	for i, st := range staged {
+		if backups[i] != "" {
+			commitErr = os.Rename(st.tmp, finals[i])
 		} else {
-			err = os.Link(st.tmp, final)
-			if err == nil {
+			commitErr = os.Link(st.tmp, finals[i])
+			if commitErr == nil {
 				_ = os.Remove(st.tmp)
 			}
 		}
-		if err != nil {
-			rollback()
-			if errors.Is(err, fs.ErrExist) {
-				return nil, fmt.Errorf("%w: %s", ErrExists, st.Name)
-			}
-			return nil, err
+		if commitErr != nil {
+			break
 		}
 		st.tmp = ""
-		placed = append(placed, final)
+		placed++
 	}
+	if commitErr != nil {
+		var rbErr []error
+		for i := 0; i < placed; i++ {
+			var err error
+			if backups[i] != "" {
+				err = os.Rename(backups[i], finals[i])
+				if err == nil {
+					backups[i] = ""
+				}
+			} else {
+				err = os.Remove(finals[i])
+			}
+			if err != nil {
+				rbErr = append(rbErr, err)
+			}
+		}
+		cleanupBackups()
+		if len(rbErr) > 0 {
+			return nil, fmt.Errorf("commit upload: %w; restoring the previous files failed, part of the upload may be visible: %w", commitErr, errors.Join(rbErr...))
+		}
+		if errors.Is(commitErr, fs.ErrExist) {
+			return nil, fmt.Errorf("%w: %s", ErrExists, staged[placed].Name)
+		}
+		return nil, fmt.Errorf("commit upload: %w", commitErr)
+	}
+	cleanupBackups()
 	out := make([]File, 0, len(staged))
 	for i, st := range staged {
-		info, err := os.Lstat(placed[i])
+		info, err := os.Lstat(finals[i])
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, s.describe(st.Name, info))
 	}
 	return out, nil
+}
+
+// backupPath returns an unused path for a replacement backup link.
+func (s *Store) backupPath() (string, error) {
+	f, err := os.CreateTemp(s.dir, backupPrefix+"*")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	_ = f.Close()
+	if err := os.Remove(name); err != nil {
+		return "", err
+	}
+	return name, nil
 }

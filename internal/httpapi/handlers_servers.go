@@ -49,6 +49,8 @@ func serversError(what string, err error) error {
 		return conflict(apitypes.ErrorCodeConflict, "the server has no container yet; start it first")
 	case errors.Is(err, servers.ErrNotRunning):
 		return conflict(apitypes.ErrorCodeConflict, "the server is not running")
+	case errors.Is(err, servers.ErrRunning):
+		return conflict(apitypes.ErrorCodeConflict, "stop the server before changing its port")
 	case errors.Is(err, servers.ErrInUse):
 		return conflict(apitypes.ErrorCodeConflict, "the "+what+" is in use")
 	case errors.Is(err, servers.ErrConflict):
@@ -139,10 +141,23 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) erro
 
 type serverJobFunc func(ctx context.Context, id int64, log io.Writer) error
 
+// startServerJob starts fn as a job for server id. The job body gets the
+// job id in its context (servers.WithJobID) so Docker failures can be
+// correlated with the daemon log.
 func (s *Server) startServerJob(r *http.Request, kind apitypes.JobKind, id int64, fn serverJobFunc) (apitypes.Job, error) {
-	return s.startJob(r, kind, apitypes.SubjectTypeServer, id, func(ctx context.Context, log io.Writer) error {
-		return fn(ctx, id, log)
+	jobID := make(chan int64, 1)
+	job, err := s.startJob(r, kind, apitypes.SubjectTypeServer, id, func(ctx context.Context, log io.Writer) error {
+		var jid int64
+		select {
+		case jid = <-jobID:
+		case <-ctx.Done():
+		}
+		return fn(servers.WithJobID(ctx, jid), id, log)
 	})
+	if err == nil {
+		jobID <- job.ID
+	}
+	return job, err
 }
 
 // serverAction returns a handler that starts a server job and responds 202.
@@ -355,6 +370,9 @@ func (s *Server) handleImportServers(w http.ResponseWriter, r *http.Request) err
 	if err := s.needServers(); err != nil {
 		return err
 	}
+	// The body may be large (servers.MaxImportBytes): bound it by
+	// inactivity, not total time.
+	r.Body = io.NopCloser(&deadlineReader{r: r.Body, rc: http.NewResponseController(w)})
 	var doc apitypes.ServerExport
 	if err := decodeJSON(r, &doc); err != nil {
 		return err

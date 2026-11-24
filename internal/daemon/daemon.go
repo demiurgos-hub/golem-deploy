@@ -54,12 +54,15 @@ type Options struct {
 	// means all interfaces.
 	PortBindAddress string
 	// ServerMemoryMB and ServerCPUs limit every server container (0 means
-	// unlimited).
+	// unlimited; the serve flags default to 2048 MiB and 2 CPUs).
 	ServerMemoryMB int
 	ServerCPUs     float64
 	// MaxRepoSizeMB bounds the size of each project checkout in MiB
 	// (--max-repo-size-mb); 0 means unlimited.
 	MaxRepoSizeMB int
+	// StaticQuotaMB caps the static file store (0 means unlimited; the
+	// serve flag defaults to 5120).
+	StaticQuotaMB int
 	// Ready, if set, is called with the bound address once serving.
 	Ready func(addr net.Addr)
 
@@ -97,7 +100,10 @@ func serverConfig(o Options) (servers.Config, error) {
 	if o.ServerCPUs < 0 || o.ServerCPUs > 1024 {
 		return servers.Config{}, errors.New("--server-cpus must be between 0 (unlimited) and 1024")
 	}
-	return servers.Config{Ports: rng, BindAddress: o.PortBindAddress, MemoryMB: o.ServerMemoryMB, CPUs: o.ServerCPUs}, nil
+	if o.StaticQuotaMB < 0 || o.StaticQuotaMB > 1<<30 {
+		return servers.Config{}, errors.New("--static-quota-mb must be 0 (unlimited) or a positive number of MiB")
+	}
+	return servers.Config{Ports: rng, PanelPort: panel, BindAddress: o.PortBindAddress, MemoryMB: o.ServerMemoryMB, CPUs: o.ServerCPUs}, nil
 }
 
 // jobShutdownGrace bounds how long running jobs get to stop.
@@ -203,12 +209,19 @@ func Run(ctx context.Context, o Options) (err error) {
 		return err
 	}
 
-	static, err := staticfiles.Open(layout.Static())
+	static, err := staticfiles.Open(layout.Static(), staticfiles.Options{QuotaBytes: int64(o.StaticQuotaMB) << 20})
 	if err != nil {
 		return err
 	}
 	runner := jobs.New(st, layout.JobLogs(), jobs.Options{Logger: logger})
-	dockerClient := docker.New(docker.Options{Runner: o.dockerCLI, Logger: logger})
+	instanceID, err := st.InstanceID(ctx)
+	if err != nil {
+		return err
+	}
+	if err := docker.SweepEnvFiles(layout.Tmp()); err != nil {
+		logger.Warn("could not remove env files left by a previous run", "err", err)
+	}
+	dockerClient := docker.New(docker.Options{Runner: o.dockerCLI, Logger: logger, InstanceID: instanceID, TempDir: layout.Tmp()})
 	svc := servers.New(st, box, dockerClient, srvCfg, logger)
 	var probe httpapi.DockerProbe = dockerClient
 	if o.docker != nil {
@@ -343,8 +356,19 @@ func reconcileServers(ctx context.Context, svc *servers.Service, runner *jobs.Ru
 	rctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	err := svc.Reconcile(rctx, func(id int64) error {
-		_, err := runner.Start(rctx, string(apitypes.JobKindServerStart), jobs.Subject{Type: string(apitypes.SubjectTypeServer), ID: jobs.SubjectID(id)}, nil,
-			func(jctx context.Context, log io.Writer) error { return svc.Start(jctx, id, log) })
+		jobID := make(chan int64, 1)
+		job, err := runner.Start(rctx, string(apitypes.JobKindServerStart), jobs.Subject{Type: string(apitypes.SubjectTypeServer), ID: jobs.SubjectID(id)}, nil,
+			func(jctx context.Context, log io.Writer) error {
+				var jid int64
+				select {
+				case jid = <-jobID:
+				case <-jctx.Done():
+				}
+				return svc.Start(servers.WithJobID(jctx, jid), id, log)
+			})
+		if err == nil {
+			jobID <- job.ID
+		}
 		return err
 	})
 	if err != nil && ctx.Err() == nil {

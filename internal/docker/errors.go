@@ -13,6 +13,12 @@ var (
 	ErrNotFound = errors.New("docker: not found")
 	// ErrNotManaged: the object exists but does not carry the managed label.
 	ErrNotManaged = errors.New("docker: object is not managed by golem-deploy")
+	// ErrNotOurs: the object carries the managed label but was not created
+	// by this installation (another instance id, none, or a container that
+	// is not the one recorded for the server).
+	ErrNotOurs = errors.New("docker: object was not created by this golem-deploy installation")
+	// ErrImageMissing: the image does not exist (docker run never pulls).
+	ErrImageMissing = errors.New("docker: image not found")
 	// ErrInUse: the object is used by a container.
 	ErrInUse = errors.New("docker: object is in use")
 	// ErrConflict: a name is taken or another state conflict.
@@ -24,9 +30,9 @@ var (
 )
 
 // CmdError describes a failed CLI call. Detail is the CLI's (capped)
-// standard error, which may name containers or images but never contains
-// container environment values (those are never in argv). It belongs in
-// daemon and job logs, never in HTTP responses.
+// standard error, which may name containers, images or host paths. It
+// belongs in the daemon log only: never in HTTP responses or job logs (job
+// bodies map the Kind to a fixed message).
 type CmdError struct {
 	Op       string
 	Kind     error

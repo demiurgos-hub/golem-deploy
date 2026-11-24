@@ -22,9 +22,11 @@ func TestValidateEnvKey(t *testing.T) {
 	for key, ok := range map[string]bool{
 		"A": true, "_x": true, "GAME_MODE": true, "a1": true, strings.Repeat("A", 128): true,
 		"": false, "1A": false, "A-B": false, "A=B": false, "A B": false, strings.Repeat("A", 129): false,
-		// Reserved: they would steer the docker CLI child itself.
-		"PATH": false, "Path": false, "HOME": false, "DOCKER_HOST": false, "docker_context": false,
-		"DOCKER_ANYTHING": false, "HTTPS_PROXY": false, "SystemRoot": false, "USERPROFILE": false,
+		// Container variables never reach the docker CLI's environment, so
+		// these are ordinary container variables (D1).
+		"PATH": true, "HOME": true, "DOCKER_HOST": true, "LD_PRELOAD": true, "GODEBUG": true, "HTTPS_PROXY": true,
+		// Reserved for variables the daemon injects.
+		"GOLEM_ENGINE": false, "golem_x": false, "Golem_": false, "GOLEM": true, "XGOLEM_A": true,
 	} {
 		if err := ValidateEnvKey(key); (err == nil) != ok {
 			t.Errorf("%q: err=%v, want ok=%v", key, err, ok)
@@ -41,11 +43,15 @@ func TestValidateEnv(t *testing.T) {
 	}{
 		{"empty", nil, true},
 		{"normal", map[string]string{"A": secret, "B": ""}, true},
-		{"newline value ok", map[string]string{"A": "x\ny"}, true},
+		{"tricky but single line", map[string]string{"A": " #x=$y \\ \"q\" 'z' ünï \t\x1b "}, true},
+		{"newline value", map[string]string{"A": "x\n" + secret}, false},
+		{"carriage return value", map[string]string{"A": secret + "\r"}, false},
 		{"nul value", map[string]string{"A": "x\x00" + secret}, false},
+		{"invalid utf8", map[string]string{"A": "\xff" + secret}, false},
+		{"one variable too large", map[string]string{"A": strings.Repeat("x", MaxEnvVarBytes)}, false},
 		{"bad key", map[string]string{"1A": secret}, false},
 		{"case duplicate", map[string]string{"Mode": "a", "MODE": "b"}, false},
-		{"too large", map[string]string{"A": strings.Repeat("x", MaxEnvBytes)}, false},
+		{"too large", map[string]string{"A": strings.Repeat("x", MaxEnvVarBytes-1), "B": strings.Repeat("x", MaxEnvVarBytes-1), "C": "xx"}, false},
 	}
 	for _, c := range cases {
 		err := ValidateEnv(c.env)

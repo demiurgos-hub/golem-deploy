@@ -18,6 +18,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
+	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/ports"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
@@ -59,18 +60,20 @@ func TestIntegrationServersAPI(t *testing.T) {
 	sfx := hex.EncodeToString(b)
 	_, netErr := exec.Command("docker", "network", "inspect", docker.NetworkName).Output()
 	networkExisted := netErr == nil
-	tag := "golem-deploy-itest-api:" + sfx
-	plain := "golem-deploy-itest-api-plain:" + sfx
-	name := "itapi-" + sfx
+	tag := "gdm2h-itest-api:" + sfx
+	plain := "gdm2h-itest-api-plain:" + sfx
+	name := "gdm2h-itapi-" + sfx
+	impostor := "gdm2h-itapi-impostor-" + sfx
 	dockerfile := "FROM " + itestBusybox + "\n" +
 		`CMD ["sh", "-c", "echo started; i=0; while true; do i=$((i+1)); echo tick $i; sleep 1; done"]` + "\n"
 	itestDocker(t, dockerfile, "build", "--quiet", "--tag", tag, "--label", docker.LabelManaged+"=true", "-")
 	itestDocker(t, dockerfile, "build", "--quiet", "--tag", plain, "-")
-	itestDocker(t, "", "volume", "create", "itapi-foreign-"+sfx)
+	itestDocker(t, "", "volume", "create", "gdm2h-itapi-foreign-"+sfx)
 	t.Cleanup(func() {
 		itestQuiet("rm", "--force", docker.ContainerName(name))
+		itestQuiet("rm", "--force", impostor)
 		itestQuiet("image", "rm", "--force", tag, plain)
-		itestQuiet("volume", "rm", "--force", "itapi-foreign-"+sfx)
+		itestQuiet("volume", "rm", "--force", "gdm2h-itapi-foreign-"+sfx)
 		if !networkExisted {
 			itestQuiet("network", "rm", docker.NetworkName)
 		}
@@ -79,7 +82,7 @@ func TestIntegrationServersAPI(t *testing.T) {
 	h := newHarness(t)
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewTextHandler(logs, nil))
-	dc := docker.New(docker.Options{Logger: logger})
+	dc := docker.New(docker.Options{Logger: logger, InstanceID: dockertest.IntegrationInstanceID, TempDir: t.TempDir()})
 	box, _ := secrets.New(bytes.Repeat([]byte{3}, secrets.KeySize))
 	// A free 10-port window for the range.
 	lo := 0
@@ -122,9 +125,10 @@ func TestIntegrationServersAPI(t *testing.T) {
 	}
 
 	errBody(t, h.do("POST", "/api/v1/servers", tok, apitypes.CreateServerRequest{Name: name, Image: plain}), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
-	errBody(t, h.do("DELETE", "/api/v1/volumes/itapi-foreign-"+sfx, tok, nil), http.StatusNotFound, apitypes.ErrorCodeNotFound)
+	errBody(t, h.do("DELETE", "/api/v1/volumes/gdm2h-itapi-foreign-"+sfx, tok, nil), http.StatusNotFound, apitypes.ErrorCodeNotFound)
 
-	rr := h.do("POST", "/api/v1/servers", tok, apitypes.CreateServerRequest{Name: name, Image: tag, Env: map[string]string{"GAME_SECRET": envMarker}})
+	rr := h.do("POST", "/api/v1/servers", tok, apitypes.CreateServerRequest{Name: name, Image: tag, Env: map[string]string{
+		"GAME_SECRET": envMarker, "LD_PRELOAD": "/nonexistent.so", "MOTD": `say "hi" #1 $x \ ünï`}})
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create %d %s", rr.Code, rr.Body.String())
 	}
@@ -135,9 +139,22 @@ func TestIntegrationServersAPI(t *testing.T) {
 	if got.State != apitypes.ServerStateRunning || got.Port != lo {
 		t.Fatalf("%+v", got)
 	}
-	ro := itestDocker(t, "", "container", "inspect", "--format", "{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.Config.User}}", got.ContainerID)
-	if ro != "true [ALL] 65532:65532" {
+	ro := itestDocker(t, "", "container", "inspect", "--format",
+		"{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.Config.User}} {{.HostConfig.Init}} {{.HostConfig.RestartPolicy.Name}} {{json .Config.Healthcheck.Test}}", got.ContainerID)
+	if ro != `true [ALL] 65532:65532 true on-failure ["NONE"]` {
 		t.Fatalf("hardening %q", ro)
+	}
+	envJSON := itestDocker(t, "", "container", "inspect", "--format", "{{json .Config.Env}}", got.ContainerID)
+	if !strings.Contains(envJSON, `"MOTD=say \"hi\" #1 $x \\ ünï"`) || !strings.Contains(envJSON, `"LD_PRELOAD=/nonexistent.so"`) {
+		t.Fatalf("container env %s", envJSON)
+	}
+	// D3: an impostor with every one of our labels is not the server's
+	// container.
+	itestDocker(t, "", "run", "--detach", "--name", impostor,
+		"--label", docker.LabelManaged+"=true", "--label", docker.LabelInstance+"="+dockertest.IntegrationInstanceID,
+		"--label", docker.LabelServerID+"="+fmt.Sprint(sv.ID), "--label", docker.LabelServer+"="+name, tag)
+	if again := decode[apitypes.Server](t, h.do("GET", base, tok, nil)); again.ContainerID != got.ContainerID {
+		t.Fatalf("container id changed to %s", again.ContainerID)
 	}
 
 	// Follow the log over a real connection and stop the server: the
@@ -190,11 +207,17 @@ func TestIntegrationServersAPI(t *testing.T) {
 		}
 	}
 	wait(h.do("POST", base+"/stop", tok, nil))
+	if state := itestDocker(t, "", "container", "inspect", "--format", "{{.State.Status}}", impostor); state != "running" {
+		t.Fatalf("impostor state %q after stop", state)
+	}
 	if rr := h.do("DELETE", base, tok, nil); rr.Code != http.StatusNoContent {
 		t.Fatalf("delete %d %s", rr.Code, rr.Body.String())
 	}
-	if out := itestDocker(t, "", "ps", "--all", "--quiet", "--filter", "name="+docker.ContainerName(name)); out != "" {
+	if out := itestDocker(t, "", "ps", "--all", "--quiet", "--filter", "name=^/"+docker.ContainerName(name)+"$"); out != "" {
 		t.Fatalf("container left: %s", out)
+	}
+	if state := itestDocker(t, "", "container", "inspect", "--format", "{{.State.Status}}", impostor); state != "running" {
+		t.Fatalf("impostor state %q after delete", state)
 	}
 	if strings.Contains(logs.String(), envMarker) {
 		t.Fatal("env value in daemon log")
