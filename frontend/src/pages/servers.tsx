@@ -14,6 +14,16 @@ import { GettingStarted } from "@/components/getting-started";
 import { InlineJob } from "@/components/jobs";
 import { OriginsEditor, hasOriginErrors, noOriginErrors, originErrorsFrom, validateOrigins, type OriginErrors } from "@/components/origins-editor";
 import { ServerActions } from "@/components/server-actions";
+import {
+  DEFAULT_DATA_SETTINGS,
+  DataSettingsFields,
+  dataSettingsErrorsFrom,
+  hasDataSettingsErrors,
+  scheduleOf,
+  validateDataSettings,
+  type DataSettingsDraft,
+  type DataSettingsErrors,
+} from "@/components/server-data";
 import { ServerStateBadge } from "@/components/status-badges";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/ui/data-table";
@@ -148,6 +158,11 @@ export function ServersPage() {
                 <span className="inline-flex flex-wrap items-center gap-1.5">
                   <ServerStateBadge server={s} />
                   {s.restart_required && <Badge tone="warning">Restart required</Badge>}
+                  {s.data.schema_mismatch && (
+                    <Badge tone="danger" title="The saved world has another schema than the server's build, so the server will not start. Open the server for the ways out.">
+                      Cannot load saved world
+                    </Badge>
+                  )}
                 </span>
               ),
             },
@@ -229,6 +244,14 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
   // The daemon's env errors (value errors name the key: env.<KEY>), until the draft changes.
   const [envServerErrors, setEnvServerErrors] = useState<EnvErrors>(noEnvErrors());
   const [errors, setErrors] = useState<CreateErrors>({});
+  const [dataSettings, setDataSettingsState] = useState<DataSettingsDraft>(DEFAULT_DATA_SETTINGS);
+  const [dataErrors, setDataErrors] = useState<DataSettingsErrors>({});
+  const setDataSettings = (d: DataSettingsDraft) => {
+    setDataSettingsState(d);
+    setDataErrors({});
+  };
+  const snapshotChanged = dataSettings.snapshot.trim() !== DEFAULT_DATA_SETTINGS.snapshot;
+  const scheduleChanged = dataSettings.interval.trim() !== DEFAULT_DATA_SETTINGS.interval || dataSettings.keep.trim() !== DEFAULT_DATA_SETTINGS.keep;
   const envResult = computeEnvDiff([], env);
   const setEnv = (d: EnvDraft) => {
     setEnvDraft(d);
@@ -255,6 +278,9 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
         ...(origins.length ? { allowed_origins: origins.map((o) => o.trim()) } : {}),
         ...(Object.keys(envResult.diff.env_set).length ? { env: envResult.diff.env_set } : {}),
         desired_state: start ? "running" : "stopped",
+        // The daemon's defaults apply to whatever is left out.
+        ...(snapshotChanged ? { snapshot_interval_seconds: Number(dataSettings.snapshot.trim()) } : {}),
+        ...(scheduleChanged ? { backup_schedule: scheduleOf(dataSettings) } : {}),
       }),
     onSuccess: (server) => {
       toast.success(`Server ${server.name} created on port ${server.port}.${start ? " Starting it." : ""}`);
@@ -268,7 +294,9 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
       if (!isApiError(err)) return;
       const envErrs = envErrorsFrom(err, env, []);
       const oErrs = originErrorsFrom(err);
-      if (envErrs) setEnvServerErrors(envErrs);
+      const dErrs = dataSettingsErrorsFrom(err);
+      if (dErrs) setDataErrors(dErrs);
+      else if (envErrs) setEnvServerErrors(envErrs);
       else if (oErrs) setOriginErrors(oErrs);
       else if (err.code === "name_taken") setErrors({ name: "A server with this name exists." });
       else if (err.code === "port_in_use") setErrors({ port: sentence(err.message) });
@@ -286,9 +314,11 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
       port: validatePort(port, { optional: true }),
     };
     const oErrs = validateOrigins(origins);
+    const dErrs = validateDataSettings(dataSettings);
     setErrors(errs);
     setOriginErrors(oErrs);
-    if (errs.name || errs.build_id || errs.port || hasOriginErrors(oErrs) || !envResult.valid) return;
+    setDataErrors(dErrs);
+    if (errs.name || errs.build_id || errs.port || hasOriginErrors(oErrs) || hasDataSettingsErrors(dErrs) || !envResult.valid) return;
     create.mutate();
   }
 
@@ -298,6 +328,7 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
       create.error.code === "port_in_use" ||
       envErrorsFrom(create.error, env, []) !== null ||
       originErrorsFrom(create.error) !== null ||
+      dataSettingsErrorsFrom(create.error) !== null ||
       ["name", "build_id", "port"].includes(create.error.field ?? ""));
 
   return (
@@ -392,6 +423,13 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
               Values are stored encrypted and never shown again. Names starting with GOLEM_ are set by Golem Deploy.
             </p>
             <EnvEditor existingKeys={[]} draft={env} onChange={setEnv} errors={mergeEnvErrors(envResult, envServerErrors)} />
+          </fieldset>
+          <fieldset className="flex flex-col gap-2">
+            <legend className="mb-1 text-sm font-medium">Saved data</legend>
+            <p className="text-xs text-muted-foreground">
+              The game keeps its world on a volume of the server. These can be changed later on the server&apos;s page.
+            </p>
+            <DataSettingsFields value={dataSettings} onChange={setDataSettings} errors={dataErrors} />
           </fieldset>
           <Checkbox label="Start the server after creating it" checked={start} onChange={(e) => setStart(e.target.checked)} />
           {create.isError && !inline && <ErrorText error={create.error} />}

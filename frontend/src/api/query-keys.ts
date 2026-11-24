@@ -39,6 +39,11 @@ export const qk = {
     stats: (id: number) => ["servers", "stats", id] as const,
     runtime: (id: number) => ["servers", "runtime", id] as const,
   },
+  backups: {
+    all: ["backups"] as const,
+    /** Every backup of the installation, or those taken from one server. */
+    list: (serverId: number | null) => ["backups", "list", serverId] as const,
+  },
   images: ["images"] as const,
   staticFiles: ["static"] as const,
   volumes: ["volumes"] as const,

@@ -5,6 +5,8 @@ import type {
   Account,
   AccountList,
   AuthOptions,
+  Backup,
+  BackupList,
   BranchList,
   Build,
   BuildList,
@@ -14,6 +16,7 @@ import type {
   CreateAPITokenRequest,
   CreateAPITokenResponse,
   CreateAccountRequest,
+  CreateBackupRequest,
   CreateBuildRequest,
   CreateBuildResponse,
   CreateProjectRequest,
@@ -29,6 +32,8 @@ import type {
   Project,
   ProjectList,
   RegisterRequest,
+  ResetServerDataRequest,
+  RestoreServerRequest,
   Server,
   ServerConnectivity,
   ServerExport,
@@ -163,6 +168,22 @@ export function createEndpoints(c: ApiClient) {
       exportAll: () => c.request<ServerExport>("GET", "/servers/export"),
       importAll: (body: ServerExport) =>
         c.request<ServerImportResult>("POST", "/servers/import", { body }),
+      /** 202 server.backup job; the body (a note) is optional. */
+      backup: (id: number, body: CreateBackupRequest) => c.request<Job>("POST", `/servers/${seg(id)}/backups`, { body }),
+      /** Admin. 202 server.restore job; 409 schema_mismatch unless `force` when the fingerprints are known and differ. */
+      restore: (id: number, body: RestoreServerRequest) => c.request<Job>("POST", `/servers/${seg(id)}/restore`, { body }),
+      /** Admin. 202 server.data_reset job. */
+      resetData: (id: number, body: ResetServerDataRequest) =>
+        c.request<Job>("POST", `/servers/${seg(id)}/data/reset`, { body }),
+    },
+    backups: {
+      /** Newest first; `server_id` filters by the server a backup was taken from. */
+      list: (filter: { server_id?: number }, signal?: AbortSignal) =>
+        c.request<BackupList>("GET", "/backups", { query: filter, signal }),
+      get: (id: number, signal?: AbortSignal) => c.request<Backup>("GET", `/backups/${seg(id)}`, { signal }),
+      /** The gzip tar archive, exactly the bytes `sha256` describes. */
+      download: (id: number) => c.download(`/backups/${seg(id)}/download`),
+      remove: (id: number) => c.request<void>("DELETE", `/backups/${seg(id)}`),
     },
     images: {
       list: (signal?: AbortSignal) => c.request<ImageList>("GET", "/images", { signal }),

@@ -59,3 +59,8 @@ export function formatDuration(seconds: number): string {
   if (m > 0) return `${m}m ${s % 60}s`;
   return `${s}s`;
 }
+
+/** A schema fingerprint shortened for tables; the full value goes in a title or copy button. */
+export function shortFingerprint(fp: string): string {
+  return fp ? fp.slice(0, 12) : "-";
+}

@@ -23,6 +23,9 @@ const KIND_LABELS: Record<string, string> = {
   "server.stop": "Stop",
   "server.restart": "Restart",
   "server.delete": "Delete",
+  "server.backup": "Back up data",
+  "server.restore": "Restore backup",
+  "server.data_reset": "Reset data",
   "certificate.issue": "Issue certificate",
   "certificate.renew": "Renew certificates",
 };

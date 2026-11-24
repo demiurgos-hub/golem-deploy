@@ -380,7 +380,7 @@ describe("server deletion outcome", () => {
     await user.click(await screen.findByRole("button", { name: "Delete" }));
     const confirm = await screen.findByRole("alertdialog", { name: "Delete server" });
     await user.click(within(confirm).getByRole("button", { name: "Delete server" }));
-    expect(await screen.findByText(/Server echo deleted: container removed and port 7830 freed\./)).toBeInTheDocument();
+    expect(await screen.findByText(/Server echo deleted: container and saved data removed, port 7830 freed\. Its backups are kept\./)).toBeInTheDocument();
     await waitFor(() => expect(history.location.pathname).toBe("/servers"));
   });
 });

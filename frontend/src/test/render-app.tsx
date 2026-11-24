@@ -31,6 +31,7 @@ export function renderApp({
     // Pages list builds on the side (first-run guide, project page); tests that care override these.
     "GET /builds": () => jsonResponse(200, { items: [] }),
     "GET /projects/{id}/builds": () => jsonResponse(200, { items: [] }),
+    "GET /backups": () => jsonResponse(200, { items: [], total_bytes: 0, max_content_bytes: 2048 * 1024 * 1024 }),
     ...routes,
   });
   const services = createServices({ transport, local: localStorage, session: sessionStorage, channel: null, document: null });

@@ -1,8 +1,10 @@
-import type { Build, CertificateInfo, Image, Project, Server, ServerRuntime } from "@/api/types.gen";
+import type { Backup, BackupList, Build, CertificateInfo, Image, Project, Server, ServerRuntime } from "@/api/types.gen";
 
-// Wire objects with every field of the milestone 3 contract, for tests to override.
+// Wire objects with every field of the contract (milestone 3 onwards), for tests to override.
 
 export const COMMIT = "4f1c2a9e0b7d3c5a8e6f1b2c3d4e5f6a7b8c9d0e";
+/** The schema fingerprint the runtime fixture reports; saved data and backups default to it too. */
+export const FINGERPRINT = "3b6f0c2a91d4e8f7";
 export const IMAGE_ID = "sha256:" + "ab".repeat(32);
 
 export function projectFixture(overrides: Partial<Project> = {}): Project {
@@ -100,8 +102,51 @@ export function serverFixture(overrides: Partial<Server> = {}): Server {
     exit_code: null,
     restart_required: false,
     certificate: null,
+    data: {
+      volume: "golem-deploy-data-3-0001",
+      schema_fingerprint: FINGERPRINT,
+      schema_mismatch: false,
+      last_backup_at: "2026-11-21T09:00:00Z",
+    },
+    snapshot_interval_seconds: 300,
+    backup_schedule: { interval_hours: 0, keep: 7 },
     created_at: "2026-11-20T10:00:00Z",
     updated_at: "2026-11-20T11:00:00Z",
+    ...overrides,
+  };
+}
+
+export function backupFixture(overrides: Partial<Backup> = {}): Backup {
+  return {
+    id: 40,
+    kind: "manual",
+    server_id: 3,
+    server_name: "echo",
+    project_id: 5,
+    project_name: "arena",
+    build_id: 12,
+    commit: COMMIT,
+    engine_version: "v0.4.0-rc.1",
+    schema_fingerprint: FINGERPRINT,
+    live: true,
+    note: "before the map update",
+    size_bytes: 3_500_000,
+    content_bytes: 9_000_000,
+    file_count: 4,
+    sha256: "5e".repeat(32),
+    job_id: 500,
+    created_by: 1,
+    created_by_username: "alice",
+    created_at: "2026-11-21T09:00:00Z",
+    ...overrides,
+  };
+}
+
+export function backupList(items: Backup[], overrides: Partial<BackupList> = {}): BackupList {
+  return {
+    items,
+    total_bytes: items.reduce((n, b) => n + b.size_bytes, 0),
+    max_content_bytes: 2048 * 1024 * 1024,
     ...overrides,
   };
 }

@@ -112,6 +112,12 @@ const serverRoute = createRoute({
   component: lazyRouteComponent(() => import("@/pages/server-detail"), "ServerDetailPage"),
 });
 
+const backupsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "/backups",
+  component: lazyRouteComponent(() => import("@/pages/backups"), "BackupsPage"),
+});
+
 const imagesRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "/images",
@@ -173,6 +179,7 @@ const routeTree = rootRoute.addChildren([
     buildRoute,
     serversRoute,
     serverRoute,
+    backupsRoute,
     imagesRoute,
     staticRoute,
     volumesRoute,

@@ -27,7 +27,10 @@ export function VolumesPage() {
 
   return (
     <>
-      <PageHeader title="Volumes" description="Server data volumes managed by Golem Deploy. Volumes outlive their servers until deleted here." />
+      <PageHeader
+        title="Volumes"
+        description="Docker volumes that hold servers' saved data. Each server keeps its world on its current data volume, which goes away with the server and is replaced by a restore or reset. Other volumes are leftovers an administrator can delete here."
+      />
       {volumes.isPending ? (
         <LoadingState label="Loading volumes" />
       ) : volumes.isError ? (
@@ -35,7 +38,7 @@ export function VolumesPage() {
       ) : volumes.data.items.length === 0 ? (
         <EmptyState
           title="No volumes"
-          description="Servers do not get data volumes yet; this comes with a later release. Volumes that Golem Deploy manages will be listed here."
+          description="A server gets its data volume when it first starts. Volumes that Golem Deploy manages are listed here."
         />
       ) : (
         <DataTable
@@ -62,6 +65,21 @@ export function VolumesPage() {
                 ),
             },
             {
+              key: "current",
+              header: "Role",
+              sortValue: (v) => (v.current ? 0 : 1),
+              cell: (v) =>
+                v.current ? (
+                  <Badge tone="success" title="The server's saved world lives here. It is deleted with the server.">
+                    Current data
+                  </Badge>
+                ) : (
+                  <span className="text-muted-foreground" title="Not the current data volume of any server: left over after a restore, a reset or a deleted server.">
+                    Leftover
+                  </span>
+                ),
+            },
+            {
               key: "in_use",
               header: "Attached",
               cell: (v) => (v.in_use ? <Badge tone="info">Mounted</Badge> : <span className="text-muted-foreground">Not mounted</span>),
@@ -76,12 +94,15 @@ export function VolumesPage() {
           ]}
           actions={
             isAdmin
-              ? (v) => (
-                  <Button size="sm" variant="outline" aria-label={`Delete volume ${v.name}`} onClick={() => setDeleting(v)}>
-                    <Trash2 />
-                    Delete
-                  </Button>
-                )
+              ? (v) =>
+                  v.current ? (
+                    <span className="text-xs text-muted-foreground">Deleted with its server</span>
+                  ) : (
+                    <Button size="sm" variant="outline" aria-label={`Delete volume ${v.name}`} onClick={() => setDeleting(v)}>
+                      <Trash2 />
+                      Delete
+                    </Button>
+                  )
               : undefined
           }
         />
@@ -94,8 +115,8 @@ export function VolumesPage() {
           deleting && (
             <>
               Delete <span className="font-medium text-foreground">{deleting.name}</span>
-              {deleting.server_name ? ` (data of ${deleting.server_name})` : ""}? All saved game data in it is lost. This cannot be
-              undone.
+              {deleting.server_name ? ` (earlier data of ${deleting.server_name})` : ""}? It is not any server&apos;s current data, but
+              the files in it are lost for good. Backups are not affected. This cannot be undone.
             </>
           )
         }
