@@ -225,3 +225,22 @@ func (s *Store) ReconcileBuilds(ctx context.Context) (int64, error) {
 	}
 	return res.RowsAffected()
 }
+
+// ServerIDsByBuild returns, for every build referenced by a server, the ids
+// of the servers configured with it (sorted).
+func (s *Store) ServerIDsByBuild(ctx context.Context) (map[int64][]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT build_id, id FROM servers WHERE build_id IS NOT NULL ORDER BY id`)
+	if err != nil {
+		return nil, mapErr("list build usage", err)
+	}
+	defer rows.Close()
+	out := map[int64][]int64{}
+	for rows.Next() {
+		var buildID, serverID int64
+		if err := rows.Scan(&buildID, &serverID); err != nil {
+			return nil, mapErr("list build usage", err)
+		}
+		out[buildID] = append(out[buildID], serverID)
+	}
+	return out, mapErr("list build usage", rows.Err())
+}

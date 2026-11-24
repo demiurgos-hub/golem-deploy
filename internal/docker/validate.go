@@ -20,7 +20,11 @@ const (
 	LabelProjectID  = "dev.golemengine.deploy.project-id"
 	LabelCommit     = "dev.golemengine.deploy.commit"
 	LabelConfigHash = "dev.golemengine.deploy.config-hash"
-	ManagedValue    = "true"
+	// LabelBuildID and LabelEngineVersion are set on images by the build
+	// pipeline: the id of the builds row and the Golem Engine version.
+	LabelBuildID       = "dev.golemengine.deploy.build-id"
+	LabelEngineVersion = "dev.golemengine.deploy.engine-version"
+	ManagedValue       = "true"
 )
 
 // Naming and fixed runtime parameters.
