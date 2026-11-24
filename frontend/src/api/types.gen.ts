@@ -235,8 +235,10 @@ export interface Backup {
   server_name: string;
   /**
    * ProjectID and ProjectName, BuildID, Commit and EngineVersion describe
-   * the build the server was assigned when the backup was taken (ids are
-   * null once the project or build was deleted).
+   * the build that wrote the data: the build of the server's recorded
+   * container (running or stopped) when it had one, otherwise the build
+   * the server was assigned (ids are null once the project or build was
+   * deleted).
    */
   project_id: number | null;
   project_name: string;
@@ -434,9 +436,10 @@ export interface Build {
   engine_version: string;
   /**
    * SchemaFingerprint is the game's schema fingerprint: read from the
-   * repository's committed generated code when the build has it, and
-   * replaced by what the game reports once a server running this build
-   * has become ready. Empty while neither is known.
+   * repository's committed generated code when the build has it;
+   * otherwise the first value a game running this build reports once its
+   * server has become ready is filled in. A recorded value is never
+   * replaced. Empty while neither is known.
    */
   schema_fingerprint: string;
   /**

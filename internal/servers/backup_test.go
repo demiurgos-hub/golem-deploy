@@ -322,7 +322,7 @@ func TestBackupFailures(t *testing.T) {
 	vol := bf.row(t).DataVolume
 	bf.admin.Set(func(s *gameadmintest.Server) { s.SnapshotStatus = 501 })
 	bf.f.SetVolumeFiles(vol, dockertest.Special("only-a-link", tar.TypeSymlink, "/"))
-	if _, err := bf.backup(t, BackupOptions{}); !strings.Contains(detail(err), "holds no files") {
+	if _, err := bf.backup(t, BackupOptions{}); !strings.Contains(detail(err), "holds no regular files (entries a backup cannot hold: 1)") {
 		t.Fatalf("%v", err)
 	}
 	bf.f.SetVolumeFiles(vol, dockertest.Reg("big", strings.Repeat("x", 101)))
@@ -596,7 +596,7 @@ func TestDeleteAndVolumeRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	var log bytes.Buffer
-	if err := bf.svc.Delete(ctx, bf.id, &log); err != nil {
+	if err := bf.svc.Delete(ctx, bf.id, DeleteOptions{}, &log); err != nil {
 		t.Fatalf("%v\n%s", err, log.String())
 	}
 	if bf.f.HasVolume(sv.DataVolume) {
@@ -721,6 +721,17 @@ func TestCleanupHelpers(t *testing.T) {
 	}
 	if _, ok := bf.f.Container(unrecordedID); !ok {
 		t.Fatal("an unrecorded container was removed")
+	}
+	// A record without a container id whose helper is not found may be a
+	// create whose reply was lost: it stays until helperForgetAfter passed.
+	if rows, _ := bf.st.ListVolumeHelpers(ctx); len(rows) != 1 || rows[0].LaunchID != never {
+		t.Fatalf("%+v", rows)
+	}
+	bf.mu.Lock()
+	bf.offset += helperForgetAfter + time.Minute
+	bf.mu.Unlock()
+	if err := bf.svc.CleanupHelpers(ctx); err != nil {
+		t.Fatal(err)
 	}
 	if rows, _ := bf.st.ListVolumeHelpers(ctx); len(rows) != 0 {
 		t.Fatalf("%+v", rows)

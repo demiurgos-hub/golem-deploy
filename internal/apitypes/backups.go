@@ -36,8 +36,10 @@ type Backup struct {
 	ServerID   *int64 `json:"server_id" tstype:"number | null,required"`
 	ServerName string `json:"server_name"`
 	// ProjectID and ProjectName, BuildID, Commit and EngineVersion describe
-	// the build the server was assigned when the backup was taken (ids are
-	// null once the project or build was deleted).
+	// the build that wrote the data: the build of the server's recorded
+	// container (running or stopped) when it had one, otherwise the build
+	// the server was assigned (ids are null once the project or build was
+	// deleted).
 	ProjectID     *int64 `json:"project_id" tstype:"number | null,required"`
 	ProjectName   string `json:"project_name"`
 	BuildID       *int64 `json:"build_id" tstype:"number | null,required"`

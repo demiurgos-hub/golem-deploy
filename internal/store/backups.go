@@ -43,6 +43,31 @@ func (s *Store) SetServerDataFingerprint(ctx context.Context, id int64, volume, 
 	return mapErr("set server data fingerprint", err)
 }
 
+// SetServerBackupFailed records when the last scheduled backup of server
+// id failed (nil: it succeeded).
+func (s *Store) SetServerBackupFailed(ctx context.Context, id int64, at *time.Time) error {
+	var v any
+	if at != nil {
+		v = formatTime(at.UTC())
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE servers SET backup_failed_at = ? WHERE id = ?`, v, id)
+	return mapErr("set server backup failure", err)
+}
+
+// LastServerBackup returns when the newest backup taken from server id was
+// taken (ok false without one).
+func (s *Store) LastServerBackup(ctx context.Context, id int64) (time.Time, bool, error) {
+	var at sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(created_at) FROM backups WHERE server_id = ?`, id).Scan(&at); err != nil {
+		return time.Time{}, false, mapErr("last server backup", err)
+	}
+	if !at.Valid {
+		return time.Time{}, false, nil
+	}
+	t, err := parseTime(at.String)
+	return t, err == nil, err
+}
+
 // Backup is a stored backup (an archive in the backups directory).
 type Backup struct {
 	ID                int64
@@ -61,9 +86,12 @@ type Backup struct {
 	SizeBytes         int64
 	ContentBytes      int64
 	FileCount         int
-	SHA256            string
-	JobID             *int64
-	CreatedBy         *int64
+	// OmittedEntries counts the entries of the data directory the archive
+	// leaves out (0: complete).
+	OmittedEntries int
+	SHA256         string
+	JobID          *int64
+	CreatedBy      *int64
 	// CreatedByUsername is read with the row; nil when CreatedBy is nil.
 	CreatedByUsername *string
 	CreatedAt         time.Time
@@ -75,12 +103,13 @@ const (
 	BackupScheduled  = "scheduled"
 	BackupPreRestore = "pre_restore"
 	BackupPreReset   = "pre_reset"
+	BackupPreDelete  = "pre_delete"
 )
 
 const (
 	backupCols = `backups.id, backups.kind, backups.file, backups.server_id, backups.server_name, backups.project_id, backups.project_name, backups.build_id,
 		backups.commit_hash, backups.engine_version, backups.schema_fingerprint, backups.live, backups.note, backups.size_bytes, backups.content_bytes,
-		backups.file_count, backups.sha256, backups.job_id, backups.created_by, backups.created_at, accounts.username`
+		backups.file_count, backups.omitted_entries, backups.sha256, backups.job_id, backups.created_by, backups.created_at, accounts.username`
 	backupFrom = ` FROM backups LEFT JOIN accounts ON accounts.id = backups.created_by`
 )
 
@@ -90,7 +119,7 @@ func scanBackup(r scanner) (Backup, error) {
 	var created string
 	var creator sql.NullString
 	if err := r.Scan(&b.ID, &b.Kind, &b.File, &serverID, &b.ServerName, &projectID, &b.ProjectName, &buildID, &b.Commit, &b.EngineVersion,
-		&b.SchemaFingerprint, &b.Live, &b.Note, &b.SizeBytes, &b.ContentBytes, &b.FileCount, &b.SHA256, &jobID, &createdBy, &created, &creator); err != nil {
+		&b.SchemaFingerprint, &b.Live, &b.Note, &b.SizeBytes, &b.ContentBytes, &b.FileCount, &b.OmittedEntries, &b.SHA256, &jobID, &createdBy, &created, &creator); err != nil {
 		return Backup{}, err
 	}
 	b.ServerID, b.ProjectID, b.BuildID, b.JobID, b.CreatedBy = int64Ptr(serverID), int64Ptr(projectID), int64Ptr(buildID), int64Ptr(jobID), int64Ptr(createdBy)
@@ -127,10 +156,10 @@ func (s *Store) CreateBackup(ctx context.Context, b Backup) (Backup, error) {
 		var id int64
 		err := tx.QueryRowContext(ctx,
 			`INSERT INTO backups (kind, file, server_id, server_name, project_id, project_name, build_id, commit_hash, engine_version,
-			 schema_fingerprint, live, note, size_bytes, content_bytes, file_count, sha256, job_id, created_by, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+			 schema_fingerprint, live, note, size_bytes, content_bytes, file_count, omitted_entries, sha256, job_id, created_by, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
 			b.Kind, b.File, nullInt64(b.ServerID), b.ServerName, nullInt64(b.ProjectID), b.ProjectName, nullInt64(b.BuildID), b.Commit, b.EngineVersion,
-			b.SchemaFingerprint, b.Live, b.Note, b.SizeBytes, b.ContentBytes, b.FileCount, b.SHA256, nullInt64(b.JobID), nullInt64(b.CreatedBy),
+			b.SchemaFingerprint, b.Live, b.Note, b.SizeBytes, b.ContentBytes, b.FileCount, b.OmittedEntries, b.SHA256, nullInt64(b.JobID), nullInt64(b.CreatedBy),
 			formatTime(s.nowUTC())).Scan(&id)
 		if err != nil {
 			return mapErr("create backup", err)

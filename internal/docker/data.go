@@ -312,21 +312,21 @@ func (c *Client) Helper(ctx context.Context, launch, containerID string) (Contai
 	return Container{}, ErrNotFound
 }
 
-// RemoveHelper removes the helper with launch id launch (see Helper); a
-// missing helper is not an error. Anonymous volumes go with it; the data
-// volume, a named volume, stays.
-func (c *Client) RemoveHelper(ctx context.Context, launch, containerID string) error {
+// RemoveHelper removes the helper with launch id launch (see Helper) and
+// reports whether there was one; a missing helper is not an error.
+// Anonymous volumes go with it; the data volume, a named volume, stays.
+func (c *Client) RemoveHelper(ctx context.Context, launch, containerID string) (found bool, err error) {
 	ct, err := c.Helper(ctx, launch, containerID)
 	if errors.Is(err, ErrNotFound) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := c.exec(ctx, quickTimeout, []string{"rm", "--force", "--volumes", "--", ct.ID}, nil, nil, nil); err != nil && !errors.Is(err, ErrNotFound) {
-		return err
+		return true, err
 	}
-	return nil
+	return true, nil
 }
 
 // helperPath validates a path inside a helper for docker cp.

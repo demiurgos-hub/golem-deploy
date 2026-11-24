@@ -151,14 +151,28 @@ func (s *Store) FinishBuild(ctx context.Context, id int64, r BuildResult) error 
 	return checkAffected("finish build", res)
 }
 
-// SetBuildFingerprint records the schema fingerprint a server built from
-// build id reported.
+// SetBuildFingerprint replaces the schema fingerprint of build id. The
+// daemon itself never replaces a recorded value (see FillBuildFingerprint);
+// this is for tests and repairs.
 func (s *Store) SetBuildFingerprint(ctx context.Context, id int64, fingerprint string) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE builds SET schema_fingerprint = ? WHERE id = ?`, fingerprint, id)
 	if err != nil {
 		return mapErr("set build fingerprint", err)
 	}
 	return checkAffected("set build fingerprint", res)
+}
+
+// FillBuildFingerprint records the schema fingerprint a game built from
+// build id reported, only while the build has none: a value read from the
+// committed code or recorded earlier is never replaced. It reports whether
+// it wrote the value.
+func (s *Store) FillBuildFingerprint(ctx context.Context, id int64, fingerprint string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE builds SET schema_fingerprint = ? WHERE id = ? AND schema_fingerprint = ''`, fingerprint, id)
+	if err != nil {
+		return false, mapErr("fill build fingerprint", err)
+	}
+	n, err := res.RowsAffected()
+	return n == 1, mapErr("fill build fingerprint", err)
 }
 
 // GetBuild returns build id, or ErrNotFound.

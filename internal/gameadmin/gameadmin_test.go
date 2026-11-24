@@ -183,6 +183,7 @@ func TestSnapshot(t *testing.T) {
 		http.StatusNotImplemented:      gameadmin.ErrSnapshotUnsupported,
 		http.StatusGatewayTimeout:      gameadmin.ErrSnapshotTimeout,
 		http.StatusInternalServerError: gameadmin.ErrSnapshotFailed,
+		http.StatusServiceUnavailable:  gameadmin.ErrNotReady,
 	} {
 		s.Set(func(s *gameadmintest.Server) { s.SnapshotStatus = status })
 		if _, err := c.Snapshot(ctx); !errors.Is(err, want) {

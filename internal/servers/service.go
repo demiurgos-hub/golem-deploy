@@ -107,8 +107,11 @@ type Config struct {
 	Backups        *backups.Store
 	BackupMaxBytes int64
 	// SnapshotRetry is the pause between snapshot requests while the game
-	// reports one in progress (default 2s).
-	SnapshotRetry time.Duration
+	// reports one in progress (default 2s); SnapshotDeadline bounds the
+	// whole request for a fresh snapshot, retries included (default
+	// DefaultSnapshotDeadline).
+	SnapshotRetry    time.Duration
+	SnapshotDeadline time.Duration
 	// Now is the clock of the backup schedule (default time.Now).
 	Now func() time.Time
 }
@@ -116,6 +119,9 @@ type Config struct {
 // DefaultBackupMaxBytes is the default of Config.BackupMaxBytes
 // (--backup-max-mb 1024).
 const DefaultBackupMaxBytes = 1024 << 20
+
+// DefaultSnapshotDeadline is the default of Config.SnapshotDeadline.
+const DefaultSnapshotDeadline = 3 * time.Minute
 
 // Service implements server operations. It is safe for concurrent use.
 type Service struct {
@@ -141,10 +147,6 @@ type Service struct {
 	// pendingVolumes holds data volumes a running job created and has not
 	// recorded (or switched to) yet; they cannot be deleted meanwhile.
 	pendingVolumes sync.Map
-	// schedMu guards schedFailed: when the last scheduled backup of a
-	// server failed.
-	schedMu     sync.Mutex
-	schedFailed map[int64]time.Time
 }
 
 // New returns a Service.
@@ -164,6 +166,9 @@ func New(st *store.Store, box *secrets.Box, dc *docker.Client, cfg Config, logge
 	if cfg.BackupMaxBytes <= 0 {
 		cfg.BackupMaxBytes = DefaultBackupMaxBytes
 	}
+	if cfg.SnapshotDeadline <= 0 {
+		cfg.SnapshotDeadline = DefaultSnapshotDeadline
+	}
 	if cfg.SnapshotRetry <= 0 {
 		cfg.SnapshotRetry = 2 * time.Second
 	}
@@ -173,7 +178,7 @@ func New(st *store.Store, box *secrets.Box, dc *docker.Client, cfg Config, logge
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Service{store: st, box: box, docker: dc, cfg: cfg, logger: logger, schedFailed: map[int64]time.Time{}}
+	return &Service{store: st, box: box, docker: dc, cfg: cfg, logger: logger}
 }
 
 // BackupMaxBytes returns the largest data directory a backup accepts.

@@ -57,6 +57,8 @@ type Server struct {
 	SnapshotBusyFor int
 	OnSnapshot      func()
 	Snapshots       int
+	// OnBusy, when set, runs (without the lock) before a 409 answer.
+	OnBusy func()
 	// Auth records the Authorization header of every request.
 	Auth  []string
 	Paths []string
@@ -182,14 +184,17 @@ func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"code": "method_not_allowed", "message": "use POST"})
 		return
 	}
-	status, hook := s.SnapshotStatus, s.OnSnapshot
+	status, hook, busy := s.SnapshotStatus, s.OnSnapshot, s.OnBusy
 	if s.SnapshotBusyFor > 0 {
 		s.SnapshotBusyFor--
 		status = http.StatusConflict
 	}
 	s.mu.Unlock()
+	if status == http.StatusConflict && busy != nil {
+		busy()
+	}
 	codes := map[int]string{http.StatusConflict: "snapshot_in_progress", http.StatusNotImplemented: "not_implemented",
-		http.StatusGatewayTimeout: "snapshot_timeout", http.StatusInternalServerError: "snapshot_failed"}
+		http.StatusGatewayTimeout: "snapshot_timeout", http.StatusInternalServerError: "snapshot_failed", http.StatusServiceUnavailable: "not_ready"}
 	if status != 0 && status != http.StatusOK {
 		writeJSON(w, status, map[string]string{"code": codes[status], "message": "fake " + codes[status]})
 		return

@@ -189,7 +189,8 @@ func TestIntegrationBackupsAPI(t *testing.T) {
 		t.Fatalf("%+v\n%s", reset.Data, log)
 	}
 
-	// Delete: the volume goes, the backups stay.
+	// Delete: a last backup of the new world, then the volume goes; the
+	// backups stay.
 	rr = h.do("DELETE", base, tok, nil)
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("delete %d %s", rr.Code, rr.Body.String())
@@ -198,7 +199,7 @@ func TestIntegrationBackupsAPI(t *testing.T) {
 		t.Fatal("volume kept after delete")
 	}
 	all := decode[apitypes.BackupList](t, h.do("GET", "/api/v1/backups", tok, nil))
-	if len(all.Items) != 3 || all.Items[0].ServerID != nil {
+	if len(all.Items) != 4 || all.Items[0].ServerID != nil || all.Items[0].Kind != apitypes.BackupKindPreDelete || all.Items[0].OmittedEntries != 0 {
 		t.Fatalf("%+v", all.Items)
 	}
 }

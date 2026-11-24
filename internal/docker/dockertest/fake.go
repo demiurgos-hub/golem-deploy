@@ -94,6 +94,10 @@ type Image struct {
 	// port (Docker's dynamic assignment), e.g. the port of a test admin
 	// server; zero assigns an unused port from 49152 up.
 	AssignPort int
+	// Content is what the image holds below directories (by absolute
+	// path). Like Docker, a create copies it into an empty named volume
+	// mounted at that path unless the mount says volume-nocopy.
+	Content map[string][]File
 }
 
 // Volume is a fake volume. Files is its content (see File).
@@ -348,6 +352,16 @@ func (f *Fake) SetContainerState(ref, state string, exitCode int) {
 }
 
 // RemoveContainer deletes a container (as if removed outside the daemon).
+// SetPublishedPort changes the host port a container reports for a
+// container port published without a host port (key like "7778/tcp").
+func (f *Fake) SetPublishedPort(ref, key string, port int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.findContainer(ref); c != nil {
+		c.Assigned[key] = port
+	}
+}
+
 func (f *Fake) RemoveContainer(ref string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -790,7 +804,7 @@ func (f *Fake) create(a []string, envFile string, cliEnv []string, w io.Writer) 
 		if !strings.Contains(m, "type=volume") {
 			continue
 		}
-		source, target, ro := "", "", false
+		source, target, ro, nocopy := "", "", false, false
 		for _, part := range strings.Split(m, ",") {
 			switch {
 			case strings.HasPrefix(part, "source="):
@@ -799,6 +813,8 @@ func (f *Fake) create(a []string, envFile string, cliEnv []string, w io.Writer) 
 				target = strings.TrimPrefix(part, "target=")
 			case part == "readonly":
 				ro = true
+			case part == "volume-nocopy":
+				nocopy = true
 			}
 		}
 		mounts = append(mounts, source)
@@ -809,6 +825,9 @@ func (f *Fake) create(a []string, envFile string, cliEnv []string, w io.Writer) 
 		if f.volumes[source] == nil {
 			// Like Docker, a missing named volume is created (unlabelled).
 			f.volumes[source] = &Volume{Name: source, Labels: map[string]string{}}
+		}
+		if v := f.volumes[source]; len(v.Files) == 0 && !nocopy && len(img.Content[target]) > 0 {
+			v.Files = slices.Clone(img.Content[target])
 		}
 	}
 	assigned := map[string]int{}
