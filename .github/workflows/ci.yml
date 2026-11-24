@@ -36,6 +36,19 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
 
+  shell:
+    name: Shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The installer runs as root on users' hosts; shellcheck is preinstalled
+      # on GitHub's Ubuntu runners.
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck scripts/install.sh
+
   go:
     name: Go
     needs: frontend

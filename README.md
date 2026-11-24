@@ -67,6 +67,10 @@ npm test                          # Vitest + Testing Library
 
 `GOLEM_DEPLOY_DEV_API=http://127.0.0.1:18080 npm run dev` points the proxy at a daemon on another address. The mock still needs a daemon for sign-in, accounts and settings; it simulates projects, servers, images, static files and volumes following the API v1 contract, for work without git or Docker. It is development-only: a production build refuses `VITE_API_MOCK` and fails if the mock code ends up in the bundle.
 
+## Install
+
+To run Golem Deploy as a systemd service on an Ubuntu or Debian host with Docker, build the binary and run `sudo scripts/install.sh /path/to/golem-deploy`. It creates the `golem-deploy` user, the data directory `/var/lib/golem-deploy`, the settings file `/etc/golem-deploy/golem-deploy.env` and the service; see [docs/INSTALL.md](docs/INSTALL.md) for requirements, upgrades, uninstalling and security notes.
+
 ## Run
 
 Create the first admin account, then start the daemon:
