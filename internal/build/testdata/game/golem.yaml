@@ -1,0 +1,15 @@
+entity_schema: schemas/entities/
+world_schema: schemas/world/
+
+simulation:
+  dimensions: 2
+
+proto:
+  package: fixture
+  go_package: example.com/golem-deploy-fixture/internal/generated
+  out: internal/generated/entities.proto
+
+integrations:
+  go-server:
+    out: internal/generated/
+    package: generated

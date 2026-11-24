@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -21,23 +23,40 @@ type Project struct {
 	LastCommit   string
 	LastPulledAt *time.Time
 	Status       string
+	// StaticAddons are ZIP files of the static store extracted into the
+	// game root at build time (never nil when read).
+	StaticAddons []StaticAddon
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+}
+
+// StaticAddon is a static store ZIP extracted at Target (a clean relative
+// path below the game root, "." for the root itself) when the project is
+// built. It is stored as JSON in projects.static_addons.
+type StaticAddon struct {
+	Name   string `json:"name"`
+	Target string `json:"target"`
 }
 
 // SealFunc produces the ciphertext of an encrypted column for a row whose id
 // is only known after insert. Returning nil stores NULL.
 type SealFunc func(id int64) ([]byte, error)
 
-const projectCols = `id, name, repo_url, branch, auth_type, auth_username, auth_secret, last_commit, last_pulled_at, status, created_at, updated_at`
+const projectCols = `id, name, repo_url, branch, auth_type, auth_username, auth_secret, last_commit, last_pulled_at, status, static_addons, created_at, updated_at`
 
 func scanProject(r scanner) (Project, error) {
 	var p Project
 	var lastPulled sql.NullString
-	var created, updated string
+	var created, updated, addons string
 	if err := r.Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.AuthType, &p.AuthUsername, &p.AuthSecret,
-		&p.LastCommit, &lastPulled, &p.Status, &created, &updated); err != nil {
+		&p.LastCommit, &lastPulled, &p.Status, &addons, &created, &updated); err != nil {
 		return Project{}, err
+	}
+	if err := json.Unmarshal([]byte(addons), &p.StaticAddons); err != nil {
+		return Project{}, fmt.Errorf("decode static_addons: %w", err)
+	}
+	if p.StaticAddons == nil {
+		p.StaticAddons = []StaticAddon{}
 	}
 	var err error
 	if p.LastPulledAt, err = parseNullTime(lastPulled); err != nil {
@@ -179,11 +198,13 @@ func (s *Store) SetProjectCheckout(ctx context.Context, id int64, c ProjectCheck
 	return out, nil
 }
 
-// ProjectRemoteUpdate changes how a project's remote is reached. Nil
-// fields are unchanged.
+// ProjectRemoteUpdate changes how a project's remote is reached and its
+// static add-ons (the columns PATCH /projects/{id} writes). Nil fields are
+// unchanged.
 type ProjectRemoteUpdate struct {
-	RepoURL *string
-	Auth    *ProjectAuthUpdate
+	RepoURL      *string
+	Auth         *ProjectAuthUpdate
+	StaticAddons *[]StaticAddon
 }
 
 // ProjectAuthUpdate replaces a project's credentials. Secret must already
@@ -195,7 +216,7 @@ type ProjectAuthUpdate struct {
 }
 
 // UpdateProjectRemote updates only the remote columns (repo_url and the
-// auth columns) of project id and returns the stored row.
+// auth columns) and static_addons of project id and returns the stored row.
 func (s *Store) UpdateProjectRemote(ctx context.Context, id int64, u ProjectRemoteUpdate) (Project, error) {
 	sets := []string{"updated_at = ?"}
 	args := []any{formatTime(s.nowUTC())}
@@ -206,6 +227,18 @@ func (s *Store) UpdateProjectRemote(ctx context.Context, id int64, u ProjectRemo
 	if u.Auth != nil {
 		sets = append(sets, "auth_type = ?", "auth_username = ?", "auth_secret = ?")
 		args = append(args, u.Auth.Type, u.Auth.Username, blobArg(u.Auth.Secret))
+	}
+	if u.StaticAddons != nil {
+		addons := *u.StaticAddons
+		if addons == nil {
+			addons = []StaticAddon{}
+		}
+		raw, err := json.Marshal(addons)
+		if err != nil {
+			return Project{}, fmt.Errorf("update project remote: %w", err)
+		}
+		sets = append(sets, "static_addons = ?")
+		args = append(args, string(raw))
 	}
 	args = append(args, id)
 	out, err := scanProject(s.db.QueryRowContext(ctx,
@@ -224,6 +257,55 @@ func (s *Store) SetProjectStatus(ctx context.Context, id int64, status string) e
 		return mapErr("set project status", err)
 	}
 	return checkAffected("set project status", res)
+}
+
+// ProjectsUsingStatic returns the names of the projects whose static
+// add-ons include the static file name, sorted.
+func (s *Store) ProjectsUsingStatic(ctx context.Context, name string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT p.name FROM projects p, json_each(p.static_addons) a
+		 WHERE json_extract(a.value, '$.name') = ? ORDER BY p.name`, name)
+	if err != nil {
+		return nil, mapErr("projects using static file", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, mapErr("projects using static file", err)
+		}
+		out = append(out, n)
+	}
+	return out, mapErr("projects using static file", rows.Err())
+}
+
+// ProjectBuildServerIDs returns the ids of the servers configured with a
+// build of project id (sorted).
+func (s *Store) ProjectBuildServerIDs(ctx context.Context, id int64) ([]int64, error) {
+	return queryIDs(ctx, s.db, "project build servers",
+		`SELECT s.id FROM servers s JOIN builds b ON b.id = s.build_id WHERE b.project_id = ? ORDER BY s.id`, id)
+}
+
+// DeleteProjectUnused deletes project id (its builds cascade) unless a
+// server is configured with one of its builds (ErrInUse), in one
+// transaction.
+func (s *Store) DeleteProjectUnused(ctx context.Context, id int64) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		ids, err := queryIDs(ctx, tx, "delete project",
+			`SELECT s.id FROM servers s JOIN builds b ON b.id = s.build_id WHERE b.project_id = ? LIMIT 1`, id)
+		if err != nil {
+			return err
+		}
+		if len(ids) > 0 {
+			return ErrInUse
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, id)
+		if err != nil {
+			return mapErr("delete project", err)
+		}
+		return checkAffected("delete project", res)
+	})
 }
 
 // DeleteProject deletes project id. Servers referencing it keep a NULL

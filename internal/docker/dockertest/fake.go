@@ -109,6 +109,51 @@ type Fake struct {
 	// object, simulating a broken or bypassed filter so tests prove the
 	// client re-checks labels itself.
 	ignoreFilters bool
+	// buildHook decides the outcome of "docker build" (see SetBuildHook).
+	buildHook func(BuildCall) BuildOutcome
+}
+
+// BuildCall is a "docker build" the fake received.
+type BuildCall struct {
+	Args       []string
+	Dockerfile []byte
+	// Dockerignore is the content of "<Dockerfile>.dockerignore" (nil when
+	// absent).
+	Dockerignore []byte
+	ContextDir   string
+	StaticDir    string
+	Tag          string
+	Labels       map[string]string
+}
+
+// BuildOutcome is what the fake's "docker build" does.
+type BuildOutcome struct {
+	// Output is printed (on stderr, like BuildKit's plain progress).
+	Output string
+	// Fail makes the build exit 1 after printing Output.
+	Fail bool
+	// Block makes the build wait until its context is cancelled.
+	Block bool
+	// Release, when Block is set and Release is not nil, ends the wait
+	// when closed (the build then succeeds or fails per Fail).
+	Release <-chan struct{}
+	// ExtraLabels are added to the image as if set by Dockerfile LABEL
+	// instructions (command-line labels still win).
+	ExtraLabels map[string]string
+	// NoMetadata leaves the metadata file unwritten; ContainerdStore
+	// writes an iidfile that does not resolve (the config digest) and puts
+	// the real id only in the metadata file, like the containerd image
+	// store.
+	NoMetadata      bool
+	ContainerdStore bool
+}
+
+// SetBuildHook installs fn as the decision of every "docker build"; nil
+// builds succeed silently.
+func (f *Fake) SetBuildHook(fn func(BuildCall) BuildOutcome) {
+	f.mu.Lock()
+	f.buildHook = fn
+	f.mu.Unlock()
 }
 
 // New returns an empty fake.
@@ -395,6 +440,8 @@ func (f *Fake) Run(ctx context.Context, _ string, cmd docker.Cmd) error {
 	a := cmd.Args
 	var ferr *failure
 	switch {
+	case has(a, "build"):
+		return f.build(ctx, a, stdout, stderr)
 	case has(a, "version"):
 		fmt.Fprintln(stdout, `{"Client":{"Version":"fake"},"Server":{"Version":"fake"}}`)
 	case has(a, "ps"):
@@ -985,5 +1032,78 @@ func (f *Fake) networkRm(names []string) *failure {
 		}
 		delete(f.networks, name)
 	}
+	return nil
+}
+
+func (f *Fake) build(ctx context.Context, a []string, stdout, stderr io.Writer) error {
+	call := BuildCall{Args: slices.Clone(a), Labels: map[string]string{}}
+	if v := flagValues(a, "--file"); len(v) > 0 {
+		call.Dockerfile, _ = os.ReadFile(v[0])
+		if b, err := os.ReadFile(v[0] + ".dockerignore"); err == nil {
+			call.Dockerignore = b
+		}
+	}
+	if v := flagValues(a, "--tag"); len(v) > 0 {
+		call.Tag = v[0]
+	}
+	for _, l := range flagValues(a, "--label") {
+		k, v, _ := strings.Cut(l, "=")
+		call.Labels[k] = v
+	}
+	for _, c := range flagValues(a, "--build-context") {
+		if v, ok := strings.CutPrefix(c, "static="); ok {
+			call.StaticDir = v
+		}
+	}
+	call.ContextDir = firstOr(positional(a))
+	f.mu.Lock()
+	hook := f.buildHook
+	f.mu.Unlock()
+	var out BuildOutcome
+	if hook != nil {
+		out = hook(call)
+	}
+	if out.Output != "" {
+		fmt.Fprint(stderr, out.Output)
+	}
+	if out.Block {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-out.Release:
+		}
+	}
+	if out.Fail {
+		fmt.Fprintln(stderr, "ERROR: failed to build: failed to solve: process did not complete successfully: exit code: 1")
+		return &ExitError{Code: 1}
+	}
+	labels := map[string]string{}
+	for k, v := range out.ExtraLabels {
+		labels[k] = v
+	}
+	for k, v := range call.Labels {
+		labels[k] = v
+	}
+	f.mu.Lock()
+	f.seq++
+	id := fmt.Sprintf("sha256:%064x", 0xb0000000+f.seq)
+	config := fmt.Sprintf("sha256:%064x", 0xcf000000+f.seq)
+	if old := f.findImage(call.Tag); old != nil {
+		old.Tags = slices.DeleteFunc(old.Tags, func(t string) bool { return t == call.Tag })
+	}
+	f.images[id] = &Image{ID: id, Tags: []string{call.Tag}, Labels: labels, Size: 1234}
+	f.mu.Unlock()
+	iid := id
+	if out.ContainerdStore {
+		iid = config
+	}
+	if v := flagValues(a, "--iidfile"); len(v) > 0 {
+		_ = os.WriteFile(v[0], []byte(iid), 0o600)
+	}
+	if v := flagValues(a, "--metadata-file"); len(v) > 0 && !out.NoMetadata {
+		md, _ := json.Marshal(map[string]string{"containerimage.digest": id, "containerimage.config.digest": config})
+		_ = os.WriteFile(v[0], md, 0o600)
+	}
+	fmt.Fprintln(stdout, "#1 exporting to image")
 	return nil
 }

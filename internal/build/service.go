@@ -1,0 +1,610 @@
+// Package build turns a project's checkout into a managed Docker image.
+//
+// The repository is untrusted. The daemon only reads a few files from the
+// checkout (golem-deploy.yaml, .dockerignore, golem.yaml, go.mod,
+// package.json, a custom Dockerfile) through a contained, symlink-refusing,
+// size-capped reader, and never writes to it. Repository code runs only
+// inside "docker build": the generated Dockerfile, its .dockerignore and the
+// static add-on staging live in a private directory below the data
+// directory's tmp/ that is removed after the build. Every value placed in
+// the Dockerfile or the docker argv passes a strict allowlist; free-form
+// commands from golem-deploy.yaml are rendered only as JSON exec-form
+// arrays.
+package build
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/demiurgos-hub/golem-deploy/internal/docker"
+	"github.com/demiurgos-hub/golem-deploy/internal/extract"
+	"github.com/demiurgos-hub/golem-deploy/internal/git"
+	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
+	"github.com/demiurgos-hub/golem-deploy/internal/logsafe"
+	"github.com/demiurgos-hub/golem-deploy/internal/store"
+)
+
+// Defaults and limits.
+const (
+	DefaultTimeout   = 30 * time.Minute
+	DefaultRetention = 5
+	// MaxActiveBuilds bounds build jobs that are queued or running across
+	// the daemon (one builds, the others wait), so waiting builds cannot
+	// occupy every job worker.
+	MaxActiveBuilds = 4
+	// KeepFailed is how many failed or cancelled builds are kept per
+	// project.
+	KeepFailed = 20
+	// TempPrefix prefixes the private build directories below tmp/.
+	TempPrefix = "build-"
+	// finalTimeout bounds the store and docker calls that record a build's
+	// outcome after its context ended.
+	finalTimeout = 30 * time.Second
+)
+
+// User-facing details of build outcomes.
+const (
+	DetailCancelled   = "cancelled"
+	DetailNoCheckout  = "the project has no checkout yet; pull it first (or build with pull)"
+	DetailDockerDown  = "Docker is not reachable on the host"
+	DetailBuildFailed = "docker build failed; see the build log"
+	DetailVanished    = "the build job ended unexpectedly; see the build log"
+)
+
+// ErrImageInUse means a build's image is used by a container.
+var ErrImageInUse = errors.New("build: the image is used by a container")
+
+// ErrTooManyBuilds means MaxActiveBuilds builds are already queued or
+// running.
+var ErrTooManyBuilds = errors.New("build: too many builds are queued")
+
+// Docker is what the service needs from *docker.Client.
+type Docker interface {
+	Build(ctx context.Context, spec docker.BuildSpec, out io.Writer) error
+	BuiltImage(ctx context.Context, spec docker.BuildSpec) (docker.Image, error)
+	ImageInUse(ctx context.Context, id string) (bool, error)
+	RemoveImage(ctx context.Context, id string) error
+}
+
+// Options configures New.
+type Options struct {
+	Store  *store.Store
+	Docker Docker
+	// InstanceID is the installation's instance id (labels, cache ids).
+	InstanceID string
+	// RepoDir holds the checkouts, TempDir the private build directories
+	// (both below the data directory), StaticDir the static store.
+	RepoDir   string
+	TempDir   string
+	StaticDir string
+	// Timeout bounds one build (default DefaultTimeout); Retention is how
+	// many successful builds are kept per project (default
+	// DefaultRetention).
+	Timeout   time.Duration
+	Retention int
+	// AddonLimits bounds static add-on extraction (default
+	// extract.DefaultLimits()).
+	AddonLimits *extract.Limits
+	Logger      *slog.Logger
+}
+
+// Service runs builds and manages their records and images. It is safe for
+// concurrent use.
+type Service struct {
+	o Options
+	// slot admits one build at a time across the daemon.
+	slot chan struct{}
+	// mu serialises retention and deletion.
+	mu sync.Mutex
+
+	activeMu sync.Mutex
+	active   int
+	finished map[int64]bool
+}
+
+// New returns a Service.
+func New(o Options) *Service {
+	if o.Timeout <= 0 {
+		o.Timeout = DefaultTimeout
+	}
+	if o.Retention <= 0 {
+		o.Retention = DefaultRetention
+	}
+	if o.AddonLimits == nil {
+		lim := extract.DefaultLimits()
+		o.AddonLimits = &lim
+	}
+	if o.Logger == nil {
+		o.Logger = slog.New(slog.DiscardHandler)
+	}
+	return &Service{o: o, slot: make(chan struct{}, 1), finished: map[int64]bool{}}
+}
+
+// Timeout returns the per-build time limit.
+func (s *Service) Timeout() time.Duration { return s.o.Timeout }
+
+// Reserve takes one of the MaxActiveBuilds build places for a build that
+// is about to be started (ErrTooManyBuilds when none is free). Pass the
+// release function to Watch once the build's job exists, or call it if the
+// job could not be started.
+func (s *Service) Reserve() (release func(), err error) {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if s.active >= MaxActiveBuilds {
+		return nil, ErrTooManyBuilds
+	}
+	s.active++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.activeMu.Lock()
+			s.active--
+			s.activeMu.Unlock()
+		})
+	}, nil
+}
+
+// Watch waits (in the background) until the job running build id is no
+// longer active, then releases its reservation and, when the job ended
+// without Run recording an outcome (cancelled while queued, a panic),
+// records one so no build stays queued or running.
+func (s *Service) Watch(id int64, done <-chan struct{}, release func()) {
+	go func() {
+		<-done
+		release()
+		s.activeMu.Lock()
+		recorded := s.finished[id]
+		delete(s.finished, id)
+		s.activeMu.Unlock()
+		if recorded {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), finalTimeout)
+		defer cancel()
+		b, err := s.o.Store.GetBuild(ctx, id)
+		if err != nil || (b.Status != store.BuildStatusQueued && b.Status != store.BuildStatusRunning) {
+			return
+		}
+		status, detail := store.BuildStatusError, DetailVanished
+		if b.JobID != nil {
+			if j, err := s.o.Store.GetJob(ctx, *b.JobID); err == nil && j.Status == store.JobCancelled {
+				status, detail = store.BuildStatusCancelled, j.Detail
+			}
+		}
+		if err := s.o.Store.FinishBuild(ctx, id, store.BuildResult{Status: status, Detail: detail}); err != nil && !errors.Is(err, store.ErrNotFound) {
+			s.o.Logger.Error("record build outcome failed", "build_id", id, "err", err)
+		}
+	}()
+}
+
+func (s *Service) markRecorded(id int64) {
+	s.activeMu.Lock()
+	s.finished[id] = true
+	s.activeMu.Unlock()
+}
+
+// run is one build in progress.
+type run struct {
+	s       *Service
+	id      int64
+	log     io.Writer
+	engine  string
+	project int64
+}
+
+// finish records the outcome with a fresh context (the job's may be done).
+func (r *run) finish(res store.BuildResult) {
+	ctx, cancel := context.WithTimeout(context.Background(), finalTimeout)
+	defer cancel()
+	if res.EngineVersion == "" {
+		res.EngineVersion = r.engine
+	}
+	if err := r.s.o.Store.FinishBuild(ctx, r.id, res); err != nil && !errors.Is(err, store.ErrNotFound) {
+		r.s.o.Logger.Error("record build outcome failed", "build_id", r.id, "err", err)
+	}
+	r.s.markRecorded(r.id)
+}
+
+// fail records a failed build and returns the job error. msg must be safe
+// to show; cause goes to the job log only.
+func (r *run) fail(msg string, cause error) error {
+	r.finish(store.BuildResult{Status: store.BuildStatusError, Detail: msg})
+	return jobs.Fail(msg, cause)
+}
+
+// cancelled records a cancelled build and returns the context error, so
+// the job ends cancelled too.
+func (r *run) cancelled(ctx context.Context) error {
+	r.finish(store.BuildResult{Status: store.BuildStatusCancelled, Detail: DetailCancelled})
+	return ctx.Err()
+}
+
+// Run is the body of a project.build job for build id. prepare, when not
+// nil, runs first in the same job (the pull of POST .../builds with
+// pull:true); its *jobs.SafeError message becomes the build's detail. Run
+// always records the build's outcome.
+func (s *Service) Run(ctx context.Context, id int64, log io.Writer, prepare jobs.Func) error {
+	r := &run{s: s, id: id, log: log}
+	b, err := s.o.Store.GetBuild(ctx, id)
+	if err != nil {
+		s.markRecorded(id)
+		return jobs.Fail("the build record no longer exists", err)
+	}
+	r.project = b.ProjectID
+	if prepare != nil {
+		if err := prepare(ctx, log); err != nil {
+			if ctx.Err() != nil {
+				return r.cancelled(ctx)
+			}
+			var se *jobs.SafeError
+			msg := "updating the checkout failed"
+			if errors.As(err, &se) && se.Msg != "" {
+				msg = "updating the checkout failed: " + se.Msg
+			}
+			return r.fail(msg, err)
+		}
+		fmt.Fprintln(log)
+	}
+	p, err := s.o.Store.GetProject(ctx, b.ProjectID)
+	if err != nil {
+		return r.fail("the project no longer exists", err)
+	}
+	checkout := git.CheckoutDir(s.o.RepoDir, p.ID)
+	if p.LastCommit == "" || !git.HasCheckout(checkout) {
+		return r.fail(DetailNoCheckout, nil)
+	}
+	fmt.Fprintf(log, "Build %d of project %s: branch %s, commit %s\n", id, p.Name, p.Branch, p.LastCommit)
+
+	select {
+	case s.slot <- struct{}{}:
+	default:
+		fmt.Fprintln(log, "Waiting for another build to finish (one build runs at a time)")
+		select {
+		case s.slot <- struct{}{}:
+		case <-ctx.Done():
+			return r.cancelled(ctx)
+		}
+	}
+	defer func() { <-s.slot }()
+	if err := s.o.Store.MarkBuildRunning(ctx, id, p.Branch, p.LastCommit); err != nil {
+		if ctx.Err() != nil {
+			return r.cancelled(ctx)
+		}
+		return r.fail("the build could not be started", err)
+	}
+	start := time.Now()
+	bctx, cancel := context.WithTimeout(ctx, s.o.Timeout)
+	defer cancel()
+	err = r.build(bctx, p, checkout)
+	switch {
+	case err == nil:
+		fmt.Fprintf(log, "Build finished in %s\n", time.Since(start).Round(time.Second))
+		s.retain(p.ID, log)
+		return nil
+	case ctx.Err() != nil:
+		return r.cancelled(ctx)
+	case errors.Is(bctx.Err(), context.DeadlineExceeded):
+		return r.fail(fmt.Sprintf("the build exceeded the time limit of %s", s.o.Timeout), err)
+	}
+	var ue *UserError
+	var se *jobs.SafeError
+	switch {
+	case errors.As(err, &ue):
+		fmt.Fprintf(log, "error: %s\n", ue.Msg)
+		return r.fail(ue.Msg, nil)
+	case errors.As(err, &se):
+		return r.fail(se.Msg, se.Err)
+	}
+	s.o.Logger.Error("build failed", "build_id", id, "project_id", p.ID, "err", err)
+	return r.fail("the build failed because of an internal error; see the daemon log", nil)
+}
+
+// build inspects the checkout, prepares the private build directory, runs
+// docker build and records the verified image.
+func (r *run) build(ctx context.Context, p store.Project, checkout string) error {
+	log := r.log
+	plan, err := Inspect(checkout)
+	if err != nil {
+		return err
+	}
+	r.engine = plan.EngineVersion
+	for _, n := range plan.Notes {
+		fmt.Fprintln(log, n)
+	}
+	fmt.Fprintf(log, "Golem Engine %s, Go %s\n", plan.EngineVersion, plan.GoVersion)
+
+	if err := os.MkdirAll(r.s.o.TempDir, 0o700); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp(r.s.o.TempDir, TempPrefix+strconv.FormatInt(r.id, 10)+"-")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			r.s.o.Logger.Warn("could not remove build directory; it is swept at the next startup", "build_id", r.id, "err", err)
+		}
+	}()
+	staticDir := filepath.Join(dir, "static")
+	dockerDir := filepath.Join(dir, "docker")
+	for _, d := range []string{staticDir, dockerDir} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			return err
+		}
+	}
+	addons := make([]Addon, 0, len(p.StaticAddons))
+	for _, a := range p.StaticAddons {
+		addons = append(addons, Addon{Name: a.Name, Target: a.Target})
+	}
+	if len(addons) > 0 {
+		if r.s.o.StaticDir == "" {
+			return userErr("the project has static add-ons but the static store is not available")
+		}
+		n, err := stageAddons(addons, r.s.o.StaticDir, dir, staticDir, *r.s.o.AddonLimits)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(log, "Static add-ons: %d (%s)\n", len(addons), byteSize(n))
+	}
+
+	var dockerfile []byte
+	if plan.Custom {
+		dockerfile = plan.CustomDockerfile
+	} else {
+		dockerfile, err = Dockerfile(plan, DockerfileParams{ProjectID: p.ID, InstanceID: r.s.o.InstanceID, Addons: len(addons) > 0})
+		if err != nil {
+			return err
+		}
+	}
+	dfPath := filepath.Join(dockerDir, "Dockerfile")
+	if err := os.WriteFile(dfPath, dockerfile, 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(dfPath+".dockerignore", Dockerignore(plan.Dockerignore), 0o600); err != nil {
+		return err
+	}
+	if !plan.Custom {
+		fmt.Fprintln(log, "Generated Dockerfile:")
+		out := logsafe.NewWriter(log, "  | ")
+		_, _ = out.Write(dockerfile)
+		_ = out.Close()
+	}
+	spec := docker.BuildSpec{
+		// The context is the repository root (a game in a subdirectory may
+		// use files next to it, e.g. a local module replacement).
+		ContextDir:    checkout,
+		Dockerfile:    dfPath,
+		StaticDir:     staticDir,
+		IIDFile:       filepath.Join(dir, "iid"),
+		MetadataFile:  filepath.Join(dir, "metadata.json"),
+		ProjectName:   p.Name,
+		ProjectID:     p.ID,
+		Commit:        p.LastCommit,
+		BuildID:       r.id,
+		EngineVersion: plan.EngineVersion,
+	}
+	fmt.Fprintf(log, "\nRunning docker build (time limit %s)\n", r.s.o.Timeout)
+	out := logsafe.NewWriter(log, "", redactions(dir, checkout, r.s.o.TempDir, r.s.o.RepoDir, r.s.o.StaticDir)...)
+	err = r.s.o.Docker.Build(ctx, spec, out)
+	_ = out.Close()
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(err, docker.ErrUnavailable) {
+			return jobs.Fail(DetailDockerDown, err)
+		}
+		return jobs.Fail(DetailBuildFailed, err)
+	}
+	vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalTimeout)
+	defer cancel()
+	img, err := r.s.o.Docker.BuiltImage(vctx, spec)
+	if errors.Is(err, docker.ErrLabelMismatch) {
+		if rerr := r.s.o.Docker.RemoveImage(vctx, img.ID); rerr != nil {
+			r.s.o.Logger.Warn("could not remove an image with foreign labels", "build_id", r.id, "image", img.ID, "err", rerr)
+		}
+		return userErr("the image sets labels in the %s namespace, which is reserved for golem-deploy; remove those LABEL instructions", strings.TrimSuffix(docker.LabelPrefix, "."))
+	}
+	if err != nil {
+		if errors.Is(err, docker.ErrUnavailable) {
+			return jobs.Fail(DetailDockerDown, err)
+		}
+		return jobs.Fail("the built image could not be found or verified", err)
+	}
+	fmt.Fprintf(log, "Built image %s (%s, %s)\n", img.ID, spec.Tag(), byteSize(img.SizeBytes))
+	r.finish(store.BuildResult{Status: store.BuildStatusSuccess, ImageID: img.ID, ImageTag: spec.Tag(), EngineVersion: plan.EngineVersion})
+	return nil
+}
+
+// redactions maps host paths that may appear in docker output to
+// placeholders (longest first, both slash styles).
+func redactions(buildDir, checkout, tmp, repos, static string) []string {
+	pairs := []string{}
+	add := func(p, repl string) {
+		if p == "" {
+			return
+		}
+		pairs = append(pairs, p, repl)
+		if s := filepath.ToSlash(p); s != p {
+			pairs = append(pairs, s, repl)
+		}
+	}
+	add(buildDir, "<build-dir>")
+	add(checkout, "<repository>")
+	add(tmp, "<tmp>")
+	add(repos, "<repositories>")
+	add(static, "<static>")
+	return pairs
+}
+
+func byteSize(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
+// retain applies the retention policy to project id after a successful
+// build: successful builds beyond the newest Retention are deleted with
+// their images unless a server is configured with them (or a container
+// uses the image); failed and cancelled builds beyond the newest
+// KeepFailed are deleted. Problems are logged, never fatal.
+func (s *Service) retain(projectID int64, log io.Writer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	list, err := s.o.Store.ListBuilds(ctx, store.BuildFilter{ProjectID: &projectID, Limit: 500})
+	if err != nil {
+		s.o.Logger.Warn("build retention skipped", "project_id", projectID, "err", err)
+		return
+	}
+	used, err := s.o.Store.ServerIDsByBuild(ctx)
+	if err != nil {
+		s.o.Logger.Warn("build retention skipped", "project_id", projectID, "err", err)
+		return
+	}
+	success, failed := 0, 0
+	removed := 0
+	for _, b := range list { // newest first
+		switch b.Status {
+		case store.BuildStatusSuccess:
+			success++
+			if success <= s.o.Retention || len(used[b.ID]) > 0 {
+				continue
+			}
+			if err := s.deleteLocked(ctx, b); err != nil {
+				s.o.Logger.Info("old build kept", "build_id", b.ID, "reason", err)
+				continue
+			}
+			removed++
+		case store.BuildStatusError, store.BuildStatusCancelled:
+			failed++
+			if failed <= KeepFailed {
+				continue
+			}
+			if _, err := s.o.Store.DeleteBuildUnused(ctx, b.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+				s.o.Logger.Info("old failed build kept", "build_id", b.ID, "reason", err)
+				continue
+			}
+			removed++
+		}
+	}
+	if removed > 0 {
+		fmt.Fprintf(log, "Retention: removed %d old build(s) (keeping the newest %d successful builds and builds that servers use)\n", removed, s.o.Retention)
+	}
+}
+
+// Delete removes a terminal build that no server is configured with,
+// together with its image (unless another successful build shares the
+// image). Errors: store.ErrNotFound, store.ErrActive, store.ErrInUse,
+// ErrImageInUse, docker errors (ErrUnavailable).
+func (s *Service) Delete(ctx context.Context, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, err := s.o.Store.GetBuild(ctx, id)
+	if err != nil {
+		return err
+	}
+	return s.deleteLocked(ctx, b)
+}
+
+func (s *Service) deleteLocked(ctx context.Context, b store.Build) error {
+	if b.Status == store.BuildStatusQueued || b.Status == store.BuildStatusRunning {
+		return store.ErrActive
+	}
+	if ids, err := s.o.Store.BuildServerIDs(ctx, b.ID); err != nil {
+		return err
+	} else if len(ids) > 0 {
+		return store.ErrInUse
+	}
+	removeImage := false
+	if b.Status == store.BuildStatusSuccess && b.ImageID != "" {
+		shared, err := s.o.Store.CountBuildsWithImage(ctx, b.ImageID, b.ID)
+		if err != nil {
+			return err
+		}
+		if shared == 0 {
+			inUse, err := s.o.Docker.ImageInUse(ctx, b.ImageID)
+			if err != nil {
+				return err
+			}
+			if inUse {
+				return ErrImageInUse
+			}
+			removeImage = true
+		}
+	}
+	if _, err := s.o.Store.DeleteBuildUnused(ctx, b.ID); err != nil {
+		return err
+	}
+	if removeImage {
+		s.removeImage(ctx, b.ID, b.ImageID)
+	}
+	return nil
+}
+
+// removeImage deletes a build's image, tolerating an image that is already
+// gone; other failures are logged (the image then shows up under
+// /images, where an admin can delete it).
+func (s *Service) removeImage(ctx context.Context, buildID int64, imageID string) {
+	err := s.o.Docker.RemoveImage(ctx, imageID)
+	switch {
+	case err == nil:
+		s.o.Logger.Info("build image removed", "build_id", buildID, "image", imageID)
+	case errors.Is(err, docker.ErrNotFound), errors.Is(err, docker.ErrNotManaged):
+	default:
+		s.o.Logger.Warn("could not remove a deleted build's image", "build_id", buildID, "image", imageID, "err", err)
+	}
+}
+
+// RemoveImages deletes the images of builds whose records are already gone
+// (a deleted project's), skipping images another build still records.
+func (s *Service) RemoveImages(ctx context.Context, builds []store.Build) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, b := range builds {
+		if b.Status != store.BuildStatusSuccess || b.ImageID == "" {
+			continue
+		}
+		if n, err := s.o.Store.CountBuildsWithImage(ctx, b.ImageID, b.ID); err != nil || n > 0 {
+			continue
+		}
+		s.removeImage(ctx, b.ID, b.ImageID)
+	}
+}
+
+// SweepTemp removes private build directories left by a previous daemon
+// process (call at startup, before builds can run).
+func SweepTemp(tmp string) error {
+	entries, err := os.ReadDir(tmp)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), TempPrefix) {
+			if err := os.RemoveAll(filepath.Join(tmp, e.Name())); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
