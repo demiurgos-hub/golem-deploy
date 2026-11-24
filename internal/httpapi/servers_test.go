@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
+	"github.com/demiurgos-hub/golem-deploy/internal/gameadmin/gameadmintest"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/ports"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
@@ -46,6 +48,11 @@ type dockerHarness struct {
 	devTok  string
 	adminSs string
 	dc      *docker.Client
+	// gameAdmin is the fake admin endpoint every built image publishes;
+	// certs the game certificate manager.
+	gameAdmin *gameadmintest.Server
+	certs     *certs.Manager
+	project   int64
 }
 
 // harnessCLIEnv is the daemon environment the fake docker CLI child gets.
@@ -67,12 +74,19 @@ func newDockerHarnessWith(t *testing.T, staticOpts staticfiles.Options, mutate .
 	if err != nil {
 		t.Fatal(err)
 	}
+	cm, err := certs.Open(certs.Options{Dir: filepath.Join(t.TempDir(), "certs", "game"), Settings: h.st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gameAdmin := gameadmintest.New(t)
 	cfg := servers.Config{
-		Ports:        ports.Range{Lo: 7000, Hi: 7004},
-		SettleWindow: 30 * time.Millisecond,
-		SettlePoll:   5 * time.Millisecond,
-		StopTimeout:  time.Second,
-		ProbePort:    func(string, int) error { return nil },
+		Ports:           ports.Range{Lo: 7000, Hi: 7004},
+		StartTimeout:    2 * time.Second,
+		ReadyPoll:       5 * time.Millisecond,
+		StopTimeout:     time.Second,
+		ProbePort:       func(string, int) error { return nil },
+		DefaultGameHost: "play.example.com",
+		Certs:           cm,
 	}
 	for _, m := range mutate {
 		m(&cfg)
@@ -94,13 +108,17 @@ func newDockerHarnessWith(t *testing.T, staticOpts staticfiles.Options, mutate .
 	})
 	srv, err := New(Config{Listen: "127.0.0.1:0", Version: "test", PublicHosts: []string{"example.com"}}, Deps{
 		Store: h.st, Sessions: h.sessions, Hasher: h.hasher, Secrets: box, Jobs: runner, Logger: logger,
-		Docker: dc, Servers: svc, Static: static, Now: h.clock.Now,
+		Docker: dc, Servers: svc, Static: static, Certs: cm, Now: h.clock.Now,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	h.srv, h.runner = srv, runner
-	dh := &dockerHarness{harness: h, fake: fake, svc: svc, static: static, logs: logs, logDir: logDir, bodies: &syncBuffer{}, dc: dc}
+	dh := &dockerHarness{harness: h, fake: fake, svc: svc, static: static, logs: logs, logDir: logDir, bodies: &syncBuffer{}, dc: dc,
+		gameAdmin: gameAdmin, certs: cm}
+	gameAdmin.Set(func(s *gameadmintest.Server) {
+		s.ExpectToken = func() string { return fake.LatestEnv(servers.EnvAdminToken) }
+	})
 	dh.admin = h.account("admin1", store.RoleAdmin, true)
 	dh.dev = h.account("dev1", store.RoleDeveloper, true)
 	dh.devTok = h.apiToken(dh.dev, nil)
@@ -116,10 +134,49 @@ func (d *dockerHarness) call(method, path, token string, body any) *httptest.Res
 	return rr
 }
 
-func (d *dockerHarness) managedImage(n int, tags ...string) string {
-	id := dockertest.ImageID(n)
-	d.fake.AddImage(dockertest.Image{ID: id, Tags: tags, Labels: dockertest.ManagedLabels(), Logs: []string{"hello from the game"}})
-	return id
+// builtImage is a successful build and its image id.
+type builtImage struct {
+	ID    int64
+	Image string
+}
+
+// testCommit is the commit of the build of image n.
+func testCommit(n int) string { return fmt.Sprintf("%040x", n) }
+
+// managedImage records a successful build of project "game" whose image is
+// image n (labelled like the build pipeline labels it).
+func (d *dockerHarness) managedImage(n int, tags ...string) builtImage {
+	return d.buildImage(n, dockertest.Image{Tags: tags, Logs: []string{"hello from the game"}})
+}
+
+// buildImage is managedImage with image options (volumes, exit, logs).
+func (d *dockerHarness) buildImage(n int, img dockertest.Image) builtImage {
+	d.t.Helper()
+	ctx := context.Background()
+	if d.project == 0 {
+		p, err := d.st.CreateProject(ctx, store.Project{Name: "game", RepoURL: "https://example.com/game.git"}, nil)
+		if err != nil {
+			d.t.Fatal(err)
+		}
+		d.project = p.ID
+	}
+	b, err := d.st.CreateBuild(ctx, store.NewBuild{ProjectID: d.project, Branch: "main"})
+	if err != nil {
+		d.t.Fatal(err)
+	}
+	img.ID = dockertest.ImageID(n)
+	if err := d.st.MarkBuildRunning(ctx, b.ID, "main", testCommit(n)); err != nil {
+		d.t.Fatal(err)
+	}
+	if err := d.st.FinishBuild(ctx, b.ID, store.BuildResult{Status: store.BuildStatusSuccess, ImageID: img.ID, EngineVersion: "v0.4.0-rc.1"}); err != nil {
+		d.t.Fatal(err)
+	}
+	img.Labels = dockertest.BuildLabels(b.ID, docker.LabelCommit, testCommit(n))
+	if img.AssignPort == 0 {
+		img.AssignPort = d.gameAdmin.Port
+	}
+	d.fake.AddImage(img)
+	return builtImage{ID: b.ID, Image: img.ID}
 }
 
 func (d *dockerHarness) waitJob(job apitypes.Job) store.Job {
@@ -201,9 +258,9 @@ func TestServerLifecycle(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1, "game:v1")
 	created := d.createServer(d.devTok, apitypes.CreateServerRequest{
-		Name: "arena", Image: "game:v1", Env: map[string]string{"GAME_SECRET": envMarker, "MODE": "ffa"},
+		Name: "arena", BuildID: img.ID, Env: map[string]string{"GAME_SECRET": envMarker, "MODE": "ffa"},
 	})
-	if created.Image != img || created.Port != 7000 || created.State != apitypes.ServerStateMissing ||
+	if created.Image != img.Image || *created.BuildID != img.ID || created.Commit != testCommit(1) || created.PublicURL != "https://play.example.com:7000/" || created.Port != 7000 || created.State != apitypes.ServerStateMissing ||
 		!slices.Equal(created.EnvKeys, []string{"GAME_SECRET", "MODE"}) || created.DesiredState != apitypes.DesiredStateStopped {
 		t.Fatalf("created %+v", created)
 	}
@@ -230,10 +287,10 @@ func TestServerLifecycle(t *testing.T) {
 			t.Errorf("run argv lacks %q: %s", want, joined)
 		}
 	}
-	if args[len(args)-2] != "--" || args[len(args)-1] != img {
+	if args[len(args)-2] != "--" || args[len(args)-1] != img.Image {
 		t.Fatalf("image not after --: %q", args)
 	}
-	if runs[0].EnvFile != "GAME_SECRET="+envMarker+"\nMODE=ffa\n" {
+	if !strings.HasPrefix(runs[0].EnvFile, "GAME_SECRET="+envMarker+"\nGOLEM_ADDR=:7777\n") || !strings.HasSuffix(runs[0].EnvFile, "MODE=ffa\n") {
 		t.Fatalf("env file %q", runs[0].EnvFile)
 	}
 	if ct, _ := d.fake.Container("golem-deploy-arena"); ct.Env["GAME_SECRET"] != envMarker || ct.RestartPolicy != docker.RestartPolicy {
@@ -250,7 +307,7 @@ func TestServerLifecycle(t *testing.T) {
 	}
 
 	// One container query batch per list call, not one per row.
-	d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "second", Image: img})
+	d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "second", BuildID: img.ID})
 	d.fake.ResetCalls()
 	rr := d.call("GET", "/api/v1/servers", d.devTok, nil)
 	list := decode[apitypes.ServerList](t, rr)
@@ -312,7 +369,7 @@ func TestServerLifecycle(t *testing.T) {
 		t.Fatal("container left after delete")
 	}
 	errBody(t, d.call("GET", fmt.Sprintf("/api/v1/servers/%d", created.ID), d.devTok, nil), http.StatusNotFound, apitypes.ErrorCodeNotFound)
-	reused := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "third", Image: img})
+	reused := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "third", BuildID: img.ID})
 	if reused.Port != 7000 {
 		t.Fatalf("port not released: %d", reused.Port)
 	}
@@ -321,25 +378,25 @@ func TestServerLifecycle(t *testing.T) {
 
 func TestServerValidation(t *testing.T) {
 	d := newDockerHarness(t)
-	d.managedImage(1, "game:v1")
-	d.fake.AddImage(dockertest.Image{ID: dockertest.ImageID(2), Tags: []string{"postgres:16"}})
+	gameV1 := d.managedImage(1, "game:v1")
+	failed, _ := d.st.CreateBuild(context.Background(), store.NewBuild{ProjectID: d.project})
 	bad := []struct {
 		req   apitypes.CreateServerRequest
 		field string
 	}{
-		{apitypes.CreateServerRequest{Name: "Bad_Name", Image: "game:v1"}, "name"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "postgres:16"}, "image"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "missing:1"}, "image"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "--privileged"}, "image"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Port: ptr(6999)}, "port"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Port: ptr(22)}, "port"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"GOLEM_ENGINE": envMarker}}, "env"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"1X": envMarker}}, "env"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"X": "a\x00" + envMarker}}, "env.X"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"MOTD": "a\n" + envMarker}}, "env.MOTD"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Env: map[string]string{"MOTD": envMarker + "\r"}}, "env.MOTD"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", ProjectID: ptr(int64(99))}, "project_id"},
-		{apitypes.CreateServerRequest{Name: "a", Image: "game:v1", DesiredState: ptr(apitypes.DesiredState("paused"))}, "desired_state"},
+		{apitypes.CreateServerRequest{Name: "Bad_Name", BuildID: gameV1.ID}, "name"},
+		{apitypes.CreateServerRequest{Name: "a"}, "build_id"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: 999}, "build_id"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: failed.ID}, "build_id"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID, AllowedOrigins: []string{"https://ok.example", "https://x.example/path"}}, "allowed_origins[1]"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID, Port: ptr(6999)}, "port"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID, Port: ptr(22)}, "port"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID, Env: map[string]string{"GOLEM_ENGINE": envMarker}}, "env"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID, Env: map[string]string{"1X": envMarker}}, "env"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID, Env: map[string]string{"X": "a\x00" + envMarker}}, "env.X"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID, Env: map[string]string{"MOTD": "a\n" + envMarker}}, "env.MOTD"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID, Env: map[string]string{"MOTD": envMarker + "\r"}}, "env.MOTD"},
+		{apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID, DesiredState: ptr(apitypes.DesiredState("paused"))}, "desired_state"},
 	}
 	for _, c := range bad {
 		e := errBody(t, d.call("POST", "/api/v1/servers", d.devTok, c.req), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
@@ -347,22 +404,30 @@ func TestServerValidation(t *testing.T) {
 			t.Errorf("%+v: field %q, want %q", c.req, e.Field, c.field)
 		}
 	}
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "a", Image: "game:v1", Port: ptr(7003)})
-	errBody(t, d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "a", Image: "game:v1"}), http.StatusConflict, apitypes.ErrorCodeNameTaken)
-	errBody(t, d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "b", Image: "game:v1", Port: ptr(7003)}), http.StatusConflict, apitypes.ErrorCodePortInUse)
-	e := errBody(t, d.call("PATCH", fmt.Sprintf("/api/v1/servers/%d", s.ID), d.devTok, apitypes.UpdateServerRequest{Image: ptr("postgres:16")}), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
-	if e.Field != "image" {
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID, Port: ptr(7003)})
+	errBody(t, d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "a", BuildID: gameV1.ID}), http.StatusConflict, apitypes.ErrorCodeNameTaken)
+	errBody(t, d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "b", BuildID: gameV1.ID, Port: ptr(7003)}), http.StatusConflict, apitypes.ErrorCodePortInUse)
+	e := errBody(t, d.call("PATCH", fmt.Sprintf("/api/v1/servers/%d", s.ID), d.devTok, apitypes.UpdateServerRequest{BuildID: &failed.ID}), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
+	if e.Field != "build_id" {
 		t.Fatalf("field %q", e.Field)
+	}
+	// The old wire fields are unknown now.
+	errBody(t, d.call("POST", "/api/v1/servers", d.devTok, `{"name":"z","image":"game:v1"}`), http.StatusBadRequest, apitypes.ErrorCodeBadRequest)
+	// Allowed origins are normalised and replaced as a whole.
+	got0 := decode[apitypes.Server](t, d.call("PATCH", fmt.Sprintf("/api/v1/servers/%d", s.ID), d.devTok,
+		apitypes.UpdateServerRequest{AllowedOrigins: &[]string{"HTTPS://Web.Example.com:443", "http://localhost:5173"}}))
+	if !slices.Equal(got0.AllowedOrigins, []string{"https://web.example.com", "http://localhost:5173"}) {
+		t.Fatalf("%v", got0.AllowedOrigins)
 	}
 	// Auto-assignment fills the lowest free ports, then reports exhaustion.
 	var got []int
 	for _, n := range []string{"b", "c", "d", "e"} {
-		got = append(got, d.createServer(d.devTok, apitypes.CreateServerRequest{Name: n, Image: "game:v1"}).Port)
+		got = append(got, d.createServer(d.devTok, apitypes.CreateServerRequest{Name: n, BuildID: gameV1.ID}).Port)
 	}
 	if !slices.Equal(got, []int{7000, 7001, 7002, 7004}) {
 		t.Fatalf("ports %v", got)
 	}
-	errBody(t, d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "f", Image: "game:v1"}), http.StatusConflict, apitypes.ErrorCodePortInUse)
+	errBody(t, d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "f", BuildID: gameV1.ID}), http.StatusConflict, apitypes.ErrorCodePortInUse)
 	d.assertNoMarker()
 }
 
@@ -380,7 +445,7 @@ func TestAutoPortRace(t *testing.T) {
 			wg.Add(1)
 			go func(name string, svc *servers.Service) {
 				defer wg.Done()
-				_, err := svc.Create(context.Background(), apitypes.CreateServerRequest{Name: name, Image: img})
+				_, err := svc.Create(context.Background(), apitypes.CreateServerRequest{Name: name, BuildID: img.ID})
 				errs <- err
 			}(fmt.Sprintf("s%d-%d", i, j), svc)
 		}
@@ -407,13 +472,13 @@ func TestAutoPortRace(t *testing.T) {
 
 func TestDockerDown(t *testing.T) {
 	d := newDockerHarness(t)
-	d.managedImage(1, "game:v1")
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: "game:v1"})
+	gameV1 := d.managedImage(1, "game:v1")
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: gameV1.ID})
 	if j := d.action(d.devTok, s.ID, "start"); j.Status != store.JobSuccess {
 		t.Fatalf("start %q", j.Detail)
 	}
 	// A server that never had a container is "missing" even without Docker.
-	never := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "never", Image: "game:v1"})
+	never := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "never", BuildID: gameV1.ID})
 	d.fake.SetDown(true)
 	list := decode[apitypes.ServerList](t, d.call("GET", "/api/v1/servers", d.devTok, nil))
 	if len(list.Items) != 2 || list.Items[0].State != apitypes.ServerStateUnknown || list.Items[1].State != apitypes.ServerStateMissing {
@@ -435,7 +500,11 @@ func TestDockerDown(t *testing.T) {
 	}
 	errBody(t, d.call("GET", "/api/v1/images", d.devTok, nil), http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
 	errBody(t, d.call("GET", fmt.Sprintf("/api/v1/servers/%d/stats", s.ID), d.devTok, nil), http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
-	errBody(t, d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "b", Image: "game:v1"}), http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
+	// Creating a server needs no Docker (the image is verified at start).
+	if rr := d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "b", BuildID: gameV1.ID}); rr.Code != http.StatusCreated {
+		t.Fatalf("%d %s", rr.Code, rr.Body.String())
+	}
+	errBody(t, d.call("GET", fmt.Sprintf("/api/v1/servers/%d/runtime", s.ID), d.devTok, nil), http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
 	if st := decode[apitypes.Status](t, d.call("GET", "/api/v1/status", d.devTok, nil)); st.DockerReachable {
 		t.Fatal("status reports docker reachable")
 	}
@@ -444,12 +513,10 @@ func TestDockerDown(t *testing.T) {
 func TestStartFailsWhenContainerExits(t *testing.T) {
 	d := newDockerHarness(t)
 	code := 3
-	id := dockertest.ImageID(5)
-	d.fake.AddImage(dockertest.Image{ID: id, Labels: dockertest.ManagedLabels(), ExitOnRun: &code,
-		Logs: []string{"boot", "fatal: bad config, secret=" + envMarker}})
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "crashy", Image: id, Env: map[string]string{"TOKEN": envMarker}})
+	id := d.buildImage(5, dockertest.Image{ExitOnRun: &code, Logs: []string{"boot", "fatal: bad config, secret=" + envMarker}})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "crashy", BuildID: id.ID, Env: map[string]string{"TOKEN": envMarker}})
 	j := d.action(d.devTok, s.ID, "start")
-	if j.Status != store.JobError || !strings.Contains(j.Detail, "exited right after starting (exit code 3)") {
+	if j.Status != store.JobError || !strings.Contains(j.Detail, "exited before the game became ready (exit code 3)") {
 		t.Fatalf("job %s %q", j.Status, j.Detail)
 	}
 	log := d.jobLog(j.ID)
@@ -463,7 +530,7 @@ func TestStartRefusesForeignContainer(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1)
 	foreign := d.fake.AddContainer(dockertest.Container{Name: "golem-deploy-arena", Image: dockertest.ImageID(9)})
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
 	j := d.action(d.devTok, s.ID, "start")
 	if j.Status != store.JobError || !strings.Contains(j.Detail, "this installation does not manage it") || !strings.Contains(j.Detail, "docker rm -f golem-deploy-arena") {
 		t.Fatalf("job %s %q", j.Status, j.Detail)
@@ -480,7 +547,7 @@ func TestStartRefusesForeignContainer(t *testing.T) {
 	d2 := newDockerHarness(t)
 	img2 := d2.managedImage(1)
 	d2.fake.AddNetwork(docker.NetworkName, nil, nil)
-	s2 := d2.createServer(d2.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img2})
+	s2 := d2.createServer(d2.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img2.ID})
 	if j := d2.action(d2.devTok, s2.ID, "start"); j.Status != store.JobError || !strings.Contains(j.Detail, "network") {
 		t.Fatalf("job %s %q", j.Status, j.Detail)
 	}
@@ -491,7 +558,7 @@ func TestStartFailsWhenPortBusy(t *testing.T) {
 		c.ProbePort = func(string, int) error { return ports.ErrBusy }
 	})
 	img := d.managedImage(1)
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
 	j := d.action(d.devTok, s.ID, "start")
 	if j.Status != store.JobError || j.Detail != "port 7000 is in use by another process on the host" {
 		t.Fatalf("job %s %q", j.Status, j.Detail)
@@ -504,11 +571,12 @@ func TestStartFailsWhenPortBusy(t *testing.T) {
 func TestExportImport(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1, "game:v1")
-	d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img, Env: map[string]string{"K": "exported-value"}})
+	d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID, Env: map[string]string{"K": "exported-value"}})
 
 	errBody(t, d.call("GET", "/api/v1/servers/export", d.devTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
 	doc := decode[apitypes.ServerExport](t, d.do("GET", "/api/v1/servers/export", d.adminSs, nil))
-	if doc.FormatVersion != 1 || len(doc.Servers) != 1 || doc.Servers[0].Env["K"] != "exported-value" || doc.Servers[0].Image != img {
+	if doc.FormatVersion != 2 || len(doc.Servers) != 1 || doc.Servers[0].Env["K"] != "exported-value" || doc.Servers[0].Project != "game" ||
+		doc.Servers[0].Commit != testCommit(1) {
 		t.Fatalf("export %+v", doc)
 	}
 
@@ -518,12 +586,13 @@ func TestExportImport(t *testing.T) {
 		status int
 		code   apitypes.ErrorCode
 	}{
-		{apitypes.ServerExport{FormatVersion: 2, Servers: []apitypes.ServerSpec{{Name: "x", Image: img}}}, 400, apitypes.ErrorCodeValidationFailed},
-		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "ok1", Image: img}, {Name: "bad", Image: img, Env: map[string]string{"GOLEM_X": envMarker}}}}, 400, apitypes.ErrorCodeValidationFailed},
-		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "ok1", Image: img}, {Name: "arena", Image: img}}}, 409, apitypes.ErrorCodeNameTaken},
-		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "ok1", Image: img}, {Name: "ok1", Image: img}}}, 400, apitypes.ErrorCodeValidationFailed},
-		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "ok1", Image: img}, {Name: "ok2", Image: img, Port: ptr(7000)}}}, 409, apitypes.ErrorCodePortInUse},
-		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "ok1", Image: img}, {Name: "ok2", Image: "postgres:16"}}}, 400, apitypes.ErrorCodeValidationFailed},
+		{apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{{Name: "x", Project: "game"}}}, 400, apitypes.ErrorCodeValidationFailed},
+		{apitypes.ServerExport{FormatVersion: 2, Servers: []apitypes.ServerSpec{{Name: "ok1", Project: "game"}, {Name: "x", Project: "game", Commit: testCommit(9)}}}, 400, apitypes.ErrorCodeValidationFailed},
+		{apitypes.ServerExport{FormatVersion: 2, Servers: []apitypes.ServerSpec{{Name: "ok1", Project: "game"}, {Name: "bad", Project: "game", Env: map[string]string{"GOLEM_X": envMarker}}}}, 400, apitypes.ErrorCodeValidationFailed},
+		{apitypes.ServerExport{FormatVersion: 2, Servers: []apitypes.ServerSpec{{Name: "ok1", Project: "game"}, {Name: "arena", Project: "game"}}}, 409, apitypes.ErrorCodeNameTaken},
+		{apitypes.ServerExport{FormatVersion: 2, Servers: []apitypes.ServerSpec{{Name: "ok1", Project: "game"}, {Name: "ok1", Project: "game"}}}, 400, apitypes.ErrorCodeValidationFailed},
+		{apitypes.ServerExport{FormatVersion: 2, Servers: []apitypes.ServerSpec{{Name: "ok1", Project: "game"}, {Name: "ok2", Project: "game", Port: ptr(7000)}}}, 409, apitypes.ErrorCodePortInUse},
+		{apitypes.ServerExport{FormatVersion: 2, Servers: []apitypes.ServerSpec{{Name: "ok1", Project: "game"}, {Name: "ok2", Project: "nope"}}}, 400, apitypes.ErrorCodeValidationFailed},
 	}
 	for i, c := range cases {
 		errBody(t, d.do("POST", "/api/v1/servers/import", d.adminSs, c.doc), c.status, c.code)
@@ -531,16 +600,16 @@ func TestExportImport(t *testing.T) {
 			t.Fatalf("case %d: partial import", i)
 		}
 	}
-	rr := d.do("POST", "/api/v1/servers/import", d.adminSs, apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{
-		{Name: "imp1", Image: "game:v1", Env: map[string]string{"S": envMarker}, DesiredState: apitypes.DesiredStateRunning},
-		{Name: "imp2", Image: img, Port: ptr(7001)},
+	rr := d.do("POST", "/api/v1/servers/import", d.adminSs, apitypes.ServerExport{FormatVersion: 2, Servers: []apitypes.ServerSpec{
+		{Name: "imp1", Project: "game", Env: map[string]string{"S": envMarker}, DesiredState: apitypes.DesiredStateRunning},
+		{Name: "imp2", Project: "game", Port: ptr(7001)},
 	}})
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("import %d %s", rr.Code, rr.Body.String())
 	}
 	_, _ = d.bodies.Write(rr.Body.Bytes())
 	res := decode[apitypes.ServerImportResult](t, rr)
-	if len(res.Created) != 2 || res.Created[0].Port != 7002 || res.Created[1].Port != 7001 ||
+	if len(res.Created) != 2 || res.Created[0].Port != 7002 || res.Created[1].Port != 7001 || *res.Created[0].BuildID != img.ID ||
 		res.Created[0].DesiredState != apitypes.DesiredStateStopped || res.Created[0].EnvKeys[0] != "S" {
 		t.Fatalf("import result %+v", res)
 	}
@@ -553,7 +622,7 @@ func TestExportImport(t *testing.T) {
 func TestServerLogFollow(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1)
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
 	if j := d.action(d.devTok, s.ID, "start"); j.Status != store.JobSuccess {
 		t.Fatalf("start %q", j.Detail)
 	}
@@ -594,7 +663,7 @@ func TestServerLogFollow(t *testing.T) {
 func TestServerLogFollowEndsOnClientDisconnect(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1)
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
 	d.action(d.devTok, s.ID, "start")
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest("GET", fmt.Sprintf("/api/v1/servers/%d/logs?follow=1", s.ID), nil).WithContext(ctx)
@@ -627,36 +696,45 @@ func waitFor(t *testing.T, cond func() bool) {
 func TestImagesAndVolumesAPI(t *testing.T) {
 	d := newDockerHarness(t)
 	used := d.managedImage(1, "game:v1")
-	free := d.managedImage(2, "game:old")
+	built := d.managedImage(2, "game:old")
+	free := dockertest.ImageID(4) // ours, but no build records it
+	d.fake.AddImage(dockertest.Image{ID: free, Tags: []string{"game:dangling"}, Labels: dockertest.OurLabels()})
 	unmanaged := dockertest.ImageID(3)
 	d.fake.AddImage(dockertest.Image{ID: unmanaged, Tags: []string{"postgres:16"}})
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: used})
+	d.fake.AddImage(dockertest.Image{ID: dockertest.ImageID(5), Tags: []string{"hand:1"}, Labels: dockertest.ManagedLabels()})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: used.ID})
 
 	list := decode[apitypes.ImageList](t, d.call("GET", "/api/v1/images", d.devTok, nil))
-	if len(list.Items) != 2 {
+	if len(list.Items) != 3 {
 		t.Fatalf("images %+v", list)
 	}
 	for _, img := range list.Items {
 		switch img.ID {
-		case used:
-			if !img.InUse || !slices.Equal(img.ServerIDs, []int64{s.ID}) {
+		case used.Image:
+			if !img.InUse || !slices.Equal(img.ServerIDs, []int64{s.ID}) || !slices.Equal(img.BuildIDs, []int64{used.ID}) {
+				t.Fatalf("%+v", img)
+			}
+		case built.Image:
+			if !img.InUse || len(img.ServerIDs) != 0 || !slices.Equal(img.BuildIDs, []int64{built.ID}) {
 				t.Fatalf("%+v", img)
 			}
 		case free:
-			if img.InUse || len(img.ServerIDs) != 0 {
+			if img.InUse || len(img.ServerIDs) != 0 || len(img.BuildIDs) != 0 {
 				t.Fatalf("%+v", img)
 			}
 		default:
 			t.Fatalf("unexpected image %s", img.ID)
 		}
 	}
-	errBody(t, d.call("DELETE", "/api/v1/images/"+used, d.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	errBody(t, d.call("DELETE", "/api/v1/images/"+used.Image, d.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	errBody(t, d.call("DELETE", "/api/v1/images/"+built.Image, d.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	errBody(t, d.call("DELETE", "/api/v1/images/"+dockertest.ImageID(5), d.adminSs, nil), http.StatusNotFound, apitypes.ErrorCodeNotFound)
 	errBody(t, d.call("DELETE", "/api/v1/images/"+unmanaged, d.adminSs, nil), http.StatusNotFound, apitypes.ErrorCodeNotFound)
 	errBody(t, d.call("DELETE", "/api/v1/images/postgres:16", d.adminSs, nil), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
 	if rr := d.call("DELETE", "/api/v1/images/"+free, d.adminSs, nil); rr.Code != http.StatusNoContent {
 		t.Fatalf("delete %d %s", rr.Code, rr.Body.String())
 	}
-	if !d.fake.HasImage(unmanaged) || !d.fake.HasImage(used) || d.fake.HasImage(free) {
+	if !d.fake.HasImage(unmanaged) || !d.fake.HasImage(used.Image) || d.fake.HasImage(free) {
 		t.Fatal("wrong images removed")
 	}
 
@@ -761,7 +839,8 @@ func TestServiceRoutesDoNotFail(t *testing.T) {
 	fill := strings.NewReplacer("{id}", "999999", "{name}", "nope")
 	for _, rt := range d.srv.routes() {
 		p := rt.path
-		if !strings.HasPrefix(p, "/servers") && !strings.HasPrefix(p, "/images") && !strings.HasPrefix(p, "/volumes") && !strings.HasPrefix(p, "/static") {
+		if !strings.HasPrefix(p, "/servers") && !strings.HasPrefix(p, "/images") && !strings.HasPrefix(p, "/volumes") && !strings.HasPrefix(p, "/static") &&
+			!strings.HasPrefix(p, "/certificates") {
 			continue
 		}
 		rr := d.do(rt.method, "/api/v1"+fill.Replace(p), d.adminSs, "{}")

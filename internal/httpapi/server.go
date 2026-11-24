@@ -18,6 +18,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
+	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
 	"github.com/demiurgos-hub/golem-deploy/internal/servers"
@@ -72,6 +73,9 @@ type Deps struct {
 	// static file routes; when nil those routes answer 503.
 	Servers *servers.Service
 	Static  *staticfiles.Store
+	// Certs manages the game certificate; nil makes the certificate routes
+	// answer 503.
+	Certs *certs.Manager
 	// SPA serves non-API paths (the embedded web client). Nil serves 404.
 	SPA http.Handler
 	// Now overrides the clock (tests).
@@ -95,6 +99,7 @@ type Server struct {
 	docker   DockerProbe
 	servers  *servers.Service
 	static   *staticfiles.Store
+	certs    *certs.Manager
 	spa      http.Handler
 	now      func() time.Time
 	proj     *projectState
@@ -190,6 +195,7 @@ func New(cfg Config, d Deps) (*Server, error) {
 		docker:     d.Docker,
 		servers:    d.Servers,
 		static:     d.Static,
+		certs:      d.Certs,
 		spa:        d.SPA,
 		now:        d.Now,
 		proj:       newProjectState(d),

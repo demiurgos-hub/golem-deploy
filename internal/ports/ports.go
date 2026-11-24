@@ -103,6 +103,45 @@ func (r Range) Lowest(used map[int]bool) (int, error) {
 	return 0, ErrExhausted
 }
 
+// Overlaps reports whether the ranges share a port.
+func (r Range) Overlaps(o Range) bool { return r.Lo <= o.Hi && o.Lo <= r.Hi }
+
+// EphemeralRangeFile is where Linux exposes the ephemeral port range.
+const EphemeralRangeFile = "/proc/sys/net/ipv4/ip_local_port_range"
+
+// ParseEphemeralRange parses the content of EphemeralRangeFile ("LO\tHI").
+func ParseEphemeralRange(content string) (Range, error) {
+	f := strings.Fields(content)
+	if len(f) != 2 {
+		return Range{}, fmt.Errorf("unexpected ephemeral port range %q", strings.TrimSpace(content))
+	}
+	lo, err1 := strconv.Atoi(f[0])
+	hi, err2 := strconv.Atoi(f[1])
+	if err1 != nil || err2 != nil || lo < 1 || hi > 65535 || lo > hi {
+		return Range{}, fmt.Errorf("unexpected ephemeral port range %q", strings.TrimSpace(content))
+	}
+	return Range{Lo: lo, Hi: hi}, nil
+}
+
+// EphemeralOverlap reads the host's ephemeral port range (Linux only; ok
+// is false elsewhere or when it cannot be read) and reports whether r
+// overlaps it. The kernel hands those ports to outgoing connections (and
+// Docker assigns them to dynamically published ports), so a game server
+// port inside it can be taken at any time. The fixed bounds of Validate
+// assume the default range (32768-60999); a host configured with a lower
+// start needs this check.
+func EphemeralOverlap(r Range, read func(string) ([]byte, error)) (eph Range, overlap, ok bool) {
+	b, err := read(EphemeralRangeFile)
+	if err != nil {
+		return Range{}, false, false
+	}
+	eph, err = ParseEphemeralRange(string(b))
+	if err != nil {
+		return Range{}, false, false
+	}
+	return eph, r.Overlaps(eph), true
+}
+
 // ErrBusy means something on the host listens on the port.
 var ErrBusy = errors.New("port is in use on the host")
 

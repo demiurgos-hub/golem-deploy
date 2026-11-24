@@ -51,7 +51,7 @@ func TestF1_IDsAreNeverReused(t *testing.T) {
 			}
 		}},
 		{"servers", func(i int) int64 {
-			sv, err := s.CreateServer(ctx, Server{Name: "s" + strconv.Itoa(i), Image: "i"}, nil)
+			sv, err := s.CreateServer(ctx, Server{Name: "s" + strconv.Itoa(i)}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
+	"github.com/demiurgos-hub/golem-deploy/internal/gameadmin/gameadmintest"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -27,6 +29,8 @@ func TestRunRejectsBadServerSettings(t *testing.T) {
 		{Listen: "127.0.0.1:8000", PortBindAddress: "example.com"},
 		{Listen: "127.0.0.1:8000", ServerMemoryMB: 4},
 		{Listen: "127.0.0.1:8000", ServerCPUs: -1},
+		{Listen: "127.0.0.1:8000", StartTimeout: 10 * time.Millisecond},
+		{Listen: "127.0.0.1:8000", StartTimeout: time.Hour},
 	}
 	for i, o := range cases {
 		dir := t.TempDir()
@@ -55,24 +59,39 @@ func TestRunReconcilesServers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx0 := context.Background()
 	img := dockertest.ImageID(1)
+	proj, err := st.CreateProject(ctx0, store.Project{Name: "game", RepoURL: "https://example.com/g.git"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := st.CreateBuild(ctx0, store.NewBuild{ProjectID: proj.ID})
+	_ = st.MarkBuildRunning(ctx0, b.ID, "main", strings.Repeat("a", 40))
+	if err := st.FinishBuild(ctx0, b.ID, store.BuildResult{Status: store.BuildStatusSuccess, ImageID: img}); err != nil {
+		t.Fatal(err)
+	}
 	port := 7401
-	sv, err := st.CreateServer(context.Background(), store.Server{Name: "arena", Image: img, Port: &port, DesiredState: "running"}, nil)
+	sv, err := st.CreateServer(ctx0, store.Server{Name: "arena", BuildID: &b.ID, Port: &port, DesiredState: "running"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	stopped := 7402
-	if _, err := st.CreateServer(context.Background(), store.Server{Name: "idle", Image: img, Port: &stopped}, nil); err != nil {
+	if _, err := st.CreateServer(ctx0, store.Server{Name: "idle", BuildID: &b.ID, Port: &stopped}, nil); err != nil {
 		t.Fatal(err)
 	}
-	instance, err := st.InstanceID(context.Background())
+	instance, err := st.InstanceID(ctx0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = st.Close()
 
 	fake := dockertest.New()
-	fake.AddImage(dockertest.Image{ID: img, Labels: dockertest.ManagedLabels()})
+	admin := gameadmintest.New(t)
+	admin.Set(func(s *gameadmintest.Server) {
+		s.ExpectToken = func() string { return fake.LatestEnv("GOLEM_ADMIN_TOKEN") }
+	})
+	fake.AddImage(dockertest.Image{ID: img, AssignPort: admin.Port,
+		Labels: dockertest.ManagedLabels(docker.LabelInstance, instance, docker.LabelBuildID, strconv.FormatInt(b.ID, 10))})
 	orphan := fake.AddContainer(dockertest.Container{Name: "golem-deploy-gone", Image: img,
 		Labels: dockertest.ManagedLabels(docker.LabelInstance, instance, docker.LabelServerID, "999", docker.LabelServer, "gone")})
 	// Claims to be server 1 with every label, but is not its recorded container.
@@ -85,7 +104,7 @@ func TestRunReconcilesServers(t *testing.T) {
 	ready := make(chan net.Addr, 1)
 	go func() {
 		done <- Run(ctx, Options{
-			DataDir: dir, Listen: "127.0.0.1:0", PortRange: "7400-7410",
+			DataDir: dir, Listen: "127.0.0.1:0", PortRange: "7400-7410", PublicHosts: []string{"play.example.com"},
 			Logger:     slog.New(slog.NewTextHandler(&lockedWriter{w: &logs}, nil)),
 			Ready:      func(a net.Addr) { ready <- a },
 			bcryptCost: bcrypt.MinCost,
@@ -101,7 +120,8 @@ func TestRunReconcilesServers(t *testing.T) {
 	}
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		if c, ok := fake.Container("golem-deploy-arena"); ok && c.State == "running" && c.Labels[docker.LabelServerID] == "1" {
+		if c, ok := fake.Container("golem-deploy-arena"); ok && c.State == "running" && c.Labels[docker.LabelServerID] == "1" &&
+			c.RestartPolicy == docker.RestartPolicy {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -135,5 +155,14 @@ func TestRunReconcilesServers(t *testing.T) {
 	}
 	if got, _ := st2.GetServer(context.Background(), sv.ID); got.ContainerID == "" || got.ContainerID == impostor {
 		t.Fatalf("recorded container %q", got.ContainerID)
+	}
+	// The game certificate was generated for the --public-host fallback and
+	// mounted into the container.
+	if _, err := os.Stat(filepath.Join(layout.GameCerts(), "tls.key")); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := fake.Container("golem-deploy-arena"); len(c.Binds) != 1 || !strings.Contains(c.Binds[0], layout.GameCerts()) ||
+		c.Env["GOLEM_PUBLIC_URL"] != "https://play.example.com:7401/wt" {
+		t.Fatalf("%+v", c)
 	}
 }

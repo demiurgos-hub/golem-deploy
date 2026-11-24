@@ -3,6 +3,7 @@ package docker
 import (
 	"net/netip"
 	"path"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -54,11 +55,14 @@ type RunSpec struct {
 	ServerID   int64
 	ServerName string
 	ProjectID  *int64
-	// Commit is recorded in the commit label (empty when not built by the
-	// daemon).
-	Commit string
-	// Image is the immutable image id ("sha256:<64 hex>") of a managed image
-	// (resolve references with Client.ManagedImage first).
+	// BuildID, Commit and EngineVersion describe the build the image comes
+	// from; they are recorded in the build-id, commit and engine-version
+	// labels (explicitly, so the image's own labels are never inherited).
+	BuildID       int64
+	Commit        string
+	EngineVersion string
+	// Image is the immutable image id ("sha256:<64 hex>") of a verified
+	// build image (Client.BuildImage).
 	Image string
 	// ImageVolumes are the paths the image declares as volumes
 	// (Image.Volumes); each gets a tmpfs unless a daemon mount (DataVolume,
@@ -82,6 +86,10 @@ type RunSpec struct {
 	// UID and GID zero mean DefaultUID/DefaultGID. Root is not expressible.
 	UID int
 	GID int
+	// GroupAdd are supplementary groups of the container user (for example
+	// the daemon's group, so the user can read the certificate bind mount).
+	// Group 0 is refused.
+	GroupAdd []int
 	// StopTimeout zero means DefaultStopTimeout.
 	StopTimeout time.Duration
 	// ConfigHash is recorded as a label so callers can tell whether the
@@ -92,7 +100,8 @@ type RunSpec struct {
 	// DataVolume is an optional named volume mounted read-write.
 	DataVolume *VolumeMount
 	// AdminPort, when non-zero, is a container TCP port published on
-	// 127.0.0.1:AdminHostPort only.
+	// 127.0.0.1 only: on AdminHostPort, or on a port Docker assigns when
+	// AdminHostPort is zero (read it back with Container.LoopbackPort).
 	AdminPort     int
 	AdminHostPort int
 }
@@ -114,6 +123,15 @@ func mountPathOK(p string, hostWindows bool) bool {
 		return true
 	}
 	return path.IsAbs(p) && path.Clean(p) == p
+}
+
+// ValidateBindSource reports whether a host path can be used as the source
+// of a read-only bind mount (RunSpec.ReadOnlyBinds).
+func ValidateBindSource(p string) error {
+	if !mountPathOK(p, runtime.GOOS == "windows") {
+		return invalid("mounts", "bind mount paths must be absolute and must not contain , \" ' = or control characters")
+	}
+	return nil
 }
 
 // mergedEnv returns Env overlaid with DaemonEnv (daemon variables replace
@@ -230,7 +248,10 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 	if s.PidsLimit < 0 || s.UID < 0 || s.GID < 0 {
 		return nil, invalid("spec", "limits and ids must not be negative")
 	}
-	for _, v := range []string{s.ConfigHash, s.Commit} {
+	if s.BuildID < 0 {
+		return nil, invalid("build_id", "build id must not be negative")
+	}
+	for _, v := range []string{s.ConfigHash, s.Commit, s.EngineVersion} {
 		if strings.ContainsAny(v, "\x00\n\r") {
 			return nil, invalid("labels", "invalid label value")
 		}
@@ -253,6 +274,15 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 	if s.ProjectID != nil {
 		projectID = strconv.FormatInt(*s.ProjectID, 10)
 	}
+	buildID := ""
+	if s.BuildID > 0 {
+		buildID = strconv.FormatInt(s.BuildID, 10)
+	}
+	for _, g := range s.GroupAdd {
+		if g <= 0 {
+			return nil, invalid("group_add", "supplementary groups must be positive")
+		}
+	}
 
 	args := []string{
 		"run", "--detach", "--pull", "never",
@@ -265,6 +295,8 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 		"--label", LabelServer + "=" + s.ServerName,
 		"--label", LabelProjectID + "=" + projectID,
 		"--label", LabelCommit + "=" + s.Commit,
+		"--label", LabelBuildID + "=" + buildID,
+		"--label", LabelEngineVersion + "=" + s.EngineVersion,
 		"--label", LabelConfigHash + "=" + s.ConfigHash,
 		"--restart", "no",
 		"--init",
@@ -292,10 +324,11 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 	for _, p := range tmpfs {
 		args = append(args, "--tmpfs", p+":"+ImageVolumeTmpfs)
 	}
-	args = append(args,
-		"--user", strconv.Itoa(uid)+":"+strconv.Itoa(gid),
-		"--network", NetworkName,
-	)
+	args = append(args, "--user", strconv.Itoa(uid)+":"+strconv.Itoa(gid))
+	for _, g := range s.GroupAdd {
+		args = append(args, "--group-add", strconv.Itoa(g))
+	}
+	args = append(args, "--network", NetworkName)
 	for _, proto := range []string{"udp", "tcp"} {
 		p := strconv.Itoa(s.HostPort) + ":" + strconv.Itoa(GamePort) + "/" + proto
 		if hostIP != "" {
@@ -307,10 +340,17 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 		if err := ValidatePort("admin_port", s.AdminPort); err != nil {
 			return nil, err
 		}
-		if err := ValidatePort("admin_host_port", s.AdminHostPort); err != nil {
-			return nil, err
+		host := ""
+		if s.AdminHostPort != 0 {
+			if err := ValidatePort("admin_host_port", s.AdminHostPort); err != nil {
+				return nil, err
+			}
+			host = strconv.Itoa(s.AdminHostPort)
 		}
-		args = append(args, "--publish", "127.0.0.1:"+strconv.Itoa(s.AdminHostPort)+":"+strconv.Itoa(s.AdminPort)+"/tcp")
+		if s.AdminPort == GamePort {
+			return nil, invalid("admin_port", "the admin port must differ from the game port")
+		}
+		args = append(args, "--publish", "127.0.0.1:"+host+":"+strconv.Itoa(s.AdminPort)+"/tcp")
 	}
 	for _, b := range s.ReadOnlyBinds {
 		if !mountPathOK(b.Source, true) || !mountPathOK(b.Target, false) {

@@ -77,3 +77,32 @@ func TestProbeFree(t *testing.T) {
 		t.Fatalf("busy udp port %s probed free", strconv.Itoa(udp))
 	}
 }
+
+func TestEphemeralOverlap(t *testing.T) {
+	read := func(content string, err error) func(string) ([]byte, error) {
+		return func(p string) ([]byte, error) {
+			if p != EphemeralRangeFile {
+				t.Fatalf("read %q", p)
+			}
+			return []byte(content), err
+		}
+	}
+	r := Range{Lo: 7000, Hi: 7099}
+	if eph, overlap, ok := EphemeralOverlap(r, read("32768\t60999\n", nil)); !ok || overlap || eph != (Range{32768, 60999}) {
+		t.Fatalf("%v %v %v", eph, overlap, ok)
+	}
+	if _, overlap, ok := EphemeralOverlap(r, read("1024 65535\n", nil)); !ok || !overlap {
+		t.Fatal("overlap not reported")
+	}
+	if _, overlap, ok := EphemeralOverlap(r, read("7099 8000", nil)); !ok || !overlap {
+		t.Fatal("edge overlap not reported")
+	}
+	for _, bad := range []string{"", "1 2 3", "x y", "9000 8000", "0 10"} {
+		if _, _, ok := EphemeralOverlap(r, read(bad, nil)); ok {
+			t.Errorf("%q parsed", bad)
+		}
+	}
+	if _, _, ok := EphemeralOverlap(r, read("", errors.New("no /proc"))); ok {
+		t.Fatal("missing file reported as a range")
+	}
+}

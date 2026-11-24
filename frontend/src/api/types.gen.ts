@@ -277,6 +277,77 @@ export interface CreateBuildResponse {
 }
 
 //////////
+// source: certificates.go
+
+/**
+ * CertificateMode is how the game certificate is obtained.
+ */
+/**
+ * CertificateModeSelfSigned: the daemon generates and rotates a
+ * short-lived self-signed certificate (the default).
+ */
+export const CertificateModeSelfSigned = "self_signed";
+/**
+ * CertificateModeCustom: an admin uploaded a certificate chain and key.
+ */
+export const CertificateModeCustom = "custom";
+/**
+ * Certificate modes.
+ */
+export type CertificateMode = typeof CertificateModeSelfSigned | typeof CertificateModeCustom;
+/**
+ * GameCertificate is the body of GET and PUT /api/v1/certificates/game
+ * (admin): the TLS certificate every game server serves for WebTransport
+ * and HTTPS. The private key is never returned.
+ */
+export interface GameCertificate {
+  mode: CertificateMode;
+  /**
+   * Subject and Issuer are the leaf certificate's distinguished names.
+   */
+  subject: string;
+  issuer: string;
+  /**
+   * DNSNames and IPAddresses are the leaf's subject alternative names.
+   */
+  dns_names: string[];
+  ip_addresses: string[];
+  not_before: string /* RFC 3339, UTC */;
+  not_after: string /* RFC 3339, UTC */;
+  /**
+   * FingerprintSHA256 is the lower-case hex SHA-256 of the leaf (the value
+   * browsers pin through WebTransport serverCertificateHashes).
+   */
+  fingerprint_sha256: string;
+  self_signed: boolean;
+  /**
+   * ChainLength is the number of certificates in the chain.
+   */
+  chain_length: number /* int */;
+  /**
+   * GameHost is the effective game host; CoversGameHost reports whether
+   * the certificate is valid for it.
+   */
+  game_host: string;
+  covers_game_host: boolean;
+}
+/**
+ * UpdateGameCertificateRequest is the body of PUT /api/v1/certificates/game.
+ * Mode "self_signed" (no PEM fields) generates a new self-signed
+ * certificate; mode "custom" installs CertificatePEM (the chain, leaf first,
+ * at most 8 certificates and 64 KiB) and PrivateKeyPEM (unencrypted PKCS#8,
+ * PKCS#1 or SEC 1; RSA of at least 2048 bits or ECDSA P-256/P-384/P-521; at
+ * most 16 KiB), which must match, be currently valid and be usable for TLS
+ * servers. Running servers pick up the new certificate within a minute
+ * without a restart; switching modes marks them restart_required.
+ */
+export interface UpdateGameCertificateRequest {
+  mode: CertificateMode;
+  certificate_pem?: string;
+  private_key_pem?: string;
+}
+
+//////////
 // source: errors.go
 
 /**
@@ -439,7 +510,8 @@ export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationF
 // source: host.go
 
 /**
- * Image is a Docker image managed (built and labelled) by Golem Deploy.
+ * Image is a Docker image managed by this Golem Deploy installation (it
+ * carries the managed and instance labels).
  */
 export interface Image {
   /**
@@ -456,12 +528,17 @@ export interface Image {
   size_bytes: number /* int64 */;
   created_at: string /* RFC 3339, UTC */;
   /**
-   * ServerIDs lists the servers configured with this image.
+   * ServerIDs lists the servers whose build has this image.
    */
   server_ids: number /* int64 */[];
   /**
-   * InUse reports whether a server references the image or any container
-   * was created from it; such images cannot be deleted (409 conflict).
+   * BuildIDs lists the successful builds that produced this image.
+   */
+  build_ids: number /* int64 */[];
+  /**
+   * InUse reports whether a build or server references the image or any
+   * container was created from it; such images cannot be deleted (409
+   * conflict).
    */
   in_use: boolean;
 }
@@ -771,8 +848,8 @@ export const ServerStateUnknown = "unknown";
  */
 export type ServerState = typeof ServerStateCreated | typeof ServerStateRunning | typeof ServerStateRestarting | typeof ServerStateExited | typeof ServerStatePaused | typeof ServerStateDead | typeof ServerStateMissing | typeof ServerStateUnknown;
 /**
- * Server is a game server: a container run from an image with a host port
- * published as both <port>/udp and <port>/tcp.
+ * Server is a game server: a container run from the image of a successful
+ * build, with a host port published as both <port>/udp and <port>/tcp.
  * Environment values are treated as secrets: they are encrypted at rest and
  * never returned. EnvKeys lists the variable names so the UI can show them;
  * to change values use UpdateServerRequest.EnvSet / EnvUnset.
@@ -784,17 +861,31 @@ export interface Server {
    */
   name: string;
   /**
-   * ProjectID is the project the image was built from; null for servers
-   * using an image not built by Golem Deploy, or after that project was
-   * deleted. Immutable.
+   * BuildID is the build the server runs; null for servers created before
+   * servers ran builds (they cannot start until a build is assigned).
+   */
+  build_id: number | null;
+  /**
+   * ProjectID, Image, Commit and EngineVersion are derived from the build
+   * (null/empty without one): its project, its immutable image id
+   * ("sha256:..."), the commit that was built and the Golem Engine version
+   * the game requires.
    */
   project_id: number | null;
-  /**
-   * Image is the immutable id ("sha256:...") of the managed image the
-   * server runs; references given on create/update are resolved to it.
-   */
   image: string;
+  commit: string;
+  engine_version: string;
   port: number /* int */;
+  /**
+   * PublicURL is the server's own page, https://<game host>:<port>/ (the
+   * game's HTTPS sidecar); empty while no game host is configured.
+   */
+  public_url: string;
+  /**
+   * AllowedOrigins are extra browser origins allowed to open WebTransport
+   * and WebSocket connections, besides the server's own origin.
+   */
+  allowed_origins: string[];
   env_keys: string[];
   desired_state: DesiredState;
   /**
@@ -808,8 +899,10 @@ export interface Server {
   exit_code: number | null;
   /**
    * RestartRequired is true when the container is running with an older
-   * definition (image, port, env or daemon run settings changed since it
-   * was started). Changes never restart a server implicitly.
+   * definition (build, port, env, allowed origins, game host, certificate
+   * mode or daemon run settings changed since it was started). Changes
+   * never restart a server implicitly. A renewed certificate is picked up
+   * without a restart.
    */
   restart_required: boolean;
   created_at: string /* RFC 3339, UTC */;
@@ -822,35 +915,39 @@ export interface ServerList {
   items: Server[];
 }
 /**
- * CreateServerRequest is the body of POST /api/v1/servers. Image is the id or
- * a tag of a managed image (it is stored as the resolved image id) declaring
- * at most 8 volumes. Port, when absent, is auto-assigned from the configured
- * port range. Env keys must match ^[A-Za-z_][A-Za-z0-9_]{0,127}$, be unique
- * ignoring case and not start with GOLEM_ (reserved for the daemon); values
- * are single-line UTF-8 (no NUL, CR or LF); at most 32 KiB per variable, 128
- * variables and 64 KiB in total. A rejected value is reported with field
- * "env.<KEY>". DesiredState defaults to "stopped"; "running" starts a
- * server.start job right after creation.
+ * CreateServerRequest is the body of POST /api/v1/servers. BuildID is
+ * required and must be a successful build. Port, when absent, is
+ * auto-assigned from the configured port range. AllowedOrigins are extra
+ * browser origins ("https://play.example.com", scheme http or https, a DNS
+ * name or IP address and an optional port; at most 16). Env keys must match
+ * ^[A-Za-z_][A-Za-z0-9_]{0,127}$, be unique ignoring case and not start with
+ * GOLEM_ (reserved for the daemon); values are single-line UTF-8 (no NUL, CR
+ * or LF); at most 32 KiB per variable, 128 variables and 64 KiB in total. A
+ * rejected value is reported with field "env.<KEY>". DesiredState defaults
+ * to "stopped"; "running" starts a server.start job right after creation.
  */
 export interface CreateServerRequest {
   name: string;
-  project_id?: number /* int64 */;
-  image: string;
+  build_id: number /* int64 */;
   port?: number /* int */;
+  allowed_origins?: string[];
   env?: { [key: string]: string};
   desired_state?: DesiredState;
 }
 /**
  * UpdateServerRequest is the body of PATCH /api/v1/servers/{id}. Absent fields
- * are unchanged. EnvSet adds or overwrites variables, EnvUnset removes them
- * (a key may not appear in both); unmentioned variables keep their stored
- * values, so the UI never has to re-send secrets. Changes apply on the next
- * (re)start. Changing Port while the server's container is running is
- * refused with 409 conflict (stop the server first).
+ * are unchanged. BuildID switches the server to another successful build.
+ * AllowedOrigins replaces the list (send [] to clear it). EnvSet adds or
+ * overwrites variables, EnvUnset removes them (a key may not appear in
+ * both); unmentioned variables keep their stored values, so the UI never has
+ * to re-send secrets. Changes apply on the next (re)start. Changing Port
+ * while the server's container is running is refused with 409 conflict
+ * (stop the server first).
  */
 export interface UpdateServerRequest {
-  image?: string;
+  build_id?: number /* int64 */;
   port?: number /* int */;
+  allowed_origins?: string[];
   env_set?: { [key: string]: string};
   env_unset?: string[];
 }
@@ -868,16 +965,19 @@ export interface ServerStats {
   sampled_at: string /* RFC 3339, UTC */;
 }
 /**
- * ServerSpec is the portable definition of one server in an export.
- * Project is referenced by name because ids differ between hosts. On import,
- * Image must name a managed image present on the host and DesiredState is
- * validated but imported servers are always created stopped.
+ * ServerSpec is the portable definition of one server in an export. The
+ * build is referenced portably by project name and commit (ids differ
+ * between hosts): on import it resolves to the newest successful build of
+ * Project with that Commit, or to the newest successful build of Project
+ * when Commit is empty. DesiredState is validated but imported servers are
+ * always created stopped.
  */
 export interface ServerSpec {
   name: string;
-  project?: string;
-  image: string;
+  project: string;
+  commit?: string;
   port?: number /* int */;
+  allowed_origins?: string[];
   env?: { [key: string]: string};
   desired_state: DesiredState;
 }
@@ -888,7 +988,7 @@ export interface ServerSpec {
  */
 export interface ServerExport {
   /**
-   * FormatVersion is 1.
+   * FormatVersion is 2.
    */
   format_version: number /* int */;
   servers: ServerSpec[];
@@ -900,6 +1000,59 @@ export interface ServerExport {
  */
 export interface ServerImportResult {
   created: Server[];
+}
+/**
+ * ServerRuntime is the body of GET /api/v1/servers/{id}/runtime: what the
+ * running game reports through its admin endpoint. Every value comes from
+ * the game and is bounded and sanitised by the daemon.
+ */
+export interface ServerRuntime {
+  /**
+   * Ready reports whether the game accepts players; NotReadyReason is the
+   * game's reason otherwise (e.g. "starting", "stopping").
+   */
+  ready: boolean;
+  not_ready_reason: string;
+  /**
+   * Sessions is the number of connected players.
+   */
+  sessions: number /* int */;
+  entities: number /* int */;
+  uptime_seconds: number /* float64 */;
+  tick: ServerTickStats;
+  game_name: string;
+  engine_version: string;
+  /**
+   * Transport is "webtransport", "websocket" or "unknown".
+   */
+  transport: string;
+  schema_fingerprint: string;
+  /**
+   * CertificateHashesPublished reports whether the game publishes its
+   * certificate hashes for browser pinning (self-signed certificates).
+   */
+  certificate_hashes_published: boolean;
+  sampled_at: string /* RFC 3339, UTC */;
+}
+/**
+ * ServerTickStats are the game loop's tick statistics.
+ */
+export interface ServerTickStats {
+  /**
+   * Tick is the current tick number.
+   */
+  tick: number /* int64 */;
+  /**
+   * Rate is the configured tick rate in ticks per second.
+   */
+  rate: number /* int */;
+  budget_ms: number /* float64 */;
+  last_ms: number /* float64 */;
+  max_ms: number /* float64 */;
+  /**
+   * Overruns counts ticks that took longer than the budget.
+   */
+  overruns: number /* int64 */;
 }
 
 //////////
@@ -943,11 +1096,22 @@ export interface Settings {
    * answers username_taken); login and its rate limits do not reveal it.
    */
   registration_enabled: boolean;
+  /**
+   * GameHost is the DNS name or IP address players use to reach game
+   * servers ("" when not set). EffectiveGameHost is what servers use: the
+   * game host, or the first --public-host when it is empty, or "" when
+   * neither exists (servers cannot start then).
+   */
+  game_host: string;
+  effective_game_host: string;
 }
 /**
  * UpdateSettingsRequest is the body of PATCH /api/v1/settings. Absent fields
- * are left unchanged.
+ * are left unchanged. GameHost must be a DNS name or an IP address (no
+ * scheme, port or path); "" clears it. Changing it regenerates a
+ * self-signed game certificate and marks running servers restart_required.
  */
 export interface UpdateSettingsRequest {
   registration_enabled?: boolean;
+  game_host?: string;
 }

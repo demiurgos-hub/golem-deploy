@@ -85,7 +85,8 @@ func buildImage(t *testing.T, tag, dockerfile string, managed bool) string {
 	t.Helper()
 	args := []string{"build", "--quiet", "--tag", tag}
 	if managed {
-		args = append(args, "--label", docker.LabelManaged+"=true", "--label", docker.LabelCommit+"=itest")
+		args = append(args, "--label", docker.LabelManaged+"=true", "--label", docker.LabelInstance+"="+dockertest.IntegrationInstanceID,
+			"--label", docker.LabelCommit+"=itest")
 	}
 	args = append(args, "-")
 	dockerCLI(t, dockerfile, args...)

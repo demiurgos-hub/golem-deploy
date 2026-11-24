@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
@@ -12,8 +13,8 @@ import (
 )
 
 // ExportFormatVersion is the ServerExport format this daemon writes and
-// accepts.
-const ExportFormatVersion = 1
+// accepts (2: servers reference a build by project and commit).
+const ExportFormatVersion = 2
 
 // MaxImportServers bounds one import document. With MaxEnvBytes of env per
 // server the largest possible document stays below MaxImportBytes even
@@ -24,39 +25,52 @@ const MaxImportServers = 128
 const MaxImportBytes = 64 << 20
 
 // Export returns every server definition including env values in plain
-// text (admin only).
+// text (admin only). A server's build is written as its project's name and
+// commit; a server without a build is exported with an empty project (it
+// cannot be imported until one is chosen).
 func (s *Service) Export(ctx context.Context) (apitypes.ServerExport, error) {
 	rows, err := s.store.ListServers(ctx)
 	if err != nil {
 		return apitypes.ServerExport{}, err
 	}
 	projects := map[int64]string{}
+	bc := s.builds()
 	out := apitypes.ServerExport{FormatVersion: ExportFormatVersion, Servers: make([]apitypes.ServerSpec, 0, len(rows))}
 	for _, sv := range rows {
 		env, err := s.openEnv(sv)
 		if err != nil {
 			return apitypes.ServerExport{}, err
 		}
-		spec := apitypes.ServerSpec{Name: sv.Name, Image: sv.Image, Port: sv.Port, DesiredState: apitypes.DesiredState(sv.DesiredState)}
+		spec := apitypes.ServerSpec{Name: sv.Name, Port: sv.Port, DesiredState: apitypes.DesiredState(sv.DesiredState)}
 		if len(env) > 0 {
 			spec.Env = env
 		}
-		if sv.ProjectID != nil {
-			name, ok := projects[*sv.ProjectID]
+		if len(sv.AllowedOrigins) > 0 {
+			spec.AllowedOrigins = append([]string{}, sv.AllowedOrigins...)
+		}
+		b, err := bc.get(ctx, sv)
+		if err != nil {
+			return apitypes.ServerExport{}, err
+		}
+		if b != nil {
+			name, ok := projects[b.ProjectID]
 			if !ok {
-				p, err := s.store.GetProject(ctx, *sv.ProjectID)
+				p, err := s.store.GetProject(ctx, b.ProjectID)
 				if err != nil && !errors.Is(err, store.ErrNotFound) {
 					return apitypes.ServerExport{}, err
 				}
 				name = p.Name
-				projects[*sv.ProjectID] = name
+				projects[b.ProjectID] = name
 			}
-			spec.Project = name
+			spec.Project, spec.Commit = name, b.Commit
 		}
 		out.Servers = append(out.Servers, spec)
 	}
 	return out, nil
 }
+
+// commitRE matches a full commit hash (SHA-1 or SHA-256 repositories).
+var commitRE = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
 
 // Import validates the whole document and then creates every server in one
 // transaction (all or nothing). Imported servers are always created
@@ -72,16 +86,6 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 	if len(doc.Servers) > MaxImportServers {
 		return nil, fieldErr("servers", "at most %d servers can be imported at once", MaxImportServers)
 	}
-	// Resolve and verify every image before taking the write lock (each is
-	// a docker call).
-	images := make([]string, len(doc.Servers))
-	for i, sp := range doc.Servers {
-		var err error
-		if images[i], err = s.resolveImage(ctx, fmt.Sprintf("servers[%d].image", i), sp.Image); err != nil {
-			return nil, err
-		}
-	}
-
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	existing, err := s.store.ListServers(ctx)
@@ -101,6 +105,11 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 	rows := make([]store.Server, len(doc.Servers))
 	envs := make([]map[string]string, len(doc.Servers))
 	projectIDs := map[string]int64{}
+	type buildKey struct {
+		project int64
+		commit  string
+	}
+	buildIDs := map[buildKey]int64{}
 
 	// Pass 1: everything except auto-assigned ports.
 	for i, sp := range doc.Servers {
@@ -123,22 +132,45 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 		if err := validateEnv(f("env"), sp.Env); err != nil {
 			return nil, err
 		}
-		row := store.Server{Name: sp.Name, DesiredState: "stopped"}
-		if sp.Project != "" {
-			pid, ok := projectIDs[sp.Project]
-			if !ok {
-				p, err := s.store.GetProjectByName(ctx, strings.ToLower(sp.Project))
-				if errors.Is(err, store.ErrNotFound) {
-					return nil, fieldErr(f("project"), "project %q does not exist", sp.Project)
-				}
-				if err != nil {
-					return nil, err
-				}
-				pid = p.ID
-				projectIDs[sp.Project] = pid
-			}
-			row.ProjectID = &pid
+		origins, err := validateOrigins(f("allowed_origins"), sp.AllowedOrigins)
+		if err != nil {
+			return nil, err
 		}
+		row := store.Server{Name: sp.Name, DesiredState: "stopped", AllowedOrigins: origins}
+		if sp.Project == "" {
+			return nil, fieldErr(f("project"), "project is required (the server runs a build of that project)")
+		}
+		if sp.Commit != "" && !commitRE.MatchString(sp.Commit) {
+			return nil, fieldErr(f("commit"), "commit must be a full lower-case commit hash")
+		}
+		pid, ok := projectIDs[sp.Project]
+		if !ok {
+			p, err := s.store.GetProjectByName(ctx, strings.ToLower(sp.Project))
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, fieldErr(f("project"), "project %q does not exist", clipName(sp.Project))
+			}
+			if err != nil {
+				return nil, err
+			}
+			pid = p.ID
+			projectIDs[sp.Project] = pid
+		}
+		key := buildKey{pid, sp.Commit}
+		bid, ok := buildIDs[key]
+		if !ok {
+			b, err := s.store.LatestSuccessfulBuild(ctx, pid, sp.Commit)
+			switch {
+			case errors.Is(err, store.ErrNotFound) && sp.Commit == "":
+				return nil, fieldErr(f("project"), "project %q has no successful build", clipName(sp.Project))
+			case errors.Is(err, store.ErrNotFound):
+				return nil, fieldErr(f("commit"), "project %q has no successful build of commit %s", clipName(sp.Project), sp.Commit)
+			case err != nil:
+				return nil, err
+			}
+			bid = b.ID
+			buildIDs[key] = bid
+		}
+		row.BuildID = &bid
 		if sp.Port != nil {
 			p := *sp.Port
 			if err := s.checkPort(f("port"), p); err != nil {
@@ -153,7 +185,6 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 			docPorts[p] = true
 			row.Port = &p
 		}
-		row.Image = images[i]
 		rows[i] = row
 		envs[i] = sp.Env
 	}
@@ -185,7 +216,7 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 	}
 	out := make([]apitypes.Server, 0, len(created))
 	for _, sv := range created {
-		v, err := s.view(sv, nil, true)
+		v, err := s.viewOne(ctx, sv, nil, true)
 		if err != nil {
 			return nil, err
 		}
@@ -193,4 +224,19 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 	}
 	s.logger.Info("servers imported", "count", len(out))
 	return out, nil
+}
+
+// clipName bounds a name from an import document echoed in a message.
+func clipName(s string) string {
+	out := []rune{}
+	for _, r := range s {
+		if len(out) == 64 {
+			return string(out) + "..."
+		}
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || (r >= 0x200b && r <= 0x206f) {
+			r = '?'
+		}
+		out = append(out, r)
+	}
+	return string(out)
 }

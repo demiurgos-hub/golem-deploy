@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/term"
 
@@ -182,6 +183,14 @@ func cmdServe(args []string, stderr io.Writer) int {
 	memoryMB := fs.Int("server-memory-mb", memDefault, "memory limit per server container in MiB (swap is not added); 0 means unlimited (env GOLEM_DEPLOY_SERVER_MEMORY_MB)")
 	cpus := fs.Float64("server-cpus", cpuDefault, "CPU limit per server container; 0 means unlimited (env GOLEM_DEPLOY_SERVER_CPUS)")
 	staticQuota := fs.Int("static-quota-mb", staticQuotaDefault, "total size limit of the static file store in MiB; 0 means unlimited (env GOLEM_DEPLOY_STATIC_QUOTA_MB)")
+	startTimeoutDefault := 60 * time.Second
+	if v := envDefault("GOLEM_DEPLOY_START_TIMEOUT", ""); v != "" {
+		if startTimeoutDefault, err = time.ParseDuration(v); err != nil {
+			fmt.Fprintf(stderr, "GOLEM_DEPLOY_START_TIMEOUT: invalid duration %q\n", v)
+			return 2
+		}
+	}
+	startTimeout := fs.Duration("start-timeout", startTimeoutDefault, "how long a server start waits for the game to report ready on its admin endpoint (env GOLEM_DEPLOY_START_TIMEOUT)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -207,6 +216,7 @@ func cmdServe(args []string, stderr io.Writer) int {
 		ServerCPUs:      *cpus,
 		MaxRepoSizeMB:   *maxRepoSize,
 		StaticQuotaMB:   *staticQuota,
+		StartTimeout:    *startTimeout,
 		Version:         buildVersion(),
 		Logger:          logger,
 		SPA:             frontend.Handler(),

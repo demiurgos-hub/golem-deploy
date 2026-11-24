@@ -93,6 +93,11 @@ func ServerEnvPurpose(id int64) string {
 	return "servers.env:" + strconv.FormatInt(id, 10)
 }
 
+// ServerAdminTokenPurpose is the purpose for servers.admin_token of row id.
+func ServerAdminTokenPurpose(id int64) string {
+	return "servers.admin_token:" + strconv.FormatInt(id, 10)
+}
+
 // LoadOrCreate returns a Box for the key file at path, creating a random key
 // with mode 0600 on first use.
 func LoadOrCreate(path string) (*Box, error) {

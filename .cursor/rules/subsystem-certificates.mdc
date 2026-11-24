@@ -1,0 +1,15 @@
+---
+description: Game certificate manager (self-signed and custom), its files, permissions and API
+globs: "{internal/certs/**/*.go,internal/httpapi/handlers_certificates.go,docs/CERTIFICATES.md}"
+alwaysApply: false
+---
+
+# Game certificates
+
+- `internal/certs.Manager` owns `<data>/certs/game/` (`tls.crt`, `tls.key`), the only certificate game servers see; it is bind-mounted read-only at `certs.ContainerDir` (the servers rule) and never baked into images. The panel's own `--tls-cert` is unrelated.
+- The mode lives in settings (`SettingMode`, `""` = `self_signed`). `Ensure(host)` is the single entry point used at startup, hourly (`Maintain`/`Check`), before every server start, by `GET /certificates/game` and after a `game_host` change: in `self_signed` it (re)generates when the pair is missing/invalid, not self-signed, its SANs differ from `selfSignedNames(host)`, it is not yet valid or less than `RenewBefore` remains; in `custom` it never changes files and reports `ErrNoCertificate`/`ErrExpired`. A future ACME mode must fit this shape (write through `install`, renew in `Ensure`).
+- Self-signed: ECDSA P-256, `SelfSignedValidity` 13 days total including the one-hour backdate (WebTransport pinning allows at most 14), SANs game host + localhost + loopback. Custom uploads go through `ValidateCustom` (size caps, CERTIFICATE blocks only, one unencrypted key, RSA ≥ 2048 or ECDSA P-256/384/521, key matches leaf, valid now, server-auth EKU); `ValidationError` messages never contain key material, and the key is never returned or logged.
+- `install` writes both files fully (fsync, final mode and group) under `.new` names, then renames key first, certificate last; the engine rejects the transient mismatched pair and retries on its next poll. `recoverPending` completes or discards an interrupted replacement at `Open`. Keep this order and atomic renames; never bind-mount single files (a rename would not reach the container).
+- Permissions: dir 0750, key 0640, cert 0644. Unix `groupPolicy`: files get the daemon's egid and containers `GroupAdd` it; with egid 0 the files get `ContainerGID` (65532) and no group is added (never hand group 0 to a container). Windows: no group handling. `Info` strings are cleaned (`clean`) before they reach the API.
+- `ValidateHost` (DNS name or IP, normalised) is shared by the `game_host` setting and `servers.ValidateOrigin`.
+- Verify with `go test ./internal/certs/... ./internal/httpapi/...` (Unix permission/group checks run only on Unix: `TestFilePermissions`); `GOLEM_DEPLOY_DOCKER_TESTS=1` adds the real mount and replacement check in `TestIntegrationServersAPI`.

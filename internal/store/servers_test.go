@@ -10,11 +10,11 @@ func TestCreateServersIsAtomic(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
 	p1, p2 := 7001, 7002
-	if _, err := s.CreateServer(ctx, Server{Name: "existing", Image: "img", Port: &p1}, nil); err != nil {
+	if _, err := s.CreateServer(ctx, Server{Name: "existing", Port: &p1}, nil); err != nil {
 		t.Fatal(err)
 	}
 	// The second row collides on port: nothing is created.
-	_, err := s.CreateServers(ctx, []Server{{Name: "a", Image: "img", Port: &p2}, {Name: "b", Image: "img", Port: &p1}}, nil)
+	_, err := s.CreateServers(ctx, []Server{{Name: "a", Port: &p2}, {Name: "b", Port: &p1}}, nil)
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("got %v", err)
 	}
@@ -23,11 +23,11 @@ func TestCreateServersIsAtomic(t *testing.T) {
 	}
 	// A failing seal rolls back too.
 	boom := errors.New("boom")
-	_, err = s.CreateServers(ctx, []Server{{Name: "a", Image: "img", Port: &p2}}, func(int, int64) ([]byte, error) { return nil, boom })
+	_, err = s.CreateServers(ctx, []Server{{Name: "a", Port: &p2}}, func(int, int64) ([]byte, error) { return nil, boom })
 	if !errors.Is(err, boom) {
 		t.Fatalf("got %v", err)
 	}
-	created, err := s.CreateServers(ctx, []Server{{Name: "a", Image: "img", Port: &p2}}, func(i int, id int64) ([]byte, error) { return []byte{byte(i), byte(id)}, nil })
+	created, err := s.CreateServers(ctx, []Server{{Name: "a", Port: &p2}}, func(i int, id int64) ([]byte, error) { return []byte{byte(i), byte(id)}, nil })
 	if err != nil || len(created) != 1 || created[0].DesiredState != "stopped" || len(created[0].Env) != 2 {
 		t.Fatalf("%+v %v", created, err)
 	}
@@ -41,7 +41,7 @@ func TestSetServerDesiredState(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
 	p := 7001
-	sv, err := s.CreateServer(ctx, Server{Name: "a", Image: "img", Port: &p}, func(int64) ([]byte, error) { return []byte("env"), nil })
+	sv, err := s.CreateServer(ctx, Server{Name: "a", Port: &p}, func(int64) ([]byte, error) { return []byte("env"), nil })
 	if err != nil {
 		t.Fatal(err)
 	}

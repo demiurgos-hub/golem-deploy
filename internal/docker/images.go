@@ -18,10 +18,11 @@ type Image struct {
 	Labels    map[string]string
 	SizeBytes int64
 	Created   time.Time
-	// ProjectID and Commit come from the build labels (empty until the
-	// build pipeline sets them).
+	// ProjectID, Commit and BuildID come from the build labels (empty or
+	// zero when absent).
 	ProjectID *int64
 	Commit    string
+	BuildID   int64
 	// Volumes are the paths the image declares with VOLUME, sorted.
 	Volumes []string
 }
@@ -58,6 +59,9 @@ func (j imageJSON) image() Image {
 	if id, err := strconv.ParseInt(labels[LabelProjectID], 10, 64); err == nil && id > 0 {
 		img.ProjectID = &id
 	}
+	if id, err := strconv.ParseInt(labels[LabelBuildID], 10, 64); err == nil && id > 0 {
+		img.BuildID = id
+	}
 	return img
 }
 
@@ -87,9 +91,14 @@ func (c *Client) inspectImages(ctx context.Context, refs []string) ([]Image, err
 	return list, nil
 }
 
-// ListImages returns the managed images (deduplicated by id).
+// ListImages returns the images this installation manages (managed and
+// instance labels; deduplicated by id).
 func (c *Client) ListImages(ctx context.Context) ([]Image, error) {
-	out, err := c.output(ctx, quickTimeout, "image", "ls", "--all", "--no-trunc", "--filter", managedFilter(), "--format", "{{json .}}")
+	if err := c.needInstance(); err != nil {
+		return nil, err
+	}
+	out, err := c.output(ctx, quickTimeout, "image", "ls", "--all", "--no-trunc", "--filter", managedFilter(), "--filter", c.instanceFilter(),
+		"--format", "{{json .}}")
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +120,7 @@ func (c *Client) ListImages(ctx context.Context) ([]Image, error) {
 	}
 	res := make([]Image, 0, len(all))
 	for _, img := range all {
-		if IsManaged(img.Labels) && !slices.ContainsFunc(res, func(x Image) bool { return x.ID == img.ID }) {
+		if c.ours(img.Labels) && !slices.ContainsFunc(res, func(x Image) bool { return x.ID == img.ID }) {
 			res = append(res, img)
 		}
 	}
@@ -120,11 +129,15 @@ func (c *Client) ListImages(ctx context.Context) ([]Image, error) {
 }
 
 // ManagedImage resolves ref (tag, id or name@digest) and returns the image
-// if it carries the managed label: ErrNotFound if absent, ErrNotManaged if
-// unlabelled. Image trust is provisional: until the build pipeline records
-// the ids of the images it builds, any image carrying the managed label is
-// accepted (images are not labelled with the instance id).
+// if it carries the managed label and this installation's instance label:
+// ErrNotFound if absent, ErrNotManaged otherwise. It is used to list and
+// delete images; it is not enough to run one: labels can be set by anyone
+// who builds an image, so a server runs only the image recorded on a
+// successful build, verified with BuildImage.
 func (c *Client) ManagedImage(ctx context.Context, ref string) (Image, error) {
+	if err := c.needInstance(); err != nil {
+		return Image{}, err
+	}
 	if err := ValidateImageRef(ref); err != nil {
 		return Image{}, err
 	}
@@ -135,10 +148,42 @@ func (c *Client) ManagedImage(ctx context.Context, ref string) (Image, error) {
 	if len(list) != 1 {
 		return Image{}, ErrNotFound
 	}
-	if !IsManaged(list[0].Labels) || !imageIDRE.MatchString(list[0].ID) {
+	if !c.ours(list[0].Labels) || !imageIDRE.MatchString(list[0].ID) {
 		return Image{}, ErrNotManaged
 	}
 	return list[0], nil
+}
+
+// BuildImage verifies that image id (a full immutable id, the image_id of
+// a successful builds row) exists and carries the managed label, this
+// installation's instance label and the build-id label buildID. It returns
+// ErrNotFound when the image is gone, ErrNotManaged when the managed or
+// instance label is missing or different, and ErrNotOurs when the build-id
+// label names another build. The store row is what makes an image
+// trusted; the labels are a second check that the id still names the
+// image that build produced.
+func (c *Client) BuildImage(ctx context.Context, id string, buildID int64) (Image, error) {
+	if err := c.needInstance(); err != nil {
+		return Image{}, err
+	}
+	if !imageIDRE.MatchString(id) || buildID <= 0 {
+		return Image{}, invalid("image", "image must be a full image id of a build")
+	}
+	list, err := c.inspectImages(ctx, []string{id})
+	if err != nil {
+		return Image{}, err
+	}
+	if len(list) != 1 || list[0].ID != id {
+		return Image{}, ErrNotFound
+	}
+	img := list[0]
+	if !c.ours(img.Labels) {
+		return Image{}, ErrNotManaged
+	}
+	if img.Labels[LabelBuildID] != strconv.FormatInt(buildID, 10) {
+		return Image{}, ErrNotOurs
+	}
+	return img, nil
 }
 
 // ContainersUsingImage reports whether any container (managed or not) was
