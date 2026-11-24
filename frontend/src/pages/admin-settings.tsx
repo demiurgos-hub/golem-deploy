@@ -163,7 +163,16 @@ function GameHostSection() {
               Save game host
             </Button>
             {draft !== null && (
-              <Button size="sm" variant="ghost" onClick={() => setDraft(null)} disabled={save.isPending}>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setDraft(null);
+                  setError(null);
+                  save.reset();
+                }}
+                disabled={save.isPending}
+              >
                 Discard
               </Button>
             )}

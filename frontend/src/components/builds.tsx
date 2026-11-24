@@ -107,7 +107,9 @@ export function ProjectBuildsSection({ project, busy, onJob }: { project: Projec
   const jobs = useSubjectJobs("project", project.id, 100);
   const isAdmin = account.data?.role === "admin";
   const noCheckout = project.last_commit === "";
-  const [pull, setPull] = useState(noCheckout);
+  // Without a checkout a build must pull; otherwise the user decides (off by default).
+  const [pullChoice, setPull] = useState(false);
+  const pull = noCheckout || pullChoice;
   const [deleting, setDeleting] = useState<Build | null>(null);
   const activeBuild = builds.data?.items.find(isBuildActive);
 
@@ -137,7 +139,7 @@ export function ProjectBuildsSection({ project, busy, onJob }: { project: Projec
         <>
           <Checkbox
             label="Pull first"
-            checked={pull || noCheckout}
+            checked={pull}
             disabled={noCheckout || start.isPending}
             onChange={(e) => setPull(e.target.checked)}
             className="text-xs"
@@ -152,7 +154,7 @@ export function ProjectBuildsSection({ project, busy, onJob }: { project: Projec
     >
       <div className="flex flex-col gap-3">
         <p className="text-xs text-muted-foreground">
-          {pull || noCheckout
+          {pull
             ? "The build first pulls the branch (local changes are discarded), then builds the new commit."
             : `The build uses the current checkout${project.last_commit ? ` (commit ${shortCommit(project.last_commit)})` : ""}. Tick "Pull first" to build the branch's latest commit.`}
           {activeBuild ? " One build runs at a time on this host; others wait in the queue." : ""}

@@ -690,6 +690,41 @@ describe("images and static files", () => {
   });
 });
 
+describe("regressions found against the real daemon", () => {
+  it("does not keep Pull first ticked once the clone that forced it has finished", async () => {
+    let current = projectFixture({ status: "cloning", last_commit: "", last_pulled_at: null });
+    renderApp({
+      path: "/projects/5",
+      signedInAs: account(),
+      routes: projectRoutes([], { "GET /projects/{id}": () => jsonResponse(200, current) }),
+    });
+    const box = await screen.findByLabelText("Pull first");
+    expect(box).toBeChecked();
+    expect(box).toBeDisabled();
+    current = projectFixture();
+    await waitFor(() => expect(screen.getByLabelText("Pull first")).not.toBeChecked(), { timeout: 4000 });
+    expect(screen.getByLabelText("Pull first")).toBeEnabled();
+  });
+
+  it("clears the game host error on Discard", async () => {
+    const { user } = renderApp({
+      path: "/admin/settings",
+      signedInAs: account(),
+      routes: {
+        "GET /settings": () => jsonResponse(200, { registration_enabled: false, game_host: "", effective_game_host: "localhost" }),
+        "GET /certificates/game": () => jsonResponse(200, { mode: "self_signed", game_host: "localhost", certificate: null }),
+      },
+    });
+    const input = await screen.findByRole("textbox", { name: "Game host" });
+    await user.type(input, "bad host");
+    await user.click(screen.getByRole("button", { name: "Save game host" }));
+    expect(screen.getByText("The host name cannot contain spaces.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Discard" }));
+    expect(screen.queryByText("The host name cannot contain spaces.")).toBeNull();
+    expect(input).toHaveValue("");
+  });
+});
+
 describe("first run", () => {
   it("shows the order of the steps and links the next one", async () => {
     const view = renderApp({
