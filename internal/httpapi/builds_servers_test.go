@@ -65,6 +65,73 @@ func TestBuildToServer(t *testing.T) {
 	}
 }
 
+// One rule for build images everywhere: an image is in use while a
+// successful build records it or any container (also a stopped server's,
+// which keeps its container) was created from it. A server switched to
+// another build keeps the old build's container until it is started again,
+// so the old build, its image and its project cannot be deleted until then.
+func TestBuildImageInUseByStoppedContainer(t *testing.T) {
+	b := newBuildHarness(t)
+	b.fake.SetBuildHook(func(dockertest.BuildCall) dockertest.BuildOutcome {
+		return dockertest.BuildOutcome{AssignPort: b.gameAdmin.Port}
+	})
+	built := func(p store.Project) apitypes.Build {
+		res := b.startBuild(b.devTok, p.ID, nil)
+		if j := b.waitJob(res.Job); j.Status != store.JobSuccess {
+			t.Fatalf("build: %s", j.Detail)
+		}
+		return b.getBuild(res.Build.ID)
+	}
+	pa, pb := b.project("alpha"), b.project("beta")
+	a1, b1 := built(pa), built(pb)
+	sv := b.createServer(b.devTok, apitypes.CreateServerRequest{Name: "s", BuildID: a1.ID})
+	if j := b.action(b.devTok, sv.ID, "start"); j.Status != store.JobSuccess {
+		t.Fatalf("start: %s", j.Detail)
+	}
+	if rr := b.call("PATCH", fmt.Sprintf("/api/v1/servers/%d", sv.ID), b.devTok, apitypes.UpdateServerRequest{BuildID: &b1.ID}); rr.Code != http.StatusOK {
+		t.Fatalf("patch: %d %s", rr.Code, rr.Body.String())
+	}
+	if j := b.action(b.devTok, sv.ID, "stop"); j.Status != store.JobSuccess {
+		t.Fatalf("stop: %s", j.Detail)
+	}
+	// No server is configured with a1 any more, but the stopped container
+	// of the server still is a1's image.
+	images := decode[apitypes.ImageList](t, b.call("GET", "/api/v1/images", b.devTok, nil))
+	for _, img := range images.Items {
+		if img.ID == a1.ImageID && (!img.InUse || len(img.BuildIDs) != 1 || len(img.ServerIDs) != 0) {
+			t.Fatalf("%+v", img)
+		}
+	}
+	want := fmt.Sprintf("the container of server %d still uses", sv.ID)
+	e := errBody(t, b.call("DELETE", fmt.Sprintf("/api/v1/builds/%d", a1.ID), b.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	if !strings.Contains(e.Message, want) {
+		t.Fatal(e.Message)
+	}
+	e = errBody(t, b.call("DELETE", fmt.Sprintf("/api/v1/projects/%d", pa.ID), b.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	if !strings.Contains(e.Message, want) {
+		t.Fatal(e.Message)
+	}
+	// DELETE /images never removes an image a build records.
+	errBody(t, b.call("DELETE", "/api/v1/images/"+a1.ImageID, b.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	if _, err := b.st.GetProject(b.t.Context(), pa.ID); err != nil || !b.fake.HasImage(a1.ImageID) {
+		t.Fatalf("project or image removed: %v", err)
+	}
+	// Starting the server again recreates its container from b1: alpha
+	// can go, with its build and image.
+	if j := b.action(b.devTok, sv.ID, "start"); j.Status != store.JobSuccess {
+		t.Fatalf("start: %s", j.Detail)
+	}
+	if rr := b.call("DELETE", fmt.Sprintf("/api/v1/projects/%d", pa.ID), b.adminSs, nil); rr.Code != http.StatusNoContent {
+		t.Fatalf("delete project: %d %s", rr.Code, rr.Body.String())
+	}
+	if b.fake.HasImage(a1.ImageID) {
+		t.Fatal("the deleted project's image is still there")
+	}
+	if !b.fake.HasImage(b1.ImageID) {
+		t.Fatal("the running server's image was removed")
+	}
+}
+
 func (b *buildHarness) getServerContainer(id int64) string {
 	b.t.Helper()
 	sv, err := b.st.GetServer(b.t.Context(), id)

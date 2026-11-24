@@ -3,14 +3,17 @@ package servers
 import (
 	"context"
 	"errors"
-	"slices"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 )
 
 // Images returns this installation's managed images with the builds that
-// produced them and the servers whose build uses them.
+// produced them and the servers whose build uses them. An image is in_use
+// while a successful build records it or any container (managed or not,
+// running or stopped) was created from it: the rule every deletion path
+// applies (DELETE /images here, build deletion, retention and project
+// deletion in internal/build).
 func (s *Service) Images(ctx context.Context) ([]apitypes.Image, error) {
 	imgs, err := s.docker.ListImages(ctx)
 	if err != nil {
@@ -24,7 +27,7 @@ func (s *Service) Images(ctx context.Context) ([]apitypes.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	cts, err := s.docker.ManagedContainers(ctx)
+	usedByContainers, err := s.docker.ImagesInUse(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +59,7 @@ func (s *Service) Images(ctx context.Context) ([]apitypes.Image, error) {
 				v.ServerIDs = append(v.ServerIDs, r.ID)
 			}
 		}
-		v.InUse = len(v.ServerIDs) > 0 || len(v.BuildIDs) > 0 || slices.ContainsFunc(cts, func(c docker.Container) bool { return c.ImageID == img.ID })
+		v.InUse = len(v.ServerIDs) > 0 || len(v.BuildIDs) > 0 || usedByContainers[img.ID]
 		out = append(out, v)
 	}
 	return out, nil

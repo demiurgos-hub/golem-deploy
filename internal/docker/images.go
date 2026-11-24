@@ -189,16 +189,6 @@ func (c *Client) BuildImage(ctx context.Context, ref BuildRef) (Image, error) {
 	return img, nil
 }
 
-// ContainersUsingImage reports whether any container (managed or not) was
-// created from the image id.
-func (c *Client) containersUsingImage(ctx context.Context, id string) (bool, error) {
-	ids, err := c.psIDs(ctx, "ancestor="+id)
-	if err != nil {
-		return false, err
-	}
-	return len(ids) > 0, nil
-}
-
 // RemoveImage deletes a managed image. It refuses unmanaged images
 // (ErrNotManaged) and images used by any container (ErrInUse); callers
 // check their own references (server rows) first.
@@ -210,11 +200,11 @@ func (c *Client) RemoveImage(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	used, err := c.containersUsingImage(ctx, img.ID)
+	used, err := c.ContainersUsingImage(ctx, img.ID)
 	if err != nil {
 		return err
 	}
-	if used {
+	if len(used) > 0 {
 		return ErrInUse
 	}
 	// Always by the immutable id that was checked, never by a tag (a tag

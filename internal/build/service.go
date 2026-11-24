@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,8 +61,24 @@ const (
 	DetailVanished    = "the build job ended unexpectedly; see the build log"
 )
 
-// ErrImageInUse means a build's image is used by a container.
+// ErrImageInUse means a build's image is used by a container. Errors that
+// match it are *ImageInUseError values naming the servers concerned.
 var ErrImageInUse = errors.New("build: the image is used by a container")
+
+// ImageInUseError means containers still use a build's image, which
+// therefore cannot be removed. ServerIDs are the servers whose recorded
+// container it is (a server keeps its container, also when stopped, until
+// it is started again, possibly with another build, or deleted); Others
+// counts containers that are no server's.
+type ImageInUseError struct {
+	ServerIDs []int64
+	Others    int
+}
+
+func (e *ImageInUseError) Error() string { return ErrImageInUse.Error() }
+
+// Is makes errors.Is(err, ErrImageInUse) true.
+func (e *ImageInUseError) Is(target error) bool { return target == ErrImageInUse }
 
 // ErrTooManyBuilds means MaxActiveBuilds builds are already queued or
 // running.
@@ -71,7 +88,7 @@ var ErrTooManyBuilds = errors.New("build: too many builds are queued")
 type Docker interface {
 	Build(ctx context.Context, spec docker.BuildSpec, out io.Writer) error
 	BuiltImage(ctx context.Context, spec docker.BuildSpec) (docker.Image, error)
-	ImageInUse(ctx context.Context, id string) (bool, error)
+	ContainersUsingImage(ctx context.Context, id string) ([]string, error)
 	RemoveImage(ctx context.Context, id string) error
 }
 
@@ -512,7 +529,13 @@ func (s *Service) retain(projectID int64, log io.Writer) {
 // Delete removes a terminal build that no server is configured with,
 // together with its image (unless another successful build shares the
 // image). Errors: store.ErrNotFound, store.ErrActive, store.ErrInUse,
-// ErrImageInUse, docker errors (ErrUnavailable).
+// *ImageInUseError, docker errors (ErrUnavailable).
+//
+// The image rules are the same everywhere (build deletion, retention,
+// project deletion, DELETE /images): an image is in use while a successful
+// build records it or any container was created from it. Deleting a build
+// drops its own record; its image is then removed unless another build
+// still records it, and the deletion is refused while a container uses it.
 func (s *Service) Delete(ctx context.Context, id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -539,12 +562,8 @@ func (s *Service) deleteLocked(ctx context.Context, b store.Build) error {
 			return err
 		}
 		if shared == 0 {
-			inUse, err := s.o.Docker.ImageInUse(ctx, b.ImageID)
-			if err != nil {
+			if err := s.imageUsers(ctx, b.ImageID); err != nil {
 				return err
-			}
-			if inUse {
-				return ErrImageInUse
 			}
 			removeImage = true
 		}
@@ -556,6 +575,63 @@ func (s *Service) deleteLocked(ctx context.Context, b store.Build) error {
 		s.removeImage(ctx, b.ID, b.ImageID)
 	}
 	return nil
+}
+
+// imageUsers returns an *ImageInUseError when containers use the image.
+func (s *Service) imageUsers(ctx context.Context, imageID string) error {
+	cids, err := s.o.Docker.ContainersUsingImage(ctx, imageID)
+	if err != nil || len(cids) == 0 {
+		return err
+	}
+	rows, err := s.o.Store.ListServers(ctx)
+	if err != nil {
+		return err
+	}
+	e := &ImageInUseError{ServerIDs: []int64{}}
+	for _, cid := range cids {
+		i := slices.IndexFunc(rows, func(r store.Server) bool { return r.ContainerID == cid })
+		if i < 0 {
+			e.Others++
+			continue
+		}
+		e.ServerIDs = append(e.ServerIDs, rows[i].ID)
+	}
+	slices.Sort(e.ServerIDs)
+	return e
+}
+
+// CheckProjectImages returns an *ImageInUseError (servers of all builds
+// merged) when containers use the image of one of builds, a project's
+// builds about to be deleted with it. Call it before deleting the project.
+func (s *Service) CheckProjectImages(ctx context.Context, builds []store.Build) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var all *ImageInUseError
+	seen := map[string]bool{}
+	for _, b := range builds {
+		if b.Status != store.BuildStatusSuccess || b.ImageID == "" || seen[b.ImageID] {
+			continue
+		}
+		seen[b.ImageID] = true
+		err := s.imageUsers(ctx, b.ImageID)
+		var e *ImageInUseError
+		switch {
+		case errors.As(err, &e):
+			if all == nil {
+				all = &ImageInUseError{ServerIDs: []int64{}}
+			}
+			all.ServerIDs = append(all.ServerIDs, e.ServerIDs...)
+			all.Others += e.Others
+		case err != nil:
+			return err
+		}
+	}
+	if all == nil {
+		return nil
+	}
+	slices.Sort(all.ServerIDs)
+	all.ServerIDs = slices.Compact(all.ServerIDs)
+	return all
 }
 
 // removeImage deletes a build's image, tolerating an image that is already

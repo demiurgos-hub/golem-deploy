@@ -236,7 +236,7 @@ func (s *Server) handleDeleteBuild(w http.ResponseWriter, r *http.Request) error
 	case errors.Is(err, store.ErrInUse):
 		return conflict(apitypes.ErrorCodeConflict, "servers are configured with this build; assign them another build or delete them first")
 	case errors.Is(err, build.ErrImageInUse):
-		return conflict(apitypes.ErrorCodeConflict, "a container uses this build's image; remove the container first")
+		return imageInUseConflict(err, "this build's image")
 	case errors.Is(err, docker.ErrUnavailable):
 		return dockerUnavailable(err)
 	default:
@@ -245,6 +245,25 @@ func (s *Server) handleDeleteBuild(w http.ResponseWriter, r *http.Request) error
 	s.logger.Info("build deleted", "request_id", requestIDFrom(r.Context()), "by", identityFrom(r).Account.ID, "build_id", id)
 	w.WriteHeader(http.StatusNoContent)
 	return nil
+}
+
+// imageInUseConflict is the 409 for a build image that containers still
+// use (*build.ImageInUseError), naming the servers whose container it is.
+func imageInUseConflict(err error, what string) error {
+	var e *build.ImageInUseError
+	if !errors.As(err, &e) || len(e.ServerIDs) == 0 {
+		return conflict(apitypes.ErrorCodeConflict, "a container that is not a server's uses "+what+"; remove that container first")
+	}
+	return conflict(apitypes.ErrorCodeConflict, "the container of server "+joinIDs(e.ServerIDs)+" still uses "+what+
+		" (a server keeps its container, also when stopped, until it is started again or deleted); restart or delete those servers first")
+}
+
+func joinIDs(ids []int64) string {
+	strs := make([]string, 0, len(ids))
+	for _, id := range ids {
+		strs = append(strs, strconv.FormatInt(id, 10))
+	}
+	return strings.Join(strs, ", ")
 }
 
 // projectBuildsInUse returns a 409 when servers are configured with builds
@@ -257,11 +276,7 @@ func (s *Server) projectBuildsInUse(ctx context.Context, id int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	strs := make([]string, 0, len(ids))
-	for _, sid := range ids {
-		strs = append(strs, strconv.FormatInt(sid, 10))
-	}
-	return conflict(apitypes.ErrorCodeConflict, "servers are configured with builds of this project (server ids "+strings.Join(strs, ", ")+"); assign them another build or delete them first")
+	return conflict(apitypes.ErrorCodeConflict, "servers are configured with builds of this project (server ids "+joinIDs(ids)+"); assign them another build or delete them first")
 }
 
 // removeProjectImages deletes the images of a deleted project's builds in

@@ -274,11 +274,33 @@ func readCapped(path string, limit int64) ([]byte, error) {
 	return b, nil
 }
 
-// ImageInUse reports whether any container (managed or not) was created
-// from the image id.
-func (c *Client) ImageInUse(ctx context.Context, id string) (bool, error) {
+// ContainersUsingImage returns the ids of the containers (managed or not,
+// running or stopped) created from the image id. An image is in use while
+// this is not empty; RemoveImage refuses it then.
+func (c *Client) ContainersUsingImage(ctx context.Context, id string) ([]string, error) {
 	if !imageIDRE.MatchString(id) {
-		return false, invalid("id", "invalid image id")
+		return nil, invalid("id", "invalid image id")
 	}
-	return c.containersUsingImage(ctx, id)
+	return c.psIDs(ctx, "ancestor="+id)
+}
+
+// ImagesInUse returns the ids of the images that any container (managed or
+// not, running or stopped) was created from: the listing counterpart of
+// ContainersUsingImage.
+func (c *Client) ImagesInUse(ctx context.Context) (map[string]bool, error) {
+	ids, err := c.psIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cts, err := c.inspectContainers(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	used := make(map[string]bool, len(cts))
+	for _, ct := range cts {
+		if ct.ImageID != "" {
+			used[ct.ImageID] = true
+		}
+	}
+	return used, nil
 }

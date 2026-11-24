@@ -179,14 +179,14 @@ func TestImageInUse(t *testing.T) {
 	dc := docker.New(docker.Options{Runner: fake, InstanceID: dockertest.InstanceID})
 	id := dockertest.ImageID(5)
 	fake.AddImage(dockertest.Image{ID: id})
-	if used, err := dc.ImageInUse(context.Background(), id); err != nil || used {
+	if used, err := dc.ContainersUsingImage(context.Background(), id); err != nil || len(used) != 0 {
 		t.Fatalf("%v %v", used, err)
 	}
 	fake.AddContainer(dockertest.Container{Image: id, State: "exited"})
-	if used, err := dc.ImageInUse(context.Background(), id); err != nil || !used {
+	if used, err := dc.ContainersUsingImage(context.Background(), id); err != nil || len(used) != 1 {
 		t.Fatalf("%v %v", used, err)
 	}
-	if _, err := dc.ImageInUse(context.Background(), "abc"); err == nil {
+	if _, err := dc.ContainersUsingImage(context.Background(), "abc"); err == nil {
 		t.Fatal("short id accepted")
 	}
 }

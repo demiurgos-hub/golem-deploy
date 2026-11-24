@@ -12,6 +12,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/build"
+	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/git"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
@@ -412,6 +413,18 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) err
 	builds, err := s.store.ListBuilds(r.Context(), store.BuildFilter{ProjectID: &p.ID, Limit: 500})
 	if err != nil {
 		return internal(err)
+	}
+	if s.builds != nil {
+		// The project's build images go with it, so the same rule as for
+		// deleting a build applies: refused while a container uses one.
+		switch err := s.builds.CheckProjectImages(r.Context(), builds); {
+		case errors.Is(err, build.ErrImageInUse):
+			return imageInUseConflict(err, "an image of this project's builds")
+		case errors.Is(err, docker.ErrUnavailable):
+			return dockerUnavailable(err)
+		case err != nil:
+			return internal(err)
+		}
 	}
 	if s.proj.repoDir != "" {
 		err := git.RemoveCheckout(s.proj.repoDir, p.ID, s.proj.tmpDir)
