@@ -1,6 +1,6 @@
 # Game servers: operator notes
 
-Golem Deploy runs each game server as one Docker container through the `docker` CLI. The daemon user must be able to use Docker (on Linux: a member of the `docker` group, which is root-equivalent on that host). This note explains what the daemon touches, how containers are confined, how ports and networking work and what server environment variables are protected from. The HTTP contract is in [API.md](API.md).
+Golem Deploy runs each game server as one Docker container through the `docker` CLI, from the image of a successful build of a project. The daemon user must be able to use Docker (on Linux: a member of the `docker` group, which is root-equivalent on that host). This note explains what the daemon touches, how containers are confined and configured for the Golem Engine, how a start is health-gated, how ports and networking work and what server environment variables are protected from. The HTTP contract is in [API.md](API.md); the game certificate is described in [CERTIFICATES.md](CERTIFICATES.md).
 
 ## Managed objects
 
@@ -8,20 +8,16 @@ Every installation has a random **instance id** (32 hex characters, generated on
 
 | Object | Name | Labels (prefix `dev.golemengine.deploy.`) |
 |--------|------|--------|
-| Server container | `golem-deploy-<server name>` | `managed`, `instance`, `server-id`, `server`, `project-id`, `commit`, `config-hash` — all set explicitly on every run (empty when not applicable), so no value can be inherited from the image |
+| Server container | `golem-deploy-<server name>` | `managed`, `instance`, `server-id`, `server`, `project-id`, `commit`, `build-id`, `engine-version`, `config-hash` — all set explicitly on every run (empty when not applicable), so no value can be inherited from the image |
 | Network | `golem-deploy` (user-defined bridge, no inter-container traffic) | `managed`, `instance` |
-| Image | built by Golem Deploy (build pipeline: next milestone) | `managed`, `project-id`, `commit` |
+| Image | `golem-deploy/<project>:<commit>`, built by the build pipeline | `managed`, `instance`, `project-id`, `commit`, `build-id`, `engine-version` |
 | Volume | server data volumes (next milestone) | `managed`, `instance`, `server-id`, `server` |
 
 **A server's container is the container whose id the daemon recorded when it created it** (column `servers.container_id`), never "a container with the right labels": containers inherit the labels of their image, and once images are built from repositories, repository authors control image labels. The recorded container's labels are verified on every inspect as a second check. A container that carries the labels but is not a recorded container is ignored (not reported, read, stopped or removed) and logged once as a foreign container. Containers, images and volumes without the labels are invisible to the API and never touched. If a container named `golem-deploy-<name>` or a network named `golem-deploy` exists that this installation does not manage, starting a server fails with a message instead of touching it.
 
-A server can only run a managed image. **Image trust is provisional:** until the build pipeline records the ids of the images it builds, any image carrying `dev.golemengine.deploy.managed=true` is accepted (images are not labelled with the instance id). Until then you can label an image yourself:
+**A server runs a build, never an image reference.** Its image is the immutable `image_id` recorded on a `success` row of the builds table; labels alone are never trusted (anyone who builds an image can set them). Before every `docker run` the daemon also inspects that image and requires the managed label, this installation's instance label and a `build-id` label equal to the build's id, so an id that no longer names the image that build produced is refused. A hand-labelled image cannot be run. Servers created before servers ran builds have no build and cannot start until one is assigned (`PATCH /servers/{id}` with `build_id`).
 
-```sh
-docker build --label dev.golemengine.deploy.managed=true -t mygame:dev .
-```
-
-Images are deleted by their immutable id after the label check, never by tag.
+`GET /images` lists the images carrying the managed and instance labels; an image recorded on a build, used by a server's build or by any container is `in_use` and cannot be deleted (delete the build instead). Images are deleted by their immutable id after the label check, never by tag.
 
 ### Upgrading from a version without recorded container ids
 
@@ -45,9 +41,41 @@ Every server container is created with:
 - user `65532:65532` (distroless "nonroot"), never root;
 - `--init`, `--no-healthcheck` and `--stop-signal SIGTERM`, so image metadata cannot change them; a 30 s graceful stop timeout;
 - `--pids-limit 512`, `--memory` from `--server-memory-mb` (default 2048 MiB, with `--memory-swap` equal to it: no extra swap) and `--cpus` from `--server-cpus` (default 2); `0` means unlimited;
-- no restart policy while the start job waits for the container to settle (so a crash keeps its real exit code), then restart policy `on-failure:5` (applied with `docker update`);
+- no restart policy until the game reports ready (so a crash is never retried during a start and keeps its real exit code), then restart policy `on-failure:5` (applied with `docker update`);
+- the game certificate directory bind-mounted read-only at `/run/golem-deploy/tls`, and on Unix hosts the daemon's group as a supplementary group (`--group-add`) so uid 65532 can read the key (see [CERTIFICATES.md](CERTIFICATES.md));
+- the game's admin port (container TCP 7778) published on `127.0.0.1` only, on a port Docker assigns;
 - `json-file` logs capped at 3 × 10 MB;
 - the `golem-deploy` bridge network.
+
+## Engine deploy contract
+
+The daemon configures every container for the Golem Engine deploy contract (golem-engine v0.4: `golem.ServerConfigFromEnv` and the generated `Runtime.Host`). The game must use it, with **WebTransport as its primary transport** (the WebSocket fallback needs it; a WebSocket-primary game fails to start with these variables). These variables are injected by the daemon and override operator variables (whose names may not start with `GOLEM_` anyway):
+
+| Variable | Value |
+|----------|-------|
+| `GOLEM_ADDR` | `:7777` (WebTransport, UDP) |
+| `GOLEM_HTTP_ADDR` | `:7777` (HTTPS sidecar: realtime config, WebSocket fallback, the game's pages; TCP) |
+| `GOLEM_TLS_CERT_FILE`, `GOLEM_TLS_KEY_FILE` | `/run/golem-deploy/tls/tls.crt`, `/run/golem-deploy/tls/tls.key` |
+| `GOLEM_TLS_RELOAD_INTERVAL` | `30s` (replaced certificates are picked up without a restart) |
+| `GOLEM_PUBLIC_URL` | `https://<game host>:<port>/wt` (the engine's default WebTransport path) |
+| `GOLEM_WS_FALLBACK_URL` | `wss://<game host>:<port>/api/ws` |
+| `GOLEM_WT_ALLOWED_ORIGINS` | `https://<game host>:<port>` plus the server's `allowed_origins` (WebTransport and WebSocket) |
+| `GOLEM_TLS_PINNED` | `1` with a self-signed certificate (publish its hashes for pinning), `0` with a custom one |
+| `GOLEM_ADMIN_ADDR` | `:7778` |
+| `GOLEM_ADMIN_TOKEN` | a random 64-character token generated for each container |
+
+`<port>` is the server's host port and `<game host>` the `game_host` setting (or the first `--public-host`). Everything except the admin token is part of the server's config hash, so changing the game host, the allowed origins or the certificate mode marks running servers `restart_required`.
+
+The admin token is stored encrypted on the server row (never returned, never logged), reaches the container only through the env file like other values and is redacted from failed-start excerpts. The daemon talks to the admin endpoint only on `127.0.0.1:<assigned port>` with a strict client: short timeouts, no proxy, no redirects, no compressed bodies, at most 64 KiB per answer; every string the game returns is bounded and stripped of control and formatting characters before it is stored or returned.
+
+## Starting a server
+
+A start (and restart) job checks the build (successful, with an image), the port, the game host and the certificate (a self-signed one is generated or renewed here), verifies the build's image, removes the server's previous container, ensures the network, checks that the port is free, runs the container and records its id, admin port and sealed token. It then waits up to `--start-timeout` (default 60 s) for the game's admin `/ready` to answer ready:
+
+- ready: the game's schema fingerprint (admin `/info`) is recorded on the build, the restart policy is applied and the job succeeds;
+- the container exits first, or the timeout passes: the job fails with a short message pointing at the server log (`GET /servers/{id}/logs`); when the admin endpoint never answered at all, it also says that the game must use the deploy contract (`golem.ServerConfigFromEnv` and `Runtime.Host`). The container is stopped and kept, without a restart policy, so its logs stay readable; its last lines (sanitised, env values and the admin token redacted) are in the job log.
+
+`GET /servers/{id}/runtime` reads the running game's admin `/ready`, `/stats` and `/info` (players, entities, tick statistics, uptime, engine version, transport, schema fingerprint).
 
 ## Environment variables
 
@@ -57,7 +85,7 @@ They reach `docker run` only through `--env-file`, **never through the command l
 
 The env-file format is one `KEY=value` per line with the value taken literally, so values must be single-line UTF-8 (no NUL, CR or LF); every other character, including spaces, quotes, `#`, `=`, `$` and backslashes, arrives unchanged. Names match `^[A-Za-z_][A-Za-z0-9_]{0,127}$`; names starting with `GOLEM_` are reserved for variables the daemon injects. Names like `PATH` or `LD_PRELOAD` are ordinary container variables.
 
-**What env values are protected from — and what not.** They are protected from other servers and from the API surface: nobody can read them through the API, the daemon never logs them, and the last log lines copied into the job log of a failed start have every line of every value (of at least 4 bytes) replaced with `[redacted]`. That redaction is best effort: a game that prints a value encoded or split is not caught, and `GET /servers/{id}/logs` is the game's raw output (sanitised, never redacted). Above all, **anyone who can change a server's image or the game's code can read that server's environment** — the game runs with it. Env values protect secrets from other servers and from people who only use the panel, not from the developers of that game.
+**What env values are protected from — and what not.** They are protected from other servers and from the API surface: nobody can read them through the API, the daemon never logs them, and the last log lines copied into the job log of a failed start have every line of every value (of at least 4 bytes) replaced with `[redacted]`. That redaction is best effort: a game that prints a value encoded or split is not caught, and `GET /servers/{id}/logs` is the game's raw output (sanitised, never redacted). Above all, **anyone who can change a server's build or the game's code can read that server's environment** — the game runs with it. Env values protect secrets from other servers and from people who only use the panel, not from the developers of that game.
 
 ## Logs
 
@@ -67,9 +95,9 @@ Job logs and job details only contain short, fixed messages for Docker failures 
 
 ## Ports
 
-Each server has one host port `N` from the configured range, published as both `N/udp` and `N/tcp` to port 7777 inside the container (the game port).
+Each server has one host port `N` from the configured range, published as both `N/udp` and `N/tcp` to port 7777 inside the container (the game port). The admin port 7778 is published on `127.0.0.1` only, on a port Docker picks from the host's ephemeral range (read back from `docker inspect`; it can change when Docker restarts the container).
 
-- The range is `--port-range` / `GOLEM_DEPLOY_PORT_RANGE`, default `7000-7099`. It must lie within 1024–32767 (below 1024 is privileged; 32768 and up is the Linux ephemeral range) and must not contain the panel's own listen port. Ports browsers refuse to connect to (for example 6000, 6566, 6665–6669, 6697, 10080) are skipped.
+- The range is `--port-range` / `GOLEM_DEPLOY_PORT_RANGE`, default `7000-7099`. It must lie within 1024–32767 (below 1024 is privileged; 32768 and up is the default Linux ephemeral range) and must not contain the panel's own listen port. Ports browsers refuse to connect to (for example 6000, 6566, 6665–6669, 6697, 10080) are skipped. On Linux the daemon reads the host's actual ephemeral range (`net.ipv4.ip_local_port_range`) at startup and logs a warning when the range overlaps it: the kernel and Docker can hand those ports out at any time.
 - Change the range by restarting the daemon with the new flag. Existing servers keep their port; a start checks the port against the current range, the browser-unsafe list and the panel's port and fails with a message to assign a new port (`PATCH /servers/{id}` with `port`) when it is no longer allowed.
 - A server's port cannot change while its container is running (`409 conflict`: stop it first), so a running container never holds a port that was given to another server.
 - `--port-bind-address` / `GOLEM_DEPLOY_PORT_BIND_ADDRESS` publishes on one host IP instead of all interfaces.
