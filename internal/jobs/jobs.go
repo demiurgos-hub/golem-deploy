@@ -213,7 +213,14 @@ func (r *Runner) Start(ctx context.Context, kind string, subject Subject, create
 		return store.Job{}, ErrSubjectBusy
 	}
 	r.subjects[subject] = 0 // reserve while the row is created
+	r.wg.Add(1)
 	r.mu.Unlock()
+	admitted := false
+	defer func() {
+		if !admitted {
+			r.wg.Done()
+		}
+	}()
 
 	release := func() {
 		r.mu.Lock()
@@ -257,7 +264,7 @@ func (r *Runner) Start(ctx context.Context, kind string, subject Subject, create
 	r.active[job.ID] = aj
 	p.queue = append(p.queue, aj)
 	r.admitLocked(p)
-	r.wg.Add(1)
+	admitted = true // run now owns the wait group entry
 	r.mu.Unlock()
 
 	go r.run(jctx, job, aj, logFile, fn)
@@ -432,6 +439,16 @@ func (r *Runner) ActiveFor(subject Subject) (int64, bool) {
 // Shutdown stops accepting jobs, cancels active ones and waits for them to
 // return until ctx is done.
 func (r *Runner) Shutdown(ctx context.Context) error {
+	select {
+	case <-r.Stop():
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("jobs did not stop in time: %w", ctx.Err())
+	}
+}
+
+// Stop cancels jobs and returns a channel that closes after their final writes.
+func (r *Runner) Stop() <-chan struct{} {
 	r.mu.Lock()
 	r.closed = true
 	for _, aj := range r.active {
@@ -445,12 +462,7 @@ func (r *Runner) Shutdown(ctx context.Context) error {
 		r.wg.Wait()
 		close(done)
 	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("jobs did not stop in time: %w", ctx.Err())
-	}
+	return done
 }
 
 // cappedWriter forwards up to limit bytes to w, then writes one truncation

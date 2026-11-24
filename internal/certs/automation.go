@@ -27,6 +27,7 @@ import (
 var (
 	ErrPanelFixed     = errors.New("panel TLS is controlled by the serve flags")
 	ErrStagingManaged = errors.New("switch both game and panel away from ACME before changing staging")
+	ErrTermsManaged   = errors.New("switch both game and panel away from ACME before clearing agreement to the subscriber terms")
 	ErrNothingManaged = errors.New("no certificates are managed by ACME")
 	errHostsChanged   = errors.New("the certificate hosts changed during issuance; retry for the current hosts")
 )
@@ -164,14 +165,21 @@ func (a *Automation) UpdateSettings(ctx context.Context, req apitypes.UpdateACME
 			}
 			s.Email = *req.Email
 		}
-		if req.Staging != nil && *req.Staging != s.Staging {
+		changingStaging := req.Staging != nil && *req.Staging != s.Staging
+		clearingTerms := req.TermsAgreed != nil && !*req.TermsAgreed
+		if changingStaging || clearingTerms {
 			mode, err := a.Game.Mode(ctx)
 			if err != nil {
 				return err
 			}
 			if mode == ModeACME || a.panel.Load().mode == apitypes.PanelCertificateModeACME {
-				return ErrStagingManaged
+				if changingStaging {
+					return ErrStagingManaged
+				}
+				return ErrTermsManaged
 			}
+		}
+		if changingStaging {
 			s.Staging = *req.Staging
 		}
 		if req.TermsAgreed != nil {
@@ -233,10 +241,12 @@ func certificateNames(managed map[string][]apitypes.ACMECertificateUse) []string
 }
 
 type attemptState struct {
-	At       *time.Time
-	Detail   string
-	Failures int
-	Retry    time.Time
+	At          *time.Time
+	Detail      string
+	Failures    int
+	Retry       time.Time
+	BlockReason string `json:",omitempty"`
+	Install     bool   `json:",omitempty"`
 }
 
 func attemptKey(account ACMEAccount, host string) string {
@@ -295,7 +305,25 @@ func (a *Automation) ACME(ctx context.Context) (apitypes.ACME, error) {
 				managed.Certificate = pair.info.APIInfo(state.gameHost)
 			}
 		}
-		if status.Detail != "" {
+		if status.BlockReason != "" {
+			managed.LastError = status.BlockReason
+			if status.Detail != "" {
+				managed.LastError += " " + status.Detail
+			}
+		}
+		panelPair := state.panel.issued[host]
+		expiredPanel := slices.Contains(managed.UsedBy, apitypes.ACMECertificateUsePanel) &&
+			panelPair != nil && !a.now().Before(panelPair.info.NotAfter)
+		if expiredPanel || (managed.Certificate != nil && !a.now().Before(managed.Certificate.NotAfter)) {
+			reason := managed.LastError
+			managed.LastError = "The installed certificate has expired."
+			if reason != "" {
+				managed.LastError += " " + reason
+			} else {
+				managed.LastError += " Renew the certificate."
+			}
+		}
+		if managed.LastError != "" {
 			managed.Status = apitypes.ACMECertificateStatusError
 		} else if managed.Certificate != nil {
 			managed.Status = apitypes.ACMECertificateStatusIssued
@@ -435,11 +463,14 @@ func (a *Automation) Start(ctx context.Context, action Action, by int64) (store.
 func operationError(err error) string {
 	var validation *ValidationError
 	var failure *acmeFailure
+	var publication *PublicationError
 	switch {
 	case errors.As(err, &validation):
 		return validation.Msg
 	case errors.As(err, &failure):
 		return failure.message
+	case errors.As(err, &publication):
+		return publication.Error()
 	case errors.Is(err, errHostsChanged):
 		return errHostsChanged.Error()
 	default:

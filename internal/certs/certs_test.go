@@ -25,10 +25,11 @@ import (
 )
 
 type memSettings struct {
-	mu      sync.Mutex
-	m       map[string]string
-	ids     []int64
-	saveErr error
+	mu           sync.Mutex
+	m            map[string]string
+	ids          []int64
+	saveErr      error
+	settingFault func(string, string) (bool, error)
 }
 
 func (s *memSettings) GetSetting(_ context.Context, k string) (string, bool, error) {
@@ -45,6 +46,14 @@ func (s *memSettings) SetSetting(_ context.Context, k, v string) error {
 	defer s.mu.Unlock()
 	if s.saveErr != nil {
 		return s.saveErr
+	}
+	if s.settingFault != nil {
+		if save, err := s.settingFault(k, v); err != nil {
+			if save {
+				s.m[k] = v
+			}
+			return err
+		}
 	}
 	s.m[k] = v
 	return nil
@@ -513,5 +522,40 @@ func TestValidateHost(t *testing.T) {
 	}
 	if Origin("2001:db8::1", 7001) != "https://[2001:db8::1]:7001" || Origin("play.example.com", 7001) != "https://play.example.com:7001" {
 		t.Fatal("origin")
+	}
+}
+
+func TestMountStaysMatchedWhileServerLoadsInitialPair(t *testing.T) {
+	m, _, _ := newManager(t)
+	ctx := t.Context()
+	host := "play.example.com"
+	old, err := m.Ensure(ctx, 1, fixedHost(host))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := m.HoldForStart(ctx, 1, old.Mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	chain, key, next, err := m.generate(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pending *PublicationError
+	if _, err := m.UseCustom(ctx, chain, key); !errors.As(err, &pending) {
+		t.Fatalf("copy should wait for engine startup: %v", err)
+	}
+	got, err := load(m.ServerDir(1))
+	if err != nil || got.Fingerprint != old.Fingerprint {
+		t.Fatalf("starting server's pair was replaced: %+v, %v", got, err)
+	}
+	release()
+	if mode, err := m.Mode(ctx); err != nil || mode != ModeCustom {
+		t.Fatalf("committed generation did not converge: %s, %v", mode, err)
+	}
+	got, err = load(m.ServerDir(1))
+	if err != nil || got.Fingerprint != next.Fingerprint {
+		t.Fatalf("new pair did not reach mount: %+v, %v", got, err)
 	}
 }

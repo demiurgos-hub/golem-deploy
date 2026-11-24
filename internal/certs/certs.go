@@ -148,14 +148,16 @@ func (i Info) APIInfo(host string) *apitypes.CertificateInfo {
 // Manager owns the certificate directory. It is safe for concurrent use;
 // changes are serialised.
 type Manager struct {
-	dir      string // canonical custom or ACME pair
-	settings Settings
-	logger   *slog.Logger
-	now      func() time.Time
-	fileGID  int // group of the files (-1: leave as created)
-	groupAdd []int
+	dir             string // canonical custom or ACME pair
+	settings        Settings
+	logger          *slog.Logger
+	now             func() time.Time
+	fileGID         int // group of the files (-1: leave as created)
+	groupAdd        []int
+	publicationWake chan struct{}
 
-	mu sync.Mutex
+	mu       sync.Mutex
+	starting map[string]bool // mounts in use by an engine loading its initial pair
 }
 
 // Open prepares the directory (creating it, fixing its mode and group and
@@ -175,7 +177,7 @@ func Open(o Options) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{dir: dir, settings: o.Settings, logger: o.Logger, now: o.Now}
+	m := &Manager{dir: dir, settings: o.Settings, logger: o.Logger, now: o.Now, publicationWake: make(chan struct{}, 1)}
 	m.fileGID, m.groupAdd = groupPolicy()
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return nil, fmt.Errorf("create certificate directory: %w", err)
@@ -268,6 +270,40 @@ func (m *Manager) Ensure(ctx context.Context, id int64, gameHost func(context.Co
 		return info, m.copyPair(m.dir, dir)
 	}
 	return m.ensureSelfSigned(dir, host)
+}
+
+// HoldForStart finishes any interrupted publication before the container
+// starts, then reserves its mount until the engine has loaded its first pair.
+func (m *Manager) HoldForStart(ctx context.Context, id int64, prepared Mode) (func(), error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mode, err := m.state(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if (mode == ModeSelfSigned) != (prepared == ModeSelfSigned) {
+		return nil, errors.New("game certificate pinning changed while preparing the server")
+	}
+	dir := m.ServerDir(id)
+	if err := m.recoverPending(dir); err != nil {
+		return nil, err
+	}
+	info, err := load(dir)
+	if err != nil {
+		return nil, err
+	}
+	if !m.now().Before(info.NotAfter) {
+		return nil, ErrExpired
+	}
+	if m.starting == nil {
+		m.starting = make(map[string]bool)
+	}
+	m.starting[dir] = true
+	return func() {
+		m.mu.Lock()
+		delete(m.starting, dir)
+		m.mu.Unlock()
+	}, nil
 }
 
 func (m *Manager) ensureSelfSigned(dir, host string) (Info, error) {
@@ -421,6 +457,9 @@ func (m *Manager) check(ctx context.Context, host func(context.Context) (string,
 			return err
 		}
 		dir := m.ServerDir(id)
+		if m.starting[dir] {
+			continue
+		}
 		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 			continue // first start or an explicit regeneration creates it
 		}

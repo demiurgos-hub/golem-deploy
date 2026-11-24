@@ -7,7 +7,7 @@ import { useACME, useGameCertificate, useSettings } from "@/api/queries";
 import { qk } from "@/api/query-keys";
 import type { CertificateMode, GameCertificate, Job, UpdateGameCertificateRequest } from "@/api/types.gen";
 import { CertificateDetails } from "@/components/certificate";
-import { ACMESettings, AutomaticCertificateCheck, PanelCertificateSettings } from "@/components/certificate-settings";
+import { ACMESettings, AutomaticCertificateCheck, PanelCertificateSettings, SharedCertificateWarning } from "@/components/certificate-settings";
 import { InlineJob } from "@/components/jobs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -221,7 +221,7 @@ function CertificatesSection({ acme }: { acme: ReturnType<typeof useACME> }) {
   return (
     <Section
       title="Game certificates"
-      description="The TLS certificate game servers serve for WebTransport and HTTPS on their ports. The panel's own TLS is separate."
+      description="The TLS certificate game servers serve for WebTransport and HTTPS on their ports."
     >
       {cert.isPending ? (
         <LoadingState label="Loading the certificate" />
@@ -238,6 +238,7 @@ function CertificatesSection({ acme }: { acme: ReturnType<typeof useACME> }) {
               </span>
             )}
           </div>
+          <SharedCertificateWarning game={cert.data} />
           {mode === "self_signed" ? (
             <SelfSignedExplanation data={cert.data} />
           ) : mode === "custom" ? (

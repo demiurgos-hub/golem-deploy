@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { isApiError, sentence } from "@/api/errors";
 import { qk } from "@/api/query-keys";
 import { usePanelCertificate, type useACME } from "@/api/queries";
-import type { ACME, Job, PanelCertificate, PanelCertificateMode, UpdateACMERequest } from "@/api/types.gen";
+import type { ACME, GameCertificate, Job, PanelCertificate, PanelCertificateMode, UpdateACMERequest } from "@/api/types.gen";
 import { useApi } from "@/app/services";
 import { CertificateDetails, CertificateExpiry } from "@/components/certificate";
 import { InlineJob } from "@/components/jobs";
@@ -21,6 +21,17 @@ const letsEncryptDirectories = [
 ];
 
 const noChallenge = "Make the daemon reachable on port 80 through --http-listen, or have the panel serve HTTPS on port 443.";
+
+export function SharedCertificateWarning({ game }: { game: GameCertificate | undefined }) {
+  const panel = usePanelCertificate();
+  if (!game || game.mode === "self_signed" || !panel.data?.hosts.includes(game.game_host)) return null;
+  return (
+    <Notice tone="warning" title="Game containers can read a key valid for the panel">
+      Every game container can read the shared game certificate&apos;s private key. A certificate for this host is also valid for the panel.
+      If games are not fully trusted, give the panel its own hostname with <code>--public-host</code>, different from the game host.
+    </Notice>
+  );
+}
 
 export function AutomaticCertificateCheck({
   acme, hosts, hostLabel, children,
@@ -187,7 +198,7 @@ function ACMEControls({ acme, readFailed }: { acme: ACME; readFailed: boolean })
         </div>
         <Checkbox
           label={<>I agree to the <a className="underline" href="https://letsencrypt.org/repository/" target="_blank" rel="noreferrer">Let&apos;s Encrypt subscriber agreement</a></>}
-          checked={draft.terms_agreed ?? acme.terms_agreed} disabled={save.isPending}
+          checked={draft.terms_agreed ?? acme.terms_agreed} disabled={save.isPending || (acme.terms_agreed && acme.certificates.length > 0)}
           onChange={(event) => setDraft({ ...draft, terms_agreed: event.target.checked })}
         />
         {save.isError && !emailError && <ErrorText error={save.error} />}

@@ -4,7 +4,7 @@ import type { ServerConnectivity } from "@/api/types.gen";
 
 export const connectionSteps = {
   server: "Server and browser checks",
-  https: "HTTPS over TCP",
+  https: "HTTPS",
   websocket: "WebSocket fallback",
   webtransport: "WebTransport over UDP",
 } as const;
@@ -101,9 +101,6 @@ function checkServer(data: ServerConnectivity) {
     throw new ConnectionCheckError("The game certificate is expired or not yet valid. Check the clock and renew or replace the certificate.");
   }
   if (!cert.covers_game_host) throw new ConnectionCheckError("The certificate does not cover the game host. Install a certificate issued for that host.");
-  if (typeof WebTransport !== "function") {
-    throw new ConnectionCheckError("WebTransport is unavailable in this browser. Use a browser that supports it and open the panel over trusted HTTPS or on localhost.");
-  }
   if (!data.test_origins.includes(window.location.origin)) {
     throw new ConnectionCheckError(data.test_origins.length
       ? `Open the panel at one of these addresses to test this server: ${data.test_origins.join(", ")}.`
@@ -152,7 +149,8 @@ export async function runConnectionTest(
     const wt = probeURL(data.webtransport_url, "https:");
     const ws = probeURL(data.websocket_url, "wss:");
     if (page.host !== wt.host || page.host !== ws.host) throw new ConnectionCheckError("The reported game endpoints disagree. Check the game host and port.");
-    if (page.hostname.startsWith("[")) {
+    // A colon in a parsed hostname identifies an IPv6 literal, with or without brackets.
+    if (page.hostname.includes(":")) {
       throw new ConnectionCheckError("Browser content security policy cannot allow a literal IPv6 game host. Configure a DNS name for that address and reload the panel.");
     }
     const hashes = data.pinned && data.certificate
@@ -178,29 +176,33 @@ export async function runConnectionTest(
   const loopbackHint = page.hostname === "localhost"
     ? " If the server listens only on IPv4, set the game host to 127.0.0.1, restart the server, and reload the panel."
     : "";
-  let tcpPassed = false;
+  let websocketPassed = false;
   if (pinned) {
     skip("https", skippedPinned);
     skip("websocket", skippedPinned);
   } else {
-    const tcp = await run("https", () => timed(signal, (stepSignal) => fetch(page.href, {
+    const https = await run("https", () => timed(signal, (stepSignal) => fetch(page.href, {
       mode: "no-cors",
       credentials: "omit",
       redirect: "manual",
       referrerPolicy: "no-referrer",
       cache: "no-store",
       signal: stepSignal,
-    })), "TCP reaches the server and this browser trusts its certificate.", () =>
+    })), "The browser received an HTTPS response from the game address.", () =>
       `Check the game host DNS, TCP port ${port} in the firewall, and whether this browser trusts the game certificate. Reload the panel if the game host changed.`);
-    tcpPassed = tcp.passed;
-    await run("websocket", () => probeWebSocket(ws, signal), "The browser opened the WebSocket fallback.", () =>
-      tcpPassed
-        ? "TCP works. Check that the game enables WebSocket fallback at this path and accepts the panel origin. Check any proxy for WebSocket upgrade support."
+    const websocket = await run("websocket", () => probeWebSocket(ws, signal), "The browser opened the WebSocket fallback.", () =>
+      https.passed
+        ? "HTTPS worked. Check that the game enables WebSocket fallback at this path and accepts the panel origin. Check any proxy for WebSocket upgrade support."
         : `Check the game certificate and TCP port ${port}, then check the WebSocket path and any proxy's upgrade support.`);
+    websocketPassed = websocket.passed;
   }
 
+  if (typeof WebTransport !== "function") {
+    skip("webtransport", "WebTransport is unavailable in this browser. Use a browser that supports it and open the panel over trusted HTTPS or on localhost.");
+    return;
+  }
   await run("webtransport", () => probeWebTransport(wt, hashes, signal), "The browser opened a WebTransport session.", () => {
-    if (tcpPassed) {
+    if (websocketPassed) {
       return `TCP works. UDP port ${port} is most likely blocked between this browser and the host. Check the cloud firewall or security group, home router, or corporate network.${loopbackHint}`;
     }
     return pinned

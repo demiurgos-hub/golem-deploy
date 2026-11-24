@@ -169,11 +169,13 @@ func TestPanelOrigins(t *testing.T) {
 		want string
 	}{
 		{"TLS default port", Config{PanelTLS: true, PanelPort: 443, PanelPublicHosts: []string{"panel.example", "panel.example"}}, "2001:db8::1",
-			"https://panel.example,https://[2001:db8::1]"},
+			"https://panel.example"},
 		{"TLS custom port", Config{PanelTLS: true, PanelPort: 8443}, "panel.example", "https://panel.example:8443"},
 		{"development", Config{PanelLoopback: true, PanelPort: 8000}, "localhost", "http://localhost:8000,http://127.0.0.1:8000"},
-		{"proxy", Config{PanelBehindProxy: true, PanelPort: 80, PanelPublicHosts: []string{"panel.example", "www.example"}}, "www.example",
+		{"plaintext public listener", Config{PanelPort: 80, PanelPublicHosts: []string{"panel.example", "www.example"}}, "www.example",
 			"http://panel.example,http://www.example,https://panel.example,https://www.example"},
+		{"TLS proxy on loopback", Config{PanelLoopback: true, PanelPort: 8000, PanelPublicHosts: []string{"panel.example", "www.example"}}, "play.example",
+			"http://panel.example:8000,http://www.example:8000,http://localhost:8000,http://127.0.0.1:8000,https://panel.example,https://www.example"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := strings.Join(tc.cfg.testOrigins(tc.host), ","); got != tc.want {

@@ -8,14 +8,17 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
+	"github.com/demiurgos-hub/golem-deploy/internal/store"
 	"github.com/mholt/acmez/v3/acme"
 )
 
@@ -123,6 +126,10 @@ func TestCertificateJobsCommitAfterIssuance(t *testing.T) {
 		t.Fatalf("%+v", active)
 	}
 	errBody(t, h.call("PUT", settings, h.adminSs, apitypes.UpdateACMERequest{Staging: ptr(true)}), 409, apitypes.ErrorCodeConflict)
+	terms := errBody(t, h.call("PUT", settings, h.adminSs, apitypes.UpdateACMERequest{TermsAgreed: ptr(false)}), 409, apitypes.ErrorCodeConflict)
+	if !strings.Contains(terms.Message, "switch both game and panel away from ACME") {
+		t.Fatal(terms.Message)
+	}
 
 	job := decode[apitypes.Job](t, h.call("POST", settings+"/renew", h.adminSs, nil))
 	done := wait(&job)
@@ -173,5 +180,188 @@ func TestHTTPChallengeOrHTTPSRedirect(t *testing.T) {
 		if tc.status == 200 && w.Body.String() != "authorization" {
 			t.Fatal(w.Body.String())
 		}
+	}
+}
+
+func TestCommittedGameChangeReportsPartialPublicationAndConverges(t *testing.T) {
+	h := newDockerHarness(t)
+	img := h.managedImage(1)
+	one := h.createServer(h.devTok, apitypes.CreateServerRequest{Name: "one", BuildID: img.ID})
+	two := h.createServer(h.devTok, apitypes.CreateServerRequest{Name: "two", BuildID: img.ID})
+	chain, key := testCertPEM(t, "play.example.com", time.Now().Add(time.Hour))
+	mount := h.certs.ServerDir(two.ID)
+	if err := os.WriteFile(mount, []byte("block second mount"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.srv.automation.Maintain(ctx)
+	}()
+	defer func() { cancel(); <-done }()
+
+	resp := h.call("PUT", "/api/v1/certificates/game", h.adminSs,
+		apitypes.UpdateGameCertificateRequest{Mode: "custom", CertificatePEM: chain, PrivateKeyPEM: key})
+	report := errBody(t, resp, http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
+	if !strings.Contains(report.Message, "new game certificate mode is active") || !strings.Contains(report.Message, "daemon will retry automatically") {
+		t.Fatal(report.Message)
+	}
+	first, err := tls.LoadX509KeyPair(filepath.Join(h.certs.ServerDir(one.ID), certs.CertFile), filepath.Join(h.certs.ServerDir(one.ID), certs.KeyFile))
+	if err != nil || first.Leaf == nil || first.Leaf.Subject.CommonName != "play.example.com" {
+		t.Fatalf("first mount was not published: %v", err)
+	}
+	if err := os.Remove(mount); err != nil {
+		t.Fatal(err)
+	}
+	// Observe the filesystem directly so the test does not trigger recovery.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		second, err := tls.LoadX509KeyPair(filepath.Join(mount, certs.CertFile), filepath.Join(mount, certs.KeyFile))
+		if err == nil && second.Leaf.Equal(first.Leaf) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("maintenance did not finish copying: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+type blockingCertificateSettings struct {
+	*store.Store
+	committed, release chan struct{}
+}
+
+func (s blockingCertificateSettings) SetSetting(ctx context.Context, key, value string) error {
+	err := s.Store.SetSetting(ctx, key, value)
+	if key == certs.SettingMode && err == nil {
+		close(s.committed)
+		<-s.release
+	}
+	return err
+}
+
+func TestShutdownJoinsSynchronousCertificatePublication(t *testing.T) {
+	h := newDockerHarness(t)
+	st := blockingCertificateSettings{Store: h.st, committed: make(chan struct{}), release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(st.release) })
+	defer release()
+	mgr, err := certs.Open(certs.Options{Dir: filepath.Join(t.TempDir(), "certs", "game"), Settings: st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.srv.certs = mgr
+	h.srv.automation = nil
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response <- h.do("PUT", "/api/v1/certificates/game", h.adminSs, apitypes.UpdateGameCertificateRequest{Mode: "self_signed"})
+	}()
+	select {
+	case <-st.committed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("certificate request did not reach the commit")
+	}
+	h.srv.beginShutdown()
+	select {
+	case <-h.srv.Drained():
+		t.Fatal("HTTP layer drained before synchronous publication")
+	default:
+	}
+	rejected := h.call("PUT", "/api/v1/certificates/game", h.adminSs, apitypes.UpdateGameCertificateRequest{Mode: "self_signed"})
+	errBody(t, rejected, http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
+	release()
+	select {
+	case <-h.srv.Drained():
+	case <-time.After(5 * time.Second):
+		t.Fatal("HTTP layer did not drain after publication")
+	}
+	if got := <-response; got.Code != http.StatusOK {
+		t.Fatalf("committed change: %d %s", got.Code, got.Body.String())
+	}
+}
+
+func TestStartRepairsInterruptedMountAfterGameHostChange(t *testing.T) {
+	h := newDockerHarness(t)
+	img := h.managedImage(1)
+	sv := h.createServer(h.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
+	chain, key := testCertPEM(t, "play.example.com", time.Now().Add(time.Hour))
+	if _, err := h.certs.UseCustom(t.Context(), []byte(chain), []byte(key)); err != nil {
+		t.Fatal(err)
+	}
+	// Use the installed pair as the previous ACME certificate without a CA request.
+	if err := h.st.SetSetting(t.Context(), certs.SettingMode, string(certs.ModeACME)); err != nil {
+		t.Fatal(err)
+	}
+	host := "next.example.com"
+	h.call("PATCH", "/api/v1/settings", h.adminSs, apitypes.UpdateSettingsRequest{GameHost: &host})
+	dir := h.certs.ServerDir(sv.ID)
+	certPath, keyPath := filepath.Join(dir, certs.CertFile), filepath.Join(dir, certs.KeyFile)
+	previous, _ := testCertPEM(t, "play.example.com", time.Now().Add(time.Hour))
+	if err := os.WriteFile(certPath, []byte(previous), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certPath+".new", []byte(chain), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
+		t.Fatal("test did not reproduce the window after the key rename")
+	}
+	j := h.action(h.devTok, sv.ID, "start")
+	if j.Status != store.JobSuccess || !strings.Contains(h.jobLog(j.ID), "game certificate does not cover the game host "+host) {
+		t.Fatalf("start with previous certificate: %+v\n%s", j, h.jobLog(j.ID))
+	}
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+		t.Fatalf("server started without a repaired pair: %v", err)
+	}
+	if got := h.getServer(h.devTok, sv.ID); got.Certificate == nil || got.Certificate.CoversGameHost {
+		t.Fatalf("previous pair's coverage: %+v", got.Certificate)
+	}
+}
+
+func TestCancelledRenewalInstallsSavedPairOnNextCheck(t *testing.T) {
+	h := newDockerHarness(t)
+	ctx := t.Context()
+	const host = "play.example.com"
+	chain, key := testCertPEM(t, host, time.Now().Add(time.Hour))
+	old, err := h.certs.UseCustom(ctx, []byte(chain), []byte(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextChain, nextKey := testCertPEM(t, host, time.Now().Add(2*time.Hour))
+	started := make(chan struct{})
+	fake := &fakeACMEClient{chain: chain, key: key}
+	fake.issue = func(ctx context.Context, host string, force bool) error {
+		close(started)
+		<-ctx.Done()
+		fake.chain, fake.key = nextChain, nextKey
+		return nil
+	}
+	setupFakeACME(t, h, fake, "http://127.0.0.1/unused", true)
+	h.call("PUT", "/api/v1/certificates/acme", h.adminSs, apitypes.UpdateACMERequest{TermsAgreed: ptr(true)})
+	if err := h.st.SetSetting(ctx, certs.SettingMode, string(certs.ModeACME)); err != nil {
+		t.Fatal(err)
+	}
+	job := decode[apitypes.Job](t, h.call("POST", "/api/v1/certificates/acme/renew", h.adminSs, nil))
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("renewal did not reach the issuer")
+	}
+	if err := h.runner.Cancel(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if done := h.waitJob(job); done.Status != store.JobCancelled {
+		t.Fatalf("renewal job: %+v", done)
+	}
+	if got, err := h.certs.Current(ctx, 0); err != nil || got.Fingerprint != old.Fingerprint {
+		t.Fatalf("job unexpectedly published: %+v, %v", got, err)
+	}
+	// Initialize runs the same storage reconciliation as the periodic check.
+	if err := h.srv.automation.Initialize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := h.certs.Current(ctx, 0); err != nil || got.NotAfter.Equal(old.NotAfter) || !got.Covers(host) {
+		t.Fatalf("did not install the issued renewal: %+v, %v", got, err)
 	}
 }

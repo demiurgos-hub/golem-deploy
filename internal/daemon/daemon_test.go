@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
+	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -253,5 +255,83 @@ func TestF5_CLIResetPasswordDeletesTokens(t *testing.T) {
 	defer st.Close()
 	if toks, _ := st.ListAPITokens(ctx, acct.ID); len(toks) != 0 {
 		t.Fatalf("tokens survived the reset: %d", len(toks))
+	}
+}
+
+func TestShutdownDeadlineKeepsStoreAndLockForCertificateJob(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	started, release := make(chan struct{}), make(chan struct{})
+	finish := sync.OnceFunc(func() { close(release) })
+	defer finish()
+	submitted := make(chan store.Job, 1)
+	submitErrors := make(chan error, 1)
+	closed, stopped := make(chan error, 1), make(chan error, 1)
+	go func() {
+		stopped <- Run(ctx, Options{
+			DataDir: dir, Listen: "127.0.0.1:0", docker: noDocker{}, dockerCLI: dockertest.New(),
+			Logger: slog.New(slog.DiscardHandler), bcryptCost: bcrypt.MinCost, stopTimeout: 50 * time.Millisecond,
+			storeClosed: func(err error) { closed <- err },
+			readyRunner: func(r *jobs.Runner) {
+				j, err := r.Start(ctx, "certificate.renew", jobs.Subject{Type: "certificate", ID: "acme"}, nil,
+					func(ctx context.Context, _ io.Writer) error {
+						close(started)
+						<-release
+						return ctx.Err()
+					})
+				submitted <- j
+				submitErrors <- err
+			},
+		})
+	}()
+	select {
+	case <-started:
+	case err := <-stopped:
+		t.Fatalf("daemon exited before starting the job: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("job did not start")
+	}
+	cancel()
+	select {
+	case err := <-stopped:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("shutdown did not report its deadline: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not return while the certificate job was blocked")
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("store closed while job was active: %v", err)
+	default:
+	}
+	layout := datadir.Layout{Root: dir}
+	if lock, err := datadir.AcquireLock(layout); !errors.Is(err, datadir.ErrLocked) {
+		if err == nil {
+			_ = lock.Release()
+		}
+		t.Fatalf("another daemon could enter while job was active: %v", err)
+	}
+	finish()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("store did not close after the job drained")
+	}
+	st, err := store.Open(t.Context(), layout.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := <-submitErrors; err != nil {
+		t.Fatal(err)
+	}
+	j, err := st.GetJob(t.Context(), (<-submitted).ID)
+	if err != nil || j.Status != store.JobCancelled {
+		t.Fatalf("job could not save its final status: %+v %v", j, err)
 	}
 }

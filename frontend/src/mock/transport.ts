@@ -795,11 +795,12 @@ export function createMockTransport(real: Transport): Transport {
       const sid = query.get("subject_id");
       const limit = Number(query.get("limit") ?? 50);
       if (!Number.isInteger(limit) || limit < 1 || limit > 500) return fail(st, 400, "bad_request", "limit must be an integer from 1 to 500");
-      return json(st, 200, { items: st.jobs.filter((j) => j.subject_type === query.get("subject_type") && (!sid || j.subject_id === sid)).slice(0, limit) });
+      return json(st, 200, { items: st.jobs.filter((j) => (admin || j.subject_type !== "certificate") && j.subject_type === query.get("subject_type") && (!sid || j.subject_id === sid)).slice(0, limit) });
     }
     if ((m = path.match(/^\/jobs\/(\d+)(\/log|\/cancel)?$/))) {
       const job = st.jobs.find((j) => j.id === Number(m?.[1]));
       if (!job) return fail(st, 404, "not_found", "job not found");
+      if (!admin && job.subject_type === "certificate") return forbidden();
       if (method === "GET" && !m[2]) return json(st, 200, job);
       const restrictedMsg = "this job was started by an administrator action; only admins can read its log or cancel it";
       if (method === "POST" && m[2] === "/cancel") {
@@ -1313,6 +1314,9 @@ export function createMockTransport(real: Transport): Transport {
         const req = body<UpdateACMERequest>();
         if (req.staging !== undefined && req.staging !== st.acme.staging && st.acme.certificates.length) {
           return fail(st, 409, "conflict", "switch away from automatic certificates before changing staging");
+        }
+        if (req.terms_agreed === false && st.acme.certificates.length) {
+          return fail(st, 409, "conflict", "switch both game and panel away from ACME before clearing agreement to the subscriber terms");
         }
         if (req.email && (new TextEncoder().encode(req.email).length > 254 || !/^[^\s@]+@[^\s@]+$/.test(req.email))) {
           return fail(st, 400, "validation_failed", "email must be a single address", "email");

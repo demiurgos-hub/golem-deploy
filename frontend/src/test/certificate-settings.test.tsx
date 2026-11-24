@@ -33,6 +33,27 @@ function settings(extra: Record<string, Handler> = {}) {
 
 describe("automatic game certificates", () => {
   it.each([
+    ["acme", true, true],
+    ["custom", true, true],
+    ["self_signed", true, false],
+    ["acme", false, false],
+    ["custom", false, false],
+  ] as const)("warns about the mounted panel-valid key in %s mode with matching host %s", async (mode, sameHost, warns) => {
+    settings({
+      "GET /certificates/game": () => jsonResponse(200, { ...game, mode, certificate: mode === "self_signed" ? null : issued }),
+      "GET /certificates/panel": () => jsonResponse(200, { ...panel, hosts: sameHost ? [game.game_host] : panel.hosts }),
+    });
+    const region = within(await screen.findByRole("region", { name: "Game certificates" }));
+    const panelRegion = within(await screen.findByRole("region", { name: "Panel certificate" }));
+    await panelRegion.findAllByText(sameHost ? game.game_host : panel.hosts.join(", "));
+    if (warns) {
+      expect(await region.findByText(/Every game container can read/)).toHaveTextContent("--public-host");
+    } else {
+      expect(region.queryByText(/Every game container can read/)).not.toBeInTheDocument();
+    }
+  });
+
+  it.each([
     [{ game_host: "" }, {}, /Game host missing/],
     [{}, { terms_agreed: false }, /Accept and save the subscriber agreement/],
     [{}, { http01_available: false }, /Make the daemon reachable on port 80/],

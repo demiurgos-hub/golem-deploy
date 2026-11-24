@@ -27,13 +27,14 @@ ExecStart=/usr/local/bin/golem-deploy serve
 Restart=on-failure
 RestartSec=5s
 
-# On SIGTERM the daemon stops accepting requests (up to 15 s for open
-# requests), cancels running jobs (up to 10 s, in parallel) and exits. It never
+# On SIGTERM the daemon stops accepting requests, gives open HTTP
+# connections up to 15 s, and cancels jobs in parallel. The whole drain
+# has a 20 s deadline, including certificate publication. The daemon never
 # stops game containers: they belong to dockerd's cgroup, not to this
 # service's, so stopping or restarting the panel leaves them running. The
 # default KillMode=control-group only kills processes the daemon started
 # itself (git, docker CLI clients such as a streaming "docker logs") if they
-# outlive the stop. 30 s covers both grace periods plus closing the database.
+# outlive the stop. 30 s covers the drain deadline plus closing the database.
 TimeoutStopSec=30s
 
 # CacheDirectory= gives non-build Docker commands a writable client config.

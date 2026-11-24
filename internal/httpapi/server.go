@@ -136,8 +136,10 @@ type Server struct {
 	api     *http.ServeMux
 	handler http.Handler
 
-	shutdownOnce sync.Once
-	shutdown     chan struct{}
+	shutdownMu sync.Mutex
+	shutdown   chan struct{}
+	requests   sync.WaitGroup
+	drained    chan struct{}
 }
 
 // Rate limits (in-memory, per process).
@@ -225,6 +227,7 @@ func New(cfg Config, d Deps) (*Server, error) {
 		publicHosts:    map[string]bool{},
 		trustedProxies: append([]netip.Prefix(nil), cfg.TrustedProxies...),
 		shutdown:       make(chan struct{}),
+		drained:        make(chan struct{}),
 	}
 	for _, h := range hosts {
 		s.publicHosts[h] = true
@@ -233,7 +236,7 @@ func New(cfg Config, d Deps) (*Server, error) {
 	for _, rt := range s.routes() {
 		s.register(rt)
 	}
-	s.handler = s.outer(http.HandlerFunc(s.dispatch))
+	s.handler = s.outer(s.trackRequests(http.HandlerFunc(s.dispatch)))
 	return s, nil
 }
 
@@ -276,6 +279,11 @@ func (s *Server) register(rt route) {
 // dispatch sends /api paths to the API mux, rendering its 404 and 405 as
 // JSON envelopes, and everything else to the web client.
 func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
+	if !s.hostAllowed(r.Host) {
+		s.logBadHost(r, requestIDFrom(r.Context()))
+		s.writeError(w, r, errBadHost)
+		return
+	}
 	if !isAPIPath(r.URL.Path) {
 		s.allowGameConnections(w.Header(), r.Context())
 		s.spa.ServeHTTP(w, r)
@@ -414,6 +422,7 @@ func OpenListener(addr, flag string) (net.Listener, error) {
 // it stops accepting connections, ends streaming responses and waits up to
 // a grace period for in-flight requests.
 func (s *Server) Serve(ctx context.Context, ln net.Listener, redirect ...net.Listener) error {
+	defer s.beginShutdown()
 	srv := s.httpServer(s.handler)
 	if s.cfg.tls() {
 		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
@@ -435,7 +444,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener, redirect ...net.Lis
 	var secondary *http.Server
 	if len(redirect) > 0 && redirect[0] != nil {
 		_, port, _ := net.SplitHostPort(ln.Addr().String())
-		secondary = s.httpServer(s.redirectHandler(port))
+		secondary = s.httpServer(s.trackRequests(s.redirectHandler(port)))
 		go func() { errCh <- secondary.Serve(redirect[0]) }()
 	}
 	go func() {
@@ -510,5 +519,37 @@ func (s *Server) redirectHandler(port string) http.Handler {
 }
 
 func (s *Server) beginShutdown() {
-	s.shutdownOnce.Do(func() { close(s.shutdown) })
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	select {
+	case <-s.shutdown:
+		return
+	default:
+		close(s.shutdown)
+	}
+	go func() {
+		s.requests.Wait()
+		close(s.drained)
+	}()
+}
+
+// Drained closes after shutdown starts and all admitted handlers return,
+// including certificate publication that outlives the HTTP connection.
+func (s *Server) Drained() <-chan struct{} { return s.drained }
+
+func (s *Server) trackRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.shutdownMu.Lock()
+		select {
+		case <-s.shutdown:
+			s.shutdownMu.Unlock()
+			s.writeError(w, r, errUnavailable)
+			return
+		default:
+			s.requests.Add(1)
+			s.shutdownMu.Unlock()
+		}
+		defer s.requests.Done()
+		next.ServeHTTP(w, r)
+	})
 }
