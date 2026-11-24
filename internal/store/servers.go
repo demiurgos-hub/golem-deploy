@@ -36,15 +36,32 @@ type Server struct {
 	AdminToken     []byte `json:"-"`
 	PendingLaunch  string `json:"-"`
 	StartComplete  bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// DataVolume is the Docker volume holding the server's data directory
+	// ("" until the first start and after a reset); only server jobs write
+	// it. DataFingerprint is the schema fingerprint of that saved data as
+	// far as the daemon knows ("" when unknown).
+	DataVolume      string
+	DataFingerprint string
+	// SnapshotIntervalSeconds is the game's autosave period (0: off).
+	// BackupIntervalHours (0: off) and BackupKeep are the backup schedule.
+	SnapshotIntervalSeconds int
+	BackupIntervalHours     int
+	BackupKeep              int
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
+
+// Defaults of the saved data settings of a new server.
+const (
+	DefaultSnapshotIntervalSeconds = 300
+	DefaultBackupKeep              = 7
+)
 
 // ErrStale is returned by UpdateServer when the stored env changed since the
 // caller read it (a concurrent update won); the caller re-reads and retries.
 var ErrStale = errors.New("store: server changed concurrently")
 
-const serverCols = `id, name, build_id, port, env, desired_state, container_id, allowed_origins, admin_port, admin_token, pending_launch, start_complete, created_at, updated_at`
+const serverCols = `id, name, build_id, port, env, desired_state, container_id, allowed_origins, admin_port, admin_token, pending_launch, start_complete, data_volume, data_fingerprint, snapshot_interval_seconds, backup_interval_hours, backup_keep, created_at, updated_at`
 
 func scanServer(r scanner) (Server, error) {
 	var sv Server
@@ -52,7 +69,7 @@ func scanServer(r scanner) (Server, error) {
 	var containerID sql.NullString
 	var origins, created, updated string
 	if err := r.Scan(&sv.ID, &sv.Name, &buildID, &port, &sv.Env, &sv.DesiredState, &containerID, &origins, &adminPort, &sv.AdminToken, &sv.PendingLaunch, &sv.StartComplete,
-		&created, &updated); err != nil {
+		&sv.DataVolume, &sv.DataFingerprint, &sv.SnapshotIntervalSeconds, &sv.BackupIntervalHours, &sv.BackupKeep, &created, &updated); err != nil {
 		return Server{}, err
 	}
 	sv.BuildID = int64Ptr(buildID)
@@ -98,14 +115,19 @@ func insertServer(ctx context.Context, tx *sql.Tx, sv Server, now string) (Serve
 	if err != nil {
 		return Server{}, err
 	}
+	if sv.BackupKeep == 0 {
+		sv.BackupKeep = DefaultBackupKeep
+	}
 	return scanServer(tx.QueryRowContext(ctx,
-		`INSERT INTO servers (name, build_id, port, env, desired_state, allowed_origins, created_at, updated_at)
-		 VALUES (?, ?, ?, NULL, ?, ?, ?, ?) RETURNING `+serverCols,
-		sv.Name, nullInt64(sv.BuildID), intPtrArg(sv.Port), sv.DesiredState, origins, now, now))
+		`INSERT INTO servers (name, build_id, port, env, desired_state, allowed_origins, snapshot_interval_seconds, backup_interval_hours, backup_keep, created_at, updated_at)
+		 VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?) RETURNING `+serverCols,
+		sv.Name, nullInt64(sv.BuildID), intPtrArg(sv.Port), sv.DesiredState, origins, sv.SnapshotIntervalSeconds, sv.BackupIntervalHours, sv.BackupKeep, now, now))
 }
 
-// CreateServer inserts sv (ID, ContainerID, admin fields and timestamps
-// ignored; empty DesiredState becomes "stopped"). When seal is non-nil it is
+// CreateServer inserts sv (ID, ContainerID, admin and data fields and
+// timestamps ignored; empty DesiredState becomes "stopped", BackupKeep 0
+// becomes DefaultBackupKeep; SnapshotIntervalSeconds is stored as given, so
+// callers pass DefaultSnapshotIntervalSeconds for the default). When seal is non-nil it is
 // called with the new id in the same transaction and its result stored as
 // env. ErrConflict means the name or port is taken.
 func (s *Store) CreateServer(ctx context.Context, sv Server, seal SealFunc) (Server, error) {
@@ -235,6 +257,11 @@ type ServerUpdate struct {
 	Env             []byte // sealed for the server's id
 	PrevContainerID string // container checked for a port change
 	PrevEnv         []byte // the ciphertext the new Env was derived from
+	// SnapshotIntervalSeconds, BackupIntervalHours and BackupKeep change
+	// the saved data settings.
+	SnapshotIntervalSeconds *int
+	BackupIntervalHours     *int
+	BackupKeep              *int
 }
 
 // UpdateServer applies u to server id (UpdatedAt is set to now) and returns
@@ -327,6 +354,15 @@ func (s *Store) updateServer(ctx context.Context, tx *sql.Tx, id int64, u Server
 	if u.Port != nil {
 		sets = append(sets, "port = ?")
 		args = append(args, *u.Port)
+	}
+	for _, c := range []struct {
+		col string
+		v   *int
+	}{{"snapshot_interval_seconds", u.SnapshotIntervalSeconds}, {"backup_interval_hours", u.BackupIntervalHours}, {"backup_keep", u.BackupKeep}} {
+		if c.v != nil {
+			sets = append(sets, c.col+" = ?")
+			args = append(args, *c.v)
+		}
 	}
 	if u.SetOrigins {
 		origins, err := originsArg(u.AllowedOrigins)
