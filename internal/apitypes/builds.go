@@ -37,9 +37,10 @@ type Build struct {
 	// EngineVersion is the Golem Engine version the game requires.
 	EngineVersion string `json:"engine_version"`
 	// SchemaFingerprint is the game's schema fingerprint: read from the
-	// repository's committed generated code when the build has it, and
-	// replaced by what the game reports once a server running this build
-	// has become ready. Empty while neither is known.
+	// repository's committed generated code when the build has it;
+	// otherwise the first value a game running this build reports once its
+	// server has become ready is filled in. A recorded value is never
+	// replaced. Empty while neither is known.
 	SchemaFingerprint string `json:"schema_fingerprint"`
 	// WebTransportPath and WebSocketPath are the endpoint paths the game
 	// serves its transports on (transport in golem-deploy.yaml, defaults
