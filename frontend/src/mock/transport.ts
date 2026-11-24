@@ -56,7 +56,17 @@ import type {
   UpdateServerRequest,
   Volume,
 } from "@/api/types.gen";
-import { checkRepoUrl, sameRepoOrigin, validateEnvKey, validateEnvTotals, validateEnvValue, validateStaticName } from "@/lib/validators";
+import {
+  BACKUP_NOTE_FORBIDDEN,
+  BACKUP_NOTE_MAX,
+  checkRepoUrl,
+  sameRepoOrigin,
+  trimBackupNote,
+  validateEnvKey,
+  validateEnvTotals,
+  validateEnvValue,
+  validateStaticName,
+} from "@/lib/validators";
 
 export const MOCK_MARKER = "golem-deploy-mock-layer";
 
@@ -91,8 +101,10 @@ interface MockState {
   statics: Map<string, { meta: StaticFile; blob: Blob }>;
   volumes: Volume[];
   backups: Backup[];
-  /** The backup each active restore job reads (it cannot be deleted meanwhile). */
+  /** The backup each restore job reads (it cannot be deleted while the job runs). */
   restoreReads: Map<number, number>;
+  /** Entries of a server's data directory that a backup leaves out (links, pipes, devices, names not allowed), by server id. */
+  omittedEntries: Map<number, number>;
   jobs: Job[];
   jobLogs: Map<number, string[]>;
   follows: Map<number, number>;
@@ -337,6 +349,7 @@ function seed(): MockState {
     size_bytes: 4_200_000 + id * 37_000,
     content_bytes: 11_800_000 + id * 91_000,
     file_count: 3,
+    omitted_entries: 0,
     sha256: fakeFingerprint(`backup-${id}`),
     job_id: null,
     created_by: kind === "scheduled" ? null : 1,
@@ -347,6 +360,8 @@ function seed(): MockState {
   const arena = { id: 11, name: "eu-arena" };
   const old = { build_id: 1, commit: COMMIT_ARENA_OLD, schema_fingerprint: FINGERPRINT_OLD };
   const backups: Backup[] = [
+    // "flood-test" keeps a link and a pipe next to its world: its backups leave them out.
+    backup(10, { id: 14, name: "flood-test" }, "manual", HOUR, { note: "before the load test", omitted_entries: 2, schema_fingerprint: "" }),
     backup(9, arena, "scheduled", 2 * HOUR),
     backup(8, { id: 15, name: "kart-eu" }, "scheduled", 4 * HOUR, {
       project_id: 2, project_name: "kart-racer", build_id: 4, commit: COMMIT_KART, schema_fingerprint: "", size_bytes: 1_100_000,
@@ -424,6 +439,7 @@ function seed(): MockState {
     volumes,
     backups,
     restoreReads: new Map(),
+    omittedEntries: new Map([[14, 2]]),
     jobs: jobs.reverse(),
     jobLogs,
     follows: new Map(),
@@ -431,7 +447,7 @@ function seed(): MockState {
     nextId: 100,
     nextBuildId: 6,
     nextJobId,
-    nextBackupId: 10,
+    nextBackupId: 11,
     volumeSeq: 2,
     requestSeq: 0,
   };
@@ -771,6 +787,7 @@ export function createMockTransport(real: Transport): Transport {
       size_bytes: 3_000_000 + Math.round(Math.random() * 2_000_000),
       content_bytes: 9_000_000 + Math.round(Math.random() * 4_000_000),
       file_count: 3,
+      omitted_entries: st.omittedEntries.get(s.id) ?? 0,
       sha256: fakeFingerprint(`backup-${id}-${Date.now()}`),
       job_id: job?.id ?? null,
       created_by: me?.id ?? null,
@@ -1340,22 +1357,38 @@ export function createMockTransport(real: Transport): Transport {
         return json(st, 200, s);
       }
       if (!sub && method === "DELETE") {
+        const rawSkip = query.get("skip_safety_backup");
+        if (rawSkip !== null && !["1", "true", "0", "false"].includes(rawSkip)) return fail(st, 400, "bad_request", "skip_safety_backup must be 1 or 0");
+        const skipSafety = rawSkip === "1" || rawSkip === "true";
+        if (skipSafety && !admin) return fail(st, 403, "forbidden", "only an administrator can delete a server without its last backup");
         if (activeJobFor(st, "server", s.id)) return fail(st, 409, "job_in_progress", "another job is already running for this server");
         // A server.delete job, awaited like the daemon does; with Docker unreachable it fails and nothing is deleted.
         const lost = s.state === "unknown";
-        const job = startJob(
+        // A last backup of the saved data comes first; one that would leave entries out is stored, then stops the deletion.
+        const safety = !lost && !skipSafety && s.data.volume !== "";
+        const omitted = safety ? (st.omittedEntries.get(s.id) ?? 0) : 0;
+        const refusal = `the last backup of the saved data would leave ${omitted} ${omitted === 1 ? "entry" : "entries"} of the data directory out (links, pipes, devices or names that are not allowed); it was stored, but nothing was deleted. An administrator can delete the server anyway with skip_safety_backup=1`;
+        const job: Job = startJob(
           st,
           me,
           false,
           "server.delete",
           "server",
           s.id,
-          lost ? [`deleting server "${s.name}"`, "FAIL"] : [`stopping container golem-deploy-${s.name}`, "removing container"],
-          () => {},
-          "Docker is unreachable",
+          lost
+            ? [`deleting server "${s.name}"`, "FAIL"]
+            : [
+                ...(safety ? ["taking a last backup of the saved data"] : []),
+                ...(omitted > 0 ? ["FAIL"] : [`stopping container golem-deploy-${s.name}`, "removing container"]),
+              ],
+          () => {
+            if (safety) addBackup(s, "pre_delete", job, me);
+          },
+          lost ? "Docker is unreachable" : refusal,
         );
         while (isActive(job)) await sleep(200);
         if (lost) return fail(st, 503, "service_unavailable", "Docker is unreachable");
+        if (omitted > 0) return fail(st, 409, "conflict", refusal);
         st.servers = st.servers.filter((x) => x.id !== s.id);
         // Its data volume goes with it; its backups stay, without the server id.
         if (s.data.volume) dropVolume(s.data.volume);
@@ -1371,8 +1404,10 @@ export function createMockTransport(real: Transport): Transport {
       }
       if (sub === "/backups" && method === "POST") {
         const req = typeof init.body === "string" && init.body ? body<CreateBackupRequest>() : {};
-        const note = req.note ?? "";
-        if (/[\r\n]/.test(note) || [...note].length > 200) return fail(st, 400, "validation_failed", "note must be a single line of at most 200 characters", "note");
+        // Like servers.ValidateNote, after removing the surrounding space.
+        const note = trimBackupNote(req.note ?? "");
+        if ([...note].length > BACKUP_NOTE_MAX) return fail(st, 400, "validation_failed", `note must be at most ${BACKUP_NOTE_MAX} characters`, "note");
+        if (BACKUP_NOTE_FORBIDDEN.test(note)) return fail(st, 400, "validation_failed", "note must be a single line without control characters", "note");
         if (activeJobFor(st, "server", s.id)) return fail(st, 409, "job_in_progress", "another job is already running for this server");
         return json(st, 202, backupJob(s, note, me));
       }
@@ -1610,7 +1645,8 @@ export function createMockTransport(real: Transport): Transport {
       }
       if (method === "DELETE") {
         if (!admin) return forbidden();
-        if ([...st.restoreReads].some(([jobId, backupId]) => backupId === b.id && st.jobs.some((j) => j.id === jobId && isActive(j)))) {
+        // Only a restore that is running reads the archive; a queued one checks it again when it starts.
+        if ([...st.restoreReads].some(([jobId, backupId]) => backupId === b.id && st.jobs.some((j) => j.id === jobId && j.status === "running"))) {
           return fail(st, 409, "conflict", "a restore is reading this backup; wait for it to finish");
         }
         st.backups = st.backups.filter((x) => x.id !== b.id);
@@ -1890,29 +1926,53 @@ export function createMockTransport(real: Transport): Transport {
     return job;
   }
 
+  /** The job detail when a safety backup leaves entries out: it was stored, and nothing was replaced. */
+  function incompleteSafetyDetail(n: number, action: "restore" | "reset"): string {
+    return `the safety backup would leave ${n} ${n === 1 ? "entry" : "entries"} of the data directory out (links, pipes, devices or names that are not allowed); it was stored, but nothing was replaced. Repeat the ${action} with skip_safety_backup to go ahead`;
+  }
+
+  /** A server whose container was removed (after a reset, or a forced restore it cannot load): it has none until its next start. */
+  function removeContainer(s: Server) {
+    containerImage.delete(s.id);
+    Object.assign(s, { state: "missing", container_id: "", started_at: null, exit_code: null, restart_required: false });
+  }
+
   /** POST /servers/{id}/restore: stop, safety backup, replace the data, start again if meant to run. */
   function restoreJob(s: Server, b: Backup, skipSafety: boolean, me: Me): Job {
     const wasActive = s.state === "running" || s.state === "restarting";
     const safety = !skipSafety && s.data.volume !== "";
+    const omitted = safety ? (st.omittedEntries.get(s.id) ?? 0) : 0;
     const steps = [
       ...(wasActive ? [`stopping container golem-deploy-${s.name}`] : []),
       ...(safety ? ["taking a safety backup of the current data"] : []),
-      `replacing the data with backup ${b.id}`,
-      ...(s.desired_state === "running" ? [`starting container golem-deploy-${s.name}`, "waiting for the game to report ready"] : []),
+      ...(omitted > 0
+        ? ["FAIL"]
+        : [
+            `replacing the data with backup ${b.id}`,
+            ...(s.desired_state === "running" ? [`starting container golem-deploy-${s.name}`, "waiting for the game to report ready"] : []),
+          ]),
     ];
     const job: Job = startJob(st, me, true, "server.restore", "server", s.id, steps, (ok) => {
-      if (!ok) return;
       if (safety) addBackup(s, "pre_restore", job, me);
+      if (!ok) return;
+      // The backup was deleted while the restore was queued (a running restore protects it).
+      if (!st.backups.some((x) => x.id === b.id)) {
+        job.status = "error";
+        job.detail = `backup ${b.id} no longer exists; nothing was replaced`;
+        return;
+      }
       if (s.data.volume) dropVolume(s.data.volume);
       newVolume(s);
       s.data.schema_fingerprint = b.schema_fingerprint;
+      // The restored directory holds only what the backup stored.
+      st.omittedEntries.delete(s.id);
       refreshDerived();
-      // A forced restore of another schema leaves the server unable to start.
-      const start = s.desired_state === "running" && !s.data.schema_mismatch;
-      Object.assign(s, start
-        ? { state: "running", started_at: iso(), exit_code: null, container_id: s.container_id || `c0ffee${s.id}0000`, restart_required: false }
-        : { state: s.container_id ? "exited" : "missing", started_at: null });
-    });
+      // A forced restore of another schema leaves the server without a container until a build that can load it is assigned.
+      if (s.data.schema_mismatch) removeContainer(s);
+      else if (s.desired_state === "running") {
+        Object.assign(s, { state: "running", started_at: iso(), exit_code: null, container_id: s.container_id || `c0ffee${s.id}0000`, restart_required: false });
+      } else Object.assign(s, { state: s.container_id ? "exited" : "missing", started_at: null });
+    }, incompleteSafetyDetail(omitted, "restore"));
     st.restoreReads.set(job.id, b.id);
     return job;
   }
@@ -1921,29 +1981,34 @@ export function createMockTransport(real: Transport): Transport {
   function resetJob(s: Server, skipSafety: boolean, me: Me): Job {
     const wasActive = s.state === "running" || s.state === "restarting";
     const safety = !skipSafety && s.data.volume !== "";
+    const omitted = safety ? (st.omittedEntries.get(s.id) ?? 0) : 0;
     const steps = [
       ...(wasActive ? [`stopping container golem-deploy-${s.name}`] : []),
       ...(safety ? ["taking a safety backup of the current data"] : []),
-      "discarding the saved data",
-      ...(s.desired_state === "running" ? [`starting container golem-deploy-${s.name}`, "waiting for the game to report ready"] : []),
+      ...(omitted > 0
+        ? ["FAIL"]
+        : ["discarding the saved data", ...(s.desired_state === "running" ? [`starting container golem-deploy-${s.name}`, "waiting for the game to report ready"] : [])]),
     ];
     const job: Job = startJob(st, me, true, "server.data_reset", "server", s.id, steps, (ok) => {
-      if (!ok) return;
       if (safety) addBackup(s, "pre_reset", job, me);
+      if (!ok) return;
       if (s.data.volume) dropVolume(s.data.volume);
       s.data.volume = "";
       s.data.schema_fingerprint = "";
+      // The discarded data goes with whatever the directory held that could not be backed up.
+      st.omittedEntries.delete(s.id);
       if (s.desired_state === "running") {
         newVolume(s);
         s.data.schema_fingerprint = st.builds.find((x) => x.id === s.build_id)?.schema_fingerprint ?? "";
         Object.assign(s, { state: "running", started_at: iso(), exit_code: null, container_id: s.container_id || `c0ffee${s.id}0000`, restart_required: false });
       } else {
-        Object.assign(s, { state: s.container_id ? "exited" : "missing", started_at: null });
+        removeContainer(s);
       }
       refreshDerived();
-    });
+    }, incompleteSafetyDetail(omitted, "reset"));
     return job;
   }
+
 
   return {
     async fetch(url, init) {
