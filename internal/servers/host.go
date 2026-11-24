@@ -109,7 +109,8 @@ func (s *Service) RemoveImage(ctx context.Context, id string) error {
 }
 
 // Volumes returns the managed volumes. ServerID is null when the labelled
-// server no longer exists.
+// server no longer exists; Current is true for a server's current data
+// volume.
 func (s *Service) Volumes(ctx context.Context) ([]apitypes.Volume, error) {
 	vols, err := s.docker.ListVolumes(ctx)
 	if err != nil {
@@ -120,8 +121,12 @@ func (s *Service) Volumes(ctx context.Context) ([]apitypes.Volume, error) {
 		return nil, err
 	}
 	known := map[int64]bool{}
+	current := map[string]int64{}
 	for _, r := range rows {
 		known[r.ID] = true
+		if r.DataVolume != "" {
+			current[r.DataVolume] = r.ID
+		}
 	}
 	out := make([]apitypes.Volume, 0, len(vols))
 	for _, v := range vols {
@@ -129,19 +134,34 @@ func (s *Service) Volumes(ctx context.Context) ([]apitypes.Volume, error) {
 		if v.ServerID != 0 && known[v.ServerID] {
 			id := v.ServerID
 			av.ServerID = &id
+			av.Current = current[v.Name] == id
 		}
 		out = append(out, av)
 	}
 	return out, nil
 }
 
-// RemoveVolume deletes a managed volume that no container mounts. Unknown
-// and unmanaged volumes are both ErrNotFound.
+// RemoveVolume deletes a managed volume that no container mounts and that
+// is not a server's current data volume (ErrVolumeCurrent, also for a
+// volume a running job created and has not recorded yet). Unknown and
+// unmanaged volumes are both ErrNotFound.
 func (s *Service) RemoveVolume(ctx context.Context, name string) error {
 	if err := docker.ValidateVolumeName(name); err != nil {
 		return fieldErr("name", "invalid volume name")
 	}
-	err := s.docker.RemoveVolume(ctx, name)
+	if _, pending := s.pendingVolumes.Load(name); pending {
+		return ErrVolumeCurrent
+	}
+	rows, err := s.store.ListServers(ctx)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		if r.DataVolume == name {
+			return ErrVolumeCurrent
+		}
+	}
+	err = s.docker.RemoveVolume(ctx, name)
 	switch {
 	case errors.Is(err, docker.ErrNotFound), errors.Is(err, docker.ErrNotManaged):
 		return ErrNotFound

@@ -32,6 +32,8 @@ func TestRunRejectsBadServerSettings(t *testing.T) {
 		{Listen: "127.0.0.1:8000", ServerCPUs: -1},
 		{Listen: "127.0.0.1:8000", StartTimeout: 10 * time.Millisecond},
 		{Listen: "127.0.0.1:8000", StartTimeout: time.Hour},
+		{Listen: "127.0.0.1:8000", BackupMaxMB: -1},
+		{Listen: "127.0.0.1:8000", BackupMaxMB: 1<<20 + 1},
 	}
 	for i, o := range cases {
 		dir := t.TempDir()

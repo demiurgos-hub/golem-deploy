@@ -32,6 +32,7 @@ func dockerUnavailable(cause error) *apiError {
 func serversError(what string, err error) error {
 	var fe *servers.FieldError
 	var ve *docker.ValidationError
+	var mm *servers.SchemaMismatchError
 	switch {
 	case err == nil:
 		return nil
@@ -41,6 +42,20 @@ func serversError(what string, err error) error {
 		return invalidField(ve.Field, ve.Msg)
 	case errors.Is(err, servers.ErrNotFound):
 		return notFound(what)
+	case errors.Is(err, servers.ErrBackupNotFound):
+		return notFound("backup")
+	case errors.Is(err, servers.ErrBackupInUse):
+		return conflict(apitypes.ErrorCodeConflict, "a running job reads this backup; wait for it to finish")
+	case errors.Is(err, servers.ErrBackupDamaged):
+		return conflict(apitypes.ErrorCodeConflict, "the backup's archive is missing or does not match its checksum")
+	case errors.Is(err, servers.ErrNoBuild):
+		return conflict(apitypes.ErrorCodeConflict, "the server has no successful build whose image exists; assign one first")
+	case errors.As(err, &mm):
+		return conflict(apitypes.ErrorCodeSchemaMismatch, mm.Error()+"; the server could not load it (restore with force to do it anyway)")
+	case errors.Is(err, servers.ErrVolumeCurrent):
+		return conflict(apitypes.ErrorCodeConflict, "the volume is a server's current data volume; delete the server or reset its data instead")
+	case errors.Is(err, servers.ErrBackupsUnavailable):
+		return errUnavailable
 	case errors.Is(err, servers.ErrNameTaken):
 		return conflict(apitypes.ErrorCodeNameTaken, "a server with that name already exists")
 	case errors.Is(err, servers.ErrPortInUse):

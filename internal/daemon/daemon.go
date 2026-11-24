@@ -21,6 +21,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
+	"github.com/demiurgos-hub/golem-deploy/internal/backups"
 	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
@@ -79,6 +80,9 @@ type Options struct {
 	// build.DefaultRetention).
 	BuildTimeout   time.Duration
 	BuildRetention int
+	// BackupMaxMB is the largest data directory a backup accepts, in MiB
+	// (--backup-max-mb; 0 means 1024).
+	BackupMaxMB int
 	// Ready, if set, is called with the bound address once serving.
 	Ready func(addr net.Addr)
 
@@ -129,8 +133,15 @@ func serverConfig(o Options) (servers.Config, error) {
 	if o.StartTimeout != 0 && (o.StartTimeout < time.Second || o.StartTimeout > 30*time.Minute) {
 		return servers.Config{}, errors.New("--start-timeout must be between 1s and 30m")
 	}
+	backupMax := o.BackupMaxMB
+	if backupMax == 0 {
+		backupMax = servers.DefaultBackupMaxBytes >> 20
+	}
+	if backupMax < 1 || backupMax > 1<<20 {
+		return servers.Config{}, errors.New("--backup-max-mb must be between 1 and 1048576")
+	}
 	return servers.Config{Ports: rng, PanelPort: panel, BindAddress: o.PortBindAddress, MemoryMB: o.ServerMemoryMB, CPUs: o.ServerCPUs,
-		StartTimeout: o.StartTimeout}, nil
+		StartTimeout: o.StartTimeout, BackupMaxBytes: int64(backupMax) << 20}, nil
 }
 
 // defaultGameHost is the first --public-host usable as a game host.
@@ -329,6 +340,20 @@ func Run(ctx context.Context, o Options) (err error) {
 	if err != nil {
 		return err
 	}
+	backupStore, err := backups.Open(layout.Backups(), backups.Options{})
+	if err != nil {
+		return err
+	}
+	// No job runs yet: archives being written when the daemon stopped and
+	// archives without a record are leftovers of an interrupted backup.
+	if files, err := st.BackupFiles(ctx); err != nil {
+		return err
+	} else if removed, err := backupStore.Sweep(files); err != nil {
+		logger.Warn("could not remove all backup files left by a previous run", "err", err)
+	} else if len(removed) > 0 {
+		logger.Warn("removed backup files left by an interrupted backup", "files", removed)
+	}
+	srvCfg.Backups = backupStore
 	// Builds run on their own pool: a waiting build holds a worker of that
 	// pool (build.MaxActiveBuilds at most), so builds never delay server
 	// starts and stops or other project jobs on the default pool.
@@ -462,7 +487,14 @@ func Run(ctx context.Context, o Options) (err error) {
 	recDone := make(chan struct{})
 	go func() {
 		defer close(recDone)
+		cleanupHelpers(recCtx, svc, logger)
 		reconcileServers(recCtx, svc, runner, logger)
+	}()
+	scheduleDone := make(chan struct{})
+	go func() {
+		defer close(scheduleDone)
+		<-recDone
+		runBackupSchedule(recCtx, svc, runner, logger)
 	}()
 	defer cancelRec()
 	cleanupDone := make(chan struct{})
@@ -499,7 +531,7 @@ func Run(ctx context.Context, o Options) (err error) {
 		}
 		deadline <- time.Now().Add(grace)
 		jobsDone := runner.Stop()
-		for _, done := range []<-chan struct{}{srv.Drained(), jobsDone, certDone, recDone, cleanupDone} {
+		for _, done := range []<-chan struct{}{srv.Drained(), jobsDone, certDone, recDone, cleanupDone, scheduleDone} {
 			<-done
 		}
 		builds.WaitWatchers()
@@ -566,6 +598,55 @@ func checkDataDirPath(dir string) error {
 		return fmt.Errorf("data directory %q cannot be used: %w (it is written into the SSH configuration of git operations); choose another --data-dir", abs, err)
 	}
 	return nil
+}
+
+// cleanupHelpers removes helper containers a previous run left behind.
+func cleanupHelpers(ctx context.Context, svc *servers.Service, logger *slog.Logger) {
+	cctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	if err := svc.CleanupHelpers(cctx); err != nil && ctx.Err() == nil {
+		logger.Warn("could not remove all helper containers left by a previous run; retrying later", "err", err)
+	}
+}
+
+// runBackupSchedule checks the backup schedules every
+// servers.ScheduleInterval until ctx ends, and retries the removal of
+// leftover helper containers.
+func runBackupSchedule(ctx context.Context, svc *servers.Service, runner *jobs.Runner, logger *slog.Logger) {
+	start := func(id int64, body func(context.Context, io.Writer) error) error {
+		jobID := make(chan int64, 1)
+		job, err := runner.Start(ctx, string(apitypes.JobKindServerBackup), jobs.Subject{Type: string(apitypes.SubjectTypeServer), ID: jobs.SubjectID(id)}, nil,
+			func(jctx context.Context, log io.Writer) error {
+				var jid int64
+				select {
+				case jid = <-jobID:
+				case <-jctx.Done():
+				}
+				return body(servers.WithJobID(jctx, jid), log)
+			})
+		if err == nil {
+			jobID <- job.ID
+			logger.Info("scheduled backup started", "server_id", id, "job_id", job.ID)
+		}
+		return err
+	}
+	ticker := time.NewTicker(servers.ScheduleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		cctx, cancel := context.WithTimeout(ctx, time.Minute)
+		if err := svc.CleanupHelpers(cctx); err != nil && ctx.Err() == nil {
+			logger.Debug("helper container cleanup failed", "err", err)
+		}
+		if _, err := svc.ScheduleBackups(cctx, start); err != nil && ctx.Err() == nil && !errors.Is(err, docker.ErrUnavailable) {
+			logger.Warn("could not check the backup schedules", "err", err)
+		}
+		cancel()
+	}
 }
 
 // reconcileServers submits startup verification and recovery as server jobs.

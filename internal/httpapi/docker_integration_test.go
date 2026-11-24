@@ -54,6 +54,21 @@ func itestQuiet(args ...string) {
 	_ = exec.CommandContext(ctx, "docker", args...).Run()
 }
 
+// itestRemoveVolumes removes the data volumes the integration instance
+// created for the named servers (and nothing else).
+func itestRemoveVolumes(servers ...string) {
+	for _, name := range servers {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		out, _ := exec.CommandContext(ctx, "docker", "volume", "ls", "--quiet",
+			"--filter", "label="+docker.LabelInstance+"="+dockertest.IntegrationInstanceID,
+			"--filter", "label="+docker.LabelServer+"="+name).Output()
+		cancel()
+		for _, v := range strings.Fields(string(out)) {
+			itestQuiet("volume", "rm", "--", v)
+		}
+	}
+}
+
 // served returns the SHA-256 of the leaf certificate served on
 // 127.0.0.1:port ("" when the handshake fails).
 func served(port int) string {
@@ -88,6 +103,7 @@ func TestIntegrationServersAPI(t *testing.T) {
 	impostor := "gdm3-itapi-impostor-" + sfx
 	t.Cleanup(func() {
 		itestQuiet("rm", "--force", docker.ContainerName(name), docker.ContainerName(stuck), impostor)
+		itestRemoveVolumes(name, stuck, "gdm3-wrong-"+sfx)
 		if !networkExisted {
 			itestQuiet("network", "rm", docker.NetworkName)
 		}

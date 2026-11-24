@@ -42,6 +42,9 @@ func (l Layout) KnownHosts() string { return filepath.Join(l.Root, "known_hosts"
 // Static is the static file store.
 func (l Layout) Static() string { return filepath.Join(l.Root, "static") }
 
+// Backups holds the backup archives of servers' saved data.
+func (l Layout) Backups() string { return filepath.Join(l.Root, "backups") }
+
 // JobLogs holds one log file per job.
 func (l Layout) JobLogs() string { return filepath.Join(l.Root, "logs", "jobs") }
 
@@ -78,6 +81,7 @@ const markerFormat = 1
 var legacyEntries = map[string]bool{
 	"golem-deploy.db": true, "golem-deploy.db-wal": true, "golem-deploy.db-shm": true, "golem-deploy.db-journal": true,
 	"keys": true, "repositories": true, "static": true, "logs": true, "tmp": true, "known_hosts": true, ".lock": true, "docker-build": true,
+	"backups": true,
 }
 
 // Prepare resolves root to an absolute path and initialises or reuses the
@@ -128,7 +132,7 @@ func Prepare(root string) (Layout, error) {
 	default:
 		return Layout{}, fmt.Errorf("stat data directory: %w", err)
 	}
-	for _, d := range []string{l.KeysDir(), l.Repositories(), l.Static(), filepath.Join(l.Root, "logs"), l.JobLogs(), l.Tmp(), l.ACME()} {
+	for _, d := range []string{l.KeysDir(), l.Repositories(), l.Static(), filepath.Join(l.Root, "logs"), l.JobLogs(), l.Tmp(), l.ACME(), l.Backups()} {
 		if err := os.Mkdir(d, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 			return Layout{}, fmt.Errorf("create %s: %w", d, err)
 		}

@@ -126,6 +126,8 @@ func TestEngineEnvContract(t *testing.T) {
 		"GOLEM_TLS_PINNED":          "1",
 		"GOLEM_ADMIN_ADDR":          ":7778",
 		"GOLEM_ADMIN_TOKEN":         "tok",
+		"GOLEM_SNAPSHOT_DIR":        "/data",
+		"GOLEM_SNAPSHOT_INTERVAL":   "0",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("%v", got)

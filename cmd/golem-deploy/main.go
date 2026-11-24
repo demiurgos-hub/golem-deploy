@@ -208,6 +208,15 @@ func cmdServe(args []string, stderr io.Writer) int {
 			return 2
 		}
 	}
+	backupMaxDefault, err := envInt("GOLEM_DEPLOY_BACKUP_MAX_MB")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if os.Getenv("GOLEM_DEPLOY_BACKUP_MAX_MB") == "" {
+		backupMaxDefault = 1024
+	}
+	backupMax := fs.Int("backup-max-mb", backupMaxDefault, "largest data directory of a server a backup accepts, in MiB (env GOLEM_DEPLOY_BACKUP_MAX_MB)")
 	buildTimeout := fs.Duration("build-timeout", buildTimeoutDefault, "time limit of one build, e.g. 30m (env GOLEM_DEPLOY_BUILD_TIMEOUT)")
 	buildRetention := fs.Int("build-retention", buildRetentionDefault, "successful builds kept per project, with their images; builds that servers use are always kept (env GOLEM_DEPLOY_BUILD_RETENTION)")
 	if err := fs.Parse(args); err != nil {
@@ -241,6 +250,7 @@ func cmdServe(args []string, stderr io.Writer) int {
 		StartTimeout:    *startTimeout,
 		BuildTimeout:    *buildTimeout,
 		BuildRetention:  *buildRetention,
+		BackupMaxMB:     *backupMax,
 		Version:         buildVersion(),
 		Logger:          logger,
 		SPA:             frontend.Handler(),

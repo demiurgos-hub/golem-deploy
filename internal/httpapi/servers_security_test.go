@@ -120,10 +120,14 @@ func TestD2_ImageVolumesBecomeTmpfs(t *testing.T) {
 	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "vol", BuildID: id.ID})
 	j := d.start(s.ID)
 	ct, _ := d.fake.Container("golem-deploy-vol")
-	if !slices.Equal(ct.Tmpfs, []string{"/tmp:rw,noexec,nosuid,size=64m", "/data:rw,noexec,nosuid,size=64m", "/var/lib/game:rw,noexec,nosuid,size=64m"}) {
+	// /data is the data volume (a daemon mount wins over the image's).
+	if !slices.Equal(ct.Tmpfs, []string{"/tmp:rw,noexec,nosuid,size=64m", "/var/lib/game:rw,noexec,nosuid,size=64m"}) {
 		t.Fatalf("tmpfs %q", ct.Tmpfs)
 	}
-	if !strings.Contains(d.jobLog(j.ID), "image volumes /data, /var/lib/game get size-limited tmpfs mounts") {
+	if vol := ct.MountTargets["/data"]; vol == "" || !strings.HasPrefix(vol, "golem-deploy-data-") {
+		t.Fatalf("mounts %v", ct.MountTargets)
+	}
+	if !strings.Contains(d.jobLog(j.ID), "image volumes /var/lib/game get size-limited tmpfs mounts") {
 		t.Fatal(d.jobLog(j.ID))
 	}
 	d.action(d.devTok, s.ID, "restart")

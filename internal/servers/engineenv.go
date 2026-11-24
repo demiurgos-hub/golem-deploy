@@ -47,6 +47,12 @@ const (
 	// EnvAdminAddr and EnvAdminToken open the admin listener.
 	EnvAdminAddr  = "GOLEM_ADMIN_ADDR"
 	EnvAdminToken = "GOLEM_ADMIN_TOKEN"
+	// EnvSnapshotDir enables entity snapshots in that directory (the data
+	// volume): the game loads world.snapshot at start and saves it when it
+	// stops. EnvSnapshotInterval is the autosave period (a Go duration;
+	// "0" turns autosave off).
+	EnvSnapshotDir      = "GOLEM_SNAPSHOT_DIR"
+	EnvSnapshotInterval = "GOLEM_SNAPSHOT_INTERVAL"
 )
 
 // Fixed parts of the contract.
@@ -59,7 +65,7 @@ const (
 	TLSReloadInterval = "30s"
 	// envContractVersion changes whenever the variables below change
 	// meaning, so running containers report restart_required.
-	envContractVersion = "engine-env-3"
+	envContractVersion = "engine-env-4"
 )
 
 // MaxAllowedOrigins bounds a server's extra allowed origins.
@@ -182,6 +188,8 @@ func engineEnv(sv store.Server, b *store.Build, p runtimeParams, token string) m
 		EnvAllowedOrigins:    strings.Join(origins, ","),
 		EnvTLSPinned:         pinned,
 		EnvAdminAddr:         ":" + strconv.Itoa(AdminContainerPort),
+		EnvSnapshotDir:       build.DataDir,
+		EnvSnapshotInterval:  snapshotInterval(sv.SnapshotIntervalSeconds),
 	}
 	if token != "" {
 		env[EnvAdminToken] = token
@@ -189,12 +197,21 @@ func engineEnv(sv store.Server, b *store.Build, p runtimeParams, token string) m
 	return env
 }
 
+// snapshotInterval renders the autosave period for the engine.
+func snapshotInterval(seconds int) string {
+	if seconds <= 0 {
+		return "0"
+	}
+	return strconv.Itoa(seconds) + "s"
+}
+
 // configHash fingerprints everything a container is created from: the
 // build and its image, the port, the daemon's run settings, the env (by a
 // hash of its ciphertext, which is re-sealed with a fresh nonce on every
 // change and reveals nothing about the values), the injected engine
 // environment without the per-container token (game host, allowed origins,
-// certificate mode), the certificate mount and the supplementary groups.
+// certificate mode, snapshot settings), the data volume, the certificate
+// mount and the supplementary groups.
 // The certificate's content is not part of it: a replaced certificate is
 // picked up by the running engine.
 func (s *Service) configHash(sv store.Server, b *store.Build, p runtimeParams) string {
@@ -215,7 +232,7 @@ func (s *Service) configHash(sv store.Server, b *store.Build, p runtimeParams) s
 	for _, k := range docker.EnvKeys(env) {
 		fmt.Fprintf(h, "%s=%s\x00", k, env[k])
 	}
-	fmt.Fprintf(h, "%s\x00%v", p.certDir, p.groupAdd)
+	fmt.Fprintf(h, "%s\x00%v\x00%s", p.certDir, p.groupAdd, sv.DataVolume)
 	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 

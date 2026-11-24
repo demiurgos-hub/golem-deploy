@@ -8,9 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/gameadmin"
@@ -84,10 +87,12 @@ func shortID(id string) string {
 }
 
 // Start (re)creates and starts the server's container: it checks the
-// build, the game host and the certificate, verifies the build's image,
-// removes the server's previous container, ensures the network, checks the
-// host port, creates the container, records its id and token, starts it and
-// waits for the game to report ready (see waitReady).
+// build, the schema of the saved data, the game host and the certificate,
+// verifies the build's image, removes the server's previous container,
+// ensures the network and the data volume, checks the host port, creates
+// the container, records its id and token, starts it and waits for the
+// game to report ready (see waitReady). A schema mismatch fails before the
+// running container is touched.
 func (s *Service) Start(ctx context.Context, id int64, log io.Writer) error {
 	sv, err := s.load(ctx, id)
 	if err != nil {
@@ -146,6 +151,13 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 	}
 	if b.Status != store.BuildStatusSuccess || b.ImageID == "" {
 		return jobs.Fail(fmt.Sprintf("build %d is not a successful build; assign another build and start again", b.ID), nil)
+	}
+	volumeGone, err := s.volumeState(ctx, sv)
+	if err != nil {
+		return err
+	}
+	if dataFingerprint := sv.DataFingerprint; !volumeGone && schemaMismatch(dataFingerprint, b.SchemaFingerprint) {
+		return schemaGuard(sv, b, dataFingerprint)
 	}
 	if s.cfg.Certs == nil {
 		return jobs.Fail("the game certificate is not configured on this daemon", nil)
@@ -213,8 +225,8 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 		return jobs.Fail(fmt.Sprintf("the server's image declares more than %d volumes", docker.MaxImageVolumes), nil)
 	}
 	fmt.Fprintf(log, "image %s of build %d verified\n", shortID(img.ID), b.ID)
-	if len(img.Volumes) > 0 {
-		fmt.Fprintf(log, "image volumes %s get size-limited tmpfs mounts\n", strings.Join(img.Volumes, ", "))
+	if tmpfs := slices.DeleteFunc(slices.Clone(img.Volumes), func(v string) bool { return path.Clean(v) == build.DataDir }); len(tmpfs) > 0 {
+		fmt.Fprintf(log, "image volumes %s get size-limited tmpfs mounts\n", strings.Join(tmpfs, ", "))
 	}
 
 	if err := s.removeRecorded(ctx, sv, log); err != nil {
@@ -234,6 +246,10 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 		fmt.Fprintln(log, "warning: the "+docker.NetworkName+" network still allows traffic between servers because containers are attached; "+
 			"isolation applies once every server is stopped and one is started again")
 	}
+	if err := s.ensureDataVolume(ctx, &sv, volumeGone, log); err != nil {
+		return err
+	}
+	fmt.Fprintf(log, "data volume %s mounted at %s (autosave %s)\n", sv.DataVolume, build.DataDir, autosave(sv.SnapshotIntervalSeconds))
 	if err := s.cfg.ProbePort(s.cfg.BindAddress, port); err != nil {
 		return jobs.Fail(fmt.Sprintf("port %d is in use by another process on the host", port), nil)
 	}
@@ -395,6 +411,12 @@ func (s *Service) ready(ctx, probeCtx context.Context, sv store.Server, b store.
 				s.logger.Warn("could not record the schema fingerprint", "build_id", b.ID, "err", err)
 			}
 		}
+		if info.SchemaFingerprint != "" && info.SchemaFingerprint != sv.DataFingerprint && sv.DataVolume != "" {
+			// The game loaded (or started) the saved world with this schema.
+			if err := s.store.SetServerDataFingerprint(context.WithoutCancel(ctx), sv.ID, sv.DataVolume, info.SchemaFingerprint); err != nil {
+				s.logger.Warn("could not record the saved data's schema fingerprint", "server_id", sv.ID, "err", err)
+			}
+		}
 		if b.EngineVersion != "" && info.EngineVersion != "" && b.EngineVersion != info.EngineVersion {
 			fmt.Fprintf(log, "note: the game reports engine %s, the build recorded %s\n", info.EngineVersion, b.EngineVersion)
 		}
@@ -409,6 +431,14 @@ func (s *Service) ready(ctx, probeCtx context.Context, sv store.Server, b store.
 	}
 	fmt.Fprintf(log, "server %q is running (restart policy %s)\n", sv.Name, docker.RestartPolicy)
 	return nil
+}
+
+// autosave describes the autosave period for job logs.
+func autosave(seconds int) string {
+	if seconds <= 0 {
+		return "off"
+	}
+	return (time.Duration(seconds) * time.Second).String()
 }
 
 func orDash(s string) string {
@@ -471,9 +501,10 @@ func (s *Service) Stop(ctx context.Context, id int64, log io.Writer) error {
 	return nil
 }
 
-// Delete stops and removes the server's container, then deletes the row
-// (releasing its port). Docker being unreachable aborts the deletion so no
-// container is left behind without a row.
+// Delete stops and removes the server's container, then its data volume,
+// then deletes the row (releasing its port); its backups stay. Docker being
+// unreachable aborts the deletion so no container or volume is left behind
+// without a row.
 func (s *Service) Delete(ctx context.Context, id int64, log io.Writer) error {
 	sv, err := s.load(ctx, id)
 	if err != nil {
@@ -485,6 +516,20 @@ func (s *Service) Delete(ctx context.Context, id int64, log io.Writer) error {
 	}
 	if err := s.removeRecorded(ctx, sv, log); err != nil {
 		return s.failDocker(ctx, sv, "remove the container", err)
+	}
+	if sv.DataVolume != "" {
+		err := s.docker.RemoveDataVolume(ctx, sv.ID, sv.DataVolume)
+		switch {
+		case errors.Is(err, docker.ErrNotManaged), errors.Is(err, docker.ErrNotOurs):
+			// The recorded name now belongs to something else: leave it.
+			s.logger.Warn("not removing a volume that is not this server's data volume", "job_id", jobIDFrom(ctx), "server_id", id, "volume", sv.DataVolume)
+		case errors.Is(err, docker.ErrInUse):
+			return jobs.Fail("the server's data volume "+sv.DataVolume+" is still used by a container; stop that container and delete the server again", err)
+		case err != nil:
+			return s.failDocker(ctx, sv, "remove the data volume", err)
+		default:
+			fmt.Fprintf(log, "removed the data volume %s (backups of the server are kept)\n", sv.DataVolume)
+		}
 	}
 	cleanupCtx := context.WithoutCancel(ctx)
 	deleteRow := func() error { return s.store.DeleteServer(cleanupCtx, id) }
