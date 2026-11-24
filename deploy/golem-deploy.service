@@ -1,0 +1,113 @@
+# systemd unit for the Golem Deploy daemon, installed by scripts/install.sh
+# to /etc/systemd/system/golem-deploy.service (see docs/INSTALL.md).
+# Settings live in /etc/golem-deploy/golem-deploy.env, not in this file:
+# re-running the installer replaces this file.
+
+[Unit]
+Description=Golem Deploy (game server hosting panel)
+Documentation=https://github.com/demiurgos-hub/golem-deploy/blob/main/docs/INSTALL.md
+# Start after Docker and stop before it. Docker is not required (Requires=):
+# the daemon reports Docker as unreachable and keeps serving the panel, and a
+# Docker restart must not restart the panel.
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+# Give up after 5 failed starts in 5 minutes instead of restarting forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# exec: the start fails if the binary cannot be executed at all.
+Type=exec
+User=golem-deploy
+# The supplementary groups come from /etc/group (the installer adds
+# golem-deploy to "docker", which grants access to /var/run/docker.sock and is
+# root-equivalent).
+EnvironmentFile=/etc/golem-deploy/golem-deploy.env
+ExecStart=/usr/local/bin/golem-deploy serve
+Restart=on-failure
+RestartSec=5s
+
+# On SIGTERM the daemon stops accepting requests (up to 15 s for open
+# requests), cancels running jobs (up to 10 s, in parallel) and exits. It never
+# stops game containers: they belong to dockerd's cgroup, not to this
+# service's, so stopping or restarting the panel leaves them running. The
+# default KillMode=control-group only kills processes the daemon started
+# itself (git, docker CLI clients such as a streaming "docker logs") if they
+# outlive the stop. 30 s covers both grace periods plus closing the database.
+TimeoutStopSec=30s
+
+# The docker CLI keeps its client state (buildx metadata, contexts) in
+# $DOCKER_CONFIG, otherwise in $HOME/.docker, and $HOME is the data
+# directory, which is dedicated to Golem Deploy. CacheDirectory= creates
+# /var/cache/golem-deploy owned by the service user and makes it writable
+# below ProtectSystem=strict; nothing in it needs a backup.
+CacheDirectory=golem-deploy
+CacheDirectoryMode=0700
+Environment=DOCKER_CONFIG=/var/cache/golem-deploy/docker
+
+# --- Hardening --------------------------------------------------------------
+# What the daemon does: listens on TCP, runs git, git-lfs, ssh and the docker
+# CLI (and itself, as git's askpass helper), connects to /var/run/docker.sock,
+# probes game ports by binding them (TCP and UDP) and writes only below its data
+# directory. Containers, bind mounts and published ports are created by
+# dockerd, which runs outside this sandbox, so none of the restrictions below
+# applies to game servers. Env files reach the docker CLI as an inherited pipe
+# (/dev/fd/3), not as files on disk.
+#
+# Running as a member of the docker group makes the service root-equivalent
+# anyway (it can start a privileged container); these settings limit what a
+# bug in the daemon or in git can do directly, not what Docker allows.
+
+# No setuid/setgid escalation for the daemon or anything it runs; git, ssh and
+# docker need none.
+NoNewPrivileges=yes
+# The daemon binds ports >= 1024 and needs no capability (also removes any
+# capability a child could otherwise gain).
+CapabilityBoundingSet=
+AmbientCapabilities=
+# The whole file system is read-only except the data directory (and the
+# cache directory above). Unix sockets such as /var/run/docker.sock can still
+# be connected to on a read-only mount. The data directory keeps its real
+# path, which matters because dockerd resolves bind mount sources on the host.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/golem-deploy
+# Home directories are not needed: git runs with a private HOME per operation
+# below the data directory, and SSH remotes always use a deploy key.
+ProtectHome=yes
+# A private /tmp: the daemon keeps its scratch files in the data directory's
+# tmp/, and no /tmp path is ever handed to dockerd.
+PrivateTmp=yes
+# Only pseudo devices (/dev/null, /dev/urandom, /dev/fd, ...) are needed.
+PrivateDevices=yes
+# Other users' processes are hidden; the daemon only looks at its own.
+ProtectProc=invisible
+# No kernel tuning, modules, kernel log, clock or hostname changes, no cgroup
+# writes; dockerd does all container setup.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# The daemon and its children never create namespaces (dockerd does), use
+# realtime scheduling, create setuid files or change the execution domain.
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Go programs, git and ssh do not generate code at run time.
+MemoryDenyWriteExecute=yes
+# Unix sockets for Docker and journald, IPv4/IPv6 for the panel, git remotes
+# and port probes, netlink for Go's network interface queries.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Only system calls an ordinary service uses, native architecture only.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# No UMask= on purpose: the data directory itself is 0700 and the daemon
+# creates keys and the database 0600 explicitly, while files it means to
+# bind-mount into containers (which run as an unprivileged user) must stay
+# readable inside them.
+
+[Install]
+WantedBy=multi-user.target
