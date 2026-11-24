@@ -71,7 +71,9 @@ binary=''
 config_opts=()
 
 need_value() {
-	[ "$#" -ge 2 ] && [ -n "$2" ] || die "$1 needs a value (see --help)"
+	if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+		die "$1 needs a value (see --help)"
+	fi
 }
 
 while [ "$#" -gt 0 ]; do
@@ -116,7 +118,9 @@ while [ "$#" -gt 0 ]; do
 	esac
 done
 if [ "$#" -gt 0 ]; then
-	[ -z "$binary" ] && [ "$#" -eq 1 ] || die "only one binary path is accepted"
+	if [ -n "$binary" ] || [ "$#" -ne 1 ]; then
+		die "only one binary path is accepted"
+	fi
 	binary=$1
 fi
 [ -n "$binary" ] || {
@@ -127,9 +131,13 @@ fi
 # --- validation of the options -----------------------------------------------
 
 if [ -n "$tls_cert" ] || [ -n "$tls_key" ]; then
-	[ -n "$tls_cert" ] && [ -n "$tls_key" ] || die "--tls-cert and --tls-key must be given together"
+	if [ -z "$tls_cert" ] || [ -z "$tls_key" ]; then
+		die "--tls-cert and --tls-key must be given together"
+	fi
 	for f in "$tls_cert" "$tls_key"; do
-		[ -f "$f" ] && [ -r "$f" ] && [ -s "$f" ] || die "$f is not a readable, non-empty file"
+		if [ ! -f "$f" ] || [ ! -r "$f" ] || [ ! -s "$f" ]; then
+			die "$f is not a readable, non-empty file"
+		fi
 		grep -q -- '-----BEGIN ' "$f" || die "$f does not look like a PEM file"
 	done
 	grep -q -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' "$tls_key" || die "$tls_key does not contain a PEM private key"
@@ -152,8 +160,9 @@ case $listen in
 *) die "--listen must be HOST:PORT, for example $DEFAULT_LISTEN_HTTP (got $listen)" ;;
 esac
 listen_port=${listen##*:}
-[[ $listen_port =~ ^[0-9]{1,5}$ ]] && [ "$((10#$listen_port))" -ge 1024 ] && [ "$((10#$listen_port))" -le 65535 ] ||
+if [[ ! $listen_port =~ ^[0-9]{1,5}$ ]] || [ "$((10#$listen_port))" -lt 1024 ] || [ "$((10#$listen_port))" -gt 65535 ]; then
 	die "--listen port must be between 1024 and 65535 (the service runs without the capability to bind lower ports; got $listen)"
+fi
 [[ $listen_host =~ ^[A-Za-z0-9.:-]*$ ]] || die "--listen host contains unexpected characters (got $listen)"
 if [ -z "$tls_cert" ]; then
 	case $listen_host in
@@ -168,8 +177,9 @@ fi
 [[ $port_range =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || die "--port-range must be LO-HI, for example $DEFAULT_PORT_RANGE (got $port_range)"
 port_lo=$((10#${BASH_REMATCH[1]}))
 port_hi=$((10#${BASH_REMATCH[2]}))
-[ "$port_lo" -ge 1024 ] && [ "$port_hi" -le 32767 ] && [ "$port_lo" -le "$port_hi" ] ||
+if [ "$port_lo" -lt 1024 ] || [ "$port_hi" -gt 32767 ] || [ "$port_lo" -gt "$port_hi" ]; then
 	die "--port-range must lie within 1024-32767 with LO <= HI (got $port_range)"
+fi
 if [ "$((10#$listen_port))" -ge "$port_lo" ] && [ "$((10#$listen_port))" -le "$port_hi" ]; then
 	die "--port-range $port_range contains the panel's listen port $listen_port"
 fi
@@ -257,7 +267,7 @@ else
 fi
 svc_group=$(id -gn "$SVC_USER")
 
-if id -nG "$SVC_USER" | tr ' ' '\n' | grep -qx docker; then
+if id -nG "$SVC_USER" | tr ' ' '\n' | grep -x docker >/dev/null; then
 	say "$SVC_USER is already a member of the docker group"
 else
 	say "Adding $SVC_USER to the docker group"
@@ -274,7 +284,9 @@ fi
 # --- data directory ----------------------------------------------------------
 
 if [ -e "$DATA_DIR" ] || [ -L "$DATA_DIR" ]; then
-	[ -d "$DATA_DIR" ] && [ ! -L "$DATA_DIR" ] || die "$DATA_DIR exists and is not a directory"
+	if [ ! -d "$DATA_DIR" ] || [ -L "$DATA_DIR" ]; then
+		die "$DATA_DIR exists and is not a directory"
+	fi
 	owner=$(stat -c %U "$DATA_DIR")
 	mode=$(stat -c %a "$DATA_DIR")
 	if [ "$owner" != "$SVC_USER" ] || [ "$mode" != 700 ]; then
@@ -370,7 +382,7 @@ for _ in $(seq "$START_TIMEOUT"); do
 	if [ "$state" = active ]; then
 		invocation=$(systemctl show -p InvocationID --value "$SERVICE")
 		if [ -n "$invocation" ] &&
-			journalctl --no-pager -q -o cat "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null | grep -q 'golem-deploy listening'; then
+			journalctl --no-pager -q -o cat "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null | grep 'golem-deploy listening' >/dev/null; then
 			started=yes
 			break
 		fi
