@@ -35,9 +35,9 @@ type Build struct {
 	WebTransportPath string
 	WebSocketPath    string
 	CreatedBy        *int64
-	CreatedAt         time.Time
-	StartedAt         *time.Time
-	FinishedAt        *time.Time
+	CreatedAt        time.Time
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
 }
 
 // NewBuild is the input of CreateBuild.
