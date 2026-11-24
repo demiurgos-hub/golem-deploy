@@ -86,7 +86,7 @@ func ValidateNote(note string) error {
 		return fieldErr("note", "note must be at most %d characters", MaxBackupNote)
 	}
 	for _, r := range note {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || r == ' ' || r == ' ' || (r >= '‪' && r <= '‮') || (r >= '⁦' && r <= '⁩') {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || r == '\u2028' || r == '\u2029' || (r >= '\u202a' && r <= '\u202e') || (r >= '\u2066' && r <= '\u2069') {
 			return fieldErr("note", "note must be a single line without control characters")
 		}
 	}
