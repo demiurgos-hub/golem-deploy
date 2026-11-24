@@ -491,6 +491,10 @@ func (s *Service) Get(ctx context.Context, id int64) (apitypes.Server, error) {
 
 // resolveBuild returns build id if it is a successful build with an image.
 // Docker is not asked here: the image is verified when the server starts.
+// errBuildGone: the build passed resolveBuild but was deleted before the
+// server row was written (the foreign key refused it).
+var errBuildGone = fieldErr("build_id", "the build was deleted meanwhile; choose another build")
+
 func (s *Service) resolveBuild(ctx context.Context, field string, id int64) (store.Build, error) {
 	if id <= 0 {
 		return store.Build{}, fieldErr(field, "build_id is required (the id of a successful build)")
@@ -627,6 +631,9 @@ func (s *Service) Create(ctx context.Context, req apitypes.CreateServerRequest) 
 			s.logger.Info("server created", "server_id", created.ID, "name", created.Name, "build_id", b.ID, "port", port, "env_keys", len(req.Env))
 			return s.viewOne(ctx, created, nil, true)
 		}
+		if errors.Is(err, store.ErrMissingReference) {
+			return apitypes.Server{}, errBuildGone
+		}
 		if !errors.Is(err, store.ErrConflict) {
 			return apitypes.Server{}, err
 		}
@@ -722,6 +729,8 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 		switch {
 		case errors.Is(err, store.ErrStale):
 			return apitypes.Server{}, ErrConflict
+		case errors.Is(err, store.ErrMissingReference):
+			return apitypes.Server{}, errBuildGone
 		case errors.Is(err, store.ErrConflict):
 			return apitypes.Server{}, ErrPortInUse
 		case errors.Is(err, store.ErrNotFound):

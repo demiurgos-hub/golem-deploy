@@ -73,3 +73,22 @@ func TestStaticAddonsAndBuildReferences(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+// A server row cannot reference a build that does not exist (deleted
+// between a caller's check and its write): ErrMissingReference, which the
+// servers service maps to a validation error instead of a 500.
+func TestServerBuildMustExist(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	missing := int64(9999)
+	if _, err := s.CreateServer(ctx, Server{Name: "s", BuildID: &missing}, nil); !errors.Is(err, ErrMissingReference) {
+		t.Fatalf("create: %v", err)
+	}
+	sv, err := s.CreateServer(ctx, Server{Name: "s"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateServer(ctx, sv.ID, ServerUpdate{BuildID: &missing}); !errors.Is(err, ErrMissingReference) {
+		t.Fatalf("update: %v", err)
+	}
+}

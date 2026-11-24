@@ -211,6 +211,9 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 	if errors.Is(err, store.ErrConflict) {
 		return nil, ErrConflict
 	}
+	if errors.Is(err, store.ErrMissingReference) {
+		return nil, errBuildGone
+	}
 	if err != nil {
 		return nil, err
 	}

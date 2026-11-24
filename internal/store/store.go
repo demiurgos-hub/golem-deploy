@@ -33,6 +33,9 @@ var (
 	// ErrActive means the row belongs to an operation that is still queued
 	// or running (an active build).
 	ErrActive = errors.New("store: still active")
+	// ErrMissingReference means a written row references a row that does
+	// not exist (a foreign key), e.g. a server's build deleted meanwhile.
+	ErrMissingReference = errors.New("store: referenced row does not exist")
 )
 
 // Store is a handle to the database. It is safe for concurrent use.
@@ -163,6 +166,8 @@ func mapErr(op string, err error) error {
 		switch se.Code() {
 		case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
 			return fmt.Errorf("%s: %w", op, ErrConflict)
+		case sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY:
+			return fmt.Errorf("%s: %w", op, ErrMissingReference)
 		}
 	}
 	return fmt.Errorf("%s: %w", op, err)
