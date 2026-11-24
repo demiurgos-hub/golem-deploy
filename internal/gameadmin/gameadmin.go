@@ -293,6 +293,8 @@ var (
 	ErrSnapshotTimeout = errors.New("gameadmin: the snapshot timed out")
 	// ErrSnapshotFailed: the game could not write the snapshot (500).
 	ErrSnapshotFailed = errors.New("gameadmin: the snapshot failed")
+	// ErrNotReady: the game is starting or stopping (503).
+	ErrNotReady = errors.New("gameadmin: the game is not ready")
 )
 
 // Snapshot asks the game to write its entity snapshot now (POST /snapshot,
@@ -305,7 +307,7 @@ func (c *Client) Snapshot(ctx context.Context) (time.Duration, error) {
 		DurationMs float64 `json:"duration_ms"`
 	}
 	status, err := c.request(ctx, http.MethodPost, "/snapshot", SnapshotTimeout, &v, http.StatusOK, http.StatusConflict,
-		http.StatusNotImplemented, http.StatusGatewayTimeout, http.StatusInternalServerError)
+		http.StatusNotImplemented, http.StatusGatewayTimeout, http.StatusInternalServerError, http.StatusServiceUnavailable)
 	if err != nil {
 		return 0, err
 	}
@@ -321,6 +323,8 @@ func (c *Client) Snapshot(ctx context.Context) (time.Duration, error) {
 		return 0, ErrSnapshotUnsupported
 	case http.StatusGatewayTimeout:
 		return 0, ErrSnapshotTimeout
+	case http.StatusServiceUnavailable:
+		return 0, ErrNotReady
 	}
 	return 0, ErrSnapshotFailed
 }
