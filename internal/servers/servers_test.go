@@ -207,7 +207,7 @@ func TestStartRecordsContainer(t *testing.T) {
 	if row2.ContainerID == row.ContainerID || len(f.Containers()) != 1 {
 		t.Fatalf("restart: %q -> %q, %d containers", row.ContainerID, row2.ContainerID, len(f.Containers()))
 	}
-	if err := svc.Delete(ctx, created.ID, &log); err != nil {
+	if err := svc.Delete(ctx, created.ID, DeleteOptions{SkipSafetyBackup: true}, &log); err != nil { // no backup store here
 		t.Fatal(err)
 	}
 	if len(f.Containers()) != 0 {

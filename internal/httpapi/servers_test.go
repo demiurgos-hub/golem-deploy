@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/backups"
 	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
@@ -88,6 +89,11 @@ func newDockerHarnessWith(t *testing.T, staticOpts staticfiles.Options, mutate .
 		ProbePort:       func(string, int) error { return nil },
 		DefaultGameHost: "play.example.com",
 		Certs:           cm,
+	}
+	// Like the daemon, every harness has a backup store: deleting a server
+	// with saved data stores a last backup.
+	if cfg.Backups, err = backups.Open(filepath.Join(t.TempDir(), "backups"), backups.Options{CheckFree: func(string, int64) error { return nil }}); err != nil {
+		t.Fatal(err)
 	}
 	for _, m := range mutate {
 		m(&cfg)

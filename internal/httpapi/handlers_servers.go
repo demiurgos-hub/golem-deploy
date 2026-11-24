@@ -10,6 +10,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
+	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/servers"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
@@ -221,7 +222,10 @@ func (s *Server) handleRestartServer() handlerFunc {
 
 // handleDeleteServer runs the deletion as a server.delete job (so it is
 // serialised with start/stop jobs and logged) and waits for it, answering
-// 204 once the container and the row are gone.
+// 204 once the container and the row are gone. The job first stores a last
+// backup of the server's data; skip_safety_backup=1 skips it and is for
+// admins only (the route is a developer route, like the static files'
+// mutations of referenced files).
 func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) error {
 	if err := s.needServers(); err != nil {
 		return err
@@ -230,6 +234,17 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return err
 	}
+	o := servers.DeleteOptions{CreatedBy: creatorOf(r)}
+	switch r.URL.Query().Get("skip_safety_backup") {
+	case "", "0", "false":
+	case "1", "true":
+		o.SkipSafetyBackup = true
+	default:
+		return badRequest("skip_safety_backup must be 1 or 0")
+	}
+	if o.SkipSafetyBackup && !identityFrom(r).hasAdminAccess() {
+		return errForbidden
+	}
 	if _, err := s.store.GetServer(r.Context(), id); errors.Is(err, store.ErrNotFound) {
 		return notFound("server")
 	} else if err != nil {
@@ -237,7 +252,7 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) erro
 	}
 	var delErr error
 	job, err := s.startServerJob(r, apitypes.JobKindServerDelete, id, func(ctx context.Context, id int64, log io.Writer) error {
-		delErr = s.servers.Delete(ctx, id, log)
+		delErr = s.servers.Delete(ctx, id, o, log)
 		return delErr
 	})
 	if err != nil {
@@ -261,7 +276,8 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) erro
 		return internal(err)
 	}
 	if final.Status == store.JobSuccess {
-		s.logger.Info("server deleted", "request_id", requestIDFrom(r.Context()), "account_id", identityFrom(r).Account.ID, "server_id", id, "job_id", job.ID)
+		s.logger.Info("server deleted", "request_id", requestIDFrom(r.Context()), "account_id", identityFrom(r).Account.ID, "server_id", id, "job_id", job.ID,
+			"skip_safety_backup", o.SkipSafetyBackup)
 		w.WriteHeader(http.StatusNoContent)
 		return nil
 	}
@@ -270,6 +286,13 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) erro
 		return dockerUnavailable(delErr)
 	case errors.Is(delErr, servers.ErrNotFound):
 		return notFound("server")
+	case errors.Is(delErr, servers.ErrSafetyBackup):
+		var safe *jobs.SafeError
+		msg := "the last backup of the server's data failed; nothing was deleted (see the log of job " + strconv.FormatInt(job.ID, 10) + ")"
+		if errors.As(delErr, &safe) {
+			msg = safe.Msg
+		}
+		return conflict(apitypes.ErrorCodeConflict, msg)
 	case delErr == nil:
 		return conflict(apitypes.ErrorCodeConflict, "the deletion was cancelled")
 	}

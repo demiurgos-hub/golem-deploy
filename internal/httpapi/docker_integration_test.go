@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/backups"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
@@ -154,8 +155,12 @@ func TestIntegrationServersAPI(t *testing.T) {
 	if lo == 0 {
 		t.Fatal("no free port window")
 	}
+	bs, err := backups.Open(filepath.Join(t.TempDir(), "backups"), backups.Options{CheckFree: func(string, int64) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
 	svc := servers.New(h.st, box, dc, servers.Config{Ports: ports.Range{Lo: lo, Hi: lo + 9}, BindAddress: "127.0.0.1", StopTimeout: 5 * time.Second,
-		StartTimeout: 20 * time.Second, DefaultGameHost: "localhost", Certs: cm}, logger)
+		StartTimeout: 20 * time.Second, DefaultGameHost: "localhost", Certs: cm, Backups: bs}, logger)
 	runner := jobs.New(h.st, t.TempDir(), jobs.Options{Logger: logger})
 	t.Cleanup(func() { _ = runner.Shutdown(context.Background()) })
 	srv, err := New(Config{Listen: "127.0.0.1:0", PublicHosts: []string{"example.com"}}, Deps{Store: h.st, Sessions: h.sessions, Hasher: h.hasher,

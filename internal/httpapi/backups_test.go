@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -235,4 +236,39 @@ func TestBackupJobsAreSerialised(t *testing.T) {
 	errBody(t, d.call("POST", base+"/backups", d.devTok, nil), http.StatusConflict, apitypes.ErrorCodeJobInProgress)
 	errBody(t, d.call("POST", base+"/restore", d.adminSs, apitypes.RestoreServerRequest{BackupID: 1}), http.StatusConflict, apitypes.ErrorCodeJobInProgress)
 	errBody(t, d.call("POST", base+"/data/reset", d.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeJobInProgress)
+}
+
+// DELETE /servers/{id} stores a last backup first; a failed one is 409
+// with the reason, and skipping it is for admin sessions only.
+func TestDeleteServerLastBackup(t *testing.T) {
+	d, _ := newBackupHarness(t)
+	img := d.managedImage(1)
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
+	base := fmt.Sprintf("/api/v1/servers/%d", s.ID)
+	d.start(s.ID)
+	s = d.getServer(d.devTok, s.ID)
+	d.fake.SetVolumeFiles(s.Data.Volume, snapshotOf(gameFingerprint), dockertest.Special("link", tar.TypeSymlink, "/"))
+
+	errBody(t, d.call("DELETE", base+"?skip_safety_backup=1", d.devTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
+	adminTok := d.apiToken(d.admin, nil) // API tokens are capped at developer
+	errBody(t, d.call("DELETE", base+"?skip_safety_backup=true", adminTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
+	errBody(t, d.call("DELETE", base+"?skip_safety_backup=yes", d.adminSs, nil), http.StatusBadRequest, apitypes.ErrorCodeBadRequest)
+	e := errBody(t, d.call("DELETE", base, d.devTok, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	if !strings.Contains(e.Message, "is incomplete") || !strings.Contains(e.Message, "nothing was deleted") || !strings.Contains(e.Message, "skip_safety_backup=1") {
+		t.Fatalf("%+v", e)
+	}
+	list := decode[apitypes.BackupList](t, d.call("GET", "/api/v1/backups", d.devTok, nil))
+	if len(list.Items) != 1 || list.Items[0].Kind != apitypes.BackupKindPreDelete || list.Items[0].OmittedEntries != 1 {
+		t.Fatalf("%+v", list)
+	}
+	if got := d.getServer(d.devTok, s.ID); got.State != apitypes.ServerStateRunning {
+		t.Fatalf("%+v", got)
+	}
+	if rr := d.call("DELETE", base+"?skip_safety_backup=1", d.adminSs, nil); rr.Code != http.StatusNoContent {
+		t.Fatalf("%d %s", rr.Code, rr.Body.String())
+	}
+	if list := decode[apitypes.BackupList](t, d.call("GET", "/api/v1/backups", d.devTok, nil)); len(list.Items) != 1 {
+		t.Fatalf("%+v", list)
+	}
+	errBody(t, d.call("GET", base, d.devTok, nil), http.StatusNotFound, apitypes.ErrorCodeNotFound)
 }

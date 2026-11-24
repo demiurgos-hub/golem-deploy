@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/build"
@@ -29,17 +30,17 @@ func dataSettings(prefix string, snapshot *int, schedule *apitypes.BackupSchedul
 	if snapshot != nil {
 		v := *snapshot
 		if v != 0 && (v < MinSnapshotIntervalSeconds || v > MaxSnapshotIntervalSeconds) {
-			return 0, 0, 0, fieldErr(prefix+"snapshot_interval_seconds", "snapshot_interval_seconds must be 0 (autosave off) or %d to %d",
+			return 0, 0, 0, fieldErr(prefix+"snapshot_interval_seconds", "the autosave period must be 0 (off) or %d to %d seconds",
 				MinSnapshotIntervalSeconds, MaxSnapshotIntervalSeconds)
 		}
 		curSnapshot = v
 	}
 	if schedule != nil {
 		if schedule.IntervalHours < 0 || schedule.IntervalHours > MaxBackupIntervalHours {
-			return 0, 0, 0, fieldErr(prefix+"backup_schedule.interval_hours", "interval_hours must be 0 (off) or 1 to %d", MaxBackupIntervalHours)
+			return 0, 0, 0, fieldErr(prefix+"backup_schedule.interval_hours", "the backup interval must be 0 (off) or 1 to %d hours", MaxBackupIntervalHours)
 		}
 		if schedule.Keep < 1 || schedule.Keep > MaxBackupKeep {
-			return 0, 0, 0, fieldErr(prefix+"backup_schedule.keep", "keep must be 1 to %d", MaxBackupKeep)
+			return 0, 0, 0, fieldErr(prefix+"backup_schedule.keep", "the number of scheduled backups to keep must be 1 to %d", MaxBackupKeep)
 		}
 		curInterval, curKeep = schedule.IntervalHours, schedule.Keep
 	}
@@ -52,13 +53,31 @@ func schemaMismatch(data, build string) bool {
 	return data != "" && build != "" && data != build
 }
 
+// refusedError is a start that failed before it touched any container
+// (see refused). It is a job failure like any other.
+type refusedError struct{ *jobs.SafeError }
+
+func (e *refusedError) Unwrap() error { return e.SafeError }
+
+// refuse marks a job failure as a start refused before any container was
+// touched.
+func refuse(msg string) error { return &refusedError{&jobs.SafeError{Msg: msg}} }
+
+// refused reports whether a start failed before it touched any container,
+// so the recorded one is in the state the start found it in and callers
+// must leave it alone.
+func refused(err error) bool {
+	var r *refusedError
+	return errors.As(err, &r)
+}
+
 // schemaGuard is the failure of a start whose saved data has another
-// schema than the build: the game would refuse to load it.
+// schema than the build: the game would refuse to load it. It is refused.
 func schemaGuard(sv store.Server, b store.Build, dataFingerprint string) error {
-	return jobs.Fail(fmt.Sprintf("the server's saved data has schema %s but build %d has schema %s, so the game cannot load it; "+
+	return refuse(fmt.Sprintf("the server's saved data has schema %s but build %d has schema %s, so the game cannot load it; "+
 		"assign a build with the saved schema (PATCH /api/v1/servers/%d with build_id), restore a backup with schema %s "+
 		"(POST /api/v1/servers/%d/restore) or reset the data (POST /api/v1/servers/%d/data/reset)",
-		dataFingerprint, b.ID, b.SchemaFingerprint, sv.ID, b.SchemaFingerprint, sv.ID, sv.ID), nil)
+		dataFingerprint, b.ID, b.SchemaFingerprint, sv.ID, b.SchemaFingerprint, sv.ID, sv.ID))
 }
 
 // volumeState inspects the server's recorded data volume: gone is true when
@@ -146,41 +165,64 @@ type helper struct {
 	server int64
 }
 
-// verifiedImage returns the server's build and its verified image, the
-// way a start verifies them. The failures are job failures.
-func (s *Service) verifiedImage(ctx context.Context, sv store.Server) (store.Build, docker.Image, error) {
+// assignedBuild returns the server's assigned build when it is a
+// successful build with an image. The failures are job failures matching
+// ErrNoBuild.
+func (s *Service) assignedBuild(ctx context.Context, sv store.Server) (store.Build, error) {
 	if sv.BuildID == nil {
-		return store.Build{}, docker.Image{}, jobs.Fail(fmt.Sprintf("the server has no build; assign a successful build with PATCH /api/v1/servers/%d (build_id)", sv.ID), ErrNoBuild)
+		return store.Build{}, jobs.Fail(fmt.Sprintf("the server has no build; assign a successful build with PATCH /api/v1/servers/%d (build_id)", sv.ID), ErrNoBuild)
 	}
 	b, err := s.store.GetBuild(ctx, *sv.BuildID)
 	if err != nil {
-		return store.Build{}, docker.Image{}, jobs.Fail("could not read the server's build", err)
+		s.logger.Warn("could not read the server's build", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", err)
+		return store.Build{}, jobs.Fail("could not read the server's build", ErrNoBuild)
 	}
 	if b.Status != store.BuildStatusSuccess || b.ImageID == "" {
-		return b, docker.Image{}, jobs.Fail(fmt.Sprintf("build %d is not a successful build; assign another build", b.ID), ErrNoBuild)
+		return b, jobs.Fail(fmt.Sprintf("build %d is not a successful build; assign another build", b.ID), ErrNoBuild)
 	}
+	return b, nil
+}
+
+// verifyBuildImage verifies build b's image the way a start does. The
+// failures are job failures; a missing or unlabelled image matches
+// ErrNoBuild.
+func (s *Service) verifyBuildImage(ctx context.Context, sv store.Server, b store.Build) (docker.Image, error) {
 	img, err := s.docker.BuildImage(ctx, buildRef(b))
 	switch {
 	case errors.Is(err, docker.ErrNotFound):
-		return b, docker.Image{}, jobs.Fail(fmt.Sprintf("the image of build %d no longer exists; build the project again", b.ID), ErrNoBuild)
+		return docker.Image{}, jobs.Fail(fmt.Sprintf("the image of build %d no longer exists; build the project again", b.ID), ErrNoBuild)
 	case errors.Is(err, docker.ErrNotManaged), errors.Is(err, docker.ErrNotOurs):
 		s.logger.Warn("refusing to use an image without this installation's build labels", "job_id", jobIDFrom(ctx), "server_id", sv.ID,
 			"build_id", b.ID, "image", b.ImageID, "err", err)
-		return b, docker.Image{}, jobs.Fail(fmt.Sprintf("the image recorded for build %d does not carry this installation's labels for that build; refusing to use it", b.ID), ErrNoBuild)
+		return docker.Image{}, jobs.Fail(fmt.Sprintf("the image recorded for build %d does not carry this installation's labels for that build; refusing to use it", b.ID), ErrNoBuild)
 	case err != nil:
-		return b, docker.Image{}, s.failDocker(ctx, sv, "inspect the server's image", err)
+		return docker.Image{}, s.failDocker(ctx, sv, "inspect the server's image", err)
 	}
 	if len(img.Volumes) > docker.MaxImageVolumes {
-		return b, docker.Image{}, jobs.Fail(fmt.Sprintf("the server's image declares more than %d volumes", docker.MaxImageVolumes), nil)
+		return docker.Image{}, jobs.Fail(fmt.Sprintf("the server's image declares more than %d volumes", docker.MaxImageVolumes), nil)
 	}
-	return b, img, nil
+	return img, nil
 }
 
-// createHelper creates a helper container from the server's verified
-// image that mounts volume at the data directory. Its launch id is
-// recorded before the create and its container id right after, so a crash
-// leaves a record that CleanupHelpers resolves. Remove it with
-// removeHelper.
+// verifiedImage returns the server's assigned build and its verified
+// image. The failures are job failures.
+func (s *Service) verifiedImage(ctx context.Context, sv store.Server) (store.Build, docker.Image, error) {
+	b, err := s.assignedBuild(ctx, sv)
+	if err != nil {
+		return b, docker.Image{}, err
+	}
+	img, err := s.verifyBuildImage(ctx, sv, b)
+	return b, img, err
+}
+
+// helperForgetAfter is how long CleanupHelpers keeps looking for a helper
+// whose create may have happened although Docker's reply was lost.
+const helperForgetAfter = 10 * time.Minute
+
+// createHelper creates a helper container from a verified build image that
+// mounts volume at the data directory. Its launch id is recorded before
+// the create and its container id right after, so a crash leaves a record
+// that CleanupHelpers resolves. Remove it with removeHelper.
 func (s *Service) createHelper(ctx context.Context, sv store.Server, b store.Build, img docker.Image, volume string, readOnly bool) (*helper, error) {
 	launch, err := docker.NewLaunchID()
 	if err != nil {
@@ -200,8 +242,12 @@ func (s *Service) createHelper(ctx context.Context, sv store.Server, b store.Bui
 		Image: img.ID, ImageVolumes: img.Volumes, Volume: volume, Target: build.DataDir, ReadOnly: readOnly,
 	})
 	if err != nil {
-		// Docker may have created it although the reply was lost.
-		s.removeHelper(ctx, h)
+		var invalid *docker.ValidationError
+		if errors.As(err, &invalid) {
+			s.removeHelper(ctx, h) // docker never ran
+		} else {
+			s.abandonHelper(ctx, h)
+		}
 		return nil, s.failDocker(ctx, sv, "create a helper container", err)
 	}
 	h.id = id
@@ -211,12 +257,35 @@ func (s *Service) createHelper(ctx context.Context, sv store.Server, b store.Bui
 	return h, nil
 }
 
+// abandonHelper handles a helper whose create failed without saying
+// whether Docker created it: a helper found now is removed and forgotten;
+// when none is found the record stays, so CleanupHelpers keeps looking for
+// helperForgetAfter (a create can still complete after its reply was
+// lost).
+func (s *Service) abandonHelper(ctx context.Context, h *helper) {
+	cctx := context.WithoutCancel(ctx)
+	defer s.activeHelpers.Delete(h.launch)
+	found, err := s.docker.RemoveHelper(cctx, h.launch, "")
+	if err != nil {
+		s.logger.Warn("could not remove a helper container after a failed create; it is retried later", "job_id", jobIDFrom(ctx), "server_id", h.server, "err", err)
+		return
+	}
+	if !found {
+		return
+	}
+	if err := s.store.DeleteVolumeHelper(cctx, h.launch); err != nil {
+		s.logger.Warn("could not forget a removed helper container", "server_id", h.server, "err", err)
+		return
+	}
+	s.knownHelpers.Delete(h.launch)
+}
+
 // removeHelper removes a helper container (also when ctx is cancelled) and
 // forgets it. A failure keeps the record, so CleanupHelpers retries.
 func (s *Service) removeHelper(ctx context.Context, h *helper) {
 	cctx := context.WithoutCancel(ctx)
 	defer s.activeHelpers.Delete(h.launch)
-	if err := s.docker.RemoveHelper(cctx, h.launch, h.id); err != nil {
+	if _, err := s.docker.RemoveHelper(cctx, h.launch, h.id); err != nil {
 		s.logger.Warn("could not remove a helper container; it is retried later", "job_id", jobIDFrom(ctx), "server_id", h.server, "err", err)
 		return
 	}
@@ -230,8 +299,10 @@ func (s *Service) removeHelper(ctx context.Context, h *helper) {
 // CleanupHelpers removes helper containers a crash or a failed removal
 // left behind: exactly the containers whose launch id was recorded (by the
 // recorded container id, or by the launch label and name when the create's
-// reply was lost). Helpers of running operations are skipped. It is safe
-// to call at any time.
+// reply was lost). A record without a container id whose helper is not
+// found stays for helperForgetAfter after it was written, since that
+// create may still complete. Helpers of running operations are skipped.
+// It is safe to call at any time.
 func (s *Service) CleanupHelpers(ctx context.Context) error {
 	rows, err := s.store.ListVolumeHelpers(ctx)
 	if err != nil {
@@ -243,7 +314,7 @@ func (s *Service) CleanupHelpers(ctx context.Context) error {
 		if _, active := s.activeHelpers.Load(h.LaunchID); active {
 			continue
 		}
-		err := s.docker.RemoveHelper(ctx, h.LaunchID, h.ContainerID)
+		found, err := s.docker.RemoveHelper(ctx, h.LaunchID, h.ContainerID)
 		if errors.Is(err, docker.ErrNotOurs) {
 			// The recorded id names something else now: never touch it.
 			s.logger.Warn("the container recorded for a helper is not that helper; forgetting the record", "server_id", h.ServerID)
@@ -253,12 +324,17 @@ func (s *Service) CleanupHelpers(ctx context.Context) error {
 			errs = append(errs, err)
 			continue
 		}
+		if !found && h.ContainerID == "" && s.cfg.Now().Sub(h.CreatedAt) < helperForgetAfter {
+			continue
+		}
 		if err := s.store.DeleteVolumeHelper(ctx, h.LaunchID); err != nil {
 			errs = append(errs, err)
 			continue
 		}
 		s.knownHelpers.Delete(h.LaunchID)
-		s.logger.Info("removed a helper container left by an interrupted operation", "server_id", h.ServerID)
+		if found {
+			s.logger.Info("removed a helper container left by an interrupted operation", "server_id", h.ServerID)
+		}
 	}
 	return errors.Join(errs...)
 }

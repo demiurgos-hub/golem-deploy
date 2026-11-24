@@ -7,6 +7,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -25,8 +26,10 @@ type JobStarter func(id int64, body func(ctx context.Context, log io.Writer) err
 // ScheduleBackups starts the scheduled backups that are due: for every
 // server with a schedule whose container is running, when its newest
 // backup of any kind is older than the interval (or it has none) and its
-// last scheduled backup did not fail within ScheduleRetryDelay. It returns
-// the ids of the servers it started a job for.
+// last scheduled backup did not fail within ScheduleRetryDelay (recorded
+// on the server row, so the delay holds across daemon restarts). It
+// returns the ids of the servers it started a job for. The job checks all
+// of this again once it holds the server's job slot.
 func (s *Service) ScheduleBackups(ctx context.Context, start JobStarter) ([]int64, error) {
 	rows, err := s.store.ListServers(ctx)
 	if err != nil {
@@ -63,10 +66,7 @@ func (s *Service) ScheduleBackups(ctx context.Context, start JobStarter) ([]int6
 		if t, ok := last[sv.ID]; ok && now.Sub(t) < time.Duration(sv.BackupIntervalHours)*time.Hour {
 			continue
 		}
-		s.schedMu.Lock()
-		failed, ok := s.schedFailed[sv.ID]
-		s.schedMu.Unlock()
-		if ok && now.Sub(failed) < ScheduleRetryDelay {
+		if sv.BackupFailedAt != nil && now.Sub(*sv.BackupFailedAt) < ScheduleRetryDelay {
 			continue
 		}
 		id := sv.ID
@@ -79,22 +79,65 @@ func (s *Service) ScheduleBackups(ctx context.Context, start JobStarter) ([]int6
 }
 
 // scheduledBackup takes a scheduled backup and applies the server's
-// retention afterwards; a failure delays the next attempt.
+// retention afterwards. It first checks again, now that it holds the
+// server's job slot, that the backup is still due; when it is not, it
+// says why and succeeds. A failure delays the next attempt.
 func (s *Service) scheduledBackup(ctx context.Context, id int64, log io.Writer) error {
 	fmt.Fprintln(log, "scheduled backup")
-	err := s.Backup(ctx, id, BackupOptions{Kind: store.BackupScheduled}, log)
-	s.schedMu.Lock()
-	if err != nil && ctx.Err() == nil {
-		s.schedFailed[id] = s.cfg.Now()
-	} else {
-		delete(s.schedFailed, id)
+	why, err := s.stillDue(ctx, id)
+	if err != nil {
+		return err
 	}
-	s.schedMu.Unlock()
+	if why != "" {
+		fmt.Fprintln(log, why)
+		return nil
+	}
+	err = s.Backup(ctx, id, BackupOptions{Kind: store.BackupScheduled}, log)
+	var at *time.Time
+	switch {
+	case err != nil && ctx.Err() != nil:
+		return err // cancelled: neither a failure nor a success
+	case err != nil:
+		now := s.cfg.Now()
+		at = &now
+	}
+	if serr := s.store.SetServerBackupFailed(context.WithoutCancel(ctx), id, at); serr != nil {
+		s.logger.Warn("could not record the outcome of a scheduled backup", "job_id", jobIDFrom(ctx), "server_id", id, "err", serr)
+	}
 	if err != nil {
 		return err
 	}
 	s.applyRetention(ctx, id, log)
 	return nil
+}
+
+// stillDue returns why a scheduled backup of server id is no longer due
+// ("" when it is): the schedule was turned off, the server no longer runs,
+// or a backup newer than the interval exists.
+func (s *Service) stillDue(ctx context.Context, id int64) (string, error) {
+	sv, err := s.load(ctx, id)
+	if err != nil {
+		return "", jobs.Fail("server not found", err)
+	}
+	if sv.BackupIntervalHours <= 0 {
+		return "the backup schedule was turned off meanwhile; nothing to do", nil
+	}
+	ct, err := s.container(ctx, sv)
+	if err != nil {
+		return "", s.failDocker(ctx, sv, "inspect the container", err)
+	}
+	if ct == nil || !adminRunning(*ct) {
+		return "the server is no longer running; scheduled backups are taken only while it runs", nil
+	}
+	last, ok, err := s.store.LastServerBackup(ctx, id)
+	if err != nil {
+		return "", jobs.Fail("could not read the server's backups", err)
+	}
+	if ok && s.cfg.Now().Sub(last) < time.Duration(sv.BackupIntervalHours)*time.Hour {
+		return fmt.Sprintf("a backup was taken meanwhile (%s), within the interval of %d hours; nothing to do",
+			last.UTC().Format(time.RFC3339), sv.BackupIntervalHours), nil
+	}
+	return "", nil
 }
 
 // applyRetention deletes the server's oldest scheduled backups beyond its

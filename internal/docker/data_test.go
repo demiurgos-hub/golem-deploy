@@ -159,8 +159,8 @@ func TestHelperCopyAndRemove(t *testing.T) {
 	if got, err := c.Helper(ctx, launch, ""); err != nil || got.ID != id {
 		t.Fatalf("%v %v", got, err)
 	}
-	if err := c.RemoveHelper(ctx, launch, ""); err != nil {
-		t.Fatal(err)
+	if found, err := c.RemoveHelper(ctx, launch, ""); err != nil || !found {
+		t.Fatal(found, err)
 	}
 	if _, ok := f.Container(id); ok {
 		t.Fatal("helper kept")
@@ -168,12 +168,12 @@ func TestHelperCopyAndRemove(t *testing.T) {
 	if _, ok := f.Container("impostor"); !ok {
 		t.Fatal("impostor removed")
 	}
-	if err := c.RemoveHelper(ctx, launch, ""); err != nil {
-		t.Fatal(err)
+	if found, err := c.RemoveHelper(ctx, launch, ""); err != nil || found {
+		t.Fatal(found, err)
 	}
 	// A recorded id that now names another container is not touched.
 	impostor, _ := f.Container("impostor")
-	if err := c.RemoveHelper(ctx, launch, impostor.ID); !errors.Is(err, docker.ErrNotOurs) {
+	if _, err := c.RemoveHelper(ctx, launch, impostor.ID); !errors.Is(err, docker.ErrNotOurs) {
 		t.Fatalf("%v", err)
 	}
 	for _, rm := range f.CallsTo("rm") {
