@@ -110,12 +110,13 @@ describe("browser connection probes", () => {
     expect(results.get("server")).toMatchObject({ status: "failed", detail: expect.stringContaining("Loading map") });
   });
 
-  it("shows a useful message when WebTransport is unavailable", async () => {
+  it("runs HTTPS and WebSocket without WebTransport", async () => {
     browser();
     vi.stubGlobal("WebTransport", undefined);
     const { results, done } = probe();
     await done;
-    expect(results.get("server")).toMatchObject({ status: "failed", detail: expect.stringContaining("WebTransport is unavailable in this browser") });
+    expect([...results.values()].map((r) => r.status)).toEqual(["passed", "passed", "passed", "skipped"]);
+    expect(results.get("webtransport")).toMatchObject({ detail: expect.stringContaining("WebTransport is unavailable in this browser") });
   });
 
   it("exposes API failures and request IDs", async () => {
@@ -136,9 +137,32 @@ describe("browser connection probes", () => {
     const { results, done } = probe();
     await done;
     expect(results.get("websocket")).toMatchObject({ status: "failed", detail: expect.stringContaining("WebSocket upgrade support") });
-    expect(results.get("webtransport")).toMatchObject({ status: "failed", detail: expect.stringContaining("TCP works. UDP port 7810 is most likely blocked") });
+    expect(results.get("webtransport")).toMatchObject({ status: "failed", detail: expect.not.stringContaining("TCP works") });
     expect(b.closeWS).toHaveBeenCalledOnce();
     expect(b.closeWT).toHaveBeenCalledOnce();
+  });
+
+  it("uses a successful WebSocket fallback as evidence that TCP works", async () => {
+    browser({ tcp: false, wt: "error" });
+    const { results, done } = probe();
+    await done;
+    expect(results.get("websocket")?.status).toBe("passed");
+    expect(results.get("webtransport")).toMatchObject({ status: "failed", detail: expect.stringContaining("TCP works. UDP port 7810 is most likely blocked") });
+  });
+
+  it("reports literal IPv6 before opening any probes", async () => {
+    const b = browser();
+    vi.stubGlobal("WebTransport", undefined);
+    const { results, done } = probe(payload({
+      page_url: "https://[2001:db8::1]:7810/",
+      webtransport_url: "https://[2001:db8::1]:7810/wt",
+      websocket_url: "wss://[2001:db8::1]:7810/ws",
+    }));
+    await done;
+    expect(results.get("server")).toMatchObject({ status: "failed", detail: expect.stringContaining("literal IPv6 game host") });
+    expect(b.fetch).not.toHaveBeenCalled();
+    expect(b.socket).not.toHaveBeenCalled();
+    expect(b.transport).not.toHaveBeenCalled();
   });
 
   it("explains the localhost IPv4-only case", async () => {
