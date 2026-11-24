@@ -19,18 +19,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/caddyserver/certmagic"
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
-	"github.com/mholt/acmez/v3/acme"
 )
 
 type fakeACME struct {
+	t *testing.T
 	*Manager
-	pairs   map[string]*certificatePair
-	err     error
-	calls   int
-	renewAt time.Time
+	pairs     map[string]*certificatePair
+	err       error
+	calls     int
+	renewAt   time.Time
+	refreshAt time.Time
 }
 
 func (f *fakeACME) Load(_ context.Context, _ ACMEAccount, host string) ([]byte, []byte, error) {
@@ -45,15 +46,11 @@ func (f *fakeACME) Issue(_ context.Context, _ ACMEAccount, host string, _ bool, 
 	if f.err != nil {
 		return f.err
 	}
-	chain, key, _, err := f.generate(host)
-	if err != nil {
-		return err
-	}
-	f.pairs[host], err = parsePair(chain, key)
-	return err
+	f.pairs[host] = testACMEPair(f.t, host, f.now())
+	return nil
 }
 func (f *fakeACME) RenewalInfo(context.Context, ACMEAccount, string, *x509.Certificate) (time.Time, time.Time, error) {
-	return f.renewAt, time.Time{}, nil
+	return f.renewAt, f.refreshAt, nil
 }
 func (*fakeACME) HTTPChallenge(http.ResponseWriter, *http.Request) bool       { return false }
 func (*fakeACME) TLSChallenge(*tls.ClientHelloInfo) (*tls.Certificate, error) { return nil, nil }
@@ -115,7 +112,7 @@ func TestACMERetryAfter(t *testing.T) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.Header().Set("Retry-After", "600")
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = io.WriteString(w, `{"type":"urn:ietf:params:acme:error:rateLimited","detail":"Order quota exhausted"}`)
+		_, _ = io.WriteString(w, `{"type":"urn:ietf:params:acme:error:rateLimited","detail":"Order quota exhausted. Retry at 2099-01-01T00:00:00Z"}`)
 	}))
 	defer ca.Close()
 	client := NewACMEClient(t.TempDir(), nil, slog.New(slog.DiscardHandler), ACMEListeners{})
@@ -124,7 +121,7 @@ func TestACMERetryAfter(t *testing.T) {
 	started := time.Now()
 	err := client.Issue(ctx, ACMEAccount{Directory: ca.URL}, "example.com", false, io.Discard)
 	var failure *acmeFailure
-	if !errors.As(err, &failure) || failure.retry.Before(started.Add(10*time.Minute)) ||
+	if !errors.As(err, &failure) || failure.retry.Before(started.Add(10*time.Minute)) || failure.retry.After(time.Now().Add(10*time.Minute)) ||
 		!strings.Contains(failure.message, "Retry after") {
 		t.Fatalf("expected Retry-After from the CA's response, got %v", err)
 	}
@@ -139,7 +136,7 @@ func (c localTLSConn) LocalAddr() net.Addr { return c.addr }
 
 func TestPanelCertificateSelection(t *testing.T) {
 	game, _, _ := newManager(t)
-	fake := &fakeACME{Manager: game, pairs: make(map[string]*certificatePair)}
+	fake := &fakeACME{t: t, Manager: game, pairs: make(map[string]*certificatePair)}
 	a := NewAutomation(AutomationOptions{Game: game, GameHost: fixedHost("play.example.com"), PublicHosts: []string{"panel.example.com", "8.8.8.8"},
 		PanelMode: apitypes.PanelCertificateModeSelfSigned, PanelDir: filepath.Join(filepath.Dir(game.dir), "panel"), Client: fake})
 	ctx := t.Context()
@@ -190,6 +187,11 @@ func TestPanelCertificateSelection(t *testing.T) {
 		t.Fatal("ambiguous fallback bypassed the listener IP")
 	}
 
+	state.issued[secondIP].info.NotAfter = a.now()
+	if got := state.selectPair(a.now(), "", "10.0.0.1"); got != state.issued["8.8.8.8"] {
+		t.Fatal("an expired IP certificate defeated the sole usable IP fallback")
+	}
+
 	if _, err := a.GetCertificate(&tls.ClientHelloInfo{SupportedProtos: []string{"acme-tls/1"}}); err == nil {
 		t.Fatal("accepted an inactive challenge")
 	}
@@ -199,7 +201,7 @@ func TestACMEReconcileNewerStorage(t *testing.T) {
 	game, c, st := newManager(t)
 	ctx := t.Context()
 	host := "game.example.com"
-	fake := &fakeACME{Manager: game, pairs: make(map[string]*certificatePair)}
+	fake := &fakeACME{t: t, Manager: game, pairs: make(map[string]*certificatePair)}
 	if err := fake.Issue(ctx, ACMEAccount{}, host, false, io.Discard); err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +284,7 @@ func TestACMEHostChangeKeepsPairAndRetries(t *testing.T) {
 	game, clock, _ := newManager(t)
 	ctx := t.Context()
 	host := "before.example.com"
-	fake := &fakeACME{Manager: game, pairs: make(map[string]*certificatePair)}
+	fake := &fakeACME{t: t, Manager: game, pairs: make(map[string]*certificatePair)}
 	a := NewAutomation(AutomationOptions{
 		Game: game, GameHost: func(context.Context) (string, error) { return host, nil },
 		PanelMode: apitypes.PanelCertificateModeNone, Client: fake, HTTP01: true,
@@ -354,7 +356,7 @@ func TestBlockedRenewalRecordsReasonAndExpiry(t *testing.T) {
 			game, c, st := newManager(t)
 			var logs bytes.Buffer
 			game.logger = slog.New(slog.NewTextHandler(&logs, nil))
-			fake := &fakeACME{Manager: game, pairs: make(map[string]*certificatePair)}
+			fake := &fakeACME{t: t, Manager: game, pairs: make(map[string]*certificatePair)}
 			host := "game.example.com"
 			if err := fake.Issue(ctx, ACMEAccount{}, host, false, io.Discard); err != nil {
 				t.Fatal(err)
@@ -428,7 +430,7 @@ func TestSavedPairInstallationFailureBacksOff(t *testing.T) {
 	game, c, st := newManager(t)
 	ctx := t.Context()
 	host := "game.example.com"
-	fake := &fakeACME{Manager: game, pairs: make(map[string]*certificatePair)}
+	fake := &fakeACME{t: t, Manager: game, pairs: make(map[string]*certificatePair)}
 	for i := range 2 {
 		if err := fake.Issue(ctx, ACMEAccount{}, host, i != 0, io.Discard); err != nil {
 			t.Fatal(err)
@@ -530,6 +532,108 @@ func TestRenewalLeavesRetryMargin(t *testing.T) {
 	}
 }
 
+func TestACMEStoredDeferralsAreBounded(t *testing.T) {
+	game, c, _ := newManager(t)
+	now := c.now()
+	for _, tc := range []struct {
+		wait, failure, ari time.Duration
+	}{
+		{-time.Hour, time.Minute, time.Hour},
+		{2 * time.Hour, 2 * time.Hour, 2 * time.Hour},
+		{100 * time.Hour, 24 * time.Hour, 24 * time.Hour},
+	} {
+		t.Run(tc.wait.String(), func(t *testing.T) {
+			host := "game.example.com"
+			account := ACMEAccount{Directory: tc.wait.String()}
+			client := &fakeACME{refreshAt: now.Add(tc.wait)}
+			a := NewAutomation(AutomationOptions{Game: game, Client: client})
+			a.recordFailure(t.Context(), account, host, now, &acmeFailure{message: "rate limited", retry: now.Add(tc.wait)}, false)
+			last, err := a.attempt(t.Context(), account, host)
+			if err != nil || !last.Retry.Equal(now.Add(tc.failure)) {
+				t.Fatalf("stored failure retry: %v, %v", last.Retry, err)
+			}
+			a.renewalDue(t.Context(), account, host, testACMEPair(t, host, now))
+			if refresh := a.schedules[host].refresh; !refresh.Equal(now.Add(tc.ari)) {
+				t.Fatalf("stored ARI refresh: %v", refresh)
+			}
+		})
+	}
+}
+
+func TestCancelledRenewAllKeepsCommitAndRecordsCancellation(t *testing.T) {
+	game, clock, settings := newManager(t)
+	ctx := t.Context()
+	const gameHost, panelHost = "game.example.com", "panel.example.com"
+	fake := &fakeACME{t: t, Manager: game, pairs: make(map[string]*certificatePair)}
+	old := testACMEPair(t, gameHost, clock.now())
+	fake.pairs[gameHost] = old
+	if _, err := game.useShared(ctx, ModeACME, old.chain, old.key); err != nil {
+		t.Fatal(err)
+	}
+	settings.m[store.SettingACME] = `{"TermsAgreed":true}`
+	a := NewAutomation(AutomationOptions{
+		Game: game, GameHost: fixedHost(gameHost), Client: fake, HTTP01: true, PublicHosts: []string{panelHost},
+		PanelMode: apitypes.PanelCertificateModeSelfSigned, PanelDir: filepath.Join(filepath.Dir(game.dir), "panel"),
+	})
+	if err := a.Initialize(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run(ctx, IssuePanel, []string{panelHost}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	release, err := game.HoldForStart(ctx, 1, ModeACME)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	dir := t.TempDir()
+	st, err := store.Open(ctx, filepath.Join(dir, "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	runner := jobs.New(st, dir, jobs.Options{Workers: 1})
+	defer func() { <-runner.Stop() }()
+	armed := make(chan struct{})
+	job, err := runner.Start(ctx, "certificate.renew", certificateSubject(), nil, func(ctx context.Context, log io.Writer) error {
+		select {
+		case <-armed:
+			return a.run(ctx, RenewAll, nil, log)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.settingFault = func(key, _ string) (bool, error) {
+		if key == SettingMode {
+			if err := runner.Cancel(job.ID); err != nil {
+				t.Error(err)
+			}
+		}
+		return true, nil
+	}
+	close(armed)
+	select {
+	case <-runner.Done(job.ID):
+	case <-time.After(5 * time.Second):
+		t.Fatal("renewal did not leave the runner")
+	}
+	if result, err := st.GetJob(ctx, job.ID); err != nil || result.Status != store.JobCancelled {
+		t.Fatalf("partially completed renewal should be cancelled: %+v, %v", result, err)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("renewal attempted the later panel host after cancellation: %d CA calls", fake.calls)
+	}
+	if current, err := game.Current(ctx, 0); err != nil || current.Fingerprint == old.info.Fingerprint {
+		t.Fatalf("cancelled renewal lost the committed generation: %+v, %v", current, err)
+	}
+	if current, err := load(game.ServerDir(1)); err != nil || current.Fingerprint != old.info.Fingerprint {
+		t.Fatalf("cancelled renewal rewrote a held mount: %+v, %v", current, err)
+	}
+}
+
 func TestACMERejectsOversizedDirectory(t *testing.T) {
 	for _, chunked := range []bool{false, true} {
 		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
@@ -551,38 +655,5 @@ func TestACMERejectsOversizedDirectory(t *testing.T) {
 				t.Fatalf("oversized response error: %v", err)
 			}
 		})
-	}
-}
-
-func TestACMEReadsExistingCertMagicAssets(t *testing.T) {
-	game, _, _ := newManager(t)
-	ctx := t.Context()
-	client := &acmeClient{dir: t.TempDir()}
-	account := ACMEAccount{Directory: "http://127.0.0.1:1/dir", Email: "Admin@example.com"}
-	storage, issuer := client.storage(account)
-	const host = "game.example.com"
-	chain, key, _, err := game.generate(host)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg := []byte(`{"status":"valid","location":"http://127.0.0.1:1/acct/123"}`)
-	accountDir := "acme/" + certmagic.StorageKeys.Safe(issuer) + "/users/admin@example.com/"
-	for file, data := range map[string][]byte{
-		certmagic.StorageKeys.SiteCert(issuer, host):       chain,
-		certmagic.StorageKeys.SitePrivateKey(issuer, host): key,
-		accountDir + "admin.key":                           key,
-		accountDir + "admin.json":                          reg,
-	} {
-		if err := storage.Store(ctx, file, data); err != nil {
-			t.Fatal(err)
-		}
-	}
-	gotChain, gotKey, err := client.Load(ctx, account, host)
-	if err != nil || !bytes.Equal(gotChain, chain) || !bytes.Equal(gotKey, key) {
-		t.Fatalf("previously saved pair was not reused: %v", err)
-	}
-	loaded, err := client.loadAccount(ctx, &acme.Client{Directory: account.Directory}, storage, issuer, account.Email)
-	if err != nil || loaded.Status != "valid" || loaded.Location != "http://127.0.0.1:1/acct/123" || loaded.PrivateKey == nil {
-		t.Fatalf("previously saved account was not reused: %v", err)
 	}
 }

@@ -82,12 +82,12 @@ type Options struct {
 	// Ready, if set, is called with the bound address once serving.
 	Ready func(addr net.Addr)
 
-	bcryptCost  int                 // tests only; 0 means auth.DefaultBcryptCost
-	docker      httpapi.DockerProbe // tests only
-	dockerCLI   docker.Runner       // tests only; nil runs the docker CLI
-	storeClosed func(error)         // tests only
-	readyRunner func(*jobs.Runner)  // tests only
-	stopTimeout time.Duration       // tests only
+	bcryptCost    int                                              // tests only; 0 means auth.DefaultBcryptCost
+	docker        httpapi.DockerProbe                              // tests only
+	dockerCLI     docker.Runner                                    // tests only; nil runs the docker CLI
+	storeClosed   func(error)                                      // tests only
+	readyServices func(*jobs.Runner, *build.Service, *store.Store) // tests only
+	stopTimeout   time.Duration                                    // tests only
 }
 
 // serverConfig validates the game server settings.
@@ -143,7 +143,7 @@ func defaultGameHost(publicHosts []string) string {
 	return ""
 }
 
-// shutdownGrace covers HTTP shutdown, jobs and certificate maintenance together.
+// shutdownGrace covers HTTP shutdown, jobs, build watchers and maintenance together.
 const shutdownGrace = 20 * time.Second
 
 // Run serves until ctx is cancelled, then shuts down gracefully and closes
@@ -452,8 +452,8 @@ func Run(ctx context.Context, o Options) (err error) {
 	if o.Ready != nil {
 		o.Ready(ln.Addr())
 	}
-	if o.readyRunner != nil {
-		o.readyRunner(runner)
+	if o.readyServices != nil {
+		o.readyServices(runner, builds, st)
 	}
 
 	// Cancel all background work with HTTP shutdown. Keep their completion
@@ -502,6 +502,7 @@ func Run(ctx context.Context, o Options) (err error) {
 		for _, done := range []<-chan struct{}{srv.Drained(), jobsDone, certDone, recDone, cleanupDone} {
 			<-done
 		}
+		builds.WaitWatchers()
 		close(finished)
 	}()
 	serveErr := srv.Serve(runCtx, ln, httpLn)

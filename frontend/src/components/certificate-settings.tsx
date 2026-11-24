@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { isApiError, sentence } from "@/api/errors";
 import { qk } from "@/api/query-keys";
 import { usePanelCertificate, type useACME } from "@/api/queries";
-import type { ACME, GameCertificate, Job, PanelCertificate, PanelCertificateMode, UpdateACMERequest } from "@/api/types.gen";
+import type { ACME, CertificateInfo, GameCertificate, Job, PanelCertificate, PanelCertificateMode, UpdateACMERequest } from "@/api/types.gen";
 import { useApi } from "@/app/services";
 import { CertificateDetails, CertificateExpiry } from "@/components/certificate";
 import { InlineJob } from "@/components/jobs";
@@ -22,13 +22,25 @@ const letsEncryptDirectories = [
 
 const noChallenge = "Make the daemon reachable on port 80 through --http-listen, or have the panel serve HTTPS on port 443.";
 
+function certificateCoversHost(cert: CertificateInfo, host: string): boolean {
+  // The API returns IP addresses in canonical form, without IPv6 brackets.
+  if (host.includes(":") || /^(\d+\.){3}\d+$/.test(host)) return cert.ip_addresses.includes(host);
+  const name = host.toLowerCase().replace(/\.$/, "");
+  const firstDot = name.indexOf(".");
+  return cert.dns_names.some((san) => {
+    const pattern = san.toLowerCase().replace(/\.$/, "");
+    return pattern === name || (firstDot > 0 && pattern === `*${name.slice(firstDot)}`);
+  });
+}
+
 export function SharedCertificateWarning({ game }: { game: GameCertificate | undefined }) {
   const panel = usePanelCertificate();
-  if (!game || game.mode === "self_signed" || !panel.data?.hosts.includes(game.game_host)) return null;
+  const cert = game?.certificate;
+  if (!game || game.mode === "self_signed" || !cert || !panel.data?.hosts.some((host) => certificateCoversHost(cert, host))) return null;
   return (
     <Notice tone="warning" title="Game containers can read a key valid for the panel">
-      Every game container can read the shared game certificate&apos;s private key. A certificate for this host is also valid for the panel.
-      If games are not fully trusted, give the panel its own hostname with <code>--public-host</code>, different from the game host.
+      Every game container can read the shared game certificate&apos;s private key. This certificate also covers a panel host.
+      If games are not fully trusted, configure panel hosts outside the shared certificate&apos;s coverage with <code>--public-host</code>.
     </Notice>
   );
 }

@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -212,6 +213,7 @@ type certOpts struct {
 	notBefore, notAfter time.Time
 	eku                 []x509.ExtKeyUsage
 	isCA                bool
+	host                string
 }
 
 func makeCert(t *testing.T, key crypto.Signer, parent *x509.Certificate, parentKey crypto.Signer, o certOpts) (*x509.Certificate, []byte) {
@@ -226,6 +228,12 @@ func makeCert(t *testing.T, key crypto.Signer, parent *x509.Certificate, parentK
 	}
 	if o.isCA {
 		tmpl.KeyUsage = x509.KeyUsageCertSign
+	}
+	if o.host != "" {
+		tmpl.DNSNames = []string{o.host}
+		if ip := net.ParseIP(o.host); ip != nil {
+			tmpl.DNSNames, tmpl.IPAddresses = nil, []net.IP{ip}
+		}
 	}
 	if parent == nil {
 		parent, parentKey = tmpl, key
@@ -527,7 +535,8 @@ func TestValidateHost(t *testing.T) {
 
 func TestMountStaysMatchedWhileServerLoadsInitialPair(t *testing.T) {
 	m, _, _ := newManager(t)
-	ctx := t.Context()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	host := "play.example.com"
 	old, err := m.Ensure(ctx, 1, fixedHost(host))
 	if err != nil {
@@ -550,12 +559,80 @@ func TestMountStaysMatchedWhileServerLoadsInitialPair(t *testing.T) {
 	if err != nil || got.Fingerprint != old.Fingerprint {
 		t.Fatalf("starting server's pair was replaced: %+v, %v", got, err)
 	}
-	release()
 	if mode, err := m.Mode(ctx); err != nil || mode != ModeCustom {
-		t.Fatalf("committed generation did not converge: %s, %v", mode, err)
+		t.Fatalf("pending copy hid committed mode: %s, %v", mode, err)
+	}
+	if current, err := m.Current(ctx, 0); err != nil || current.Fingerprint != next.Fingerprint {
+		t.Fatalf("pending copy hid committed certificate: %+v, %v", current, err)
+	}
+	other := m.ServerDir(2)
+	if current, err := load(other); err != nil || current.Fingerprint != next.Fingerprint {
+		t.Fatalf("publication stopped before other server: %+v, %v", current, err)
+	}
+	stamp := time.Unix(1_700_000_000, 0)
+	path := filepath.Join(other, CertFile)
+	if err := os.Chtimes(path, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Ensure(ctx, 2, fixedHost(host)); err != nil {
+		t.Fatalf("unrelated start blocked by publication: %v", err)
+	}
+	<-m.publicationWake // Require release to wake the publisher.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&Automation{AutomationOptions: AutomationOptions{Game: m}}).maintainPublication(ctx)
+	}()
+	defer func() { cancel(); <-done }()
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.mu.Lock()
+		_, err := os.Stat(m.stagingDir())
+		m.mu.Unlock()
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("released hold did not wake publisher: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	got, err = load(m.ServerDir(1))
 	if err != nil || got.Fingerprint != next.Fingerprint {
 		t.Fatalf("new pair did not reach mount: %+v, %v", got, err)
+	}
+	if stat, err := os.Stat(path); err != nil || !stat.ModTime().Equal(stamp) {
+		t.Fatalf("already-published mount was rewritten: %v, %v", stat, err)
+	}
+}
+
+func TestSelfSignedMountCanRotateWhileAnotherMountIsHeld(t *testing.T) {
+	m, _, _ := newManager(t)
+	ctx := t.Context()
+	const oldHost, newHost = "old.example.com", "new.example.com"
+	if _, err := m.Ensure(ctx, 1, fixedHost(oldHost)); err != nil {
+		t.Fatal(err)
+	}
+	release, err := m.HoldForStart(ctx, 1, ModeSelfSigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	var incomplete *PublicationError
+	if _, err := m.UseSelfSigned(ctx, fixedHost(oldHost)); !errors.As(err, &incomplete) {
+		t.Fatalf("expected pending publication: %v", err)
+	}
+	current, err := m.Ensure(ctx, 2, fixedHost(newHost))
+	if err != nil || !current.Covers(newHost) {
+		t.Fatalf("other start did not select its current host: %+v, %v", current, err)
+	}
+	release()
+	if err := m.finishPublication(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := load(m.ServerDir(2))
+	if err != nil || got.Fingerprint != current.Fingerprint {
+		t.Fatalf("publication replay replaced a newer self-signed pair: %+v, %v", got, err)
 	}
 }

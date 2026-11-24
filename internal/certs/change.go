@@ -31,7 +31,7 @@ func (m *Manager) stagingDir() string {
 // and the identity of its complete stage in one operation. After that
 // point publication is independent of the client request.
 func (m *Manager) change(ctx context.Context, mode Mode, stagePairs func(string, []int64) error) error {
-	if _, err := m.state(ctx); err != nil {
+	if err := m.finishPublication(ctx); err != nil {
 		return err
 	}
 	ids, err := m.settings.ListServerIDs(ctx)
@@ -75,29 +75,32 @@ func (m *Manager) change(ctx context.Context, mode Mode, stagePairs func(string,
 		// result. A stage for an uncommitted value is never published.
 		saved, _, readErr := m.settings.GetSetting(commitCtx, SettingMode)
 		if readErr != nil {
+			m.wakePublisher()
 			return errors.Join(err, readErr)
 		}
 		if saved != value {
 			return errors.Join(err, os.RemoveAll(stage))
 		}
 	}
-	if err := m.publish(mode); err != nil {
+	if err := m.publish(commitCtx, mode); err != nil {
 		m.logger.Warn("committed game certificate publication incomplete", "mode", mode, "err", err)
-		select {
-		case m.publicationWake <- struct{}{}:
-		default:
-		}
+		m.wakePublisher()
 		return &PublicationError{cause: err}
 	}
 	return nil
 }
 
-// state recovers the committed generation before returning a mode to any
-// daemon caller. An incomplete or uncommitted stage never enters a mount.
-func (m *Manager) state(ctx context.Context) (Mode, error) {
+func (m *Manager) wakePublisher() {
+	select {
+	case m.publicationWake <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Manager) committedMode(ctx context.Context) (Mode, string, error) {
 	value, _, err := m.settings.GetSetting(ctx, SettingMode)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	rawMode, generation, _ := strings.Cut(value, ":")
 	mode := Mode(rawMode)
@@ -105,23 +108,48 @@ func (m *Manager) state(ctx context.Context) (Mode, error) {
 		mode = ModeSelfSigned
 	}
 	if !mode.Valid() {
-		return "", fmt.Errorf("certs: unknown certificate mode %q", mode)
+		return "", "", fmt.Errorf("certs: unknown certificate mode %q", mode)
+	}
+	if generation == "" {
+		value = ""
+	}
+	return mode, value, nil
+}
+
+func (m *Manager) committedStage(value string) (string, error) {
+	if value == "" {
+		return "", nil
 	}
 	stage := m.stagingDir()
 	record, err := os.ReadFile(filepath.Join(stage, generationFile))
 	switch {
 	case err != nil && !errors.Is(err, os.ErrNotExist):
 		return "", err
-	case generation != "" && string(record) == value:
-		return mode, m.publish(mode)
+	case string(record) == value:
+		return stage, nil
 	default:
-		return mode, os.RemoveAll(stage)
+		return "", nil
 	}
 }
 
-func (m *Manager) publish(mode Mode) error {
+func (m *Manager) finishPublication(ctx context.Context) error {
+	mode, value, err := m.committedMode(ctx)
+	if err != nil {
+		return err
+	}
+	stage, err := m.committedStage(value)
+	if err != nil {
+		return err
+	}
+	if stage == "" {
+		return os.RemoveAll(m.stagingDir())
+	}
+	return m.publish(ctx, mode)
+}
+
+func (m *Manager) publish(ctx context.Context, mode Mode) error {
 	stage := m.stagingDir()
-	entries, err := os.ReadDir(stage)
+	ids, err := m.settings.ListServerIDs(ctx)
 	if err != nil {
 		return err
 	}
@@ -130,18 +158,20 @@ func (m *Manager) publish(mode Mode) error {
 			return err
 		}
 	}
-	for _, entry := range entries {
-		id, err := strconv.ParseInt(entry.Name(), 10, 64)
-		if err != nil || id <= 0 {
-			continue
+	var failures error
+	held := false
+	for _, id := range ids {
+		if _, err := m.publishServer(stage, id, mode); errors.Is(err, errMountHeld) {
+			held = true
+		} else if err != nil {
+			failures = errors.Join(failures, err)
 		}
-		src := filepath.Join(stage, entry.Name())
-		if mode != ModeSelfSigned {
-			src = filepath.Join(stage, "custom")
-		}
-		if err := m.copyPair(src, m.ServerDir(id)); err != nil {
-			return err
-		}
+	}
+	if failures != nil {
+		return failures
+	}
+	if held {
+		return errMountHeld
 	}
 	if mode == ModeSelfSigned {
 		if err := m.removeLegacyPair(); err != nil {
@@ -163,6 +193,31 @@ func (m *Manager) publish(mode Mode) error {
 	return os.RemoveAll(done)
 }
 
+func (m *Manager) publishServer(stage string, id int64, mode Mode) (bool, error) {
+	if stage == "" {
+		return false, nil
+	}
+	entry := filepath.Join(stage, strconv.FormatInt(id, 10))
+	if _, err := os.Stat(entry); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	src := entry
+	if mode != ModeSelfSigned {
+		src = filepath.Join(stage, "custom")
+	}
+	if err := m.copyPair(src, m.ServerDir(id)); err != nil {
+		return true, err
+	}
+	// Retire the entry only after the mount is durable. A later start or
+	// self-signed rotation can then change the mount without a stage replay.
+	if err := os.Rename(entry, entry+"-done"); err != nil {
+		return true, err
+	}
+	return true, syncDir(stage)
+}
+
 func (m *Manager) removeLegacyPair() error {
 	for _, name := range []string{CertFile, KeyFile, pendingCert, pendingKey} {
 		if err := removeIfPresent(filepath.Join(m.dir, name)); err != nil {
@@ -176,8 +231,11 @@ func (m *Manager) openFiles(ctx context.Context) error {
 	if err := os.MkdirAll(m.serversDir(), 0o700); err != nil {
 		return err
 	}
-	mode, err := m.state(ctx)
+	mode, _, err := m.committedMode(ctx)
 	if err != nil {
+		return err
+	}
+	if err := m.finishPublication(ctx); err != nil {
 		return err
 	}
 	if err := m.recoverPending(m.dir); err != nil {

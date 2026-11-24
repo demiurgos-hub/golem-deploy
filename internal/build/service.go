@@ -135,6 +135,7 @@ type Service struct {
 
 	activeMu sync.Mutex
 	active   int
+	watchers sync.WaitGroup
 }
 
 // New returns a Service.
@@ -184,7 +185,7 @@ func (s *Service) Reserve() (release func(), err error) {
 // without Run recording an outcome (cancelled while queued, a panic),
 // records one so no build stays queued or running.
 func (s *Service) Watch(id int64, done <-chan struct{}, release func()) {
-	go func() {
+	s.watchers.Go(func() {
 		<-done
 		release()
 		ctx, cancel := context.WithTimeout(context.Background(), finalTimeout)
@@ -202,8 +203,12 @@ func (s *Service) Watch(id int64, done <-chan struct{}, release func()) {
 		if err := s.o.Store.FinishBuild(ctx, id, store.BuildResult{Status: status, Detail: detail}); err != nil && !errors.Is(err, store.ErrNotFound) {
 			s.o.Logger.Error("record build outcome failed", "build_id", id, "error", safeBuildError(err))
 		}
-	}()
+	})
 }
+
+// WaitWatchers joins the final status writes. Call after handlers have
+// drained so that no further watchers can be registered.
+func (s *Service) WaitWatchers() { s.watchers.Wait() }
 
 // run is one build in progress.
 type run struct {
