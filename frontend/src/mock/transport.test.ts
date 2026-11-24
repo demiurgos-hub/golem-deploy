@@ -62,4 +62,83 @@ describe("mock transport contract", () => {
     const results = await Promise.all([upload([new File(["1"], "a.bin")]), upload([new File(["2"], "b.bin")]), upload([new File(["3"], "c.bin")])]);
     expect(results.map((r) => r.status).sort()).toEqual([201, 201, 429]);
   });
+
+  it("builds: no checkout without pull, a build runs to success with an image, in-use builds cannot be deleted", async () => {
+    const t = createMockTransport(real);
+    // Project 3 has no checkout (failed clone).
+    expect(await call(t, "POST", "/projects/3/builds", {})).toMatchObject({ status: 409, body: { error: { code: "conflict" } } });
+    expect((await call(t, "GET", "/builds?status=bogus")).status).toBe(400);
+    const started = await call(t, "POST", "/projects/1/builds", { pull: true });
+    expect(started).toMatchObject({ status: 202, body: { build: { status: "queued", project_id: 1 }, job: { kind: "project.build", subject_type: "project" } } });
+    expect(await call(t, "POST", "/projects/1/builds", {})).toMatchObject({ status: 409, body: { error: { code: "job_in_progress" } } });
+    const id = started.body.build.id as number;
+    let b = (await call(t, "GET", `/builds/${id}`)).body;
+    for (let i = 0; i < 60 && (b.status === "queued" || b.status === "running"); i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      b = (await call(t, "GET", `/builds/${id}`)).body;
+    }
+    expect(b).toMatchObject({ status: "success", image_tag: expect.stringContaining(`-b${id}`), webtransport_path: "/wt" });
+    const listed = await call(t, "GET", "/projects/1/builds");
+    expect(listed.body.items[0].id).toBe(id);
+    const images = (await call(t, "GET", "/images")).body.items as { id: string; build_ids: number[] }[];
+    expect(images.find((i) => i.id === b.image_id)?.build_ids).toEqual([id]);
+    // Build 3 is the build of several servers.
+    expect(await call(t, "DELETE", "/builds/3")).toMatchObject({ status: 409, body: { error: { code: "conflict" } } });
+    expect(await call(t, "DELETE", `/images/${encodeURIComponent(b.image_id)}`)).toMatchObject({ status: 409 });
+    expect((await call(t, "DELETE", `/builds/${id}`)).status).toBe(204);
+  }, 20_000);
+
+  it("servers: a build of the same project only, job_in_progress for port and build changes, runtime 200/409/503", async () => {
+    const t = createMockTransport(real);
+    expect(await call(t, "POST", "/servers", { name: "x", build_id: 2 })).toMatchObject({ status: 400, body: { error: { field: "build_id" } } });
+    // Server 12 runs project 1; build 4 belongs to project 2.
+    expect(await call(t, "PATCH", "/servers/12", { build_id: 4 })).toMatchObject({ status: 400, body: { error: { field: "build_id" } } });
+    expect((await call(t, "PATCH", "/servers/12", { build_id: 3 })).body).toMatchObject({ build_id: 3, project_id: 1 });
+    expect(await call(t, "PATCH", "/servers/12", { allowed_origins: ["https://ok.example.com", "ftp://x"] })).toMatchObject({
+      body: { error: { field: "allowed_origins[1]" } },
+    });
+    expect((await call(t, "POST", "/servers/12/start")).status).toBe(202);
+    expect(await call(t, "PATCH", "/servers/12", { port: 7050 })).toMatchObject({ status: 409, body: { error: { code: "job_in_progress" } } });
+    expect((await call(t, "GET", "/servers/11/runtime")).body).toMatchObject({ ready: true, transport: "webtransport" });
+    expect(await call(t, "GET", "/servers/14/runtime")).toMatchObject({ status: 503, body: { error: { code: "service_unavailable" } } });
+    expect(await call(t, "GET", "/servers/16/runtime")).toMatchObject({ status: 409 });
+    // Servers created before builds can start only once one is assigned.
+    expect((await call(t, "GET", "/servers/18")).body).toMatchObject({ build_id: null, project_id: null });
+  });
+
+  it("certificates, static add-ons and import format 2", async () => {
+    const t = createMockTransport(real);
+    expect((await call(t, "GET", "/certificates/game")).body).toMatchObject({ mode: "self_signed", certificate: null });
+    expect(await call(t, "PUT", "/certificates/game", { mode: "self_signed", certificate_pem: "x" })).toMatchObject({ body: { error: { field: "certificate_pem" } } });
+    const pem = "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----";
+    expect(await call(t, "PUT", "/certificates/game", { mode: "custom", certificate_pem: pem, private_key_pem: "nope" })).toMatchObject({
+      body: { error: { field: "private_key_pem" } },
+    });
+    const custom = await call(t, "PUT", "/certificates/game", { mode: "custom", certificate_pem: pem, private_key_pem: "-----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----" });
+    expect(custom.body).toMatchObject({ mode: "custom", certificate: { self_signed: false } });
+    expect(JSON.stringify(custom.body)).not.toContain("PRIVATE KEY");
+    expect((await call(t, "GET", "/servers/11")).body).toMatchObject({ restart_required: true, certificate: { self_signed: false } });
+
+    expect(await call(t, "PATCH", "/projects/1", { static_addons: [{ name: "sound_bank.bin", target: "a" }] })).toMatchObject({
+      body: { error: { field: "static_addons[0].name" } },
+    });
+    expect(await call(t, "PATCH", "/projects/1", { static_addons: [{ name: "textures.zip", target: "../x" }] })).toMatchObject({
+      body: { error: { field: "static_addons[0].target" } },
+    });
+    expect((await call(t, "PATCH", "/projects/1", { static_addons: [{ name: "textures.zip", target: "./assets/" }], allow_custom_dockerfile: true })).body).toMatchObject({
+      static_addons: [{ name: "textures.zip", target: "assets" }],
+      allow_custom_dockerfile: true,
+    });
+    expect(await call(t, "DELETE", "/static/textures.zip")).toMatchObject({ status: 409, body: { error: { code: "conflict" } } });
+
+    const exported = (await call(t, "GET", "/servers/export")).body;
+    expect(exported.format_version).toBe(2);
+    expect(exported.servers.find((s: { name: string }) => s.name === "eu-arena")).toMatchObject({ project: "arena-shooter", commit: expect.any(String) });
+    expect(await call(t, "POST", "/servers/import", { format_version: 1, servers: [{ name: "n", image: "x" }] })).toMatchObject({ status: 400, body: { error: { code: "bad_request" } } });
+    expect(await call(t, "POST", "/servers/import", { format_version: 2, servers: [{ name: "n", project: "private-sandbox" }] })).toMatchObject({
+      body: { error: { field: "servers[0].project" } },
+    });
+    const imported = await call(t, "POST", "/servers/import", { format_version: 2, servers: [{ name: "n", project: "kart-racer" }] });
+    expect(imported.body.created[0]).toMatchObject({ build_id: 4, project_id: 2, desired_state: "stopped" });
+  });
 });
