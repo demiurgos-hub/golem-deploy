@@ -27,6 +27,7 @@ import { useLogStream } from "@/hooks/use-log-stream";
 import { computeEnvDiff, emptyDraft, envErrorsFrom, mergeEnvErrors, noEnvErrors, type EnvDraft, type EnvErrors } from "@/lib/env-diff";
 import { formatBytes, formatDateTime, formatDuration, formatPercent, formatRelative, shortCommit } from "@/lib/format";
 import { safeHttpUrl } from "@/lib/url";
+import { ConnectionTest } from "@/components/connection-test";
 import { validatePort } from "@/lib/validators";
 import { NotFoundPage } from "@/pages/not-found";
 import { buildOptionLabel, buildsByProject } from "@/pages/servers";
@@ -284,6 +285,7 @@ function ServerDetail({ id }: { id: number }) {
           </Section>
           <RuntimeSection server={s} />
         </div>
+        <ConnectionTest serverId={s.id} />
         <BuildSection server={s} busy={activeJob !== null} onJob={shown.show} />
         <div className="grid gap-6 lg:grid-cols-2">
           <OriginsSection server={s} />

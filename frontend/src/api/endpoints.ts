@@ -1,5 +1,6 @@
 import type { ApiClient } from "@/api/client";
 import type {
+  ACME,
   APITokenList,
   Account,
   AccountList,
@@ -24,10 +25,12 @@ import type {
   Job,
   JobList,
   LoginRequest,
+  PanelCertificate,
   Project,
   ProjectList,
   RegisterRequest,
   Server,
+  ServerConnectivity,
   ServerExport,
   ServerImportResult,
   ServerList,
@@ -39,8 +42,12 @@ import type {
   Status,
   SubjectType,
   SwitchBranchRequest,
+  UpdateACMERequest,
   UpdateAccountRequest,
   UpdateGameCertificateRequest,
+  UpdateGameCertificateResponse,
+  UpdatePanelCertificateRequest,
+  UpdatePanelCertificateResponse,
   UpdateProjectRequest,
   UpdateServerRequest,
   UpdateSettingsRequest,
@@ -127,7 +134,13 @@ export function createEndpoints(c: ApiClient) {
     certificates: {
       game: (signal?: AbortSignal) => c.request<GameCertificate>("GET", "/certificates/game", { signal }),
       updateGame: (body: UpdateGameCertificateRequest) =>
-        c.request<GameCertificate>("PUT", "/certificates/game", { body }),
+        c.request<UpdateGameCertificateResponse>("PUT", "/certificates/game", { body }),
+      panel: (signal?: AbortSignal) => c.request<PanelCertificate>("GET", "/certificates/panel", { signal }),
+      updatePanel: (body: UpdatePanelCertificateRequest) =>
+        c.request<UpdatePanelCertificateResponse>("PUT", "/certificates/panel", { body }),
+      acme: (signal?: AbortSignal) => c.request<ACME>("GET", "/certificates/acme", { signal }),
+      updateACME: (body: UpdateACMERequest) => c.request<ACME>("PUT", "/certificates/acme", { body }),
+      renew: () => c.request<Job>("POST", "/certificates/acme/renew"),
     },
     servers: {
       list: (signal?: AbortSignal) => c.request<ServerList>("GET", "/servers", { signal }),
@@ -144,6 +157,8 @@ export function createEndpoints(c: ApiClient) {
         c.request<ServerStats>("GET", `/servers/${seg(id)}/stats`, { signal }),
       runtime: (id: number, signal?: AbortSignal) =>
         c.request<ServerRuntime>("GET", `/servers/${seg(id)}/runtime`, { signal }),
+      connectivity: (id: number, signal?: AbortSignal) =>
+        c.request<ServerConnectivity>("GET", `/servers/${seg(id)}/connectivity`, { signal }),
       logsPath: (id: number) => `/servers/${seg(id)}/logs`,
       exportAll: () => c.request<ServerExport>("GET", "/servers/export"),
       importAll: (body: ServerExport) =>

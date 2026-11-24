@@ -9,6 +9,7 @@ import { qk } from "@/api/query-keys";
 import type { Build, Job, Project, ServerExport } from "@/api/types.gen";
 import { buildName } from "@/components/builds";
 import { EnvEditor } from "@/components/env-editor";
+import { GameAddress } from "@/components/game-address";
 import { GettingStarted } from "@/components/getting-started";
 import { InlineJob } from "@/components/jobs";
 import { OriginsEditor, hasOriginErrors, noOriginErrors, originErrorsFrom, validateOrigins, type OriginErrors } from "@/components/origins-editor";
@@ -102,9 +103,12 @@ export function ServersPage() {
               header: "Name",
               sortValue: (s) => s.name,
               cell: (s) => (
-                <Link to="/servers/$id" params={{ id: String(s.id) }} className="font-medium underline-offset-4 hover:underline">
-                  {s.name}
-                </Link>
+                <div className="flex flex-col items-start gap-1">
+                  <Link to="/servers/$id" params={{ id: String(s.id) }} className="font-medium underline-offset-4 hover:underline">
+                    {s.name}
+                  </Link>
+                  <GameAddress url={s.public_url} />
+                </div>
               ),
             },
             {

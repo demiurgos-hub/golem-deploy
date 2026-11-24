@@ -86,6 +86,7 @@ describe("project builds", () => {
     expect(within(rows[0]).getByText(/by root/)).toBeInTheDocument();
     expect(within(rows[1]).getByText(COMMIT.slice(0, 12))).toBeInTheDocument();
     expect(within(rows[1]).getByRole("link", { name: "echo" })).toHaveAttribute("href", "/servers/3");
+    expect(await within(rows[1]).findByRole("link", { name: "https://localhost:7810/" })).toHaveAttribute("href", "https://localhost:7810/");
     // Developers cannot delete builds.
     expect(screen.queryByRole("button", { name: /Delete build/ })).toBeNull();
   });
@@ -543,7 +544,8 @@ describe("settings: game host and certificates", () => {
         "GET /settings": () => jsonResponse(200, settings),
         "GET /certificates/game": () => jsonResponse(200, n >= 2 ? custom : selfSigned),
         "PUT /certificates/game": () =>
-          ++n === 1 ? errorResponse(400, "validation_failed", "the private key does not match the certificate", { field: "private_key_pem" }) : jsonResponse(200, custom),
+          ++n === 1 ? errorResponse(400, "validation_failed", "the private key does not match the certificate", { field: "private_key_pem" }) :
+            jsonResponse(200, { certificate: custom, job: null }),
       },
     });
     expect(await screen.findByText(/Each server has its own self-signed certificate/)).toBeInTheDocument();
@@ -589,7 +591,7 @@ describe("settings: game host and certificates", () => {
         "GET /settings": () => jsonResponse(200, settings),
         "GET /certificates/game": () =>
           jsonResponse(200, { mode: "custom", game_host: "panel.example.com", certificate: certFixture({ self_signed: false, covers_game_host: false, issuer: "CN=CA" }) }),
-        "PUT /certificates/game": () => jsonResponse(200, selfSigned),
+        "PUT /certificates/game": () => jsonResponse(200, { certificate: selfSigned, job: null }),
       },
     });
     expect(await screen.findByText("The certificate does not cover the game host")).toBeInTheDocument();

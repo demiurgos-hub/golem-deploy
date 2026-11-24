@@ -12,7 +12,7 @@ export const qk = {
   jobs: {
     all: ["jobs"] as const,
     detail: (id: number) => ["jobs", "detail", id] as const,
-    forSubject: (type: SubjectType, id: number) => ["jobs", "subject", type, String(id)] as const,
+    forSubject: (type: SubjectType, id: number | string) => ["jobs", "subject", type, String(id)] as const,
   },
   projects: {
     all: ["projects"] as const,
@@ -26,7 +26,12 @@ export const qk = {
     successful: ["builds", "successful"] as const,
     detail: (id: number) => ["builds", "detail", id] as const,
   },
-  certificate: ["certificate"] as const,
+  certificates: {
+    all: ["certificates"] as const,
+    game: ["certificates", "game"] as const,
+    panel: ["certificates", "panel"] as const,
+    acme: ["certificates", "acme"] as const,
+  },
   servers: {
     all: ["servers"] as const,
     list: ["servers", "list"] as const,

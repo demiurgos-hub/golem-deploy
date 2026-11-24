@@ -115,7 +115,7 @@ describe("mock transport contract", () => {
       body: { error: { field: "private_key_pem" } },
     });
     const custom = await call(t, "PUT", "/certificates/game", { mode: "custom", certificate_pem: pem, private_key_pem: "-----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----" });
-    expect(custom.body).toMatchObject({ mode: "custom", certificate: { self_signed: false } });
+    expect(custom.body).toMatchObject({ certificate: { mode: "custom", certificate: { self_signed: false } }, job: null });
     expect(JSON.stringify(custom.body)).not.toContain("PRIVATE KEY");
     expect((await call(t, "GET", "/servers/11")).body).toMatchObject({ restart_required: true, certificate: { self_signed: false } });
 

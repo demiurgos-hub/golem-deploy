@@ -70,6 +70,7 @@ func (s *Server) routes() []route {
 		{method: "GET", path: "/servers/{id}/logs", access: AccessDeveloper, handler: s.handleServerLogs},
 		{method: "GET", path: "/servers/{id}/stats", access: AccessDeveloper, handler: s.handleServerStats},
 		{method: "GET", path: "/servers/{id}/runtime", access: AccessDeveloper, handler: s.handleServerRuntime},
+		{method: "GET", path: "/servers/{id}/connectivity", access: AccessDeveloper, handler: s.handleServerConnectivity},
 
 		// Game certificate.
 		{method: "GET", path: "/certificates/game", access: AccessAdmin, handler: s.handleGetGameCertificate},

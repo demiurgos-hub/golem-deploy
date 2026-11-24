@@ -160,6 +160,7 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 			return "", jobs.Fail("no game host is configured: set game_host (PATCH /api/v1/settings) or start the daemon with --public-host", nil)
 		}
 		p.gameHost = host
+		p.testOrigins = s.cfg.testOrigins(host)
 		return host, nil
 	})
 	var settingsFailure *jobs.SafeError

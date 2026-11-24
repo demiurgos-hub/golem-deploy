@@ -112,7 +112,8 @@ func (fx *fixture) build(t *testing.T, n int, commit string) store.Build {
 func TestEngineEnvContract(t *testing.T) {
 	port := 7001
 	sv := store.Server{ID: 3, Port: &port, AllowedOrigins: []string{"https://play.example.com:7001", "https://web.example.com"}}
-	got := engineEnv(sv, nil, runtimeParams{gameHost: "play.example.com", certMode: certs.ModeSelfSigned}, "tok")
+	got := engineEnv(sv, nil, runtimeParams{gameHost: "play.example.com", certMode: certs.ModeSelfSigned,
+		testOrigins: []string{"https://web.example.com", "https://panel.example.com"}}, "tok")
 	want := map[string]string{
 		"GOLEM_ADDR":                ":7777",
 		"GOLEM_HTTP_ADDR":           ":7777",
@@ -121,7 +122,7 @@ func TestEngineEnvContract(t *testing.T) {
 		"GOLEM_TLS_RELOAD_INTERVAL": "30s",
 		"GOLEM_PUBLIC_URL":          "https://play.example.com:7001/wt",
 		"GOLEM_WS_FALLBACK_URL":     "wss://play.example.com:7001/api/ws",
-		"GOLEM_WT_ALLOWED_ORIGINS":  "https://play.example.com:7001,https://web.example.com",
+		"GOLEM_WT_ALLOWED_ORIGINS":  "https://play.example.com:7001,https://web.example.com,https://panel.example.com",
 		"GOLEM_TLS_PINNED":          "1",
 		"GOLEM_ADMIN_ADDR":          ":7778",
 		"GOLEM_ADMIN_TOKEN":         "tok",
@@ -160,6 +161,28 @@ func TestEngineEnvContract(t *testing.T) {
 	}
 }
 
+func TestPanelOrigins(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		host string
+		want string
+	}{
+		{"TLS default port", Config{PanelTLS: true, PanelPort: 443, PanelPublicHosts: []string{"panel.example", "panel.example"}}, "2001:db8::1",
+			"https://panel.example,https://[2001:db8::1]"},
+		{"TLS custom port", Config{PanelTLS: true, PanelPort: 8443}, "panel.example", "https://panel.example:8443"},
+		{"development", Config{PanelLoopback: true, PanelPort: 8000}, "localhost", "http://localhost:8000,http://127.0.0.1:8000"},
+		{"proxy", Config{PanelBehindProxy: true, PanelPort: 80, PanelPublicHosts: []string{"panel.example", "www.example"}}, "www.example",
+			"http://panel.example,http://www.example,https://panel.example,https://www.example"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := strings.Join(tc.cfg.testOrigins(tc.host), ","); got != tc.want {
+				t.Fatalf("%q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // Everything that affects the container changes the config hash; the
 // per-container admin token does not exist in it.
 func TestConfigHash(t *testing.T) {
@@ -184,7 +207,12 @@ func TestConfigHash(t *testing.T) {
 			sv.AllowedOrigins = []string{"https://web.example.com"}
 			return svc.configHash(sv, &b, p)
 		},
-		"host":   func() string { q := p; q.gameHost = "other.example.com"; return svc.configHash(base, &b, q) },
+		"host": func() string { q := p; q.gameHost = "other.example.com"; return svc.configHash(base, &b, q) },
+		"panel": func() string {
+			q := p
+			q.testOrigins = []string{"https://panel.example.com"}
+			return svc.configHash(base, &b, q)
+		},
 		"mode":   func() string { q := p; q.certMode = certs.ModeCustom; return svc.configHash(base, &b, q) },
 		"mount":  func() string { q := p; q.certDir = "/elsewhere"; return svc.configHash(base, &b, q) },
 		"groups": func() string { q := p; q.groupAdd = nil; return svc.configHash(base, &b, q) },

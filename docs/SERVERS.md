@@ -61,7 +61,7 @@ The daemon configures every container for the Golem Engine deploy contract (gole
 | `GOLEM_TLS_RELOAD_INTERVAL` | `30s` (replaced certificates are picked up without a restart) |
 | `GOLEM_PUBLIC_URL` | `https://<game host>:<port><webtransport path>`: the engine's default `/wt` unless the build recorded another `transport.webtransport_path` from `golem-deploy.yaml` (see [BUILDS.md](BUILDS.md#golem-deployyaml)) |
 | `GOLEM_WS_FALLBACK_URL` | `wss://<game host>:<port><websocket path>`: `/api/ws` unless the build recorded another `transport.websocket_path` |
-| `GOLEM_WT_ALLOWED_ORIGINS` | `https://<game host>:<port>` plus the server's `allowed_origins` (WebTransport and WebSocket) |
+| `GOLEM_WT_ALLOWED_ORIGINS` | `https://<game host>:<port>`, the server's `allowed_origins`, then the panel's browser test origins (WebTransport and WebSocket) |
 | `GOLEM_TLS_PINNED` | `1` with a self-signed certificate (publish its hashes for pinning), `0` with a custom one |
 | `GOLEM_ADMIN_ADDR` | `:7778` |
 | `GOLEM_ADMIN_TOKEN` | a random 64-character token generated for each container |
@@ -136,5 +136,9 @@ iptables -I DOCKER-USER 5 -i "$BR" -d 192.168.0.0/16 -j DROP
 Use the matching `ip6tables` rules if IPv6 is enabled for Docker.
 
 ### Firewall
+
+On the server page, **Connection test** checks readiness and then probes the game from the browser over HTTPS, WebSocket and WebTransport. With a pinned self-signed certificate it tests WebTransport using the server's SHA-256 fingerprint. The game may count the short transport connections as players joining and leaving. Run the test from the network where players have trouble. If HTTPS succeeds and WebTransport fails, check the UDP rule for the server's port on the cloud firewall or security group, the router, and the browser's network.
+
+Open the panel through a configured public host using the panel's scheme and port. The effective game host is included in the origin list as well. A plain HTTP loopback listener also includes `localhost` and `127.0.0.1`, and `--insecure-http` adds HTTPS on the default port for each public host so a TLS-terminating proxy can serve the panel. Restart servers with stale launch settings to apply the origin list. Reload the panel after changing the game host so its Content Security Policy allows connections to the new host. If the local game server listens only on IPv4, use `127.0.0.1` as the game host so the browser tries the right loopback address. For an IPv6 game address, use a DNS name pointing to that address so the browser policy can allow the probe.
 
 Docker publishes ports by programming iptables/nftables directly, **bypassing ufw and firewalld rules**: a published game port is reachable even if ufw denies it. Restrict exposure with `--port-bind-address` or Docker's `DOCKER-USER` chain. Conversely, cloud or provider firewalls (security groups) sit in front of the host and must allow the whole port range for **both UDP and TCP** for players to connect.

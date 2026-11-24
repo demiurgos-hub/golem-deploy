@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,60 @@ func TestServerRuntimeRoute(t *testing.T) {
 	errBody(t, d.call("GET", path, d.devTok, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
 	d.assertNoMarker()
 	d.assertNoAdminToken()
+}
+
+func TestServerConnectivityRoute(t *testing.T) {
+	d := newDockerHarness(t, func(c *servers.Config) {
+		c.PanelPort = 8000
+		c.PanelLoopback = true
+	})
+	img := d.managedImage(1)
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID, Env: map[string]string{"K": envMarker}})
+	path := fmt.Sprintf("/api/v1/servers/%d/connectivity", s.ID)
+	errBody(t, d.call("GET", path, "", nil), http.StatusUnauthorized, apitypes.ErrorCodeUnauthenticated)
+	errBody(t, d.call("GET", "/api/v1/servers/999/connectivity", d.devTok, nil), http.StatusNotFound, apitypes.ErrorCodeNotFound)
+	read := func() apitypes.ServerConnectivity {
+		t.Helper()
+		rr := d.call("GET", path, d.devTok, nil)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%d: %s", rr.Code, rr.Body.String())
+		}
+		return decode[apitypes.ServerConnectivity](t, rr)
+	}
+	got := read()
+	wantOrigins := []string{"http://play.example.com:8000", "http://localhost:8000", "http://127.0.0.1:8000"}
+	if got.Running || got.TestOriginsActive || got.Certificate != nil || !got.Pinned ||
+		!slices.Equal(got.TestOrigins, wantOrigins) || got.PageURL != "https://play.example.com:7000/" ||
+		got.WebTransportURL != "https://play.example.com:7000/wt" || got.WebSocketURL != "wss://play.example.com:7000/api/ws" {
+		t.Fatalf("without a container: %+v", got)
+	}
+	d.start(s.ID)
+	if got = read(); !got.Running || !got.TestOriginsActive || got.Certificate == nil || !got.Certificate.CoversGameHost {
+		t.Fatalf("after start: %+v", got)
+	}
+	rr := d.call("PATCH", "/api/v1/settings", d.adminSs, apitypes.UpdateSettingsRequest{GameHost: ptr("other.example.com")})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("%d: %s", rr.Code, rr.Body.String())
+	}
+	if got = read(); !got.Running || got.TestOriginsActive || got.TestOrigins[0] != "http://other.example.com:8000" {
+		t.Fatalf("after a configuration change: %+v", got)
+	}
+	d.fake.SetDown(true)
+	errBody(t, d.call("GET", path, d.devTok, nil), http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
+	d.assertNoMarker()
+	d.assertNoAdminToken()
+}
+
+func TestGameConnectionsCSP(t *testing.T) {
+	d := newDockerHarness(t)
+	got := d.call("GET", "/", "", nil).Header().Get("Content-Security-Policy")
+	want := strings.Replace(cspSPA, "connect-src 'self'", "connect-src 'self' https://play.example.com:* wss://play.example.com:*", 1)
+	if got != want {
+		t.Fatalf("SPA policy = %q, want %q", got, want)
+	}
+	if got := d.call("GET", "/api/v1/status", "", nil).Header().Get("Content-Security-Policy"); got != cspAPI {
+		t.Fatalf("API policy = %q, want %q", got, cspAPI)
+	}
 }
 
 // assertNoAdminToken checks that no admin token of any container appears in
