@@ -175,6 +175,9 @@ export async function runConnectionTest(
 
   const { page, wt, ws, pinned, hashes } = preflight.value;
   const port = page.port || "443";
+  const loopbackHint = page.hostname === "localhost"
+    ? " If the server listens only on IPv4, set the game host to 127.0.0.1, restart the server, and reload the panel."
+    : "";
   let tcpPassed = false;
   if (pinned) {
     skip("https", skippedPinned);
@@ -198,10 +201,10 @@ export async function runConnectionTest(
 
   await run("webtransport", () => probeWebTransport(wt, hashes, signal), "The browser opened a WebTransport session.", () => {
     if (tcpPassed) {
-      return `TCP works. UDP port ${port} is most likely blocked between this browser and the host. Check the cloud firewall or security group, home router, or corporate network.`;
+      return `TCP works. UDP port ${port} is most likely blocked between this browser and the host. Check the cloud firewall or security group, home router, or corporate network.${loopbackHint}`;
     }
     return pinned
-      ? `Allow UDP port ${port} through the firewall or router. If the certificate just rotated, wait a minute for the server to reload it and retry.`
-      : `Allow UDP port ${port} through the firewall or router. Check the game host and certificate if the HTTPS check also failed.`;
+      ? `Allow UDP port ${port} through the firewall or router. If the certificate just rotated, wait a minute for the server to reload it and retry.${loopbackHint}`
+      : `Allow UDP port ${port} through the firewall or router. Check the game host and certificate if the HTTPS check also failed.${loopbackHint}`;
   });
 }

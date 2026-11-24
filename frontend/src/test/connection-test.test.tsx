@@ -141,6 +141,20 @@ describe("browser connection probes", () => {
     expect(b.closeWT).toHaveBeenCalledOnce();
   });
 
+  it("explains the localhost IPv4-only case", async () => {
+    browser({ wt: "error" });
+    const { results, done } = probe(payload({
+      pinned: true,
+      page_url: "https://localhost:7810/",
+      webtransport_url: "https://localhost:7810/wt",
+      websocket_url: "wss://localhost:7810/api/ws",
+    }));
+    await done;
+    expect(results.get("webtransport")).toMatchObject({
+      status: "failed", detail: expect.stringContaining("If the server listens only on IPv4, set the game host to 127.0.0.1"),
+    });
+  });
+
   it("still tests both transports after an HTTPS failure", async () => {
     browser({ tcp: false });
     const { results, done } = probe();
