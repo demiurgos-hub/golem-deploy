@@ -39,16 +39,16 @@ Ubuntu or Debian. Docker Engine must already be installed and running.
 
 Options (they only shape a new $ENV_FILE; an existing one is kept):
   --public-host NAMES   comma-separated host names the panel is reached by
-  --listen ADDR         panel listen address (default $DEFAULT_LISTEN_HTTP,
-                        or $DEFAULT_LISTEN_TLS with TLS)
+  --listen ADDR         panel listen address (default :443 with :80 for HTTP
+                        when both ports are free, $DEFAULT_LISTEN_HTTP
+                        otherwise, or $DEFAULT_LISTEN_TLS with TLS files)
   --port-range LO-HI    host ports for game servers (default $DEFAULT_PORT_RANGE)
   --tls-cert FILE       TLS certificate (PEM), copied to $TLS_CERT_DEST
   --tls-key FILE        TLS private key (PEM), copied to $TLS_KEY_DEST
   -h, --help            show this help
 
-Without TLS files the panel listens on loopback only (plain HTTP); reach it
-through an SSH tunnel. Re-run with --tls-cert and --tls-key to install renewed
-certificates.
+The panel starts with a self-signed certificate when it serves HTTPS without
+TLS files. Port 80 or 443 must be reachable for automatic certificates.
 EOF
 }
 
@@ -60,10 +60,26 @@ die() {
 	exit 1
 }
 
+# Print socket ownership when ss is available. Minimal Linux hosts can
+# still identify listening ports (state 0A) through the kernel tables.
+tcp_listener() {
+	local port=$1 owner=''
+	if command -v ss >/dev/null 2>&1; then
+		owner=$(ss -H -ltnp "sport = :$port" 2>/dev/null || true)
+	fi
+	if [ -n "$owner" ]; then
+		printf '%s' "$owner"
+		return 0
+	fi
+	awk -v port="$(printf '%04X' "$port")" \
+		'$2 ~ (":" port "$") && $4 == "0A" { found=1 } END { exit !found }' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
 # --- arguments ---------------------------------------------------------------
 
 public_host=''
 listen=''
+http_listen=''
 port_range=''
 tls_cert=''
 tls_key=''
@@ -145,7 +161,14 @@ if [ -n "$tls_cert" ] || [ -n "$tls_key" ]; then
 fi
 
 if [ -z "$listen" ]; then
-	if [ -n "$tls_cert" ]; then listen=$DEFAULT_LISTEN_TLS; else listen=$DEFAULT_LISTEN_HTTP; fi
+	if [ -n "$tls_cert" ]; then
+		listen=$DEFAULT_LISTEN_TLS
+	elif [ ! -e "$ENV_FILE" ]; then
+		listen=:443
+		http_listen=:80
+	else
+		listen=$DEFAULT_LISTEN_HTTP
+	fi
 fi
 [ -n "$port_range" ] || port_range=$DEFAULT_PORT_RANGE
 
@@ -160,19 +183,10 @@ case $listen in
 *) die "--listen must be HOST:PORT, for example $DEFAULT_LISTEN_HTTP (got $listen)" ;;
 esac
 listen_port=${listen##*:}
-if [[ ! $listen_port =~ ^[0-9]{1,5}$ ]] || [ "$((10#$listen_port))" -lt 1024 ] || [ "$((10#$listen_port))" -gt 65535 ]; then
-	die "--listen port must be between 1024 and 65535 (the service runs without the capability to bind lower ports; got $listen)"
+if [[ ! $listen_port =~ ^[0-9]{1,5}$ ]] || [ "$((10#$listen_port))" -lt 1 ] || [ "$((10#$listen_port))" -gt 65535 ]; then
+	die "--listen port must be between 1 and 65535 (got $listen)"
 fi
 [[ $listen_host =~ ^[A-Za-z0-9.:-]*$ ]] || die "--listen host contains unexpected characters (got $listen)"
-if [ -z "$tls_cert" ]; then
-	case $listen_host in
-	127.* | ::1 | localhost) ;;
-	*)
-		die "without --tls-cert/--tls-key the panel serves plain HTTP and may only listen on a loopback address (got $listen);" \
-			"configure TLS, or see docs/INSTALL.md for running it behind a TLS-terminating reverse proxy"
-		;;
-	esac
-fi
 
 [[ $port_range =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]] || die "--port-range must be LO-HI, for example $DEFAULT_PORT_RANGE (got $port_range)"
 port_lo=$((10#${BASH_REMATCH[1]}))
@@ -185,7 +199,7 @@ if [ "$((10#$listen_port))" -ge "$port_lo" ] && [ "$((10#$listen_port))" -le "$p
 fi
 
 if [ -n "$public_host" ]; then
-	[[ $public_host =~ ^[A-Za-z0-9.,-]+$ ]] || die "--public-host takes comma-separated host names (letters, digits, dots and hyphens; got $public_host)"
+	[[ $public_host =~ ^[A-Za-z0-9.,:-]+$ ]] || die "--public-host takes comma-separated DNS names or IP addresses (got $public_host)"
 fi
 
 # --- host checks -------------------------------------------------------------
@@ -193,6 +207,29 @@ fi
 say "Checking the host"
 
 [ "$(id -u)" -eq 0 ] || die "run this script as root (for example with sudo)"
+
+if [ -n "$http_listen" ]; then
+	busy=''
+	for port in 443 80; do
+		if owner=$(tcp_listener "$port"); then
+			warn "TCP port $port is already in use${owner:+ ($owner)}"
+			busy=yes
+		fi
+	done
+	if [ -n "$busy" ]; then
+		listen=''
+		http_listen=''
+		for port in {8000..8099}; do
+			if [ "$port" -ge "$port_lo" ] && [ "$port" -le "$port_hi" ]; then continue; fi
+			if ! tcp_listener "$port" >/dev/null; then
+				listen=127.0.0.1:$port
+				break
+			fi
+		done
+		[ -n "$listen" ] || die "no free fallback loopback port in 8000-8099; set --listen explicitly"
+		warn "Using $listen. Automatic certificates need TCP port 80 or 443 reachable from the internet."
+	fi
+fi
 
 [ -r /etc/os-release ] || die "cannot read /etc/os-release; only Ubuntu and Debian are supported"
 # shellcheck source=/dev/null
@@ -340,7 +377,7 @@ else
 		tls_lines="GOLEM_DEPLOY_TLS_CERT=$TLS_CERT_DEST
 GOLEM_DEPLOY_TLS_KEY=$TLS_KEY_DEST"
 	else
-		tls_lines="# No TLS: the panel serves plain HTTP and may only listen on loopback.
+		tls_lines="# Optional operator TLS files. Non-loopback listeners otherwise use managed TLS.
 #GOLEM_DEPLOY_TLS_CERT=$TLS_CERT_DEST
 #GOLEM_DEPLOY_TLS_KEY=$TLS_KEY_DEST"
 	fi
@@ -353,6 +390,7 @@ GOLEM_DEPLOY_TLS_KEY=$TLS_KEY_DEST"
 #   systemctl restart golem-deploy
 GOLEM_DEPLOY_DATA_DIR=$DATA_DIR
 GOLEM_DEPLOY_LISTEN=$listen
+GOLEM_DEPLOY_HTTP_LISTEN=$http_listen
 GOLEM_DEPLOY_PUBLIC_HOST=$public_host
 GOLEM_DEPLOY_PORT_RANGE=$port_range
 $tls_lines
@@ -412,6 +450,7 @@ fi
 # older, edited one.
 eff_listen=$(sed -n 's/^GOLEM_DEPLOY_LISTEN=//p' "$ENV_FILE" | tail -n 1)
 eff_cert=$(sed -n 's/^GOLEM_DEPLOY_TLS_CERT=//p' "$ENV_FILE" | tail -n 1)
+eff_insecure=$(sed -n 's/^GOLEM_DEPLOY_INSECURE_HTTP=//p' "$ENV_FILE" | tail -n 1)
 eff_hosts=$(sed -n 's/^GOLEM_DEPLOY_PUBLIC_HOST=//p' "$ENV_FILE" | tail -n 1)
 eff_range=$(sed -n 's/^GOLEM_DEPLOY_PORT_RANGE=//p' "$ENV_FILE" | tail -n 1)
 eff_listen=${eff_listen:-$DEFAULT_LISTEN_HTTP}
@@ -429,12 +468,22 @@ Golem Deploy $new_version is installed.
      runuser -u $SVC_USER -- $BIN_DEST admin create --data-dir $DATA_DIR --username admin
 
 EOF
+eff_host=${eff_listen%:*}
 if [ -n "$eff_cert" ]; then
 	first_host=${eff_hosts%%,*}
 	cat <<EOF
 2. Open the panel at https://${first_host:-<this host>}:$eff_port/ (allow TCP port
-   $eff_port in your firewall). Certificates are not renewed automatically yet:
+   $eff_port in your firewall). TLS files are renewed by the operator:
    after renewing, re-run this script with --tls-cert and --tls-key.
+
+EOF
+elif [[ $eff_host != 127.* && $eff_host != '[::1]' && $eff_host != localhost && $eff_insecure != true && $eff_insecure != 1 ]]; then
+	first_host=${eff_hosts%%,*}
+	cat <<EOF
+2. Open the panel at https://${first_host:-<this host>}:$eff_port/ (allow TCP port
+   $eff_port in your firewall). Compare the startup fingerprint in
+   journalctl -u $SERVICE with the browser certificate. Configure automatic
+   certificates in the panel after making port 80 or 443 reachable.
 
 EOF
 else

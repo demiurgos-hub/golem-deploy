@@ -61,10 +61,9 @@ Environment=DOCKER_CONFIG=/var/cache/golem-deploy/docker
 # No setuid/setgid escalation for the daemon or anything it runs; git, ssh and
 # docker need none.
 NoNewPrivileges=yes
-# The daemon binds ports >= 1024 and needs no capability (also removes any
-# capability a child could otherwise gain).
-CapabilityBoundingSet=
-AmbientCapabilities=
+# Only allow the capability needed for HTTPS on 443 and HTTP-01 on 80.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 # The whole file system is read-only except the data directory (and the
 # cache directory above). Unix sockets such as /var/run/docker.sock can still
 # be connected to on a read-only mount. The data directory keeps its real
