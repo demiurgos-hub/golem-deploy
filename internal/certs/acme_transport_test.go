@@ -72,6 +72,18 @@ func TestACMEOrderHasAggregateTrafficLimits(t *testing.T) {
 			}
 		})
 	}
+	t.Run("coincident response limit", func(t *testing.T) {
+		transport := acmeTransport{
+			bytes: maxACMEOrderBytes - maxACMEResponseBytes,
+			base: acmeRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+				body := strings.NewReader(strings.Repeat("x", maxACMEResponseBytes+1))
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(body), ContentLength: -1}, nil
+			}),
+		}
+		if _, err := transport.RoundTrip(httptest.NewRequest(http.MethodPost, "http://ca.example/order", nil)); !errors.Is(err, errACMEOrderBudget) {
+			t.Fatalf("overlapping response and order limits must end the order: %v", err)
+		}
+	})
 }
 
 func TestACMEOnlyFollowsIssuerLinksForFirstChain(t *testing.T) {

@@ -57,14 +57,14 @@ func (t *acmeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	remaining := int64(maxACMEOrderBytes) - t.bytes
 	limit := min(int64(maxACMEResponseBytes), remaining)
 	if resp.ContentLength > limit {
-		return nil, t.bodyLimitError(limit)
+		return nil, t.bodyLimitError(remaining)
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(nil, resp.Body, limit))
 	t.bytes += int64(len(body))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			return nil, t.bodyLimitError(limit)
+			return nil, t.bodyLimitError(remaining)
 		}
 		return nil, err
 	}
@@ -73,12 +73,12 @@ func (t *acmeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-func (t *acmeTransport) bodyLimitError(limit int64) error {
-	if limit < maxACMEResponseBytes {
+func (t *acmeTransport) bodyLimitError(remaining int64) error {
+	if remaining <= maxACMEResponseBytes {
 		t.exhausted = true
 		return errACMEOrderBudget
 	}
-	return &http.MaxBytesError{Limit: limit}
+	return &http.MaxBytesError{Limit: maxACMEResponseBytes}
 }
 
 func (t *acmeTransport) inspectResponse(req *http.Request, resp *http.Response, body []byte) {
