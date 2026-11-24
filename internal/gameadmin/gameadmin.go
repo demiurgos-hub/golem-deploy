@@ -1,6 +1,6 @@
 // Package gameadmin is a small, strict client for the Golem Engine admin
 // endpoint of a game server container (golem/host AdminOptions): GET
-// /ready, /info and /stats with a bearer token.
+// /ready, /info and /stats and POST /snapshot with a bearer token.
 //
 // The game is untrusted code, so is everything it answers. The client only
 // ever connects to 127.0.0.1 on the port Docker published the container's
@@ -116,11 +116,17 @@ func (c *Client) connection(ctx context.Context) error {
 // get performs GET path and decodes a JSON answer with an accepted status
 // into dst; it returns the status.
 func (c *Client) get(ctx context.Context, path string, dst any, accept ...int) (int, error) {
+	return c.request(ctx, http.MethodGet, path, RequestTimeout, dst, accept...)
+}
+
+// request performs method path (without a body) within timeout and
+// decodes a JSON answer with an accepted status into dst.
+func (c *Client) request(ctx context.Context, method, path string, timeout time.Duration, dst any, accept ...int) (int, error) {
 	if !c.session {
 		// Non-session callers can use the same configuration concurrently.
 		c = &Client{addr: c.addr, token: c.token}
 	}
-	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if err := c.connection(ctx); err != nil {
 		return 0, err
@@ -139,7 +145,7 @@ func (c *Client) get(ctx context.Context, path string, dst any, accept ...int) (
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+c.addr+path, nil)
+	req, err := http.NewRequestWithContext(ctx, method, "http://"+c.addr+path, nil)
 	if err != nil {
 		return 0, ErrUnreachable
 	}
@@ -270,6 +276,53 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 		WebTransportCertificateHashes: c.hashes(v.WebTransportCertificateHashes),
 		HTTPCertificateHashes:         c.hashes(v.HTTPCertificateHashes),
 	}, nil
+}
+
+// SnapshotTimeout bounds POST /snapshot: the engine gives a snapshot 60
+// seconds before it answers 504 itself.
+const SnapshotTimeout = 75 * time.Second
+
+// Errors of Snapshot besides ErrUnreachable, ErrUnauthorized and
+// ErrBadResponse.
+var (
+	// ErrSnapshotInProgress: another snapshot is being written (409).
+	ErrSnapshotInProgress = errors.New("gameadmin: a snapshot is already in progress")
+	// ErrSnapshotUnsupported: the game has no snapshot hook (501).
+	ErrSnapshotUnsupported = errors.New("gameadmin: the game does not support snapshots")
+	// ErrSnapshotTimeout: the engine gave up waiting for the snapshot (504).
+	ErrSnapshotTimeout = errors.New("gameadmin: the snapshot timed out")
+	// ErrSnapshotFailed: the game could not write the snapshot (500).
+	ErrSnapshotFailed = errors.New("gameadmin: the snapshot failed")
+)
+
+// Snapshot asks the game to write its entity snapshot now (POST /snapshot,
+// no body) and returns how long it took as the game reports it (bounded).
+// The answer's status decides the outcome; error bodies are only checked to
+// be JSON.
+func (c *Client) Snapshot(ctx context.Context) (time.Duration, error) {
+	var v struct {
+		OK         bool    `json:"ok"`
+		DurationMs float64 `json:"duration_ms"`
+	}
+	status, err := c.request(ctx, http.MethodPost, "/snapshot", SnapshotTimeout, &v, http.StatusOK, http.StatusConflict,
+		http.StatusNotImplemented, http.StatusGatewayTimeout, http.StatusInternalServerError)
+	if err != nil {
+		return 0, err
+	}
+	switch status {
+	case http.StatusOK:
+		if !v.OK {
+			return 0, fmt.Errorf("%w: snapshot not confirmed", ErrBadResponse)
+		}
+		return time.Duration(math.Min(clampFloat(v.DurationMs), float64(time.Hour/time.Millisecond))) * time.Millisecond, nil
+	case http.StatusConflict:
+		return 0, ErrSnapshotInProgress
+	case http.StatusNotImplemented:
+		return 0, ErrSnapshotUnsupported
+	case http.StatusGatewayTimeout:
+		return 0, ErrSnapshotTimeout
+	}
+	return 0, ErrSnapshotFailed
 }
 
 // Stats is the sanitised answer of GET /stats.
