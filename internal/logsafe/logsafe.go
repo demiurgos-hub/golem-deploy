@@ -42,7 +42,7 @@ type Writer struct {
 // applied to every complete line before it is escaped (for example a host
 // path and a placeholder); the longest match wins at each position.
 func NewWriter(w io.Writer, prefix string, replace ...string) *Writer {
-	s := &Writer{w: w, prefix: prefix, mu: make(chan struct{}, 1)}
+	s := &Writer{w: w, prefix: string(AppendSafe(nil, []byte(prefix), MaxLine-len(TruncatedMarker))), mu: make(chan struct{}, 1)}
 	var pairs []string
 	for i := 0; i+1 < len(replace); i += 2 {
 		if replace[i] != "" {
@@ -105,8 +105,10 @@ func (s *Writer) emit() error {
 	}
 	out := make([]byte, 0, len(s.prefix)+min(len(raw), MaxLine)+32)
 	out = append(out, s.prefix...)
-	out = AppendSafe(out, raw, MaxLine)
-	if s.cut || len(raw) > MaxLine {
+	prefixLen := len(out)
+	out, truncated := appendSafe(out, raw, MaxLine-prefixLen)
+	if s.cut || truncated {
+		out, _ = appendSafe(out[:prefixLen], raw, MaxLine-prefixLen-len(TruncatedMarker))
 		out = append(out, TruncatedMarker...)
 	}
 	out = append(out, '\n')
@@ -125,14 +127,17 @@ func (s *Writer) Close() error {
 	return s.emit()
 }
 
-// AppendSafe appends the sanitised form of raw (decoded up to limit input
-// bytes) to out.
+// AppendSafe appends at most limit bytes of the sanitised form of raw to out.
 func AppendSafe(out, raw []byte, limit int) []byte {
-	for i := 0; i < len(raw) && i < limit; {
+	out, _ = appendSafe(out, raw, limit)
+	return out
+}
+
+func appendSafe(out, raw []byte, limit int) ([]byte, bool) {
+	end := len(out) + limit
+	for i := 0; i < len(raw); {
 		r, size := utf8.DecodeRune(raw[i:])
-		if r == utf8.RuneError && size == 1 && len(raw) > limit && !utf8.FullRune(raw[i:]) {
-			break // a character cut off by the line limit, not invalid input
-		}
+		start := len(out)
 		i += size
 		switch {
 		case r == utf8.RuneError && size == 1:
@@ -150,12 +155,15 @@ func AppendSafe(out, raw []byte, limit int) []byte {
 		default:
 			out = utf8.AppendRune(out, r)
 		}
+		if len(out) > end {
+			return out[:start], true
+		}
 	}
-	return out
+	return out, false
 }
 
 // String returns the sanitised form of s on one line (newlines escaped),
-// capped at MaxLine input bytes.
+// capped at MaxLine rendered bytes.
 func String(s string) string {
 	return string(AppendSafe(nil, []byte(s), MaxLine))
 }
