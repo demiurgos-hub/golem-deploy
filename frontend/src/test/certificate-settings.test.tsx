@@ -15,7 +15,7 @@ const acme: ACME = {
   directory_url: "https://acme-v02.api.letsencrypt.org/directory",
   http01_available: true, tls_alpn01_available: false, certificates: [],
 };
-const issued = certFixture({ issuer: "CN=Test CA", self_signed: false, fingerprint_sha256: "88".repeat(32) });
+const issued = certFixture({ issuer: "CN=Test CA", self_signed: false, fingerprint_sha256: "88".repeat(32), dns_names: [game.game_host] });
 const issuing = job({ kind: "certificate.issue", subject_type: "certificate", subject_id: "acme", restricted: true, status: "running" });
 
 function settings(extra: Record<string, Handler> = {}) {
@@ -52,6 +52,31 @@ describe("automatic game certificates", () => {
       expect(region.queryByText(/Every game container can read/)).not.toBeInTheDocument();
     }
   });
+
+  it.each([
+    ["acme", "panel.example.com", ["PANEL.example.com"], [], true],
+    ["custom", "panel.example.com", ["*.example.com"], [], true],
+    ["custom", "deep.panel.example.com", ["*.example.com"], [], false],
+    ["custom", "example.com", ["*.example.com"], [], false],
+    ["acme", "2001:db8::1", [], ["2001:db8::1"], true],
+    ["custom", "192.0.2.5", ["192.0.2.5"], [], false],
+  ] satisfies [GameCertificate["mode"], string, string[], string[], boolean][])(
+    "matches the installed %s certificate's SANs against panel host %s",
+    async (mode, host, dns_names, ip_addresses, warns) => {
+      settings({
+        "GET /certificates/game": () => jsonResponse(200, { ...game, mode, certificate: { ...issued, dns_names, ip_addresses } }),
+        "GET /certificates/panel": () => jsonResponse(200, { ...panel, hosts: [host] }),
+      });
+      const region = within(await screen.findByRole("region", { name: "Game certificates" }));
+      const panelRegion = within(await screen.findByRole("region", { name: "Panel certificate" }));
+      await panelRegion.findAllByText(host);
+      if (warns) {
+        expect(await region.findByText(/Every game container can read/)).toBeInTheDocument();
+      } else {
+        expect(region.queryByText(/Every game container can read/)).not.toBeInTheDocument();
+      }
+    },
+  );
 
   it.each([
     [{ game_host: "" }, {}, /Game host missing/],

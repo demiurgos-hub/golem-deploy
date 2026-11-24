@@ -137,22 +137,29 @@ describe("browser connection probes", () => {
     const { results, done } = probe();
     await done;
     expect(results.get("websocket")).toMatchObject({ status: "failed", detail: expect.stringContaining("WebSocket upgrade support") });
-    expect(results.get("webtransport")).toMatchObject({ status: "failed", detail: expect.not.stringContaining("TCP works") });
+    expect(results.get("webtransport")).toMatchObject({ status: "failed", detail: expect.not.stringContaining("WebSocket passed") });
     expect(b.closeWS).toHaveBeenCalledOnce();
     expect(b.closeWT).toHaveBeenCalledOnce();
   });
 
-  it("uses a successful WebSocket fallback as evidence that TCP works", async () => {
+  it("reports both possible WebTransport failures after WebSocket passes", async () => {
     browser({ tcp: false, wt: "error" });
     const { results, done } = probe();
     await done;
     expect(results.get("websocket")?.status).toBe("passed");
-    expect(results.get("webtransport")).toMatchObject({ status: "failed", detail: expect.stringContaining("TCP works. UDP port 7810 is most likely blocked") });
+    expect(results.get("webtransport")).toMatchObject({
+      status: "failed",
+      detail: "WebSocket passed, but WebTransport failed. The most common cause is UDP port 7810 being blocked between this browser and the host. The game may also not serve WebTransport on this path.",
+    });
   });
 
-  it("reports literal IPv6 before opening any probes", async () => {
+  it("reports an unbracketed IPv6 hostname before opening any probes", async () => {
     const b = browser();
-    vi.stubGlobal("WebTransport", undefined);
+    vi.stubGlobal("URL", class extends URL {
+      override get hostname() {
+        return super.hostname.replace(/^\[|\]$/g, "");
+      }
+    });
     const { results, done } = probe(payload({
       page_url: "https://[2001:db8::1]:7810/",
       webtransport_url: "https://[2001:db8::1]:7810/wt",

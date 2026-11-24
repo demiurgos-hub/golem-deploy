@@ -203,7 +203,7 @@ export async function runConnectionTest(
   }
   await run("webtransport", () => probeWebTransport(wt, hashes, signal), "The browser opened a WebTransport session.", () => {
     if (websocketPassed) {
-      return `TCP works. UDP port ${port} is most likely blocked between this browser and the host. Check the cloud firewall or security group, home router, or corporate network.${loopbackHint}`;
+      return `WebSocket passed, but WebTransport failed. The most common cause is UDP port ${port} being blocked between this browser and the host. The game may also not serve WebTransport on this path.${loopbackHint}`;
     }
     return pinned
       ? `Allow UDP port ${port} through the firewall or router. If the certificate just rotated, wait a minute for the server to reload it and retry.${loopbackHint}`
