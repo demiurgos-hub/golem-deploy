@@ -13,6 +13,7 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/gameadmin"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
+	"github.com/demiurgos-hub/golem-deploy/internal/logsafe"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -364,7 +365,7 @@ func (s *Service) writeExcerpt(ctx context.Context, sv store.Server, env map[str
 		fmt.Fprintln(log, "(could not read the container logs)")
 		return
 	}
-	san := newSanitizer(log, JobLogPrefix)
+	san := logsafe.NewWriter(log, JobLogPrefix)
 	_, _ = io.Copy(san, bytes.NewReader(redact(out, env)))
 	_ = san.Close()
 }

@@ -47,11 +47,8 @@ func TestStaticAddonsAndBuildReferences(t *testing.T) {
 	}
 	_ = s.FinishBuild(ctx, b.ID, BuildResult{Status: BuildStatusSuccess, ImageID: "sha256:1"})
 	sv, _ := s.CreateServer(ctx, Server{Name: "s"}, nil)
-	if err := s.AssignServerBuild(ctx, sv.ID, &b.ID); err != nil {
+	if _, err := s.UpdateServer(ctx, sv.ID, ServerUpdate{BuildID: &b.ID}); err != nil {
 		t.Fatal(err)
-	}
-	if err := s.AssignServerBuild(ctx, 999, &b.ID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("missing server: %v", err)
 	}
 	if ids, _ := s.ProjectBuildServerIDs(ctx, p.ID); !reflect.DeepEqual(ids, []int64{sv.ID}) {
 		t.Fatalf("%v", ids)
@@ -62,7 +59,7 @@ func TestStaticAddonsAndBuildReferences(t *testing.T) {
 	if err := s.DeleteProjectUnused(ctx, p.ID); !errors.Is(err, ErrInUse) {
 		t.Fatalf("project in use: %v", err)
 	}
-	_ = s.AssignServerBuild(ctx, sv.ID, nil)
+	_ = s.DeleteServer(ctx, sv.ID)
 	if err := s.DeleteProjectUnused(ctx, p.ID); err != nil {
 		t.Fatal(err)
 	}

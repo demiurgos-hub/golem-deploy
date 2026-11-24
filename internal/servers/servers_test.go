@@ -10,13 +10,14 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
+	"github.com/demiurgos-hub/golem-deploy/internal/logsafe"
 	"github.com/demiurgos-hub/golem-deploy/internal/ports"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
 func sanitize(prefix string, chunks ...string) string {
 	var out bytes.Buffer
-	s := newSanitizer(&out, prefix)
+	s := logsafe.NewWriter(&out, prefix)
 	for _, c := range chunks {
 		_, _ = s.Write([]byte(c))
 	}
@@ -25,7 +26,8 @@ func sanitize(prefix string, chunks ...string) string {
 }
 
 // D9: control sequences, forged lines, broken UTF-8 (also across chunk
-// boundaries) and over-long lines.
+// boundaries) and over-long lines, as container output reaches /logs and
+// job logs (through internal/logsafe).
 func TestD9_Sanitizer(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -33,7 +35,9 @@ func TestD9_Sanitizer(t *testing.T) {
 		want   string
 	}{
 		{"ansi and osc", []string{"\x1b[31mred\x1b[0m \x1b]0;title\x07 bell\x07"}, `\x1b[31mred\x1b[0m \x1b]0;title\x07 bell\x07` + "\n"},
-		{"carriage return overwrite", []string{"ok\rFAKE daemon line\n"}, `ok\x0dFAKE daemon line` + "\n"},
+		// A carriage return cannot overwrite a line on a terminal: it ends
+		// the line, and the next one gets its own prefix.
+		{"carriage return overwrite", []string{"ok\rFAKE daemon line\n"}, "ok\nFAKE daemon line\n"},
 		{"c1 and separators", []string{"a\u0085b\u2028c\u202ed\u009be"}, `a\u0085b\u2028c\u202ed\u009be` + "\n"},
 		{"tab and del", []string{"a\tb\x7fc\x00"}, "a\tb" + `\x7fc\x00` + "\n"},
 		{"invalid utf8", []string{"a\xffb\xc3"}, "a\uFFFDb\uFFFD\n"},
@@ -47,28 +51,30 @@ func TestD9_Sanitizer(t *testing.T) {
 		}
 	}
 	// A line pretending to be a daemon message is visibly container output.
-	got := sanitize(JobLogPrefix, "server \"arena\" is running\nerror: fake\n")
+	got := sanitize(JobLogPrefix, "server \"arena\" is running\rerror: fake\n")
 	if got != "container | server \"arena\" is running\ncontainer | error: fake\n" {
 		t.Fatalf("%q", got)
 	}
 	// Long lines are cut with a marker, also mid-character, and the rest
 	// of the line is dropped (memory stays bounded).
-	long := strings.Repeat("é", MaxLogLine) // 2 bytes each
+	long := strings.Repeat("é", logsafe.MaxLine) // 2 bytes each
 	got = sanitize("", long[:len(long)-1], "tail\nnext\n")
 	lines := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
-	if len(lines) != 2 || !strings.HasSuffix(lines[0], TruncatedMarker) || lines[1] != "next" {
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], logsafe.TruncatedMarker) || lines[1] != "next" {
 		t.Fatalf("lines %d %q", len(lines), lines[len(lines)-1])
 	}
-	body := strings.TrimSuffix(lines[0], TruncatedMarker)
-	if len(body) > MaxLogLine || !utf8.ValidString(body) || strings.ContainsRune(body, utf8.RuneError) {
+	body := strings.TrimSuffix(lines[0], logsafe.TruncatedMarker)
+	if len(body) > logsafe.MaxLine || !utf8.ValidString(body) || strings.ContainsRune(body, utf8.RuneError) {
 		t.Fatalf("cut line: %d bytes, valid %v", len(body), utf8.ValidString(body))
 	}
-	s := newSanitizer(&bytes.Buffer{}, "")
+	var sink bytes.Buffer
+	s := logsafe.NewWriter(&sink, "")
 	for i := 0; i < 1000; i++ {
 		_, _ = s.Write(bytes.Repeat([]byte("x"), 64<<10))
 	}
-	if len(s.line) > MaxLogLine+utf8.UTFMax {
-		t.Fatalf("buffer grew to %d bytes", len(s.line))
+	_ = s.Close()
+	if sink.Len() > logsafe.MaxLine+len(logsafe.TruncatedMarker)+1 {
+		t.Fatalf("one endless line produced %d bytes", sink.Len())
 	}
 }
 

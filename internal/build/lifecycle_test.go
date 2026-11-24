@@ -134,11 +134,7 @@ func TestRetention(t *testing.T) {
 		t.Fatal("oldest build's image kept")
 	}
 	// A build a server is configured with is kept beyond retention.
-	sv, err := e.st.CreateServer(ctx, store.Server{Name: "s1"}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := e.st.AssignServerBuild(ctx, sv.ID, &builds[1].ID); err != nil {
+	if _, err := e.st.CreateServer(ctx, store.Server{Name: "s1", BuildID: &builds[1].ID}, nil); err != nil {
 		t.Fatal(err)
 	}
 	for range 2 {
@@ -186,12 +182,11 @@ func TestDelete(t *testing.T) {
 	if err := e.svc.Delete(ctx, 9999); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("missing: %v", err)
 	}
-	sv, _ := e.st.CreateServer(ctx, store.Server{Name: "s1"}, nil)
-	_ = e.st.AssignServerBuild(ctx, sv.ID, &b1.ID)
+	sv, _ := e.st.CreateServer(ctx, store.Server{Name: "s1", BuildID: &b1.ID}, nil)
 	if err := e.svc.Delete(ctx, b1.ID); !errors.Is(err, store.ErrInUse) {
 		t.Fatalf("in use: %v", err)
 	}
-	_ = e.st.AssignServerBuild(ctx, sv.ID, nil)
+	_ = e.st.DeleteServer(ctx, sv.ID)
 	// A container (of any origin) created from the image blocks removal.
 	cid := e.fake.AddContainer(dockertest.Container{Image: b1.ImageID, State: "exited"})
 	if err := e.svc.Delete(ctx, b1.ID); !errors.Is(err, ErrImageInUse) {

@@ -201,11 +201,8 @@ func TestBuildConflicts(t *testing.T) {
 
 	// A build a server is configured with cannot be deleted, nor can its
 	// project.
-	sv, err := b.st.CreateServer(ctx, store.Server{Name: "s1"}, nil)
+	sv, err := b.st.CreateServer(ctx, store.Server{Name: "s1", BuildID: &res.Build.ID}, nil)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := b.st.AssignServerBuild(ctx, sv.ID, &res.Build.ID); err != nil {
 		t.Fatal(err)
 	}
 	if got := b.getBuild(res.Build.ID); len(got.ServerIDs) != 1 || got.ServerIDs[0] != sv.ID {
@@ -230,7 +227,7 @@ func TestBuildConflicts(t *testing.T) {
 		t.Fatalf("checkout removed although the delete was refused: %v", err)
 	}
 	// A container from the image blocks deleting the build.
-	_ = b.st.AssignServerBuild(ctx, sv.ID, nil)
+	_ = b.st.DeleteServer(ctx, sv.ID)
 	cid := b.fake.AddContainer(dockertest.Container{Image: b.getBuild(res.Build.ID).ImageID})
 	errBody(t, b.call("DELETE", fmt.Sprintf("/api/v1/builds/%d", res.Build.ID), b.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
 	b.fake.RemoveContainer(cid)

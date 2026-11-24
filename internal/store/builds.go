@@ -235,17 +235,6 @@ func (s *Store) DeleteBuildUnused(ctx context.Context, id int64) (Build, error) 
 	return b, err
 }
 
-// AssignServerBuild sets the build server serverID is configured with
-// (nil clears it). ErrNotFound when the server does not exist.
-func (s *Store) AssignServerBuild(ctx context.Context, serverID int64, buildID *int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE servers SET build_id = ?, updated_at = ? WHERE id = ?`,
-		nullInt64(buildID), formatTime(s.nowUTC()), serverID)
-	if err != nil {
-		return mapErr("assign server build", err)
-	}
-	return checkAffected("assign server build", res)
-}
-
 // BuildServerIDs returns the ids of the servers configured with build id
 // (sorted).
 func (s *Store) BuildServerIDs(ctx context.Context, id int64) ([]int64, error) {

@@ -25,6 +25,7 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
+	"github.com/demiurgos-hub/golem-deploy/internal/logsafe"
 	"github.com/demiurgos-hub/golem-deploy/internal/ports"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
@@ -823,13 +824,13 @@ func (s *Service) CheckLogs(ctx context.Context, id int64) error {
 
 // Logs writes the server's container output to w, sanitised (control
 // characters escaped, invalid UTF-8 replaced, lines capped; see
-// sanitizer) but not redacted: it is the game's own output.
+// internal/logsafe) but not redacted: it is the game's own output.
 func (s *Service) Logs(ctx context.Context, id int64, o docker.LogOptions, w io.Writer) error {
 	sv, err := s.load(ctx, id)
 	if err != nil {
 		return err
 	}
-	san := newSanitizer(w, "")
+	san := logsafe.NewWriter(w, "")
 	err = s.docker.ServerLogs(ctx, ref(sv), o, san)
 	if cerr := san.Close(); err == nil && ctx.Err() == nil {
 		err = cerr

@@ -90,8 +90,8 @@ const DefaultMaxLogBytes = 16 << 20
 // Runner executes jobs. Create it with New after store.Reconcile and stop it
 // with Shutdown.
 type Runner struct {
-	store  *store.Store
-	logDir string
+	store   *store.Store
+	logDir  string
 	logger  *slog.Logger
 	workers int
 	maxLog  int64
