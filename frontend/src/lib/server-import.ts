@@ -10,19 +10,24 @@ export interface ImportCheck {
 export const IMPORT_LIMIT_BYTES = 64 * 1024 * 1024;
 /** One import document holds at most 128 servers. */
 export const IMPORT_MAX_SERVERS = 128;
+/** The export format this client reads and the daemon accepts (servers reference project + commit). */
+export const EXPORT_FORMAT_VERSION = 2;
+const MAX_ORIGINS = 16;
+const COMMIT_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-const SPEC_FIELDS = new Set(["name", "project", "image", "port", "env", "desired_state"]);
+const SPEC_FIELDS = new Set(["name", "project", "commit", "port", "allowed_origins", "env", "desired_state"]);
 
 /**
  * Checks a JSON export (GET /servers/export) before anything is sent, listing
  * every problem the client can detect. The daemon re-validates everything,
  * including what only it can know (existing names and ports, the port range,
- * project names, that each image is a managed image on this host), stops at
- * the first problem and creates all servers or none.
+ * that each project exists and has a successful build of the commit, the
+ * allowed origins' exact rules), stops at the first problem and creates all
+ * servers or none.
  */
 export function checkServerImport(text: string): ImportCheck {
   let data: unknown;
@@ -36,7 +41,13 @@ export function checkServerImport(text: string): ImportCheck {
   for (const k of Object.keys(data)) {
     if (k !== "format_version" && k !== "servers") errors.push(`Unknown top-level field "${k}".`);
   }
-  if (data.format_version !== 1) errors.push("format_version must be 1.");
+  if (data.format_version !== EXPORT_FORMAT_VERSION) {
+    errors.push(
+      data.format_version === 1
+        ? "This is a format version 1 export (servers named an image). This version needs format 2, where each server names its project and commit: export again from an up-to-date Golem Deploy."
+        : `format_version must be ${EXPORT_FORMAT_VERSION}.`,
+    );
+  }
   if (!Array.isArray(data.servers)) {
     errors.push("servers must be a list.");
     return { value: null, errors };
@@ -65,9 +76,20 @@ export function checkServerImport(text: string): ImportCheck {
     } else {
       names.set(raw.name, i);
     }
-    if (typeof raw.image !== "string" || !raw.image.trim()) errors.push(`${label}: image is required.`);
-    if (raw.project !== undefined && (typeof raw.project !== "string" || (raw.project !== "" && !RESOURCE_NAME_RE.test(raw.project)))) {
+    if (typeof raw.project !== "string" || raw.project === "") {
+      errors.push(`${label}: project is required (the server runs a build of that project). A server exported without a build has an empty project: fill it in.`);
+    } else if (!RESOURCE_NAME_RE.test(raw.project)) {
       errors.push(`${label}: project must be a project name.`);
+    }
+    if (raw.commit !== undefined && raw.commit !== "" && (typeof raw.commit !== "string" || !COMMIT_RE.test(raw.commit))) {
+      errors.push(`${label}: commit must be a full lower-case commit hash (or empty for the newest successful build).`);
+    }
+    if (raw.allowed_origins !== undefined && raw.allowed_origins !== null) {
+      if (!Array.isArray(raw.allowed_origins) || raw.allowed_origins.some((o) => typeof o !== "string")) {
+        errors.push(`${label}: allowed_origins must be a list of origins.`);
+      } else if (raw.allowed_origins.length > MAX_ORIGINS) {
+        errors.push(`${label}: at most ${MAX_ORIGINS} allowed origins.`);
+      }
     }
     if (raw.port !== undefined && raw.port !== null) {
       if (typeof raw.port !== "number" || !Number.isInteger(raw.port) || raw.port < 1024 || raw.port > 32767) {
@@ -104,7 +126,7 @@ export function checkServerImport(text: string): ImportCheck {
     servers.push(raw as unknown as ServerSpec);
   });
 
-  return errors.length ? { value: null, errors } : { value: { format_version: 1, servers }, errors };
+  return errors.length ? { value: null, errors } : { value: { format_version: EXPORT_FORMAT_VERSION, servers }, errors };
 }
 
 /**
@@ -117,7 +139,8 @@ export function describeImportField(field: string | undefined, doc: ServerExport
   if (!m) return field;
   const i = Number(m[1]);
   const name = doc?.servers[i]?.name;
-  // Value errors name the variable: servers[0].env.MOTD.
-  const attr = m[2]?.startsWith("env.") ? `environment variable ${m[2].slice(4)}` : m[2];
+  // Value errors name the variable (servers[0].env.MOTD) or the entry (servers[0].allowed_origins[1]).
+  const origin = m[2] ? /^allowed_origins\[(\d+)\]$/.exec(m[2]) : null;
+  const attr = m[2]?.startsWith("env.") ? `environment variable ${m[2].slice(4)}` : origin ? `allowed origin ${Number(origin[1]) + 1}` : m[2];
   return `Server ${i + 1}${name ? ` (${name})` : ""}${attr ? `, ${attr}` : ""}`;
 }

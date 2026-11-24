@@ -1,15 +1,17 @@
 import { useMemo, useState, type FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { Download, Plus, Upload } from "lucide-react";
 import { useApi } from "@/app/services";
 import { isApiError, sentence } from "@/api/errors";
-import { useAccount, useImages, useProjects, useServers } from "@/api/queries";
+import { useAccount, useProjects, useServers, useSuccessfulBuilds } from "@/api/queries";
 import { qk } from "@/api/query-keys";
-import type { Image, Job, Project, ServerExport } from "@/api/types.gen";
-import { imageLabel, imageName } from "@/lib/images";
+import type { Build, Job, Project, ServerExport } from "@/api/types.gen";
+import { buildName } from "@/components/builds";
 import { EnvEditor } from "@/components/env-editor";
+import { GettingStarted } from "@/components/getting-started";
 import { InlineJob } from "@/components/jobs";
+import { OriginsEditor, hasOriginErrors, noOriginErrors, originErrorsFrom, validateOrigins, type OriginErrors } from "@/components/origins-editor";
 import { ServerActions } from "@/components/server-actions";
 import { ServerStateBadge } from "@/components/status-badges";
 import { Button } from "@/components/ui/button";
@@ -23,26 +25,34 @@ import { useToast } from "@/components/ui/toast";
 import { saveBlob } from "@/lib/download";
 import { computeEnvDiff, emptyDraft, envErrorsFrom, mergeEnvErrors, noEnvErrors, type EnvDraft, type EnvErrors } from "@/lib/env-diff";
 import { IMPORT_LIMIT_BYTES, checkServerImport, describeImportField } from "@/lib/server-import";
-import { formatBytes } from "@/lib/format";
+import { formatBytes, formatRelative } from "@/lib/format";
 import { validatePort, validateResourceName } from "@/lib/validators";
 
 export function ServersPage() {
   const servers = useServers();
   const projects = useProjects();
-  const images = useImages();
+  const builds = useSuccessfulBuilds();
   const account = useAccount();
+  const search: { create?: number } = useSearch({ strict: false });
+  const navigate = useNavigate();
   const isAdmin = account.data?.role === "admin";
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState<{ projectId?: number } | null>(search.create ? { projectId: search.create } : null);
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
   const [jobs, setJobs] = useState<Record<number, Job>>({});
   const projectNames = useMemo(() => new Map((projects.data?.items ?? []).map((p) => [p.id, p.name])), [projects.data]);
+  const buildById = useMemo(() => new Map((builds.data?.items ?? []).map((b) => [b.id, b])), [builds.data]);
+
+  function closeCreate() {
+    setCreating(null);
+    if (search.create) void navigate({ to: "/servers", search: {}, replace: true });
+  }
 
   return (
     <>
       <PageHeader
         title="Servers"
-        description="Game server containers. Each publishes its port on the host over both UDP and TCP."
+        description="Each server runs a successful build of a project in a container, on a port published over both UDP and TCP."
         actions={
           <>
             {isAdmin && (
@@ -57,13 +67,14 @@ export function ServersPage() {
                 </Button>
               </>
             )}
-            <Button onClick={() => setCreating(true)}>
+            <Button onClick={() => setCreating({})}>
               <Plus />
               New server
             </Button>
           </>
         }
       />
+      <GettingStarted />
       {servers.isPending ? (
         <LoadingState label="Loading servers" />
       ) : servers.isError ? (
@@ -71,9 +82,9 @@ export function ServersPage() {
       ) : servers.data.items.length === 0 ? (
         <EmptyState
           title="No servers yet"
-          description="Create a server from an image to run a game."
+          description="Create a server from a successful build of a project to run a game."
           action={
-            <Button onClick={() => setCreating(true)}>
+            <Button onClick={() => setCreating({})}>
               <Plus />
               New server
             </Button>
@@ -110,14 +121,19 @@ export function ServersPage() {
                 ),
             },
             {
-              key: "image",
-              header: "Image",
+              key: "build",
+              header: "Build",
               hideOnSmall: true,
-              cell: (s) => (
-                <code className="block max-w-56 truncate font-mono text-xs" title={s.image}>
-                  {imageLabel(s.image, images.data?.items)}
-                </code>
-              ),
+              cell: (s) =>
+                s.build_id === null ? (
+                  <Badge tone="warning" title="Created before servers ran builds: assign a build on the server's page before it can start.">
+                    No build
+                  </Badge>
+                ) : (
+                  <Link to="/builds/$id" params={{ id: String(s.build_id) }} className="font-mono text-xs hover:underline">
+                    {buildName(buildById.get(s.build_id) ?? { id: s.build_id, commit: s.commit })}
+                  </Link>
+                ),
             },
             { key: "port", header: "Port", sortValue: (s) => s.port, cell: (s) => <span className="tabular-nums">{s.port}</span> },
             {
@@ -151,72 +167,95 @@ export function ServersPage() {
           }
         />
       )}
-      {creating && <CreateServerDialog onClose={() => setCreating(false)} />}
+      {creating && <CreateServerDialog initialProjectId={creating.projectId} onClose={closeCreate} />}
       <ExportDialog open={exporting} onOpenChange={setExporting} />
       {importing && <ImportDialog onClose={() => setImporting(false)} />}
     </>
   );
 }
 
-/** One option per managed image, keyed by image id (the server stores the id). */
-export function imageOptions(images: readonly Image[], projects: Map<number, Project>) {
-  return images.map((img) => {
-    const project = img.project_id !== null ? projects.get(img.project_id) : undefined;
-    const extra = [img.tags.length > 1 ? `+${img.tags.length - 1} tags` : "", project ? project.name : ""].filter(Boolean).join(", ");
-    return { value: img.id, label: extra ? `${imageName(img)} (${extra})` : imageName(img), projectId: img.project_id };
-  });
+/** Successful builds grouped by project (newest first within each), only projects that have one. */
+export function buildsByProject(builds: readonly Build[]): Map<number, Build[]> {
+  const out = new Map<number, Build[]>();
+  for (const b of [...builds].sort((a, z) => z.id - a.id)) {
+    if (b.status !== "success") continue;
+    out.set(b.project_id, [...(out.get(b.project_id) ?? []), b]);
+  }
+  return out;
 }
 
-/** Shown instead of a server form while no managed image exists. */
-export function NoImagesNotice() {
+/** One option per successful build: "#12 (4f1c2a9e0b7d), main, 2 hours ago". */
+export function buildOptionLabel(b: Build, current?: number | null): string {
+  return `${buildName(b)}, ${b.branch || "-"}, ${formatRelative(b.finished_at ?? b.created_at)}${b.id === current ? " (current)" : ""}`;
+}
+
+/** Shown instead of a server form while no successful build exists. */
+export function NoBuildsNotice() {
   return (
-    <Notice tone="info" title="No managed images yet">
-      Servers run images built by Golem Deploy from a project. The build pipeline is not available yet, so until then an
-      operator has to label an image on the host by hand (see docs/SERVERS.md). Images that are not managed are never offered.
+    <Notice tone="info" title="No successful builds yet">
+      A server runs a successful build of a project. Open a{" "}
+      <Link to="/projects" className="underline underline-offset-2">
+        project
+      </Link>{" "}
+      and start a build; once it succeeds you can create a server from it here.
     </Notice>
   );
 }
 
-function CreateServerDialog({ onClose }: { onClose: () => void }) {
+type CreateErrors = Partial<Record<"name" | "build_id" | "port", string | null>>;
+
+function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: number; onClose: () => void }) {
   const api = useApi();
   const toast = useToast();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const images = useImages();
+  const builds = useSuccessfulBuilds();
   const projects = useProjects();
-  const projectMap = useMemo(() => new Map((projects.data?.items ?? []).map((p) => [p.id, p])), [projects.data]);
-  const options = useMemo(() => imageOptions(images.data?.items ?? [], projectMap), [images.data, projectMap]);
+  const grouped = useMemo(() => buildsByProject(builds.data?.items ?? []), [builds.data]);
+  const choices: Project[] = (projects.data?.items ?? []).filter((p) => grouped.has(p.id));
 
   const [name, setName] = useState("");
-  const [imageChoice, setImageChoice] = useState("");
-  const [projectId, setProjectId] = useState("");
+  const [projectChoice, setProjectChoice] = useState<number | null>(initialProjectId ?? null);
+  const [buildChoice, setBuildChoice] = useState<number | null>(null);
   const [port, setPort] = useState("");
   const [start, setStart] = useState(false);
+  const [origins, setOriginsState] = useState<string[]>([]);
+  const [originErrors, setOriginErrors] = useState<OriginErrors>(noOriginErrors());
   const [env, setEnvDraft] = useState<EnvDraft>(emptyDraft());
   // The daemon's env errors (value errors name the key: env.<KEY>), until the draft changes.
   const [envServerErrors, setEnvServerErrors] = useState<EnvErrors>(noEnvErrors());
-  const [errors, setErrors] = useState<Partial<Record<"name" | "image" | "port", string | null>>>({});
+  const [errors, setErrors] = useState<CreateErrors>({});
   const envResult = computeEnvDiff([], env);
   const setEnv = (d: EnvDraft) => {
     setEnvDraft(d);
     setEnvServerErrors(noEnvErrors());
   };
-  const image = imageChoice || options[0]?.value || "";
-  const noImages = images.isSuccess && options.length === 0;
+  const setOrigins = (o: string[]) => {
+    setOriginsState(o);
+    setOriginErrors(noOriginErrors());
+  };
+  const projectId = projectChoice !== null && grouped.has(projectChoice) ? projectChoice : (choices[0]?.id ?? null);
+  const projectBuilds = projectId !== null ? (grouped.get(projectId) ?? []) : [];
+  // The newest successful build of the project unless the user picked another.
+  const buildId = buildChoice !== null && projectBuilds.some((b) => b.id === buildChoice) ? buildChoice : (projectBuilds[0]?.id ?? null);
+  const loaded = builds.isSuccess && projects.isSuccess;
+  const noBuilds = loaded && choices.length === 0;
+  const askedProjectMissing = loaded && initialProjectId !== undefined && !grouped.has(initialProjectId);
 
   const create = useMutation({
     mutationFn: () =>
       api.servers.create({
         name,
-        image,
-        ...(projectId ? { project_id: Number(projectId) } : {}),
+        build_id: buildId ?? 0,
         ...(port.trim() ? { port: Number(port) } : {}),
+        ...(origins.length ? { allowed_origins: origins.map((o) => o.trim()) } : {}),
         ...(Object.keys(envResult.diff.env_set).length ? { env: envResult.diff.env_set } : {}),
         desired_state: start ? "running" : "stopped",
       }),
     onSuccess: (server) => {
-      toast.success(`Server ${server.name} created on port ${server.port}.`);
+      toast.success(`Server ${server.name} created on port ${server.port}.${start ? " Starting it." : ""}`);
       void queryClient.invalidateQueries({ queryKey: qk.servers.all });
+      void queryClient.invalidateQueries({ queryKey: qk.builds.all });
       void queryClient.invalidateQueries({ queryKey: qk.status });
       onClose();
       void navigate({ to: "/servers/$id", params: { id: String(server.id) } });
@@ -224,30 +263,28 @@ function CreateServerDialog({ onClose }: { onClose: () => void }) {
     onError: (err) => {
       if (!isApiError(err)) return;
       const envErrs = envErrorsFrom(err, env, []);
+      const oErrs = originErrorsFrom(err);
       if (envErrs) setEnvServerErrors(envErrs);
+      else if (oErrs) setOriginErrors(oErrs);
       else if (err.code === "name_taken") setErrors({ name: "A server with this name exists." });
       else if (err.code === "port_in_use") setErrors({ port: sentence(err.message) });
-      else if (err.code === "validation_failed" && (err.field === "name" || err.field === "image" || err.field === "port")) {
+      else if (err.code === "validation_failed" && (err.field === "name" || err.field === "build_id" || err.field === "port")) {
         setErrors({ [err.field]: sentence(err.message) });
       }
     },
   });
 
-  function pickImage(value: string) {
-    setImageChoice(value);
-    const opt = options.find((o) => o.value === value);
-    if (opt?.projectId != null) setProjectId(String(opt.projectId));
-  }
-
   function submit(e: FormEvent) {
     e.preventDefault();
-    const errs = {
+    const errs: CreateErrors = {
       name: validateResourceName(name),
-      image: image ? null : "Choose an image.",
+      build_id: buildId === null ? "Choose a build." : null,
       port: validatePort(port, { optional: true }),
     };
+    const oErrs = validateOrigins(origins);
     setErrors(errs);
-    if (errs.name || errs.image || errs.port || !envResult.valid) return;
+    setOriginErrors(oErrs);
+    if (errs.name || errs.build_id || errs.port || hasOriginErrors(oErrs) || !envResult.valid) return;
     create.mutate();
   }
 
@@ -256,74 +293,105 @@ function CreateServerDialog({ onClose }: { onClose: () => void }) {
     (create.error.code === "name_taken" ||
       create.error.code === "port_in_use" ||
       envErrorsFrom(create.error, env, []) !== null ||
-      ["name", "image", "port"].includes(create.error.field ?? ""));
+      originErrorsFrom(create.error) !== null ||
+      ["name", "build_id", "port"].includes(create.error.field ?? ""));
 
   return (
     <Dialog
       open
       onOpenChange={(o) => !o && onClose()}
       title="New server"
+      description="A server runs one successful build of a project. Its project cannot change later; its build can be replaced by another build of the same project."
       size="lg"
       footer={
         <>
           <Button variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" form="create-server" loading={create.isPending} disabled={!images.isSuccess || noImages}>
+          <Button type="submit" form="create-server" loading={create.isPending} disabled={!loaded || noBuilds}>
             Create server
           </Button>
         </>
       }
     >
-      {images.isPending ? (
-        <LoadingState label="Loading managed images" />
-      ) : images.isError ? (
-        <ErrorState error={images.error} title="Could not load the managed images" onRetry={() => void images.refetch()} />
-      ) : noImages ? (
-        <NoImagesNotice />
+      {builds.isError ? (
+        <ErrorState error={builds.error} title="Could not load the builds" onRetry={() => void builds.refetch()} />
+      ) : projects.isError ? (
+        <ErrorState error={projects.error} title="Could not load the projects" onRetry={() => void projects.refetch()} />
+      ) : !loaded ? (
+        <LoadingState label="Loading builds" />
+      ) : noBuilds ? (
+        <NoBuildsNotice />
       ) : (
-      <form id="create-server" onSubmit={submit} noValidate className="flex flex-col gap-4">
-        <Field label="Name" error={errors.name} hint="Lower-case letters, digits and '-'. Cannot be changed later.">
-          {(p) => <Input {...p} spellCheck={false} value={name} onChange={(e) => setName(e.target.value)} autoFocus />}
-        </Field>
-        <Field label="Image" error={errors.image} hint="Managed images only (built by Golem Deploy or labelled on the host), declaring at most 8 volumes.">
-          {(p) => (
-            <Select {...p} value={image} onChange={(e) => pickImage(e.target.value)}>
-              {options.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </Select>
+        <form id="create-server" onSubmit={submit} noValidate className="flex flex-col gap-4">
+          {askedProjectMissing && (
+            <Notice tone="warning" title="That project has no successful build">
+              Choose another project, or build it first.
+            </Notice>
           )}
-        </Field>
-        <Field label="Project" hint="Optional. Links the server to the project its image was built from. Cannot be changed later.">
-          {(p) => (
-            <Select {...p} value={projectId} onChange={(e) => setProjectId(e.target.value)}>
-              <option value="">None</option>
-              {(projects.data?.items ?? []).map((proj) => (
-                <option key={proj.id} value={proj.id}>
-                  {proj.name}
-                </option>
-              ))}
-            </Select>
-          )}
-        </Field>
-        <Field
-          label="Port"
-          error={errors.port}
-          hint="Leave blank to take the lowest free port of the daemon's port range. Published as UDP and TCP."
-        >
-          {(p) => <Input {...p} inputMode="numeric" className="w-32" value={port} onChange={(e) => setPort(e.target.value)} />}
-        </Field>
-        <fieldset className="flex flex-col gap-2">
-          <legend className="mb-1 text-sm font-medium">Environment</legend>
-          <p className="text-xs text-muted-foreground">Values are stored encrypted and never shown again.</p>
-          <EnvEditor existingKeys={[]} draft={env} onChange={setEnv} errors={mergeEnvErrors(envResult, envServerErrors)} />
-        </fieldset>
-        <Checkbox label="Start the server after creating it" checked={start} onChange={(e) => setStart(e.target.checked)} />
-        {create.isError && !inline && <ErrorText error={create.error} />}
-      </form>
+          <Field label="Name" error={errors.name} hint="Lower-case letters, digits and '-'. Cannot be changed later.">
+            {(p) => <Input {...p} spellCheck={false} value={name} onChange={(e) => setName(e.target.value)} autoFocus />}
+          </Field>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Project" hint="Only projects with a successful build. Cannot be changed later.">
+              {(p) => (
+                <Select
+                  {...p}
+                  value={projectId ?? ""}
+                  onChange={(e) => {
+                    setProjectChoice(Number(e.target.value));
+                    setBuildChoice(null);
+                    setErrors((x) => ({ ...x, build_id: null }));
+                  }}
+                >
+                  {choices.map((proj) => (
+                    <option key={proj.id} value={proj.id}>
+                      {proj.name}
+                    </option>
+                  ))}
+                </Select>
+              )}
+            </Field>
+            <Field label="Build" error={errors.build_id} hint="Successful builds, newest first.">
+              {(p) => (
+                <Select
+                  {...p}
+                  value={buildId ?? ""}
+                  onChange={(e) => {
+                    setBuildChoice(Number(e.target.value));
+                    setErrors((x) => ({ ...x, build_id: null }));
+                  }}
+                >
+                  {projectBuilds.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {buildOptionLabel(b)}
+                    </option>
+                  ))}
+                </Select>
+              )}
+            </Field>
+          </div>
+          <Field label="Port" error={errors.port} hint="Leave blank to take the lowest free port of the daemon's port range. Published as UDP and TCP.">
+            {(p) => <Input {...p} inputMode="numeric" className="w-32" value={port} onChange={(e) => setPort(e.target.value)} />}
+          </Field>
+          <fieldset className="flex flex-col gap-2">
+            <legend className="mb-1 text-sm font-medium">Allowed origins</legend>
+            <p className="text-xs text-muted-foreground">
+              Optional. Extra browser origins (pages served elsewhere) that may open WebTransport and WebSocket connections to the
+              game. The server&apos;s own address is always allowed.
+            </p>
+            <OriginsEditor origins={origins} onChange={setOrigins} errors={originErrors} />
+          </fieldset>
+          <fieldset className="flex flex-col gap-2">
+            <legend className="mb-1 text-sm font-medium">Environment</legend>
+            <p className="text-xs text-muted-foreground">
+              Values are stored encrypted and never shown again. Names starting with GOLEM_ are set by Golem Deploy.
+            </p>
+            <EnvEditor existingKeys={[]} draft={env} onChange={setEnv} errors={mergeEnvErrors(envResult, envServerErrors)} />
+          </fieldset>
+          <Checkbox label="Start the server after creating it" checked={start} onChange={(e) => setStart(e.target.checked)} />
+          {create.isError && !inline && <ErrorText error={create.error} />}
+        </form>
       )}
     </Dialog>
   );
@@ -435,8 +503,8 @@ function ImportDialog({ onClose }: { onClose: () => void }) {
         )}
         {check?.value && (
           <Notice tone="info" title="Ready to import">
-            {check.value.servers.map((s) => s.name).join(", ")}. Projects are matched by name, and every image must be a
-            managed image on this host.
+            {check.value.servers.map((s) => s.name).join(", ")}. Projects are matched by name; each server gets the newest
+            successful build of its commit (or of its project, without a commit) on this host.
           </Notice>
         )}
         {importAll.isError && (

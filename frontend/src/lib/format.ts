@@ -46,3 +46,16 @@ export function shortImageId(id: string): string {
 export function formatPercent(n: number): string {
   return Number.isFinite(n) ? `${n.toFixed(1)}%` : "-";
 }
+
+/** A duration in seconds as "3d 4h", "2h 5m", "4m 10s" or "12s". */
+export function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "-";
+  const s = Math.floor(seconds);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}

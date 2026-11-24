@@ -1,12 +1,13 @@
 import { useRef, useState, type DragEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { Download, Trash2, Upload, X } from "lucide-react";
 import { useApi } from "@/app/services";
 import { MAX_CONCURRENT_UPLOADS } from "@/api/client";
 import { describeError, isAbortError, isApiError } from "@/api/errors";
-import { useStaticFiles } from "@/api/queries";
+import { useAccount, useProjects, useStaticFiles } from "@/api/queries";
 import { qk } from "@/api/query-keys";
-import type { StaticFile, StaticFileList } from "@/api/types.gen";
+import type { Project, StaticFile, StaticFileList } from "@/api/types.gen";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 
@@ -80,6 +81,20 @@ export function fitWarning(list: StaticFileList, items: readonly { file: File }[
   return `These uploads cannot all fit: ${problems.join("; ")}. Files that do not fit are rejected with "insufficient storage"; delete files or upload fewer.`;
 }
 
+/** For each static file name, the projects that extract it as a static add-on. */
+export function addonUsers(projects: readonly Project[]): Map<string, Project[]> {
+  const out = new Map<string, Project[]>();
+  for (const p of projects) {
+    for (const a of p.static_addons) {
+      const list = out.get(a.name) ?? [];
+      if (!list.includes(p)) out.set(a.name, [...list, p]);
+    }
+  }
+  return out;
+}
+
+const names = (ps: readonly Project[]) => ps.map((p) => p.name).join(", ");
+
 /** Runs fn over items with at most `limit` in flight, in order. */
 async function runPool<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>) {
   let next = 0;
@@ -106,6 +121,11 @@ export function StaticFilesPage() {
   const toast = useToast();
   const queryClient = useQueryClient();
   const files = useStaticFiles();
+  const projects = useProjects();
+  const account = useAccount();
+  const isAdmin = account.data?.role === "admin";
+  // Which projects use each file as an add-on: replacing one needs an admin, deleting one is refused.
+  const users = addonUsers(projects.data?.items ?? []);
   const [queue, setQueue] = useState<UploadItem[]>([]);
   const [confirmReplace, setConfirmReplace] = useState(false);
   const [deleting, setDeleting] = useState<StaticFile | null>(null);
@@ -127,12 +147,16 @@ export function StaticFilesPage() {
     // while the state updater below may run later.
     const added = Array.from(list);
     setQueue((q) => {
-      const names = new Set(q.filter((i) => i.state === "ready" || i.state === "uploading" || i.state === "waiting").map((i) => i.file.name));
+      const queued = new Set(q.filter((i) => i.state === "ready" || i.state === "uploading" || i.state === "waiting").map((i) => i.file.name));
       const next: UploadItem[] = [];
       for (const file of added) {
         let error = checkUploadFile(file);
-        if (!error && names.has(file.name)) error = "A file with this name is already queued.";
-        names.add(file.name);
+        if (!error && queued.has(file.name)) error = "A file with this name is already queued.";
+        const usedBy = users.get(file.name);
+        if (!error && !isAdmin && existing.has(file.name) && usedBy) {
+          error = `The stored ${file.name} is a static add-on of ${names(usedBy)}; only an administrator can replace it.`;
+        }
+        queued.add(file.name);
         next.push({
           id: localId("upload"),
           file,
@@ -255,7 +279,10 @@ export function StaticFilesPage() {
 
   return (
     <>
-      <PageHeader title="Static files" description="Files made available to project builds, such as assets too large for the repository." />
+      <PageHeader
+        title="Static files"
+        description="Files for project builds, such as assets too large for the repository. A project extracts ZIP files from here as static add-ons (set on the project page)."
+      />
       <div className="flex flex-col gap-6">
         {files.data && <StorageUsage list={files.data} />}
         <Section
@@ -356,6 +383,25 @@ export function StaticFilesPage() {
                   cell: (f) => <span title={formatDateTime(f.modified_at)}>{formatRelative(f.modified_at)}</span>,
                 },
                 {
+                  key: "used",
+                  header: "Used by",
+                  hideOnSmall: true,
+                  cell: (f) => {
+                    const ps = users.get(f.name);
+                    return ps ? (
+                      <span className="flex flex-wrap gap-x-2">
+                        {ps.map((p) => (
+                          <Link key={p.id} to="/projects/$id" params={{ id: String(p.id) }} className="hover:underline">
+                            {p.name}
+                          </Link>
+                        ))}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground">-</span>
+                    );
+                  },
+                },
+                {
                   key: "kind",
                   header: "Type",
                   hideOnSmall: true,
@@ -382,7 +428,14 @@ export function StaticFilesPage() {
                     {!(download.isPending && download.variables === f.name) && <Download />}
                     Download
                   </Button>
-                  <Button size="sm" variant="outline" aria-label={`Delete ${f.name}`} onClick={() => setDeleting(f)}>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    aria-label={`Delete ${f.name}`}
+                    disabled={users.has(f.name)}
+                    title={users.has(f.name) ? `A static add-on of ${names(users.get(f.name) ?? [])}: remove it from the project first.` : undefined}
+                    onClick={() => setDeleting(f)}
+                  >
                     <Trash2 />
                   </Button>
                 </>
@@ -399,9 +452,14 @@ export function StaticFilesPage() {
         description={
           <>
             <p>These files already exist and will be replaced:</p>
-            <ul className="mt-2 list-disc pl-5 font-mono text-xs text-foreground">
+            <ul className="mt-2 list-disc pl-5 text-xs text-foreground">
               {replacing.map((i) => (
-                <li key={i.id}>{i.file.name}</li>
+                <li key={i.id}>
+                  <span className="font-mono">{i.file.name}</span>
+                  {users.get(i.file.name) && (
+                    <span className="text-muted-foreground"> (add-on of {names(users.get(i.file.name) ?? [])}: their next build uses the new file)</span>
+                  )}
+                </li>
               ))}
             </ul>
           </>
@@ -417,8 +475,8 @@ export function StaticFilesPage() {
         title="Delete static file"
         description={
           <>
-            Delete <span className="font-mono text-foreground">{deleting?.name}</span> ({formatBytes(deleting?.size_bytes ?? 0)})?
-            Builds that use it will fail until it is uploaded again.
+            Delete <span className="font-mono text-foreground">{deleting?.name}</span> ({formatBytes(deleting?.size_bytes ?? 0)})? It
+            cannot be recovered. Files that a project uses as a static add-on cannot be deleted.
           </>
         }
         confirmLabel="Delete file"

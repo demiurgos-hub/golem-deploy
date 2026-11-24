@@ -187,7 +187,8 @@ export function describeError(err: unknown): string {
     case "session_required":
       return "This action needs a signed-in session, not an API token.";
     case "job_in_progress":
-      return "Another operation is already running for this item. Wait for it to finish.";
+      // The daemon says which job blocks what (e.g. a port or build change while a start runs).
+      return err.message ? sentence(err.message) : "Another operation is already running for this item. Wait for it to finish.";
     case "bad_host":
       return (
         "The daemon does not accept the host name in this page's address. Open the panel by IP address, " +

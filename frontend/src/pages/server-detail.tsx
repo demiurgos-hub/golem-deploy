@@ -1,16 +1,20 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
-import { ArrowLeft, Pencil, RotateCw, Trash2 } from "lucide-react";
+import { ArrowLeft, ExternalLink, Pencil, Rocket, RotateCw, Trash2 } from "lucide-react";
 import { useApi } from "@/app/services";
 import { describeError, isApiError, sentence } from "@/api/errors";
-import { isJobActive, useImages, useProjects, useServer, useServerStats, useSubjectJobs } from "@/api/queries";
+import { isJobActive, useProjects, useServer, useServerRuntime, useServerStats, useSubjectJobs, useSuccessfulBuilds } from "@/api/queries";
 import { qk } from "@/api/query-keys";
 import type { Job, Server, UpdateServerRequest } from "@/api/types.gen";
+import { buildName } from "@/components/builds";
+import { CertificateDetails } from "@/components/certificate";
 import { EnvEditor } from "@/components/env-editor";
 import { InlineJob, JobsPanel, useShownJob } from "@/components/jobs";
+import { OriginsEditor, hasOriginErrors, noOriginErrors, originErrorsFrom, validateOrigins, type OriginErrors } from "@/components/origins-editor";
 import { ServerActions } from "@/components/server-actions";
-import { ServerStateBadge, portLocked, serverActionsBlocked } from "@/components/status-badges";
+import { ServerStateBadge, isContainerActive, portLocked, serverActionsBlocked } from "@/components/status-badges";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { ConfirmDialog, Dialog } from "@/components/ui/dialog";
@@ -21,11 +25,11 @@ import { ErrorState, ErrorText, LoadingState, Notice } from "@/components/ui/sta
 import { useToast } from "@/components/ui/toast";
 import { useLogStream } from "@/hooks/use-log-stream";
 import { computeEnvDiff, emptyDraft, envErrorsFrom, mergeEnvErrors, noEnvErrors, type EnvDraft, type EnvErrors } from "@/lib/env-diff";
-import { formatBytes, formatDateTime, formatPercent, formatRelative } from "@/lib/format";
-import { imageLabel } from "@/lib/images";
+import { formatBytes, formatDateTime, formatDuration, formatPercent, formatRelative, shortCommit } from "@/lib/format";
+import { safeHttpUrl } from "@/lib/url";
 import { validatePort } from "@/lib/validators";
 import { NotFoundPage } from "@/pages/not-found";
-import { NoImagesNotice, imageOptions } from "@/pages/servers";
+import { buildOptionLabel, buildsByProject } from "@/pages/servers";
 
 export function ServerDetailPage() {
   const { id: rawId } = useParams({ strict: false });
@@ -43,6 +47,16 @@ function BackLink() {
   );
 }
 
+const START_KINDS = new Set(["server.start", "server.restart"]);
+
+/** The newest start or restart job when it failed and nothing newer replaced it: the reason the server is not running. */
+export function failedStart(jobs: readonly Job[] | undefined): Job | null {
+  const latest = jobs?.find((j) => START_KINDS.has(j.kind));
+  if (!latest || latest.status !== "error") return null;
+  // A newer stop (or any active job) supersedes the failure.
+  const newer = jobs?.slice(0, jobs.indexOf(latest)) ?? [];
+  return newer.some((j) => j.kind === "server.stop" || isJobActive(j)) ? null : latest;
+}
 
 function ServerDetail({ id }: { id: number }) {
   const api = useApi();
@@ -52,7 +66,6 @@ function ServerDetail({ id }: { id: number }) {
   const server = useServer(id);
   const jobs = useSubjectJobs("server", id);
   const projects = useProjects();
-  const images = useImages();
   const [dialog, setDialog] = useState<"edit" | "delete" | null>(null);
   // The server.delete job of a deletion that did not answer 204 (failed, or still running after the wait).
   const [deleteJob, setDeleteJob] = useState<Job | null>(null);
@@ -97,6 +110,7 @@ function ServerDetail({ id }: { id: number }) {
     toast.success(`Server ${target.name} deleted: container removed and port ${target.port} freed.`);
     queryClient.removeQueries({ queryKey: qk.servers.detail(target.id) });
     void queryClient.invalidateQueries({ queryKey: qk.servers.list });
+    void queryClient.invalidateQueries({ queryKey: qk.builds.all });
     void queryClient.invalidateQueries({ queryKey: qk.volumes });
     void queryClient.invalidateQueries({ queryKey: qk.status });
     void navigate({ to: "/servers" });
@@ -118,7 +132,8 @@ function ServerDetail({ id }: { id: number }) {
   const currentJob = shown.job;
   const blocked = serverActionsBlocked(s);
   const project = s.project_id !== null ? projects.data?.items.find((p) => p.id === s.project_id) : undefined;
-  const address = `${window.location.hostname}:${s.port}`;
+  const failed = failedStart(jobs.data?.items);
+  const gameUrl = s.public_url ? safeHttpUrl(s.public_url) : null;
 
   return (
     <>
@@ -130,12 +145,21 @@ function ServerDetail({ id }: { id: number }) {
             <ServerStateBadge server={s} />
           </span>
         }
+        description={
+          gameUrl ? (
+            <a href={gameUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 font-mono text-xs hover:underline">
+              {gameUrl}
+              <ExternalLink aria-hidden className="size-3" />
+              <span className="sr-only">(opens in a new tab)</span>
+            </a>
+          ) : undefined
+        }
         actions={
           <>
             <ServerActions server={s} size="md" busy={activeJob !== null} onJob={shown.show} />
             <Button variant="outline" onClick={() => setDialog("edit")}>
               <Pencil />
-              Edit
+              Change port
             </Button>
             <Button
               variant="outline"
@@ -152,8 +176,15 @@ function ServerDetail({ id }: { id: number }) {
       <div className="flex flex-col gap-6">
         {s.restart_required && (
           <Notice tone="warning" title="Restart required">
-            The running container was created from an older definition (image, port, environment or the daemon&apos;s run
-            settings changed). Changes never restart a server on their own: restart it to apply them.
+            The running container was created from an older definition: the build, port, environment, allowed origins, the game
+            host, the certificate mode or the daemon&apos;s run settings changed since it started. Changes never restart a server on
+            their own: restart it to apply them (connected players are disconnected).
+          </Notice>
+        )}
+        {s.build_id === null && (
+          <Notice tone="warning" title="No build assigned">
+            This server was created before servers ran builds, so it cannot start. Choose a successful build in the Build section
+            below.
           </Notice>
         )}
         {s.state === "unknown" && (
@@ -163,34 +194,52 @@ function ServerDetail({ id }: { id: number }) {
             few seconds.
           </Notice>
         )}
-        {currentJob && (
-          <InlineJob key={currentJob.id} job={currentJob} onDismiss={shown.dismiss} />
+        {failed && failed.id !== currentJob?.id && (
+          <Notice
+            tone="danger"
+            title={`The last ${failed.kind === "server.restart" ? "restart" : "start"} failed`}
+            action={
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={() => shown.show(failed)}>
+                  Show job log
+                </Button>
+                <a href="#logs" className="inline-flex h-8 items-center rounded-md border border-input px-2.5 text-xs font-medium hover:bg-accent">
+                  Server log
+                </a>
+              </div>
+            }
+          >
+            <span className="whitespace-pre-wrap break-words">{failed.detail || "The job failed without a message; its log has the details."}</span>
+            <span className="mt-1 block text-xs">
+              {formatRelative(failed.finished_at ?? failed.created_at)}, job {failed.id}.
+            </span>
+          </Notice>
         )}
+        {currentJob && <InlineJob key={currentJob.id} job={currentJob} onDismiss={shown.dismiss} />}
         <div className="grid gap-6 lg:grid-cols-2">
           <Section title="Details">
             <DetailList
               items={[
                 {
-                  term: "Address",
-                  value: (
+                  term: "Game URL",
+                  value: gameUrl ? (
                     <span className="flex flex-col gap-1">
-                      <span className="inline-flex items-center gap-2">
-                        <code className="font-mono text-sm">{address}</code>
-                        <CopyButton value={address} size="icon" variant="ghost" label="Copy address" />
+                      <span className="inline-flex flex-wrap items-center gap-2">
+                        <a href={gameUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 break-all font-mono text-xs hover:underline">
+                          {gameUrl}
+                          <ExternalLink aria-hidden className="size-3 shrink-0" />
+                          <span className="sr-only">(opens in a new tab)</span>
+                        </a>
+                        <CopyButton value={gameUrl} size="icon" variant="ghost" label="Copy game URL" />
                       </span>
                       <span className="text-xs text-muted-foreground">
-                        Port {s.port} is published over both UDP and TCP. The host name is the one you use for this page;
-                        players may need your public address instead.
+                        Port {s.port} is published over UDP (WebTransport) and TCP (HTTPS and the WebSocket fallback).
                       </span>
                     </span>
-                  ),
-                },
-                {
-                  term: "Image",
-                  value: (
-                    <span className="flex flex-col gap-0.5">
-                      <span>{imageLabel(s.image, images.data?.items)}</span>
-                      <code className="break-all font-mono text-xs text-muted-foreground">{s.image}</code>
+                  ) : (
+                    <span className="text-muted-foreground">
+                      No game host is configured, so the server has no address and cannot start. An administrator sets it under
+                      Settings.
                     </span>
                   ),
                 },
@@ -203,6 +252,20 @@ function ServerDetail({ id }: { id: number }) {
                       <Link to="/projects/$id" params={{ id: String(s.project_id) }} className="hover:underline">
                         {project?.name ?? `project ${s.project_id}`}
                       </Link>
+                    ),
+                },
+                {
+                  term: "Build",
+                  value:
+                    s.build_id === null ? (
+                      <span className="text-muted-foreground">None</span>
+                    ) : (
+                      <span className="flex flex-col gap-0.5">
+                        <Link to="/builds/$id" params={{ id: String(s.build_id) }} className="hover:underline">
+                          Build {buildName({ id: s.build_id, commit: s.commit })}
+                        </Link>
+                        {s.engine_version && <span className="text-xs text-muted-foreground">Golem Engine {s.engine_version}</span>}
+                      </span>
                     ),
                 },
                 { term: "Desired state", value: s.desired_state },
@@ -219,8 +282,14 @@ function ServerDetail({ id }: { id: number }) {
               ]}
             />
           </Section>
-          <StatsSection server={s} />
+          <RuntimeSection server={s} />
         </div>
+        <BuildSection server={s} busy={activeJob !== null} onJob={shown.show} />
+        <div className="grid gap-6 lg:grid-cols-2">
+          <OriginsSection server={s} />
+          <CertificateSection server={s} />
+        </div>
+        <StatsSection server={s} />
         <EnvSection server={s} />
         <LogsSection server={s} />
         <Section title="Jobs" description="Recent start, stop, restart and delete operations.">
@@ -228,7 +297,7 @@ function ServerDetail({ id }: { id: number }) {
         </Section>
       </div>
 
-      {dialog === "edit" && <EditServerDialog server={s} onClose={() => setDialog(null)} />}
+      {dialog === "edit" && <EditServerDialog server={s} busy={activeJob !== null} onClose={() => setDialog(null)} />}
       <ConfirmDialog
         open={dialog === "delete"}
         onOpenChange={(o) => !o && setDialog(null)}
@@ -244,6 +313,369 @@ function ServerDetail({ id }: { id: number }) {
         onConfirm={() => remove(s)}
       />
     </>
+  );
+}
+
+function Metric({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <div className="flex flex-col rounded-md border border-border px-3 py-2" title={hint}>
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span className="text-lg font-semibold tabular-nums">{value}</span>
+    </div>
+  );
+}
+
+/**
+ * What the running game reports through its admin endpoint. 409 (not
+ * running) and 503 (endpoint silent or Docker unreachable) are expected and
+ * shown as text; the server poll catches up with the state.
+ */
+function RuntimeSection({ server }: { server: Server }) {
+  const runtime = useServerRuntime(server);
+  const running = server.state === "running";
+  const err = runtime.error;
+  const conflict = isApiError(err) && err.code === "conflict";
+  const unavailable = isApiError(err) && err.code === "service_unavailable";
+  const r = runtime.data;
+  return (
+    <Section title="Game runtime" description={running ? "Reported by the game, refreshed every few seconds while this page is visible." : undefined}>
+      {!running || conflict ? (
+        <p className="text-sm text-muted-foreground">
+          {conflict && isApiError(err) ? `${sentence(err.message)} ` : ""}The game reports its runtime while the server is running.
+        </p>
+      ) : runtime.isPending ? (
+        <LoadingState label="Asking the game" />
+      ) : unavailable && !r ? (
+        <Notice tone="warning" title="The game did not answer">
+          {describeError(err)}
+        </Notice>
+      ) : runtime.isError && !r ? (
+        <ErrorState error={err} title="Could not read the game's runtime" onRetry={() => void runtime.refetch()} />
+      ) : r ? (
+        <div className="flex flex-col gap-3">
+          {runtime.isError && (
+            <p className="text-xs text-amber-700 dark:text-amber-400" role="status">
+              The last refresh failed ({describeError(err)}); showing the values sampled {formatRelative(r.sampled_at)}.
+            </p>
+          )}
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            {r.ready ? <Badge tone="success">Ready</Badge> : <Badge tone="warning">Not ready</Badge>}
+            {!r.ready && r.not_ready_reason && <span className="break-words text-muted-foreground">{r.not_ready_reason}</span>}
+            {r.game_name && <span className="text-xs text-muted-foreground">{r.game_name}</span>}
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            <Metric label="Players" value={r.sessions.toLocaleString()} hint="Connected sessions" />
+            <Metric label="Entities" value={r.entities.toLocaleString()} />
+            <Metric label="Uptime" value={formatDuration(r.uptime_seconds)} />
+          </div>
+          <DetailList
+            items={[
+              {
+                term: "Tick",
+                value: (
+                  <span className="tabular-nums">
+                    {r.tick.rate} Hz, tick {r.tick.tick.toLocaleString()}
+                  </span>
+                ),
+              },
+              {
+                term: "Tick time",
+                value: (
+                  <span className="tabular-nums">
+                    last {r.tick.last_ms.toFixed(1)} ms, max {r.tick.max_ms.toFixed(1)} ms of a {r.tick.budget_ms.toFixed(1)} ms budget
+                    {r.tick.overruns > 0 ? `, ${r.tick.overruns.toLocaleString()} overruns` : ", no overruns"}
+                  </span>
+                ),
+              },
+              { term: "Engine", value: r.engine_version ? <code className="font-mono text-xs">{r.engine_version}</code> : "-" },
+              { term: "Transport", value: r.transport || "unknown" },
+              { term: "Schema", value: r.schema_fingerprint ? <code className="break-all font-mono text-xs">{r.schema_fingerprint}</code> : "-" },
+              { term: "Certificate hashes", value: r.certificate_hashes_published ? "Published (clients pin the self-signed certificate)" : "Not published" },
+              { term: "Sampled", value: formatDateTime(r.sampled_at) },
+            ]}
+          />
+        </div>
+      ) : null}
+    </Section>
+  );
+}
+
+/** The build the server runs, and moving it to another successful build of the same project ("deploy"). */
+function BuildSection({ server, busy, onJob }: { server: Server; busy: boolean; onJob: (job: Job) => void }) {
+  const [deploying, setDeploying] = useState(false);
+  return (
+    <Section
+      title="Build"
+      description="A server runs one successful build of its project. Deploying another build changes what the next start runs."
+      actions={
+        <Button size="sm" variant={server.build_id === null ? "primary" : "outline"} onClick={() => setDeploying(true)}>
+          <Rocket />
+          {server.build_id === null ? "Choose a build" : "Deploy another build"}
+        </Button>
+      }
+    >
+      {server.build_id === null ? (
+        <p className="text-sm text-muted-foreground">No build assigned. The server cannot start until it has one.</p>
+      ) : (
+        <p className="text-sm">
+          Runs{" "}
+          <Link to="/builds/$id" params={{ id: String(server.build_id) }} className="font-medium hover:underline">
+            build {buildName({ id: server.build_id, commit: server.commit })}
+          </Link>
+          {server.commit && (
+            <>
+              {" "}
+              (commit <code className="font-mono text-xs">{shortCommit(server.commit)}</code>
+              {server.engine_version ? `, Golem Engine ${server.engine_version}` : ""})
+            </>
+          )}
+          .
+        </p>
+      )}
+      {deploying && <DeployDialog server={server} busy={busy} onJob={onJob} onClose={() => setDeploying(false)} />}
+    </Section>
+  );
+}
+
+function DeployDialog({ server, busy, onJob, onClose }: { server: Server; busy: boolean; onJob: (job: Job) => void; onClose: () => void }) {
+  const api = useApi();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+  const builds = useSuccessfulBuilds();
+  const projects = useProjects();
+  const grouped = useMemo(() => buildsByProject(builds.data?.items ?? []), [builds.data]);
+  // A server's project is fixed: only builds of that project (any project for a server that never had a build).
+  const options = useMemo(
+    () => (server.project_id !== null ? (grouped.get(server.project_id) ?? []) : [...grouped.values()].flat().sort((a, b) => b.id - a.id)),
+    [grouped, server.project_id],
+  );
+  const others = options.filter((b) => b.id !== server.build_id);
+  const [choice, setChoice] = useState<number | null>(null);
+  const selected = choice ?? others[0]?.id ?? null;
+  const [error, setError] = useState<string | null>(null);
+  const running = isContainerActive(server.state);
+  const projectName = (id: number) => projects.data?.items.find((p) => p.id === id)?.name ?? `project ${id}`;
+
+  const deploy = useMutation({
+    mutationFn: async (restart: boolean) => {
+      const updated = await api.servers.update(server.id, { build_id: selected ?? 0 });
+      queryClient.setQueryData(qk.servers.detail(updated.id), updated);
+      const job = restart ? await api.servers.restart(server.id) : null;
+      return { updated, job };
+    },
+    onSuccess: ({ updated, job }) => {
+      void queryClient.invalidateQueries({ queryKey: qk.servers.all });
+      void queryClient.invalidateQueries({ queryKey: qk.builds.all });
+      if (job) {
+        queryClient.setQueryData(qk.jobs.detail(job.id), job);
+        void queryClient.invalidateQueries({ queryKey: qk.jobs.forSubject("server", server.id) });
+        onJob(job);
+        toast.success(`Deploying build #${updated.build_id}: ${updated.name} is restarting.`);
+      } else {
+        toast.success(
+          running ? `Build #${updated.build_id} assigned. Restart ${updated.name} to run it.` : `Build #${updated.build_id} assigned. The next start runs it.`,
+        );
+      }
+      onClose();
+    },
+    onError: (err) => {
+      if (isApiError(err) && err.code === "validation_failed" && err.field === "build_id") setError(sentence(err.message));
+      // The build is saved even if the restart was refused: refresh to show it.
+      void queryClient.invalidateQueries({ queryKey: qk.servers.detail(server.id) });
+    },
+  });
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(o) => !o && !deploy.isPending && onClose()}
+      title={`Deploy a build to ${server.name}`}
+      description={
+        server.project_id !== null
+          ? `Only successful builds of ${projectName(server.project_id)} can be deployed: a server's project is fixed when it is created.`
+          : "This server has no build yet; choose any successful build. Its project then becomes the server's project."
+      }
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose} disabled={deploy.isPending}>
+            Cancel
+          </Button>
+          {running ? (
+            <>
+              <Button variant="outline" disabled={selected === null || busy} loading={deploy.isPending && deploy.variables === false} onClick={() => deploy.mutate(false)}>
+                Assign without restarting
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={selected === null || busy}
+                title={busy ? "Wait for the running job to finish." : undefined}
+                loading={deploy.isPending && deploy.variables === true}
+                onClick={() => deploy.mutate(true)}
+              >
+                Deploy and restart
+              </Button>
+            </>
+          ) : (
+            <Button disabled={selected === null || busy} loading={deploy.isPending} onClick={() => deploy.mutate(false)}>
+              Assign build
+            </Button>
+          )}
+        </>
+      }
+    >
+      {builds.isPending ? (
+        <LoadingState label="Loading builds" />
+      ) : builds.isError ? (
+        <ErrorState error={builds.error} title="Could not load the builds" onRetry={() => void builds.refetch()} />
+      ) : others.length === 0 ? (
+        <Notice tone="info" title="No other successful build">
+          {server.project_id !== null ? (
+            <>
+              Start a new build on the{" "}
+              <Link to="/projects/$id" params={{ id: String(server.project_id) }} className="underline underline-offset-2">
+                project page
+              </Link>
+              ; once it succeeds it can be deployed here.
+            </>
+          ) : (
+            "Build a project first; once a build succeeds it can be assigned here."
+          )}
+        </Notice>
+      ) : (
+        <div className="flex flex-col gap-4">
+          <Field label="Build" error={error}>
+            {(p) => (
+              <Select
+                {...p}
+                value={selected ?? ""}
+                onChange={(e) => {
+                  setChoice(Number(e.target.value));
+                  setError(null);
+                }}
+              >
+                {others.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {server.project_id === null ? `${projectName(b.project_id)} ` : ""}
+                    {buildOptionLabel(b, server.build_id)}
+                  </option>
+                ))}
+              </Select>
+            )}
+          </Field>
+          {running ? (
+            <Notice tone="warning" title="Applying it restarts the server">
+              The server is running. Deploy and restart stops the game, starts the new build and waits until it reports ready:
+              every connected player is disconnected. Assign without restarting keeps the game running on the current build until
+              its next restart.
+            </Notice>
+          ) : (
+            <p className="text-sm text-muted-foreground">The server is not running: the next start runs the new build.</p>
+          )}
+          {busy && <p className="text-xs text-muted-foreground">A job is running for this server; the build can change once it ends.</p>}
+          {deploy.isError && !(isApiError(deploy.error) && deploy.error.field === "build_id") && <ErrorText error={deploy.error} />}
+        </div>
+      )}
+    </Dialog>
+  );
+}
+
+/** Extra browser origins for WebTransport and WebSocket; the server's own address is always allowed. */
+function OriginsSection({ server }: { server: Server }) {
+  const api = useApi();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+  const [draft, setDraftState] = useState<string[] | null>(null);
+  const [errors, setErrors] = useState<OriginErrors>(noOriginErrors());
+  const origins = draft ?? server.allowed_origins;
+  const changed = draft !== null && JSON.stringify(draft.map((o) => o.trim())) !== JSON.stringify(server.allowed_origins);
+  const setDraft = (d: string[] | null) => {
+    setDraftState(d);
+    setErrors(noOriginErrors());
+  };
+  const save = useMutation({
+    mutationFn: (list: string[]) => api.servers.update(server.id, { allowed_origins: list }),
+    onSuccess: (s) => {
+      queryClient.setQueryData(qk.servers.detail(s.id), s);
+      void queryClient.invalidateQueries({ queryKey: qk.servers.list });
+      setDraft(null);
+      toast.success(isContainerActive(s.state) ? "Allowed origins saved. Restart the server to apply them." : "Allowed origins saved.");
+    },
+    onError: (err) => {
+      const routed = originErrorsFrom(err);
+      if (routed) setErrors(routed);
+    },
+  });
+  const own = server.public_url ? server.public_url.replace(/\/$/, "") : null;
+  return (
+    <Section
+      title="Allowed origins"
+      description={
+        <>
+          Browser pages on these origins may open WebTransport and WebSocket connections to the game. The server&apos;s own address
+          {own ? (
+            <>
+              {" "}
+              (<code className="font-mono">{own}</code>)
+            </>
+          ) : null}{" "}
+          is always allowed. Changes apply on the next start or restart.
+        </>
+      }
+      actions={
+        <>
+          {changed && (
+            <Button size="sm" variant="ghost" onClick={() => setDraft(null)} disabled={save.isPending}>
+              Discard
+            </Button>
+          )}
+          <Button
+            size="sm"
+            disabled={!changed}
+            loading={save.isPending}
+            onClick={() => {
+              const list = origins.map((o) => o.trim());
+              const errs = validateOrigins(list);
+              setErrors(errs);
+              if (!hasOriginErrors(errs)) save.mutate(list);
+            }}
+          >
+            Save origins
+          </Button>
+        </>
+      }
+    >
+      <OriginsEditor origins={origins} onChange={setDraft} errors={errors} disabled={save.isPending} />
+      {save.isError && !originErrorsFrom(save.error) && (
+        <div className="mt-3">
+          <ErrorText error={save.error} />
+        </div>
+      )}
+    </Section>
+  );
+}
+
+/** The certificate the server's game serves (its own self-signed one, or the shared custom one). */
+function CertificateSection({ server }: { server: Server }) {
+  const cert = server.certificate;
+  return (
+    <Section title="Certificate" description="The TLS certificate the game serves for WebTransport and HTTPS on its port.">
+      {cert === null ? (
+        <p className="text-sm text-muted-foreground">
+          No certificate yet. With self-signed certificates (the default) each server gets its own when it first starts.
+        </p>
+      ) : (
+        <div className="flex flex-col gap-3">
+          <CertificateDetails cert={cert} />
+          {cert.self_signed && (
+            <p className="text-xs text-muted-foreground">
+              Self-signed and short-lived (renewed automatically): native clients and pages that pin the published hashes connect
+              fine, but browsers opening the game URL directly show a certificate warning. An administrator can install a trusted
+              certificate under Settings.
+            </p>
+          )}
+        </div>
+      )}
+    </Section>
   );
 }
 
@@ -463,112 +895,88 @@ function LogsSection({ server }: { server: Server }) {
   );
 }
 
-function EditServerDialog({ server, onClose }: { server: Server; onClose: () => void }) {
+function EditServerDialog({ server, busy, onClose }: { server: Server; busy: boolean; onClose: () => void }) {
   const api = useApi();
   const toast = useToast();
   const queryClient = useQueryClient();
-  const images = useImages();
-  const projects = useProjects();
-  const options = imageOptions(images.data?.items ?? [], new Map((projects.data?.items ?? []).map((p) => [p.id, p])));
-  const [image, setImage] = useState(server.image);
   const [port, setPort] = useState(String(server.port));
-  const [errors, setErrors] = useState<Partial<Record<"image" | "port", string | null>>>({});
+  const [error, setError] = useState<string | null>(null);
   const locked = portLocked(server);
-  const [sentPort, setSentPort] = useState(false);
   const update = useMutation({
     mutationFn: (body: UpdateServerRequest) => api.servers.update(server.id, body),
     onSuccess: (s) => {
       queryClient.setQueryData(qk.servers.detail(s.id), s);
       void queryClient.invalidateQueries({ queryKey: qk.servers.list });
-      toast.success(s.state === "running" ? "Server updated. Restart it to apply the changes." : "Server updated.");
+      toast.success(`Port changed to ${s.port}.`);
       onClose();
     },
     onError: (err) => {
-      if (isApiError(err) && err.code === "port_in_use") setErrors({ port: sentence(err.message) });
-      // The container started meanwhile (another user, an API token): the port cannot change while it runs.
-      else if (isApiError(err) && err.code === "conflict" && sentPort) setErrors({ port: sentence(err.message) });
-      else if (isApiError(err) && err.code === "validation_failed" && (err.field === "image" || err.field === "port")) {
-        setErrors({ [err.field]: sentence(err.message) });
+      // port_in_use; conflict when the container started meanwhile (another user, an API token);
+      // job_in_progress while a start or stop runs; validation errors of the port.
+      if (isApiError(err) && (err.code === "port_in_use" || err.code === "conflict" || err.code === "job_in_progress" || err.field === "port")) {
+        setError(describeError(err));
       }
     },
   });
 
   function submit(e: FormEvent) {
     e.preventDefault();
-    const errs = { image: image ? null : "Choose an image.", port: locked ? null : validatePort(port, { optional: false }) };
-    setErrors(errs);
-    if (errs.image || errs.port) return;
-    const body: UpdateServerRequest = {};
-    if (image !== server.image) body.image = image;
-    if (!locked && Number(port) !== server.port) body.port = Number(port);
-    setSentPort(body.port !== undefined);
-    if (Object.keys(body).length === 0) {
+    const err = locked ? null : validatePort(port, { optional: false });
+    setError(err);
+    if (err || locked) return;
+    if (Number(port) === server.port) {
       onClose();
       return;
     }
-    update.mutate(body);
+    update.mutate({ port: Number(port) });
   }
 
   const inline =
     isApiError(update.error) &&
-    (update.error.code === "port_in_use" ||
-      (update.error.code === "conflict" && sentPort) ||
-      update.error.field === "image" ||
-      update.error.field === "port");
+    (update.error.code === "port_in_use" || update.error.code === "conflict" || update.error.code === "job_in_progress" || update.error.field === "port");
   return (
     <Dialog
       open
       onOpenChange={(o) => !o && onClose()}
-      title={`Edit ${server.name}`}
-      description="Changes apply on the next start or restart."
+      title={`Change the port of ${server.name}`}
+      description="The game URL changes with the port; the next start publishes the new one."
       footer={
         <>
           <Button variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" form="edit-server" loading={update.isPending}>
+          <Button type="submit" form="edit-server" loading={update.isPending} disabled={locked !== null}>
             Save
           </Button>
         </>
       }
     >
       <form id="edit-server" onSubmit={submit} noValidate className="flex flex-col gap-4">
-        {images.isPending ? (
-          <LoadingState label="Loading managed images" />
-        ) : images.isError ? (
-          <ErrorState error={images.error} title="Could not load the managed images" onRetry={() => void images.refetch()} />
-        ) : options.length === 0 ? (
-          <NoImagesNotice />
-        ) : (
-          <Field label="Image" error={errors.image} hint="Managed images only.">
-            {(p) => (
-              <Select {...p} value={image} onChange={(e) => setImage(e.target.value)}>
-                {!options.some((o) => o.value === server.image) && (
-                  <option value={server.image}>{imageLabel(server.image, images.data.items)} (current, no longer managed)</option>
-                )}
-                {options.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                    {o.value === server.image ? " (current)" : ""}
-                  </option>
-                ))}
-              </Select>
-            )}
-          </Field>
-        )}
         <Field
           label="Port"
-          error={errors.port}
+          error={error}
           hint={
             locked === "running"
               ? "Stop the server to change its port: a running container keeps the port it was started with."
               : locked === "unknown"
                 ? "Docker cannot be reached, so the daemon cannot tell whether the server is running. The port can be changed once Docker is reachable and the server is stopped."
-                : "Published as UDP and TCP."
+                : busy
+                  ? "A job is running for this server: the port can change once it ends."
+                  : "Published as UDP and TCP. Must be inside the daemon's port range."
           }
         >
           {(p) => (
-            <Input {...p} inputMode="numeric" className="w-32" value={locked ? String(server.port) : port} disabled={locked !== null} onChange={(e) => setPort(e.target.value)} />
+            <Input
+              {...p}
+              inputMode="numeric"
+              className="w-32"
+              value={locked ? String(server.port) : port}
+              disabled={locked !== null}
+              onChange={(e) => {
+                setPort(e.target.value);
+                setError(null);
+              }}
+            />
           )}
         </Field>
         {update.isError && !inline && <ErrorText error={update.error} />}

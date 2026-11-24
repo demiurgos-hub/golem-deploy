@@ -18,6 +18,7 @@ const KIND_LABELS: Record<string, string> = {
   "project.clone": "Clone",
   "project.pull": "Pull",
   "project.branch": "Switch branch",
+  "project.build": "Build",
   "server.start": "Start",
   "server.stop": "Stop",
   "server.restart": "Restart",

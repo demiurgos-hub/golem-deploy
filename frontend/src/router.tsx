@@ -85,10 +85,25 @@ const projectRoute = createRoute({
   component: lazyRouteComponent(() => import("@/pages/project-detail"), "ProjectDetailPage"),
 });
 
+export type ServersSearch = { create?: number };
+
+/** `?create=<project id>` opens the new-server dialog for that project (links from builds and the first-run guide). */
+function validateServersSearch(search: Record<string, unknown>): ServersSearch {
+  const n = Number(search.create);
+  return Number.isSafeInteger(n) && n > 0 ? { create: n } : {};
+}
+
 const serversRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "/servers",
+  validateSearch: validateServersSearch,
   component: lazyRouteComponent(() => import("@/pages/servers"), "ServersPage"),
+});
+
+const buildRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "/builds/$id",
+  component: lazyRouteComponent(() => import("@/pages/build-detail"), "BuildDetailPage"),
 });
 
 const serverRoute = createRoute({
@@ -155,6 +170,7 @@ const routeTree = rootRoute.addChildren([
     indexRoute,
     projectsRoute,
     projectRoute,
+    buildRoute,
     serversRoute,
     serverRoute,
     imagesRoute,

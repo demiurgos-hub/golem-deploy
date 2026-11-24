@@ -7,7 +7,9 @@ import { isApiError, sentence } from "@/api/errors";
 import { isJobActive, isProjectBusy, useAccount, useBranches, useProject, useSubjectJobs } from "@/api/queries";
 import { qk } from "@/api/query-keys";
 import type { Job, Project, UpdateProjectRequest } from "@/api/types.gen";
+import { ProjectBuildsSection } from "@/components/builds";
 import { InlineJob, JobsPanel, useShownJob } from "@/components/jobs";
+import { BuildSettingsSection, StaticAddonsSection } from "@/components/static-addons";
 import {
   ProjectAuthFields,
   authErrorsFrom,
@@ -148,6 +150,7 @@ function ProjectDetail({ id }: { id: number }) {
             onDismiss={shown.dismiss}
           />
         )}
+        <ProjectBuildsSection project={p} busy={activeJob !== null} onJob={onJob} />
         <Section title="Details">
           <DetailList
             items={[
@@ -173,7 +176,11 @@ function ProjectDetail({ id }: { id: number }) {
             ]}
           />
         </Section>
-        <Section title="Jobs" description="Recent operations on this project. Select one to see its log.">
+        <div className="grid gap-6 lg:grid-cols-2">
+          <StaticAddonsSection project={p} isAdmin={isAdmin} />
+          <BuildSettingsSection project={p} isAdmin={isAdmin} />
+        </div>
+        <Section title="Jobs" description="Recent clones, pulls, branch switches and builds of this project. Select one to see its log.">
           <JobsPanel subjectType="project" subjectId={id} />
         </Section>
       </div>
@@ -186,8 +193,9 @@ function ProjectDetail({ id }: { id: number }) {
         title="Delete project"
         description={
           <>
-            Delete <span className="font-medium text-foreground">{p.name}</span>? The checkout and stored credentials are removed.
-            Servers created from it keep running but lose the link to the project.
+            Delete <span className="font-medium text-foreground">{p.name}</span>? The checkout, the stored credentials and every
+            build of the project with its image are removed. This is refused while a job runs for the project, while servers are
+            configured with one of its builds, or while a server&apos;s container still uses one of its images.
           </>
         }
         confirmLabel="Delete project"

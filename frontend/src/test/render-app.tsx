@@ -28,6 +28,9 @@ export function renderApp({
     "GET /account": () => jsonResponse(200, currentAccount(me)),
     "GET /status": () => jsonResponse(200, STATUS),
     "GET /auth/options": () => jsonResponse(200, { registration_enabled: false }),
+    // Pages list builds on the side (first-run guide, project page); tests that care override these.
+    "GET /builds": () => jsonResponse(200, { items: [] }),
+    "GET /projects/{id}/builds": () => jsonResponse(200, { items: [] }),
     ...routes,
   });
   const services = createServices({ transport, local: localStorage, session: sessionStorage, channel: null, document: null });
