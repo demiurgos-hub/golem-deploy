@@ -23,9 +23,15 @@ import (
 
 // Limits of an archive besides the content size (--backup-max-mb).
 const (
-	// MaxEntries bounds the entries of a data directory (every tar entry
-	// counts, also the skipped ones).
+	// MaxEntries bounds the entries of a data directory: every tar header
+	// counts, also those of skipped entries and the PAX or GNU records that
+	// precede an entry.
 	MaxEntries = 100000
+	// EntryAllowance is how many bytes of the copy stream each entry may
+	// take besides its content (header blocks, PAX or GNU records,
+	// padding). The stream may hold at most the content limit plus this
+	// allowance per entry; more is ErrTooLarge.
+	EntryAllowance = 16 << 10
 	// MaxPathBytes, MaxNameBytes and MaxDepth bound an entry's path.
 	MaxPathBytes = 1024
 	MaxNameBytes = 255
@@ -78,11 +84,64 @@ type Result struct {
 
 const maxSkippedListed = 50
 
-func (r *Result) skip(name, reason string) {
+func (r *Result) skip(name, reason string, redact func(string) string) {
 	r.SkippedCount++
 	if len(r.Skipped) < maxSkippedListed {
+		if redact != nil {
+			name = redact(name)
+		}
 		r.Skipped = append(r.Skipped, Skipped{Name: safeName(name), Reason: reason})
 	}
+}
+
+// errBudget: the copy stream is longer than its content limit plus
+// EntryAllowance per entry.
+var errBudget = fmt.Errorf("%w: the copy stream exceeds its byte budget", ErrTooLarge)
+
+// budgetReader fails with errBudget once more than limit() bytes were read.
+type budgetReader struct {
+	r     io.Reader
+	read  int64
+	limit func() int64
+}
+
+func (b *budgetReader) Read(p []byte) (int, error) {
+	room := b.limit() - b.read
+	if room <= 0 {
+		return 0, errBudget
+	}
+	if int64(len(p)) > room {
+		p = p[:room]
+	}
+	n, err := b.r.Read(p)
+	b.read += int64(n)
+	return n, err
+}
+
+// metaRecords counts the PAX and GNU records the tar reader merged into h:
+// each was a header of its own in the stream.
+func metaRecords(h *tar.Header) int {
+	n := 0
+	if len(h.PAXRecords) > 0 {
+		n++
+	}
+	if h.Format&tar.FormatGNU != 0 {
+		if len(h.Name) > 100 {
+			n++ // a GNU long name record
+		}
+		if len(h.Linkname) > 100 {
+			n++ // a GNU long link record
+		}
+	}
+	return n
+}
+
+// streamErr maps an error reading the copy stream.
+func streamErr(err error) error {
+	if errors.Is(err, errBudget) {
+		return errBudget
+	}
+	return fmt.Errorf("%w: %w", ErrBadStream, err)
 }
 
 // cleanRel validates a relative entry path: valid UTF-8 without control
@@ -148,15 +207,25 @@ func newTree() *tree { return &tree{names: map[string]bool{}, dirs: map[string]b
 // entries to w. Only regular files and directories are kept; links,
 // pipes, devices and entries with unsafe paths are skipped and reported.
 // Kept entries get uid and gid 0, masked modes and no extended attributes.
-// More than maxContent bytes of file content is ErrTooLarge, more than
-// MaxEntries entries ErrTooManyEntries; both stop at once.
+// Every entry's content counts against maxContent, also a skipped one's,
+// and is refused before it is read: more is ErrTooLarge, like a stream
+// longer than maxContent plus EntryAllowance per entry. More than
+// MaxEntries headers is ErrTooManyEntries. Both stop at once.
 func Normalize(r io.Reader, base string, maxContent int64, w io.Writer) (Result, error) {
+	return NormalizeRedacted(r, base, maxContent, nil, w)
+}
+
+// NormalizeRedacted is Normalize with redact applied to the raw name of
+// every listed skipped entry before it is sanitised (nil: none).
+func NormalizeRedacted(r io.Reader, base string, maxContent int64, redact func(string) string, w io.Writer) (Result, error) {
 	var res Result
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
-	tr := tar.NewReader(r)
-	t := newTree()
 	entries := 0
+	br := &budgetReader{r: r, limit: func() int64 { return maxContent + int64(entries+2)*EntryAllowance }}
+	tr := tar.NewReader(br)
+	t := newTree()
+	var data int64 // content of every entry so far, kept or not
 	var head *headWriter
 	for {
 		h, err := tr.Next()
@@ -164,19 +233,23 @@ func Normalize(r io.Reader, base string, maxContent int64, w io.Writer) (Result,
 			break
 		}
 		if err != nil {
-			return res, fmt.Errorf("%w: %w", ErrBadStream, err)
+			return res, streamErr(err)
 		}
-		entries++
+		entries += 1 + metaRecords(h)
 		if entries > MaxEntries {
 			return res, ErrTooManyEntries
 		}
+		if h.Size < 0 || h.Size > maxContent-data {
+			return res, ErrTooLarge
+		}
+		data += h.Size
 		name := strings.TrimSuffix(h.Name, "/")
 		if name == base {
 			continue // the directory itself
 		}
 		rel, ok := strings.CutPrefix(name, base+"/")
 		if !ok {
-			res.skip(name, "invalid path")
+			res.skip(name, "invalid path", redact)
 			continue
 		}
 		kind := ""
@@ -196,16 +269,16 @@ func Normalize(r io.Reader, base string, maxContent int64, w io.Writer) (Result,
 		}
 		switch {
 		case kind != "":
-			res.skip(rel, kind)
+			res.skip(rel, kind, redact)
 			continue
 		case !cleanRel(rel):
-			res.skip(rel, "invalid path")
+			res.skip(rel, "invalid path", redact)
 			continue
 		case t.names[rel]:
-			res.skip(rel, "duplicate")
+			res.skip(rel, "duplicate", redact)
 			continue
 		case !t.dirs[path.Dir(rel)]:
-			res.skip(rel, "outside a kept directory")
+			res.skip(rel, "outside a kept directory", redact)
 			continue
 		}
 		t.names[rel] = true
@@ -220,9 +293,6 @@ func Normalize(r io.Reader, base string, maxContent int64, w io.Writer) (Result,
 			res.Dirs++
 			continue
 		}
-		if h.Size < 0 || h.Size > maxContent-res.ContentBytes {
-			return res, ErrTooLarge
-		}
 		out.Typeflag, out.Mode, out.Size = tar.TypeReg, fileMode(h.Mode), h.Size
 		if err := tw.WriteHeader(out); err != nil {
 			return res, err
@@ -234,7 +304,7 @@ func Normalize(r io.Reader, base string, maxContent int64, w io.Writer) (Result,
 		}
 		n, err := io.Copy(dst, io.LimitReader(tr, h.Size))
 		if err != nil {
-			return res, fmt.Errorf("%w: %w", ErrBadStream, err)
+			return res, streamErr(err) // a write error (no space) stays matchable
 		}
 		if n != h.Size {
 			return res, fmt.Errorf("%w: short file", ErrBadStream)

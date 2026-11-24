@@ -198,13 +198,23 @@ func (s *Store) path(file string) (string, error) {
 	return filepath.Join(s.dir, file), nil
 }
 
-// OpenFile opens a stored archive for reading.
+// OpenFile opens a stored archive for reading: without following a link
+// (the name must be a regular file, and the opened file must be the one
+// the name named), ErrMissing otherwise. Read and serve that open file
+// only, never the name again.
 func (s *Store) OpenFile(file string) (*os.File, fs.FileInfo, error) {
 	p, err := s.path(file)
 	if err != nil {
 		return nil, nil, err
 	}
-	f, err := os.Open(p)
+	named, err := os.Lstat(p)
+	if errors.Is(err, fs.ErrNotExist) || (err == nil && !named.Mode().IsRegular()) {
+		return nil, nil, ErrMissing
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	f, err := os.OpenFile(p, os.O_RDONLY|noFollow, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil, ErrMissing
 	}
@@ -212,32 +222,49 @@ func (s *Store) OpenFile(file string) (*os.File, fs.FileInfo, error) {
 		return nil, nil, err
 	}
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
+	if err != nil || !info.Mode().IsRegular() || !os.SameFile(named, info) {
 		f.Close()
 		return nil, nil, ErrMissing
 	}
 	return f, info, nil
 }
 
+// OpenVerified opens a stored archive like OpenFile and checks that it has
+// the recorded size and SHA-256 (ErrMissing otherwise). The returned file
+// is positioned at its start, so the caller reads exactly the bytes that
+// were verified.
+func (s *Store) OpenVerified(file string, size int64, sum string) (*os.File, error) {
+	f, info, err := s.OpenFile(file)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() != size {
+		f.Close()
+		return nil, ErrMissing
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err == nil && (n != size || hex.EncodeToString(h.Sum(nil)) != sum) {
+		err = ErrMissing
+	}
+	if err == nil {
+		_, err = f.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 // Verify checks that the archive exists with the recorded size and
 // SHA-256 (ErrMissing otherwise).
 func (s *Store) Verify(file string, size int64, sum string) error {
-	f, info, err := s.OpenFile(file)
+	f, err := s.OpenVerified(file, size, sum)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	if info.Size() != size {
-		return ErrMissing
-	}
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return err
-	}
-	if hex.EncodeToString(h.Sum(nil)) != sum {
-		return ErrMissing
-	}
-	return nil
+	return f.Close()
 }
 
 // Remove deletes a stored archive (a missing file is not an error).

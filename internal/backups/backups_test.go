@@ -333,3 +333,160 @@ func TestStoreCommitSweepVerifyDelete(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+// countingReader counts the bytes read from r.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// rawBlock is a ustar header block written by hand (the tar writer refuses
+// to write some of the records a hostile stream can hold).
+func rawBlock(name string, typ byte, size int) []byte {
+	b := make([]byte, 512)
+	copy(b[0:100], name)
+	copy(b[100:108], "0000644\x00")
+	copy(b[108:116], "0000000\x00")
+	copy(b[116:124], "0000000\x00")
+	copy(b[124:136], []byte(strings.Repeat("0", 11-len(strconvOct(size)))+strconvOct(size)+"\x00"))
+	copy(b[136:148], "00000000000\x00")
+	b[156] = typ
+	copy(b[257:265], "ustar\x0000")
+	copy(b[148:156], "        ")
+	sum := 0
+	for _, c := range b {
+		sum += int(c)
+	}
+	chk := strconvOct(sum)
+	copy(b[148:156], strings.Repeat("0", 6-len(chk))+chk+"\x00 ")
+	return b
+}
+
+func strconvOct(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	s := ""
+	for ; n > 0; n /= 8 {
+		s = string(rune('0'+n%8)) + s
+	}
+	return s
+}
+
+func padded(b []byte) []byte {
+	if r := len(b) % 512; r != 0 {
+		b = append(b, make([]byte, 512-r)...)
+	}
+	return b
+}
+
+// One input budget: the content of a skipped entry counts and is refused
+// before it is read, the PAX records before entries count towards the
+// entry limit, and a stream of records that never reaches an entry stops
+// once it exceeds the byte budget.
+func TestNormalizeInputBudget(t *testing.T) {
+	// A regular file with a name that is not allowed is still content.
+	big := strings.Repeat("z", 5000)
+	in := dockerTar(t, reg("a", "x"), entry{name: "data/../big", typ: tar.TypeReg, data: big})
+	cr := &countingReader{r: bytes.NewReader(in)}
+	if _, err := Normalize(cr, "data", 1000, io.Discard); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("%v", err)
+	}
+	if cr.n >= int64(len(in))-1000 {
+		t.Fatalf("read %d of %d bytes: the oversized entry was drained", cr.n, len(in))
+	}
+	// An oversized header of a type without content is refused as well.
+	var hb bytes.Buffer
+	hb.Write(rawBlock("data/", tar.TypeDir, 0))
+	hb.Write(rawBlock("data/fifo", tar.TypeFifo, 1<<30))
+	hb.Write(make([]byte, 1024))
+	if _, err := Normalize(bytes.NewReader(hb.Bytes()), "data", 1000, io.Discard); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("%v", err)
+	}
+	// Every entry here carries a PAX record: two headers each.
+	var half []entry
+	for i := 0; i < MaxEntries/2+1; i++ {
+		half = append(half, entry{name: "data/p" + strings.Repeat("x", i%5), typ: tar.TypeFifo})
+	}
+	if _, err := Normalize(bytes.NewReader(dockerTar(t, half...)), "data", 1<<20, io.Discard); !errors.Is(err, ErrTooManyEntries) {
+		t.Fatalf("%v", err)
+	}
+	// Records that pile up before any entry: stopped by the byte budget,
+	// without reading the rest of the stream.
+	var chain bytes.Buffer
+	chain.Write(rawBlock("data/", tar.TypeDir, 0))
+	rec := "4105 comment=" + strings.Repeat("c", 4091) + "\n"
+	for i := 0; i < 200; i++ {
+		chain.Write(rawBlock("PaxHeaders/x", tar.TypeXHeader, len(rec)))
+		chain.Write(padded([]byte(rec)))
+	}
+	chain.Write(rawBlock("data/f", tar.TypeReg, 0))
+	chain.Write(make([]byte, 1024))
+	cr = &countingReader{r: bytes.NewReader(chain.Bytes())}
+	if _, err := Normalize(cr, "data", 1000, io.Discard); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("%v", err)
+	}
+	if limit := int64(1000 + 3*EntryAllowance); cr.n > limit {
+		t.Fatalf("read %d bytes, budget %d", cr.n, limit)
+	}
+}
+
+// Names of skipped entries are redacted before they are sanitised.
+func TestNormalizeRedactsSkippedNames(t *testing.T) {
+	in := dockerTar(t, reg("a", "x"), entry{name: "data/sec-ret-value\x1b", typ: tar.TypeSymlink, link: "/"})
+	res, err := NormalizeRedacted(bytes.NewReader(in), "data", 1<<20, func(s string) string { return strings.ReplaceAll(s, "sec-ret-value", "[redacted]") }, io.Discard)
+	if err != nil || len(res.Skipped) != 1 || res.Skipped[0].Name != `[redacted]\x1b` {
+		t.Fatalf("%+v %v", res, err)
+	}
+}
+
+// Archives are opened once, without following links: a link or a
+// directory under an archive's name is missing, and the verified open
+// file is read from its start.
+func TestOpenVerifiedDoesNotFollowLinks(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "backups"), Options{CheckFree: func(string, int64) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := s.Create()
+	_, _ = p.Write([]byte("archive bytes"))
+	file, size, sum, err := p.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := s.OpenVerified(file, size, sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(f)
+	f.Close()
+	if string(got) != "archive bytes" {
+		t.Fatalf("%q", got)
+	}
+	if _, err := s.OpenVerified(file, size+1, sum); !errors.Is(err, ErrMissing) {
+		t.Fatalf("%v", err)
+	}
+	dirName := strings.Repeat("d", 32) + ".tar.gz"
+	if err := os.Mkdir(filepath.Join(s.Dir(), dirName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.OpenFile(dirName); !errors.Is(err, ErrMissing) {
+		t.Fatalf("directory: %v", err)
+	}
+	link := strings.Repeat("e", 32) + ".tar.gz"
+	if err := os.Symlink(filepath.Join(s.Dir(), file), filepath.Join(s.Dir(), link)); err != nil {
+		t.Skipf("cannot create a symbolic link here: %v", err)
+	}
+	if _, _, err := s.OpenFile(link); !errors.Is(err, ErrMissing) {
+		t.Fatalf("link: %v", err)
+	}
+	if err := s.Verify(link, size, sum); !errors.Is(err, ErrMissing) {
+		t.Fatalf("link: %v", err)
+	}
+}
