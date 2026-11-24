@@ -184,7 +184,7 @@ function GameHostSection() {
   );
 }
 
-const MODE_LABELS: Record<CertificateMode, string> = { self_signed: "Self-signed", custom: "Custom certificate" };
+const MODE_LABELS: Record<CertificateMode, string> = { self_signed: "Self-signed", custom: "Custom certificate", acme: "Automatic" };
 
 /**
  * The game certificate: the mode, what it means, the installed custom
