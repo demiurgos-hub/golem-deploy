@@ -2,6 +2,8 @@
 
 `scripts/install.sh` installs an already built `golem-deploy` binary as a systemd service on **Ubuntu or Debian**. It is a minimal installer: it does not download releases, install Docker, configure certificates or touch the firewall. A full installer (checksum-verified releases, Docker installation, setup link, certificate management) will replace it.
 
+Windows with Docker Desktop is supported for development only. On Windows, Golem Deploy leaves the data directory ACL unchecked and unchanged. Certificate keys and temporary environment files inherit its permissions. Run production installations on Linux.
+
 ## Requirements
 
 - Ubuntu or Debian with systemd as the init system, and root access.
