@@ -185,14 +185,14 @@ func TestRunSuccess(t *testing.T) {
 	if err != nil || b.Status != store.BuildStatusSuccess {
 		t.Fatalf("%v %+v\n%s", err, b, log)
 	}
-	if b.ImageTag != "golem-deploy/arena:cccccccccccc" || b.EngineVersion != "v0.4.0-rc.1" || !strings.HasPrefix(b.ImageID, "sha256:") ||
+	if b.ImageTag != fmt.Sprintf("golem-deploy/arena:cccccccccccc-b%d", b.ID) || b.EngineVersion != "v0.4.0-rc.1" || !strings.HasPrefix(b.ImageID, "sha256:") ||
 		b.Commit != strings.Repeat("c", 40) || b.StartedAt == nil || b.FinishedAt == nil || b.Detail != "" {
 		t.Fatalf("recorded %+v", b)
 	}
 	// Exact argv: only validated values, the context last after "--".
 	dfDir := filepath.Dir(call.Args[2])
 	buildDir := filepath.Dir(dfDir)
-	want := []string{"build", "--file", filepath.Join(buildDir, "docker", "Dockerfile"), "--tag", "golem-deploy/arena:cccccccccccc",
+	want := []string{"build", "--file", filepath.Join(buildDir, "docker", "Dockerfile"), "--tag", fmt.Sprintf("golem-deploy/arena:cccccccccccc-b%d", b.ID),
 		"--label", "dev.golemengine.deploy.managed=true",
 		"--label", "dev.golemengine.deploy.instance=" + dockertest.InstanceID,
 		"--label", fmt.Sprintf("dev.golemengine.deploy.project-id=%d", p.ID),

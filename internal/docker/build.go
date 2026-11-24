@@ -57,13 +57,18 @@ var (
 	engineVersionRE = regexp.MustCompile(`^v[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}(-[0-9A-Za-z.-]{1,100})?$`)
 )
 
-// Tag returns the image tag of the build.
+// Tag returns the image tag of the build:
+// golem-deploy/<project>:<commit[:12]>-b<build id>. Every build has a tag of
+// its own: with Docker's containerd image store, moving a tag to another
+// image deletes the image it named (even while containers run from it), so
+// a tag shared by two builds of one commit would delete the older build's
+// image, which servers may still run.
 func (s BuildSpec) Tag() string {
 	c := s.Commit
 	if len(c) > 12 {
 		c = c[:12]
 	}
-	return "golem-deploy/" + s.ProjectName + ":" + c
+	return "golem-deploy/" + s.ProjectName + ":" + c + "-b" + strconv.FormatInt(s.BuildID, 10)
 }
 
 // Labels returns the labels the build sets from the command line, which

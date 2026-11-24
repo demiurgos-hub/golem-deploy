@@ -151,8 +151,8 @@ type BuildOutcome struct {
 	ExtraLabels map[string]string
 	// NoMetadata leaves the metadata file unwritten; ContainerdStore
 	// writes an iidfile that does not resolve (the config digest) and puts
-	// the real id only in the metadata file, like the containerd image
-	// store.
+	// the real id only in the metadata file, and deletes an image whose
+	// last tag the build takes over, like the containerd image store.
 	NoMetadata      bool
 	ContainerdStore bool
 	// AssignPort is the image's Image.AssignPort (for example the port of
@@ -1178,6 +1178,11 @@ func (f *Fake) build(ctx context.Context, a []string, stdout, stderr io.Writer) 
 	config := fmt.Sprintf("sha256:%064x", 0xcf000000+f.seq)
 	if old := f.findImage(call.Tag); old != nil {
 		old.Tags = slices.DeleteFunc(old.Tags, func(t string) bool { return t == call.Tag })
+		if out.ContainerdStore && len(old.Tags) == 0 {
+			// The containerd image store deletes an image whose last name
+			// moves to another image, even while containers use it.
+			delete(f.images, old.ID)
+		}
 	}
 	f.images[id] = &Image{ID: id, Tags: []string{call.Tag}, Labels: labels, Size: 1234, AssignPort: out.AssignPort}
 	f.mu.Unlock()

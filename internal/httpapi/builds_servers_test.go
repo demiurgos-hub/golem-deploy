@@ -140,3 +140,36 @@ func (b *buildHarness) getServerContainer(id int64) string {
 	}
 	return sv.ContainerID
 }
+
+// Rebuilding a commit must not take the older build's image away from the
+// servers running it: every build has its own tag, because the containerd
+// image store deletes an image whose last tag moves to another image.
+func TestRebuildKeepsOlderBuildImage(t *testing.T) {
+	b := newBuildHarness(t)
+	p := b.project("arena")
+	b.fake.SetBuildHook(func(dockertest.BuildCall) dockertest.BuildOutcome {
+		return dockertest.BuildOutcome{AssignPort: b.gameAdmin.Port, ContainerdStore: true}
+	})
+	build := func() apitypes.Build {
+		res := b.startBuild(b.devTok, p.ID, nil)
+		if j := b.waitJob(res.Job); j.Status != store.JobSuccess {
+			t.Fatalf("build: %s", j.Detail)
+		}
+		return b.getBuild(res.Build.ID)
+	}
+	first := build()
+	sv := b.createServer(b.devTok, apitypes.CreateServerRequest{Name: "s", BuildID: first.ID})
+	if j := b.action(b.devTok, sv.ID, "start"); j.Status != store.JobSuccess {
+		t.Fatalf("start: %s", j.Detail)
+	}
+	second := build()
+	if second.Commit != first.Commit || second.ImageTag == first.ImageTag {
+		t.Fatalf("tags %q and %q", first.ImageTag, second.ImageTag)
+	}
+	if !b.fake.HasImage(first.ImageID) {
+		t.Fatal("the first build's image was deleted by the rebuild")
+	}
+	if j := b.action(b.devTok, sv.ID, "restart"); j.Status != store.JobSuccess {
+		t.Fatalf("restart on the first build: %s", j.Detail)
+	}
+}

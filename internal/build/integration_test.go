@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"io/fs"
 	"net"
@@ -184,7 +185,7 @@ func TestIntegrationBuildFixtureGame(t *testing.T) {
 			t.Errorf("build log contains %q", leak)
 		}
 	}
-	if got.EngineVersion != "v0.4.0-rc.1" || got.ImageTag != "golem-deploy/"+name+":abababababab" {
+	if got.EngineVersion != "v0.4.0-rc.1" || got.ImageTag != fmt.Sprintf("golem-deploy/%s:abababababab-b%d", name, got.ID) {
 		t.Errorf("recorded %+v", got)
 	}
 	labels, err := dockerCLI(t, "image", "inspect", "--format", "{{json .Config.Labels}} {{.Config.User}} {{json .Config.Entrypoint}} {{.Config.WorkingDir}}", got.ImageID)

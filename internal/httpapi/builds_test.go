@@ -122,7 +122,7 @@ func TestBuildLifecycle(t *testing.T) {
 		t.Fatalf("job %+v\n%s", j, b.jobLog(res.Job.ID))
 	}
 	got := b.getBuild(res.Build.ID)
-	if got.Status != apitypes.BuildStatusSuccess || got.ImageTag != "golem-deploy/arena:aaaaaaaaaaaa" || got.EngineVersion != "v0.4.0-rc.1" ||
+	if got.Status != apitypes.BuildStatusSuccess || got.ImageTag != fmt.Sprintf("golem-deploy/arena:aaaaaaaaaaaa-b%d", got.ID) || got.EngineVersion != "v0.4.0-rc.1" ||
 		got.Commit != strings.Repeat("a", 40) || got.StartedAt == nil || got.FinishedAt == nil || len(got.ServerIDs) != 0 {
 		t.Fatalf("%+v", got)
 	}

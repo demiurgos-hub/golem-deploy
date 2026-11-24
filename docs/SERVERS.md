@@ -12,7 +12,7 @@ Every installation has a random **instance id** (32 hex characters, generated on
 |--------|------|--------|
 | Server container | `golem-deploy-<server name>` | `managed`, `instance`, `server-id`, `server`, `project-id`, `commit`, `build-id`, `engine-version`, `config-hash` — all set explicitly on every run (empty when not applicable), so no value can be inherited from the image |
 | Network | `golem-deploy` (user-defined bridge, no inter-container traffic) | `managed`, `instance` |
-| Image | `golem-deploy/<project>:<commit[:12]>`, built by a build ([BUILDS.md](BUILDS.md)) | `managed`, `instance`, `project-id`, `commit`, `build-id`, `engine-version` |
+| Image | `golem-deploy/<project>:<commit[:12]>-b<build id>`, built by a build ([BUILDS.md](BUILDS.md)) | `managed`, `instance`, `project-id`, `commit`, `build-id`, `engine-version` |
 | Volume | server data volumes (next milestone) | `managed`, `instance`, `server-id`, `server` |
 
 **A server's container is the container whose id the daemon recorded when it created it** (column `servers.container_id`), never "a container with the right labels": containers inherit the labels of their image, and once images are built from repositories, repository authors control image labels. The recorded container's labels are verified on every inspect as a second check. A container that carries the labels but is not a recorded container is ignored (not reported, read, stopped or removed) and logged once as a foreign container. Containers, images and volumes without the labels are invisible to the API and never touched. If a container named `golem-deploy-<name>` or a network named `golem-deploy` exists that this installation does not manage, starting a server fails with a message instead of touching it.
