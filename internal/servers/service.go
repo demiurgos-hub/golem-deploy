@@ -34,13 +34,14 @@ import (
 // Errors returned by Service. Handlers map them to API errors; docker
 // errors (docker.ErrUnavailable in particular) pass through wrapped.
 var (
-	ErrNotFound    = errors.New("servers: not found")
-	ErrNameTaken   = errors.New("servers: name taken")
-	ErrPortInUse   = errors.New("servers: port in use")
-	ErrNoContainer = errors.New("servers: server has no container")
-	ErrNotRunning  = errors.New("servers: server is not running")
-	ErrInUse       = errors.New("servers: object is in use")
-	ErrConflict    = errors.New("servers: conflicting change")
+	ErrNotFound      = errors.New("servers: not found")
+	ErrNameTaken     = errors.New("servers: name taken")
+	ErrPortInUse     = errors.New("servers: port in use")
+	ErrNoContainer   = errors.New("servers: server has no container")
+	ErrNotRunning    = errors.New("servers: server is not running")
+	ErrInUse         = errors.New("servers: object is in use")
+	ErrJobInProgress = store.ErrServerJob
+	ErrConflict      = errors.New("servers: conflicting change")
 	// ErrRunning: the change needs the server to be stopped first (its
 	// port cannot change while its container runs).
 	ErrRunning = errors.New("servers: server is running")
@@ -156,10 +157,7 @@ func (s *Service) params(ctx context.Context) (runtimeParams, error) {
 	}
 	p := runtimeParams{gameHost: host}
 	if s.cfg.Certs != nil {
-		if p.certMode, err = s.cfg.Certs.Mode(ctx); err != nil {
-			return runtimeParams{}, err
-		}
-		p.certDir, p.groupAdd = s.cfg.Certs.Dir(), s.cfg.Certs.GroupAdd()
+		p.groupAdd = s.cfg.Certs.GroupAdd()
 	}
 	return p, nil
 }
@@ -315,7 +313,7 @@ func (c *buildCache) get(ctx context.Context, sv store.Server) (*store.Build, er
 // view renders a server. b is its build (nil when it has none), ct its
 // recorded container (nil when it has none); dockerOK false means runtime
 // state is unknown.
-func (s *Service) view(sv store.Server, b *store.Build, p runtimeParams, ct *docker.Container, dockerOK bool) (apitypes.Server, error) {
+func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p runtimeParams, ct *docker.Container, dockerOK bool) (apitypes.Server, error) {
 	env, err := s.openEnv(sv)
 	if err != nil {
 		return apitypes.Server{}, err
@@ -336,6 +334,14 @@ func (s *Service) view(sv store.Server, b *store.Build, p runtimeParams, ct *doc
 		State:          apitypes.ServerStateMissing,
 		CreatedAt:      sv.CreatedAt.UTC(),
 		UpdatedAt:      sv.UpdatedAt.UTC(),
+	}
+	if s.cfg.Certs != nil {
+		info, err := s.cfg.Certs.Current(ctx, sv.ID)
+		if err != nil {
+			return apitypes.Server{}, err
+		}
+		out.Certificate = info.APIInfo(p.gameHost)
+		p.certMode, p.certDir = info.Mode, s.cfg.Certs.ServerDir(sv.ID)
 	}
 	if b != nil {
 		pid := b.ProjectID
@@ -389,15 +395,21 @@ func (s *Service) containers(rows []store.Server, cts []docker.Container) map[in
 	}
 	out := map[int64]*docker.Container{}
 	claimed := map[string]bool{}
+	pending := map[int64]store.Server{}
 	for _, sv := range rows {
+		if sv.PendingLaunch != "" {
+			pending[sv.ID] = sv
+		}
 		if ct := byID[sv.ContainerID]; ct != nil && s.docker.IsServerContainer(*ct, ref(sv)) {
 			out[sv.ID] = ct
 			claimed[ct.ID] = true
 		}
 	}
 	for i := range cts {
-		if !claimed[cts[i].ID] {
-			s.logForeign(cts[i])
+		ct := cts[i]
+		sv := pending[ct.ServerID]
+		if !claimed[ct.ID] && !s.docker.IsPendingServerContainer(ct, sv.ID, sv.Name, sv.PendingLaunch) {
+			s.logForeign(ct)
 		}
 	}
 	return out
@@ -428,7 +440,7 @@ func (s *Service) List(ctx context.Context) ([]apitypes.Server, error) {
 		if err != nil {
 			return nil, err
 		}
-		v, err := s.view(sv, b, p, byServer[sv.ID], derr == nil)
+		v, err := s.view(ctx, sv, b, p, byServer[sv.ID], derr == nil)
 		if err != nil {
 			return nil, err
 		}
@@ -471,7 +483,7 @@ func (s *Service) viewOne(ctx context.Context, sv store.Server, ct *docker.Conta
 	if err != nil {
 		return apitypes.Server{}, err
 	}
-	return s.view(sv, b, p, ct, dockerOK)
+	return s.view(ctx, sv, b, p, ct, dockerOK)
 }
 
 // Get returns one server with runtime state.
@@ -663,11 +675,6 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 			return apitypes.Server{}, fieldErr("env_unset", "a variable cannot be in both env_set and env_unset")
 		}
 	}
-	if req.Port != nil {
-		if err := s.checkPort("port", *req.Port); err != nil {
-			return apitypes.Server{}, err
-		}
-	}
 	var origins []string
 	if req.AllowedOrigins != nil {
 		var err error
@@ -675,12 +682,6 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 			return apitypes.Server{}, err
 		}
 	}
-	if req.BuildID != nil {
-		if _, err := s.resolveBuild(ctx, "build_id", *req.BuildID); err != nil {
-			return apitypes.Server{}, err
-		}
-	}
-
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	var updated store.Server
@@ -689,13 +690,30 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 		if err != nil {
 			return apitypes.Server{}, err
 		}
-		u := store.ServerUpdate{BuildID: req.BuildID, SetOrigins: req.AllowedOrigins != nil, AllowedOrigins: origins}
-		if req.Port != nil && (sv.Port == nil || *sv.Port != *req.Port) {
+		u := store.ServerUpdate{SetOrigins: req.AllowedOrigins != nil, AllowedOrigins: origins}
+		portChange := req.Port != nil && (sv.Port == nil || *sv.Port != *req.Port)
+		buildChange := req.BuildID != nil && (sv.BuildID == nil || *sv.BuildID != *req.BuildID)
+		if portChange || buildChange {
+			if err := s.store.CheckServerJob(ctx, id); err != nil {
+				return apitypes.Server{}, err
+			}
+		}
+		if buildChange {
+			if _, err := s.resolveBuild(ctx, "build_id", *req.BuildID); err != nil {
+				return apitypes.Server{}, err
+			}
+			u.BuildID = req.BuildID
+		}
+		if portChange {
+			if err := s.checkPort("port", *req.Port); err != nil {
+				return apitypes.Server{}, err
+			}
 			if err := s.checkStopped(ctx, sv); err != nil {
 				return apitypes.Server{}, err
 			}
 			p := *req.Port
 			u.Port = &p
+			u.PrevContainerID = sv.ContainerID
 		}
 		if len(req.EnvSet) > 0 || len(req.EnvUnset) > 0 {
 			env, err := s.openEnv(sv)
@@ -729,6 +747,8 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 		switch {
 		case errors.Is(err, store.ErrStale):
 			return apitypes.Server{}, ErrConflict
+		case errors.Is(err, store.ErrServerProject):
+			return apitypes.Server{}, fieldErr("build_id", "the build must belong to the server's project")
 		case errors.Is(err, store.ErrMissingReference):
 			return apitypes.Server{}, errBuildGone
 		case errors.Is(err, store.ErrConflict):

@@ -1,35 +1,13 @@
-// Package certs owns the installation's game certificate: one TLS
-// certificate and key, stored as tls.crt and tls.key in the data
-// directory's certs/game/ and bind-mounted read-only into every server
-// container, where the engine serves it for WebTransport and the HTTPS
-// sidecar and reloads it when the files change.
-//
-// The certificate has a mode, stored in the settings table:
-//
-//   - self_signed (the default): the daemon generates an ECDSA P-256
-//     certificate valid for 13 days (WebTransport serverCertificateHashes
-//     pinning accepts at most 14) for the game host, localhost and the
-//     loopback addresses. It is regenerated when the game host changes and
-//     rotated when less than RenewBefore of its validity remains (Ensure,
-//     called at startup, hourly by Maintain and before every server start).
-//   - custom: an admin uploads a PEM chain and key (UseCustom), which are
-//     validated and stored as given; the daemon never changes them.
-//
-// A certificate manager (ACME) is meant to become a third mode on top of
-// the same files: it writes through install, and Ensure renews it.
-//
-// Files are replaced atomically and in a fixed order (see install), so a
-// running engine either keeps the old pair or loads the new one. The
-// container user (uid 65532) reads them through the group: on Unix the
-// directory is 0750 and the key 0640, owned by the daemon's group, and the
-// container gets that group as a supplementary group (GroupAdd); when the
-// daemon runs with group 0 the files get group 65532 (the container's own
-// group) instead, so no container is ever given group 0.
+// Package certs manages the game TLS files on their per-server read-only
+// mounts. Self-signed servers have independent keys. In custom mode each
+// mount receives a copy of the administrator's pair.
 package certs
 
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -47,6 +25,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 )
 
 // Mode is how the game certificate is obtained.
@@ -110,6 +90,7 @@ const SettingMode = "game_certificate_mode"
 type Settings interface {
 	GetSetting(ctx context.Context, key string) (string, bool, error)
 	SetSetting(ctx context.Context, key, value string) error
+	ListServerIDs(ctx context.Context) ([]int64, error)
 }
 
 // Options configures Open.
@@ -150,10 +131,24 @@ func (i Info) Covers(host string) bool {
 	return i.leaf.VerifyHostname(host) == nil
 }
 
+// APIInfo maps an installed leaf to its public metadata.
+func (i Info) APIInfo(host string) *apitypes.CertificateInfo {
+	if i.Fingerprint == "" {
+		return nil
+	}
+	return &apitypes.CertificateInfo{
+		Subject: i.Subject, Issuer: i.Issuer,
+		DNSNames: append([]string{}, i.DNSNames...), IPAddresses: append([]string{}, i.IPAddresses...),
+		NotBefore: i.NotBefore.UTC(), NotAfter: i.NotAfter.UTC(),
+		FingerprintSHA256: i.Fingerprint, SelfSigned: i.SelfSigned, ChainLength: i.ChainLength,
+		CoversGameHost: i.Covers(host),
+	}
+}
+
 // Manager owns the certificate directory. It is safe for concurrent use;
 // changes are serialised.
 type Manager struct {
-	dir      string
+	dir      string // canonical custom pair (also read on upgrades)
 	settings Settings
 	logger   *slog.Logger
 	now      func() time.Time
@@ -185,113 +180,142 @@ func Open(o Options) (*Manager, error) {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return nil, fmt.Errorf("create certificate directory: %w", err)
 	}
-	if err := os.Mkdir(dir, 0o750); err != nil && !errors.Is(err, os.ErrExist) {
-		return nil, fmt.Errorf("create certificate directory: %w", err)
-	}
-	fi, err := os.Lstat(dir)
-	if err != nil {
+	if err := syncDir(filepath.Dir(filepath.Dir(dir))); err != nil {
 		return nil, err
 	}
-	if !fi.IsDir() {
-		return nil, fmt.Errorf("certificate directory %s is not a directory", dir)
-	}
-	if err := m.setPerm(dir, 0o750); err != nil {
+	if err := m.prepareDir(dir); err != nil {
 		return nil, err
 	}
-	m.recoverPending()
+	if err := m.openFiles(context.Background()); err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
-// Dir returns the absolute certificate directory (the bind mount source).
-func (m *Manager) Dir() string { return m.dir }
+// ServerDir is the stable bind mount source used in both modes.
+func (m *Manager) ServerDir(id int64) string {
+	return filepath.Join(m.serversDir(), fmt.Sprint(id))
+}
+
+func (m *Manager) serversDir() string {
+	return filepath.Join(filepath.Dir(m.dir), "servers")
+}
 
 // GroupAdd returns the supplementary groups a server container needs to
 // read the files (nil when none are needed, e.g. on Windows hosts).
 func (m *Manager) GroupAdd() []int { return slices.Clone(m.groupAdd) }
 
-// Mode returns the configured mode.
+// Mode returns the configured mode after completing any committed change.
 func (m *Manager) Mode(ctx context.Context) (Mode, error) {
-	v, ok, err := m.settings.GetSetting(ctx, SettingMode)
-	if err != nil {
-		return "", err
-	}
-	if !ok || v == "" {
-		return ModeSelfSigned, nil
-	}
-	if !Mode(v).Valid() {
-		return "", fmt.Errorf("certs: unknown certificate mode %q in settings", v)
-	}
-	return Mode(v), nil
-}
-
-// Current returns the installed certificate without changing anything
-// (ErrNoCertificate when none is installed).
-func (m *Manager) Current(ctx context.Context) (Info, error) {
-	mode, err := m.Mode(ctx)
-	if err != nil {
-		return Info{}, err
-	}
-	info, err := m.load()
-	if err != nil {
-		return Info{}, err
-	}
-	info.Mode = mode
-	return info, nil
-}
-
-// Ensure makes sure a usable certificate for host is installed and returns
-// it. In self_signed mode it generates one when none is installed, when
-// the installed one is not self-signed, does not name exactly host,
-// localhost and the loopback addresses, is not yet valid or has less than
-// RenewBefore left. In custom mode it changes nothing and reports
-// ErrNoCertificate or ErrExpired.
-func (m *Manager) Ensure(ctx context.Context, host string) (Info, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	mode, err := m.Mode(ctx)
+	return m.state(ctx)
+}
+
+// Current returns certificate metadata for the configured mode. Pass 0 for
+// the installation view, which only describes a custom certificate.
+func (m *Manager) Current(ctx context.Context, id int64) (Info, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mode, err := m.state(ctx)
 	if err != nil {
 		return Info{}, err
 	}
-	info, lerr := m.load()
-	if mode == ModeCustom {
-		if lerr != nil {
-			return Info{}, lerr
+	dir := m.dir
+	if mode == ModeSelfSigned {
+		if id == 0 {
+			return Info{Mode: mode}, nil
 		}
+		dir = m.ServerDir(id)
+	}
+	info, err := load(dir)
+	info.Mode = mode
+	if errors.Is(err, ErrNoCertificate) {
+		return Info{Mode: mode}, nil
+	}
+	return info, err
+}
+
+// Ensure prepares a server's mount and returns the selected certificate.
+// In custom mode it never generates a missing pair.
+func (m *Manager) Ensure(ctx context.Context, id int64, gameHost func(context.Context) (string, error)) (Info, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mode, err := m.state(ctx)
+	if err != nil {
+		return Info{}, err
+	}
+	host, err := gameHost(ctx)
+	if err != nil {
+		return Info{}, err
+	}
+	dir := m.ServerDir(id)
+	if mode == ModeCustom {
+		info, err := load(m.dir)
 		info.Mode = mode
+		if err != nil {
+			return info, err
+		}
 		if !m.now().Before(info.NotAfter) {
 			return info, ErrExpired
 		}
-		return info, nil
+		if m.now().Before(info.NotBefore) {
+			return info, ErrNoCertificate
+		}
+		if current, err := load(dir); err == nil && current.Fingerprint == info.Fingerprint {
+			return info, nil
+		}
+		return info, m.copyPair(m.dir, dir)
 	}
-	if lerr == nil && m.selfSignedOK(info, host) {
-		info.Mode = mode
-		return info, nil
-	}
-	reason := "none installed"
-	if lerr == nil {
-		reason = "host or validity changed"
-	}
-	return m.generate(host, reason)
+	return m.ensureSelfSigned(dir, host)
 }
 
-// UseSelfSigned switches to self_signed mode and installs a freshly
-// generated certificate for host.
-func (m *Manager) UseSelfSigned(ctx context.Context, host string) (Info, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	info, err := m.generate(host, "requested")
+func (m *Manager) ensureSelfSigned(dir, host string) (Info, error) {
+	if err := m.recoverPending(dir); err != nil {
+		return Info{}, err
+	}
+	info, err := load(dir)
+	if err == nil && m.selfSignedOK(info, host) {
+		info.Mode = ModeSelfSigned
+		return info, nil
+	}
+	if err != nil && !errors.Is(err, ErrNoCertificate) {
+		return Info{}, err
+	}
+	chain, key, info, err := m.generate(host)
 	if err != nil {
 		return Info{}, err
 	}
-	if err := m.settings.SetSetting(ctx, SettingMode, string(ModeSelfSigned)); err != nil {
-		return Info{}, err
-	}
-	return info, nil
+	return info, m.install(dir, chain, key)
 }
 
-// UseCustom validates an uploaded PEM chain (leaf first) and private key,
-// installs them and switches to custom mode. Validation failures are
-// *ValidationError.
+// UseSelfSigned regenerates a distinct pair for every server.
+func (m *Manager) UseSelfSigned(ctx context.Context, gameHost func(context.Context) (string, error)) (Info, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	info := Info{Mode: ModeSelfSigned}
+	return info, m.change(ctx, ModeSelfSigned, func(stage string, ids []int64) error {
+		host, err := gameHost(ctx)
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			chain, key, _, err := m.generate(host)
+			if err != nil {
+				return err
+			}
+			if err := m.install(filepath.Join(stage, fmt.Sprint(id)), chain, key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// UseCustom validates and installs the administrator's shared pair.
 func (m *Manager) UseCustom(ctx context.Context, chainPEM, keyPEM []byte) (Info, error) {
 	chain, key, err := ValidateCustom(chainPEM, keyPEM, m.now())
 	if err != nil {
@@ -299,23 +323,43 @@ func (m *Manager) UseCustom(ctx context.Context, chainPEM, keyPEM []byte) (Info,
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.install(chain, key); err != nil {
+	if err := m.change(ctx, ModeCustom, func(stage string, ids []int64) error {
+		if err := m.install(filepath.Join(stage, "custom"), chain, key); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if err := os.Mkdir(filepath.Join(stage, fmt.Sprint(id)), 0o700); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		return Info{}, err
 	}
-	if err := m.settings.SetSetting(ctx, SettingMode, string(ModeCustom)); err != nil {
-		return Info{}, err
-	}
-	info, err := m.load()
-	if err != nil {
-		return Info{}, err
-	}
+	info, err := load(m.dir)
 	info.Mode = ModeCustom
-	m.logger.Info("custom game certificate installed", "fingerprint", info.Fingerprint, "not_after", info.NotAfter)
-	return info, nil
+	return info, err
 }
 
-// Maintain runs Ensure for the current game host every CheckInterval until
-// ctx is done (call Ensure once at startup first). Failures are logged.
+// RemoveServer removes the mount after the container is gone, then
+// deletes the row while holding the lock used to enumerate servers for
+// certificate replacements.
+func (m *Manager) RemoveServer(ctx context.Context, id int64, deleteRow func() error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, err := m.state(ctx); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(m.ServerDir(id)); err != nil {
+		return err
+	}
+	if err := syncDir(m.serversDir()); err != nil {
+		return err
+	}
+	return deleteRow()
+}
+
+// Maintain checks and rotates existing certificates hourly.
 func (m *Manager) Maintain(ctx context.Context, host func(context.Context) (string, error)) {
 	t := time.NewTicker(CheckInterval)
 	defer t.Stop()
@@ -324,27 +368,60 @@ func (m *Manager) Maintain(ctx context.Context, host func(context.Context) (stri
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			m.Check(ctx, host)
 		}
-		m.Check(ctx, host)
 	}
 }
 
-// Check runs Ensure once for the current game host and logs the outcome.
+// Check updates existing self-signed pairs for the current host, or warns
+// when the custom certificate is missing or approaching expiry.
 func (m *Manager) Check(ctx context.Context, host func(context.Context) (string, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.check(ctx, host); err != nil {
+		m.logger.Warn("game certificate check failed", "err", err)
+	}
+}
+
+func (m *Manager) check(ctx context.Context, host func(context.Context) (string, error)) error {
+	mode, err := m.state(ctx)
+	if err != nil {
+		return err
+	}
+	if mode == ModeCustom {
+		info, err := load(m.dir)
+		if err != nil {
+			return err
+		}
+		if left := info.NotAfter.Sub(m.now()); left <= 0 {
+			m.logger.Error("the custom game certificate has expired; upload a new one", "not_after", info.NotAfter)
+		} else if left < customWarnBefore {
+			m.logger.Warn("the custom game certificate expires soon; upload a renewed one", "not_after", info.NotAfter)
+		}
+		return nil
+	}
 	h, err := host(ctx)
 	if err != nil {
-		m.logger.Warn("could not read the game host for the certificate check", "err", err)
-		return
+		return err
 	}
-	info, err := m.Ensure(ctx, h)
-	switch {
-	case errors.Is(err, ErrExpired):
-		m.logger.Error("the custom game certificate has expired; upload a new one (PUT /api/v1/certificates/game)", "not_after", info.NotAfter)
-	case err != nil:
-		m.logger.Error("game certificate check failed", "err", err)
-	case info.Mode == ModeCustom && info.NotAfter.Sub(m.now()) < customWarnBefore:
-		m.logger.Warn("the custom game certificate expires soon; upload a renewed one", "not_after", info.NotAfter)
+	ids, err := m.settings.ListServerIDs(ctx)
+	if err != nil {
+		return err
 	}
+	var failures error
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		dir := m.ServerDir(id)
+		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+			continue // first start or an explicit regeneration creates it
+		}
+		if _, err := m.ensureSelfSigned(dir, h); err != nil {
+			failures = errors.Join(failures, err)
+		}
+	}
+	return failures
 }
 
 // selfSignedOK reports whether info is a usable generated certificate for
@@ -354,7 +431,8 @@ func (m *Manager) selfSignedOK(info Info, host string) bool {
 	if !info.SelfSigned || info.NotBefore.After(now) || info.NotAfter.Sub(now) < RenewBefore {
 		return false
 	}
-	if info.NotAfter.Sub(info.NotBefore) > 14*24*time.Hour {
+	key, ok := info.leaf.PublicKey.(*ecdsa.PublicKey)
+	if info.NotAfter.Sub(info.NotBefore) > SelfSignedValidity || !ok || key.Curve != elliptic.P256() {
 		return false
 	}
 	dns, ips := selfSignedNames(host)
@@ -368,15 +446,15 @@ func sortedCopy(s []string) []string {
 }
 
 // load reads and parses the installed pair.
-func (m *Manager) load() (Info, error) {
-	certPEM, err := os.ReadFile(filepath.Join(m.dir, CertFile))
+func load(dir string) (Info, error) {
+	certPEM, err := os.ReadFile(filepath.Join(dir, CertFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return Info{}, ErrNoCertificate
 	}
 	if err != nil {
 		return Info{}, err
 	}
-	keyPEM, err := os.ReadFile(filepath.Join(m.dir, KeyFile))
+	keyPEM, err := os.ReadFile(filepath.Join(dir, KeyFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return Info{}, ErrNoCertificate
 	}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -33,6 +34,8 @@ type Server struct {
 	AllowedOrigins []string
 	AdminPort      int
 	AdminToken     []byte `json:"-"`
+	PendingLaunch  string `json:"-"`
+	StartComplete  bool
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
@@ -41,14 +44,14 @@ type Server struct {
 // caller read it (a concurrent update won); the caller re-reads and retries.
 var ErrStale = errors.New("store: server changed concurrently")
 
-const serverCols = `id, name, build_id, port, env, desired_state, container_id, allowed_origins, admin_port, admin_token, created_at, updated_at`
+const serverCols = `id, name, build_id, port, env, desired_state, container_id, allowed_origins, admin_port, admin_token, pending_launch, start_complete, created_at, updated_at`
 
 func scanServer(r scanner) (Server, error) {
 	var sv Server
 	var buildID, port, adminPort sql.NullInt64
 	var containerID sql.NullString
 	var origins, created, updated string
-	if err := r.Scan(&sv.ID, &sv.Name, &buildID, &port, &sv.Env, &sv.DesiredState, &containerID, &origins, &adminPort, &sv.AdminToken,
+	if err := r.Scan(&sv.ID, &sv.Name, &buildID, &port, &sv.Env, &sv.DesiredState, &containerID, &origins, &adminPort, &sv.AdminToken, &sv.PendingLaunch, &sv.StartComplete,
 		&created, &updated); err != nil {
 		return Server{}, err
 	}
@@ -195,6 +198,24 @@ func (s *Store) ListServers(ctx context.Context) ([]Server, error) {
 	return out, mapErr("list servers", rows.Err())
 }
 
+// ListServerIDs returns the server ids for certificate maintenance.
+func (s *Store) ListServerIDs(ctx context.Context) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id FROM servers ORDER BY id")
+	if err != nil {
+		return nil, mapErr("list server ids", err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, mapErr("list server ids", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, mapErr("list server ids", rows.Err())
+}
+
 // CountServers returns the number of servers.
 func (s *Store) CountServers(ctx context.Context) (int, error) {
 	var n int
@@ -202,28 +223,95 @@ func (s *Store) CountServers(ctx context.Context) (int, error) {
 	return n, mapErr("count servers", err)
 }
 
-// ServerUpdate lists the columns UpdateServer changes; nil/false fields are
-// left alone. BuildID, Port and AllowedOrigins (when SetOrigins) are written
-// as given (they do not depend on the previous row). Env is a
-// read-modify-write of the sealed variables, so it is compare-and-swapped:
-// it is written only while the stored ciphertext still equals PrevEnv,
-// otherwise UpdateServer fails with ErrStale.
+// ServerUpdate lists the columns UpdateServer changes; nil/false fields
+// are left alone. A port change requires the inspected PrevContainerID,
+// and an env change requires the ciphertext it was derived from.
 type ServerUpdate struct {
-	BuildID        *int64
-	Port           *int
-	SetOrigins     bool
-	AllowedOrigins []string
-	SetEnv         bool
-	Env            []byte // sealed for the server's id
-	PrevEnv        []byte // the ciphertext the new Env was derived from
+	BuildID         *int64
+	Port            *int
+	SetOrigins      bool
+	AllowedOrigins  []string
+	SetEnv          bool
+	Env             []byte // sealed for the server's id
+	PrevContainerID string // container checked for a port change
+	PrevEnv         []byte // the ciphertext the new Env was derived from
 }
 
 // UpdateServer applies u to server id (UpdatedAt is set to now) and returns
 // the stored row. It never writes desired_state (SetServerDesiredState) or
 // the container columns (SetServerContainer), which jobs change
-// concurrently. ErrConflict means the port is taken, ErrStale that the env
-// changed meanwhile.
+// concurrently. ErrConflict means the port is taken. ErrStale means the
+// container or the env changed meanwhile.
 func (s *Store) UpdateServer(ctx context.Context, id int64, u ServerUpdate) (Server, error) {
+	var out Server
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var current Server
+		if u.Port != nil || u.BuildID != nil {
+			var err error
+			current, err = scanServer(tx.QueryRowContext(ctx, "SELECT "+serverCols+" FROM servers WHERE id = ?", id))
+			if err != nil {
+				return mapErr("update server", err)
+			}
+			if err := checkServerJob(ctx, tx, id); err != nil {
+				return err
+			}
+		}
+		if u.Port != nil && current.ContainerID != u.PrevContainerID {
+			return ErrStale
+		}
+		if u.BuildID != nil {
+			var projectID int64
+			err := tx.QueryRowContext(ctx, "SELECT project_id FROM builds WHERE id = ? AND status = 'success' AND image_id <> ''", *u.BuildID).Scan(&projectID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrMissingReference
+			}
+			if err != nil {
+				return mapErr("read new server build", err)
+			}
+			if current.BuildID != nil {
+				var currentProjectID int64
+				if err := tx.QueryRowContext(ctx, "SELECT project_id FROM builds WHERE id = ?", *current.BuildID).Scan(&currentProjectID); err != nil {
+					return mapErr("read current server build", err)
+				}
+				if currentProjectID != projectID {
+					return ErrServerProject
+				}
+			}
+		}
+		var err error
+		out, err = s.updateServer(ctx, tx, id, u)
+		return err
+	})
+	return out, err
+}
+
+// ErrServerProject and ErrServerJob protect a server's project and active jobs.
+var (
+	ErrServerProject = errors.New("store: server project cannot change")
+	ErrServerJob     = errors.New("store: server job in progress")
+)
+
+// CheckServerJob reports an active job early, before inspecting Docker for
+// a port change. UpdateServer also checks within its write transaction.
+func (s *Store) CheckServerJob(ctx context.Context, id int64) error {
+	return checkServerJob(ctx, s.db, id)
+}
+
+func checkServerJob(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, id int64) error {
+	var active bool
+	err := q.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM jobs WHERE subject_type = 'server' AND subject_id = ? AND status IN ('queued', 'running'))", strconv.FormatInt(id, 10)).Scan(&active)
+	if err != nil {
+		return mapErr("check server job", err)
+	}
+	if active {
+		return ErrServerJob
+	}
+	return nil
+}
+
+func (s *Store) updateServer(ctx context.Context, tx *sql.Tx, id int64, u ServerUpdate) (Server, error) {
 	sets := []string{"updated_at = ?"}
 	args := []any{formatTime(s.nowUTC())}
 	if u.BuildID != nil {
@@ -250,7 +338,7 @@ func (s *Store) UpdateServer(ctx context.Context, id int64, u ServerUpdate) (Ser
 		where += " AND env IS ?"
 		whereArgs = append(whereArgs, blobArg(u.PrevEnv))
 	}
-	out, err := scanServer(s.db.QueryRowContext(ctx,
+	out, err := scanServer(tx.QueryRowContext(ctx,
 		`UPDATE servers SET `+strings.Join(sets, ", ")+` WHERE `+where+` RETURNING `+serverCols,
 		append(args, whereArgs...)...))
 	if err == nil {
@@ -258,7 +346,7 @@ func (s *Store) UpdateServer(ctx context.Context, id int64, u ServerUpdate) (Ser
 	}
 	err = mapErr("update server", err)
 	if errors.Is(err, ErrNotFound) && u.SetEnv {
-		if _, gerr := s.GetServer(ctx, id); gerr == nil {
+		if _, gerr := scanServer(tx.QueryRowContext(ctx, "SELECT "+serverCols+" FROM servers WHERE id = ?", id)); gerr == nil {
 			return Server{}, ErrStale
 		}
 	}
@@ -289,12 +377,9 @@ func (s *Store) SetServerContainer(ctx context.Context, id int64, containerID st
 	if containerID == "" {
 		return errors.New("set server container: empty container id")
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE servers SET container_id = ?, admin_port = ?, admin_token = ? WHERE id = ?`,
+	err := s.durableWrite(ctx, `UPDATE servers SET container_id = ?, admin_port = ?, admin_token = ?, pending_launch = '', start_complete = 0 WHERE id = ?`,
 		containerID, nullPort(adminPort), blobArg(adminToken), id)
-	if err != nil {
-		return mapErr("set server container", err)
-	}
-	return checkAffected("set server container", res)
+	return mapErr("set server container", err)
 }
 
 // SetServerAdminPort updates the recorded admin host port of server id while
@@ -317,9 +402,25 @@ func nullPort(p int) any {
 // endpoint) of server id if it is still containerID (so a stale caller
 // cannot clear a newer record).
 func (s *Store) ClearServerContainer(ctx context.Context, id int64, containerID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE servers SET container_id = NULL, admin_port = NULL, admin_token = NULL WHERE id = ? AND container_id = ?`,
+	_, err := s.db.ExecContext(ctx, `UPDATE servers SET container_id = NULL, admin_port = NULL, admin_token = NULL, start_complete = 0 WHERE id = ? AND container_id = ?`,
 		id, containerID)
 	return mapErr("clear server container", err)
+}
+
+// SetServerPendingLaunch records the identity for a Docker create before
+// issuing it, so a lost reply does not orphan the resulting container.
+func (s *Store) SetServerPendingLaunch(ctx context.Context, id int64, launch string) error {
+	err := s.durableWrite(ctx, "UPDATE servers SET pending_launch = ? WHERE id = ? AND container_id IS NULL", launch, id)
+	return mapErr("record server launch", err)
+}
+
+// CompleteServerStart commits the health-gated start after the restart policy.
+func (s *Store) CompleteServerStart(ctx context.Context, id int64, containerID string) error {
+	res, err := s.db.ExecContext(ctx, "UPDATE servers SET start_complete = 1 WHERE id = ? AND container_id = ?", id, containerID)
+	if err != nil {
+		return mapErr("complete server start", err)
+	}
+	return checkAffected("complete server start", res)
 }
 
 // DeleteServer deletes server id.

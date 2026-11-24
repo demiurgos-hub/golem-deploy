@@ -95,6 +95,8 @@ type RunSpec struct {
 	// ConfigHash is recorded as a label so callers can tell whether the
 	// running container matches the stored definition.
 	ConfigHash string
+	// LaunchID is the daemon-generated identity of a pending create.
+	LaunchID string
 	// ReadOnlyBinds are extra read-only bind mounts.
 	ReadOnlyBinds []BindMount
 	// DataVolume is an optional named volume mounted read-write.
@@ -153,7 +155,7 @@ func (s RunSpec) mergedEnv() map[string]string {
 }
 
 // EnvFile validates the environment and returns the env-file content for
-// "docker run --env-file" (nil when there are no variables).
+// "docker create --env-file" (nil when there are no variables).
 func (s RunSpec) EnvFile() ([]byte, error) {
 	if err := ValidateEnv(s.Env); err != nil {
 		return nil, err
@@ -278,6 +280,9 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 	if s.BuildID > 0 {
 		buildID = strconv.FormatInt(s.BuildID, 10)
 	}
+	if s.LaunchID != "" && !ValidInstanceID(s.LaunchID) {
+		return nil, invalid("launch", "invalid launch id")
+	}
 	for _, g := range s.GroupAdd {
 		if g <= 0 {
 			return nil, invalid("group_add", "supplementary groups must be positive")
@@ -285,7 +290,7 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 	}
 
 	args := []string{
-		"run", "--detach", "--pull", "never",
+		"create", "--pull", "never",
 		"--name", ContainerName(s.ServerName),
 		// Every label of our namespace, so none can be inherited from the
 		// image.
@@ -298,6 +303,7 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 		"--label", LabelBuildID + "=" + buildID,
 		"--label", LabelEngineVersion + "=" + s.EngineVersion,
 		"--label", LabelConfigHash + "=" + s.ConfigHash,
+		"--label", LabelLaunchID + "=" + s.LaunchID,
 		"--restart", "no",
 		"--init",
 		"--no-healthcheck",

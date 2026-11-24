@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,14 +9,18 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/gameadmin/gameadmintest"
 	"github.com/demiurgos-hub/golem-deploy/internal/servers"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
@@ -99,8 +104,7 @@ func testCertPEM(t *testing.T, host string, notAfter time.Time) (string, string)
 func TestGameCertificateRoutes(t *testing.T) {
 	d := newDockerHarness(t)
 	got := decode[apitypes.GameCertificate](t, d.call("GET", "/api/v1/certificates/game", d.adminSs, nil))
-	if got.Mode != apitypes.CertificateModeSelfSigned || !got.Certificate.SelfSigned || !got.Certificate.CoversGameHost || got.GameHost != "play.example.com" ||
-		len(got.Certificate.FingerprintSHA256) != 64 || got.Certificate.NotAfter.Sub(got.Certificate.NotBefore) > 14*24*time.Hour {
+	if got.Mode != apitypes.CertificateModeSelfSigned || got.Certificate != nil || got.GameHost != "play.example.com" {
 		t.Fatalf("%+v", got)
 	}
 	errBody(t, d.call("GET", "/api/v1/certificates/game", d.devTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
@@ -108,7 +112,7 @@ func TestGameCertificateRoutes(t *testing.T) {
 	certPEM, keyPEM := testCertPEM(t, "play.example.com", time.Now().Add(60*24*time.Hour))
 	rr := d.call("PUT", "/api/v1/certificates/game", d.adminSs, apitypes.UpdateGameCertificateRequest{Mode: "custom", CertificatePEM: certPEM, PrivateKeyPEM: keyPEM})
 	custom := decode[apitypes.GameCertificate](t, rr)
-	if custom.Mode != apitypes.CertificateModeCustom || !custom.Certificate.CoversGameHost || custom.Certificate.FingerprintSHA256 == got.Certificate.FingerprintSHA256 {
+	if custom.Mode != apitypes.CertificateModeCustom || !custom.Certificate.CoversGameHost || custom.Certificate.FingerprintSHA256 == "" {
 		t.Fatalf("%+v", custom)
 	}
 	keyBody := strings.Split(keyPEM, "\n")[1]
@@ -152,10 +156,10 @@ func TestGameCertificateRoutes(t *testing.T) {
 		t.Fatalf("%+v", now)
 	}
 	back := decode[apitypes.GameCertificate](t, d.call("PUT", "/api/v1/certificates/game", d.adminSs, apitypes.UpdateGameCertificateRequest{Mode: "self_signed"}))
-	if back.Mode != apitypes.CertificateModeSelfSigned || !back.Certificate.CoversGameHost {
+	if back.Mode != apitypes.CertificateModeSelfSigned || back.Certificate != nil {
 		t.Fatalf("%+v", back)
 	}
-	if got := d.getServer(d.devTok, s.ID); !got.RestartRequired {
+	if got := d.getServer(d.devTok, s.ID); !got.RestartRequired || got.Certificate == nil || !got.Certificate.CoversGameHost {
 		t.Fatal("mode switch did not mark the server restart_required")
 	}
 }
@@ -166,7 +170,13 @@ func TestGameHostSetting(t *testing.T) {
 	if set.GameHost != "" || set.EffectiveGameHost != "play.example.com" {
 		t.Fatalf("%+v", set)
 	}
-	first := decode[apitypes.GameCertificate](t, d.call("GET", "/api/v1/certificates/game", d.adminSs, nil))
+	img := d.managedImage(1)
+	sv := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "hostcheck", BuildID: img.ID})
+	d.start(sv.ID)
+	first := d.getServer(d.devTok, sv.ID)
+	if first.Certificate == nil {
+		t.Fatal("server certificate missing")
+	}
 	for _, bad := range []string{"https://x.example", "x.example:7000", "x.example/a", "a b", "[::1]", "*.example.com"} {
 		e := errBody(t, d.call("PATCH", "/api/v1/settings", d.adminSs, apitypes.UpdateSettingsRequest{GameHost: &bad}), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
 		if e.Field != "game_host" {
@@ -178,8 +188,8 @@ func TestGameHostSetting(t *testing.T) {
 		t.Fatalf("%+v", set)
 	}
 	// The self-signed certificate follows the game host.
-	regen := decode[apitypes.GameCertificate](t, d.call("GET", "/api/v1/certificates/game", d.adminSs, nil))
-	if regen.Certificate.FingerprintSHA256 == first.Certificate.FingerprintSHA256 || !regen.Certificate.CoversGameHost || regen.GameHost != "game.example.com" {
+	regen := d.getServer(d.devTok, sv.ID)
+	if regen.Certificate.FingerprintSHA256 == first.Certificate.FingerprintSHA256 || !regen.Certificate.CoversGameHost {
 		t.Fatalf("%+v", regen)
 	}
 	// Clearing it falls back to --public-host.
@@ -188,4 +198,131 @@ func TestGameHostSetting(t *testing.T) {
 		t.Fatalf("%+v", set)
 	}
 	errBody(t, d.call("PATCH", "/api/v1/settings", d.devTok, apitypes.UpdateSettingsRequest{GameHost: ptr("x.example")}), http.StatusForbidden, apitypes.ErrorCodeForbidden)
+}
+
+func TestServersMountOnlyTheirOwnCertificateDirectory(t *testing.T) {
+	d := newDockerHarness(t)
+	build := d.managedImage(1)
+	a := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena-a", BuildID: build.ID})
+	b := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena-b", BuildID: build.ID})
+	if a.Certificate != nil || b.Certificate != nil {
+		t.Fatal("new servers already have a self-signed certificate")
+	}
+	readPair := func(id int64) (cert, key []byte) {
+		t.Helper()
+		dir := d.certs.ServerDir(id)
+		cert, err := os.ReadFile(filepath.Join(dir, certs.CertFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err = os.ReadFile(filepath.Join(dir, certs.KeyFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cert, key
+	}
+	for _, sv := range []apitypes.Server{a, b} {
+		d.start(sv.ID)
+		ct, ok := d.fake.Container("golem-deploy-" + sv.Name)
+		want := "type=bind,source=" + d.certs.ServerDir(sv.ID) + ",target=" + certs.ContainerDir + ",readonly"
+		if !ok || len(ct.Binds) != 1 || ct.Binds[0] != want {
+			t.Fatalf("unexpected mounts for server %s: %v", sv.Name, ct.Binds)
+		}
+	}
+	a = d.getServer(d.devTok, a.ID)
+	b = d.getServer(d.devTok, b.ID)
+	_, aKey := readPair(a.ID)
+	_, bKey := readPair(b.ID)
+	if a.Certificate == nil || b.Certificate == nil || a.Certificate.FingerprintSHA256 == b.Certificate.FingerprintSHA256 || bytes.Equal(aKey, bKey) {
+		t.Fatal("servers share a certificate or key in self-signed mode")
+	}
+	chain, key := testCertPEM(t, "play.example.com", time.Now().Add(time.Hour))
+	path := "/api/v1/certificates/game"
+	custom := decode[apitypes.GameCertificate](t, d.call("PUT", path, d.adminSs, apitypes.UpdateGameCertificateRequest{
+		Mode: apitypes.CertificateModeCustom, CertificatePEM: chain, PrivateKeyPEM: key,
+	}))
+	for _, sv := range []apitypes.Server{a, b} {
+		got := d.getServer(d.devTok, sv.ID)
+		cert, keyOnDisk := readPair(sv.ID)
+		if custom.Certificate == nil || got.Certificate == nil || got.Certificate.FingerprintSHA256 != custom.Certificate.FingerprintSHA256 ||
+			string(cert) != chain || string(keyOnDisk) != key || got.ContainerID != sv.ContainerID {
+			t.Fatalf("custom pair was not published to server %s", sv.Name)
+		}
+	}
+	mode := decode[apitypes.GameCertificate](t, d.call("PUT", path, d.adminSs, apitypes.UpdateGameCertificateRequest{Mode: apitypes.CertificateModeSelfSigned}))
+	_, newAKey := readPair(a.ID)
+	_, newBKey := readPair(b.ID)
+	if mode.Certificate != nil || bytes.Equal(aKey, newAKey) || bytes.Equal(bKey, newBKey) || bytes.Equal(newAKey, newBKey) {
+		t.Fatal("switching to self-signed did not install a new independent key for each server")
+	}
+	if rr := d.call("DELETE", fmt.Sprintf("/api/v1/servers/%d", a.ID), d.devTok, nil); rr.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(d.certs.ServerDir(a.ID)); !os.IsNotExist(err) {
+		t.Fatalf("deleted server's key directory remains: %v", err)
+	}
+	readPair(b.ID)
+}
+
+func TestServerProjectIsFixedOnCreateAndImport(t *testing.T) {
+	d := newDockerHarness(t)
+	first, sameProject := d.managedImage(1), d.managedImage(2)
+	created := d.createServer(d.devTok, apitypes.CreateServerRequest{
+		Name: "fixed-project", BuildID: first.ID, Env: map[string]string{"SECRET": envMarker},
+	})
+	imported := decode[apitypes.ServerImportResult](t, d.call("POST", "/api/v1/servers/import", d.adminSs, apitypes.ServerExport{
+		FormatVersion: servers.ExportFormatVersion,
+		Servers: []apitypes.ServerSpec{{Name: "imported-project", Project: "game", Commit: testCommit(1),
+			Env: map[string]string{"SECRET": envMarker}}},
+	}))
+	if len(imported.Created) != 1 {
+		t.Fatalf("imported %d servers", len(imported.Created))
+	}
+	project, err := d.st.CreateProject(t.Context(), store.Project{Name: "other-game", RepoURL: "https://example.com/other.git"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.project = project.ID
+	other := d.managedImage(3)
+	for _, sv := range []apitypes.Server{created, imported.Created[0]} {
+		path := fmt.Sprintf("/api/v1/servers/%d", sv.ID)
+		e := errBody(t, d.call("PATCH", path, d.devTok, apitypes.UpdateServerRequest{BuildID: &other.ID}),
+			http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
+		if e.Field != "build_id" {
+			t.Fatalf("wrong field: %s", e.Field)
+		}
+		still := d.getServer(d.devTok, sv.ID)
+		if *still.BuildID != first.ID || len(still.EnvKeys) != 1 || still.EnvKeys[0] != "SECRET" {
+			t.Fatalf("rejected patch changed the server: %+v", still)
+		}
+		got := decode[apitypes.Server](t, d.call("PATCH", path, d.devTok, apitypes.UpdateServerRequest{BuildID: &sameProject.ID}))
+		if *got.BuildID != sameProject.ID || *got.ProjectID != *created.ProjectID {
+			t.Fatalf("same-project patch failed: %+v", got)
+		}
+	}
+}
+
+func TestServerPortAndBuildChangesRejectActiveJob(t *testing.T) {
+	d := newDockerHarness(t)
+	a, b := d.managedImage(1), d.managedImage(2)
+	sv := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "busy", BuildID: a.ID})
+	ctx := t.Context()
+	j, err := d.st.CreateJob(ctx, store.NewJob{Kind: "server.start", SubjectType: "server", SubjectID: fmt.Sprint(sv.ID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("/api/v1/servers/%d", sv.ID)
+	for _, req := range []apitypes.UpdateServerRequest{{Port: ptr(7004)}, {BuildID: &b.ID}} {
+		errBody(t, d.call("PATCH", path, d.devTok, req), http.StatusConflict, apitypes.ErrorCodeJobInProgress)
+	}
+	if _, err := d.st.UpdateServer(ctx, sv.ID, store.ServerUpdate{BuildID: &b.ID}); !errors.Is(err, store.ErrServerJob) {
+		t.Fatalf("the store allowed a job to race the PATCH: %v", err)
+	}
+	if err := d.st.FinishJob(ctx, j.ID, store.JobCancelled, ""); err != nil {
+		t.Fatal(err)
+	}
+	got := decode[apitypes.Server](t, d.call("PATCH", path, d.devTok, apitypes.UpdateServerRequest{Port: ptr(7004), BuildID: &b.ID}))
+	if got.Port != 7004 || got.BuildID == nil || *got.BuildID != b.ID {
+		t.Fatalf("idle server update failed: %+v", got)
+	}
 }

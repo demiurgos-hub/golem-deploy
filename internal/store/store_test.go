@@ -472,6 +472,9 @@ func TestServersCRUD(t *testing.T) {
 	p, _ := s.CreateProject(ctx, Project{Name: "game", RepoURL: "x"}, nil)
 	b1, _ := s.CreateBuild(ctx, NewBuild{ProjectID: p.ID})
 	b2, _ := s.CreateBuild(ctx, NewBuild{ProjectID: p.ID})
+	if err := s.FinishBuild(ctx, b2.ID, BuildResult{Status: BuildStatusSuccess, ImageID: "image"}); err != nil {
+		t.Fatal(err)
+	}
 	port := 27015
 	sv, err := s.CreateServer(ctx, Server{Name: "eu-1", BuildID: &b1.ID, Port: &port, AllowedOrigins: []string{"https://a.example"}},
 		func(id int64) ([]byte, error) { return []byte("ct"), nil })

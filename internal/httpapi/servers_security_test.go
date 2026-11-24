@@ -246,7 +246,7 @@ func TestD4_MemoryLimitWithoutSwap(t *testing.T) {
 	img := d.managedImage(1)
 	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
 	d.start(s.ID)
-	run := strings.Join(d.fake.CallsTo("run")[0].Args, " ")
+	run := strings.Join(d.fake.CallsTo("create")[0].Args, " ")
 	if !strings.Contains(run, "--memory 2048m --memory-swap 2048m") || !strings.Contains(run, "--cpus 2") {
 		t.Fatal(run)
 	}
@@ -434,7 +434,7 @@ func TestD11_PortRules(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "port 7004 is no longer allowed") || !strings.Contains(err.Error(), fmt.Sprintf("PATCH /api/v1/servers/%d", s.ID)) {
 		t.Fatalf("got %v", err)
 	}
-	if len(d.fake.CallsTo("run")) != 0 {
+	if len(d.fake.CallsTo("create")) != 0 {
 		t.Fatal("started on a disallowed port")
 	}
 	// The panel's own port is never used.

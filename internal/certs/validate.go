@@ -16,11 +16,10 @@ import (
 
 // Limits on uploaded certificates.
 const (
-	MaxChainBytes   = 64 << 10
-	MaxKeyBytes     = 16 << 10
-	MaxChainCerts   = 8
-	MinRSABits      = 2048
-	notYetValidSlop = 5 * time.Minute
+	MaxChainBytes = 64 << 10
+	MaxKeyBytes   = 16 << 10
+	MaxChainCerts = 8
+	MinRSABits    = 2048
 )
 
 // Request fields named by ValidationError.
@@ -110,12 +109,18 @@ func ValidateCustom(chainPEM, keyPEM []byte, now time.Time) (chainOut, keyOut []
 	switch {
 	case !now.Before(leaf.NotAfter):
 		return nil, nil, invalid(FieldCertificate, "the certificate expired on %s", leaf.NotAfter.UTC().Format(time.RFC3339))
-	case now.Add(notYetValidSlop).Before(leaf.NotBefore):
+	case now.Before(leaf.NotBefore):
 		return nil, nil, invalid(FieldCertificate, "the certificate is not valid before %s", leaf.NotBefore.UTC().Format(time.RFC3339))
 	}
 	if len(leaf.ExtKeyUsage) > 0 && !slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageServerAuth) &&
 		!slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageAny) {
 		return nil, nil, invalid(FieldCertificate, "the certificate is not valid for TLS servers (extended key usage)")
+	}
+	for i := 1; i < len(chain); i++ {
+		child, parent := chain[i-1], chain[i]
+		if !bytes.Equal(child.RawIssuer, parent.RawSubject) || child.CheckSignatureFrom(parent) != nil {
+			return nil, nil, invalid(FieldCertificate, "certificate %d in the chain must be signed by certificate %d", i, i+1)
+		}
 	}
 	var out bytes.Buffer
 	for _, c := range chain {

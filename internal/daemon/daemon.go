@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -141,6 +142,9 @@ func Run(ctx context.Context, o Options) (err error) {
 	logger := o.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if runtime.GOOS == "windows" {
+		logger.Warn("Windows is a development platform only. Data directory permissions are not checked or restricted here. Keys and temporary environment files inherit the data directory ACL. Use Linux for production.")
 	}
 	if (o.TLSCert == "") != (o.TLSKey == "") {
 		return errors.New("--tls-cert and --tls-key must be set together")
@@ -437,8 +441,7 @@ func checkDataDirPath(dir string) error {
 	return nil
 }
 
-// reconcileServers starts, as jobs, the servers whose desired state is
-// running but whose container is not (the job runner bounds concurrency).
+// reconcileServers submits startup verification and recovery as server jobs.
 func reconcileServers(ctx context.Context, svc *servers.Service, runner *jobs.Runner, logger *slog.Logger) {
 	rctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
@@ -451,7 +454,7 @@ func reconcileServers(ctx context.Context, svc *servers.Service, runner *jobs.Ru
 				case jid = <-jobID:
 				case <-jctx.Done():
 				}
-				return svc.Start(servers.WithJobID(jctx, jid), id, log)
+				return svc.Recover(servers.WithJobID(jctx, jid), id, log)
 			})
 		if err == nil {
 			jobID <- job.ID

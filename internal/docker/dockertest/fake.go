@@ -492,8 +492,10 @@ func (f *Fake) Run(ctx context.Context, _ string, cmd docker.Cmd) error {
 		ferr = f.ps(a, stdout)
 	case has(a, "container", "inspect"):
 		ferr = f.inspectContainers(positional(a), stdout)
-	case has(a, "run"):
-		ferr = f.run(a, call.EnvFile, cmd.Env, stdout)
+	case has(a, "create"):
+		ferr = f.create(a, call.EnvFile, cmd.Env, stdout)
+	case has(a, "start"):
+		ferr = f.start(a)
 	case has(a, "update"):
 		ferr = f.update(a)
 	case has(a, "stop"):
@@ -696,7 +698,7 @@ func hostPort(publish string) string {
 	return parts[len(parts)-2] + "/" + proto
 }
 
-func (f *Fake) run(a []string, envFile string, cliEnv []string, w io.Writer) *failure {
+func (f *Fake) create(a []string, envFile string, cliEnv []string, w io.Writer) *failure {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	pos := positional(a)
@@ -797,16 +799,27 @@ func (f *Fake) run(a []string, envFile string, cliEnv []string, w io.Writer) *fa
 		restart = v[0]
 	}
 	c := &Container{
-		ID: f.nextID(), Name: name, Image: img.ID, Labels: labels, State: "running", RestartPolicy: restart,
+		ID: f.nextID(), Name: name, Image: img.ID, Labels: labels, State: "created", RestartPolicy: restart,
 		Created: f.tick(), Ports: ports, Mounts: mounts, Binds: binds, Tmpfs: flagValues(a, "--tmpfs"), Network: network,
 		Env: envVals, Logs: slices.Clone(img.Logs), GroupAdd: flagValues(a, "--group-add"), Assigned: assigned,
 	}
-	c.StartedAt = c.Created
-	if img.ExitOnRun != nil {
-		c.State, c.ExitCode = "exited", *img.ExitOnRun
-	}
 	f.containers[c.ID] = c
 	fmt.Fprintln(w, c.ID)
+	return nil
+}
+
+func (f *Fake) start(a []string) *failure {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := positional(a)
+	c := f.containers[ids[0]]
+	if c == nil {
+		return &failure{1, "Error: No such container: " + ids[0]}
+	}
+	c.State, c.StartedAt = "running", f.tick()
+	if img := f.images[c.Image]; img != nil && img.ExitOnRun != nil {
+		c.State, c.ExitCode = "exited", *img.ExitOnRun
+	}
 	return nil
 }
 

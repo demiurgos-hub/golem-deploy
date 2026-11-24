@@ -49,6 +49,8 @@ func serversError(what string, err error) error {
 		return conflict(apitypes.ErrorCodeConflict, "the server has no container yet; start it first")
 	case errors.Is(err, servers.ErrNotRunning):
 		return conflict(apitypes.ErrorCodeConflict, "the server is not running")
+	case errors.Is(err, servers.ErrJobInProgress):
+		return conflict(apitypes.ErrorCodeJobInProgress, "a job is active for this server; wait for it or cancel it")
 	case errors.Is(err, servers.ErrRunning):
 		return conflict(apitypes.ErrorCodeConflict, "stop the server before changing its port")
 	case errors.Is(err, servers.ErrInUse):

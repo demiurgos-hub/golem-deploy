@@ -3,10 +3,12 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -140,6 +142,9 @@ func TestRunReconcilesServers(t *testing.T) {
 			t.Fatal("orphaned or impostor container touched")
 		}
 	}
+	if hasWarning := strings.Contains(logs.String(), "Windows is a development platform only"); hasWarning != (runtime.GOOS == "windows") {
+		t.Fatalf("unexpected Windows data directory warning: %t", hasWarning)
+	}
 	if strings.Count(logs.String(), "is not the container recorded for any server") != 2 {
 		t.Fatalf("orphan and impostor not logged once each:\n%s", logs.String())
 	}
@@ -157,10 +162,11 @@ func TestRunReconcilesServers(t *testing.T) {
 	}
 	// The game certificate was generated for the --public-host fallback and
 	// mounted into the container.
-	if _, err := os.Stat(filepath.Join(layout.GameCerts(), "tls.key")); err != nil {
+	certDir := filepath.Join(layout.Root, "certs", "servers", fmt.Sprint(sv.ID))
+	if _, err := os.Stat(filepath.Join(certDir, "tls.key")); err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := fake.Container("golem-deploy-arena"); len(c.Binds) != 1 || !strings.Contains(c.Binds[0], layout.GameCerts()) ||
+	if c, _ := fake.Container("golem-deploy-arena"); len(c.Binds) != 1 || !strings.Contains(c.Binds[0], certDir) ||
 		c.Env["GOLEM_PUBLIC_URL"] != "https://play.example.com:7401/wt" {
 		t.Fatalf("%+v", c)
 	}

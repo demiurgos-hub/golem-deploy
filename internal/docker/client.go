@@ -331,7 +331,7 @@ func classify(ctx context.Context, args []string, err error, stderr string) erro
 		"is the docker daemon running", "docker daemon is not running",
 		"permission denied while trying to connect", "failed to connect to the docker api"):
 		ce.Kind = ErrUnavailable
-	case len(args) > 0 && args[0] == "run" && containsAny(low, "no such image", "unable to find image"):
+	case len(args) > 0 && args[0] == "create" && containsAny(low, "no such image", "unable to find image"):
 		ce.Kind = ErrImageMissing
 	case containsAny(low, "no such container", "no such image", "no such volume",
 		"no such network", "no such object", "not found"):

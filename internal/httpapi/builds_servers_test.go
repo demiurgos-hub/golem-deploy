@@ -40,7 +40,7 @@ func TestBuildToServer(t *testing.T) {
 		if j := b.action(b.devTok, sv.ID, "start"); j.Status != store.JobSuccess {
 			t.Fatalf("start: %s\n%s", j.Detail, b.jobLog(j.ID))
 		}
-		run := b.fake.CallsTo("run")
+		run := b.fake.CallsTo("create")
 		last := run[len(run)-1]
 		if !strings.Contains(strings.Join(last.Args, " "), built.ImageID) {
 			t.Fatalf("server not run from the build's image: %v", last.Args)
@@ -69,7 +69,7 @@ func TestBuildToServer(t *testing.T) {
 // successful build records it or any container (also a stopped server's,
 // which keeps its container) was created from it. A server switched to
 // another build keeps the old build's container until it is started again,
-// so the old build, its image and its project cannot be deleted until then.
+// so the old build and its image cannot be deleted until then.
 func TestBuildImageInUseByStoppedContainer(t *testing.T) {
 	b := newBuildHarness(t)
 	b.fake.SetBuildHook(func(dockertest.BuildCall) dockertest.BuildOutcome {
@@ -82,8 +82,8 @@ func TestBuildImageInUseByStoppedContainer(t *testing.T) {
 		}
 		return b.getBuild(res.Build.ID)
 	}
-	pa, pb := b.project("alpha"), b.project("beta")
-	a1, b1 := built(pa), built(pb)
+	pa := b.project("alpha")
+	a1, b1 := built(pa), built(pa)
 	sv := b.createServer(b.devTok, apitypes.CreateServerRequest{Name: "s", BuildID: a1.ID})
 	if j := b.action(b.devTok, sv.ID, "start"); j.Status != store.JobSuccess {
 		t.Fatalf("start: %s", j.Detail)
@@ -107,10 +107,6 @@ func TestBuildImageInUseByStoppedContainer(t *testing.T) {
 	if !strings.Contains(e.Message, want) {
 		t.Fatal(e.Message)
 	}
-	e = errBody(t, b.call("DELETE", fmt.Sprintf("/api/v1/projects/%d", pa.ID), b.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
-	if !strings.Contains(e.Message, want) {
-		t.Fatal(e.Message)
-	}
 	// DELETE /images never removes an image a build records.
 	e = errBody(t, b.call("DELETE", "/api/v1/images/"+a1.ImageID, b.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
 	if !strings.Contains(e.Message, fmt.Sprintf("belongs to build %d", a1.ID)) {
@@ -119,16 +115,15 @@ func TestBuildImageInUseByStoppedContainer(t *testing.T) {
 	if _, err := b.st.GetProject(b.t.Context(), pa.ID); err != nil || !b.fake.HasImage(a1.ImageID) {
 		t.Fatalf("project or image removed: %v", err)
 	}
-	// Starting the server again recreates its container from b1: alpha
-	// can go, with its build and image.
+	// Starting again recreates the container from b1 and frees a1.
 	if j := b.action(b.devTok, sv.ID, "start"); j.Status != store.JobSuccess {
 		t.Fatalf("start: %s", j.Detail)
 	}
-	if rr := b.call("DELETE", fmt.Sprintf("/api/v1/projects/%d", pa.ID), b.adminSs, nil); rr.Code != http.StatusNoContent {
-		t.Fatalf("delete project: %d %s", rr.Code, rr.Body.String())
+	if rr := b.call("DELETE", fmt.Sprintf("/api/v1/builds/%d", a1.ID), b.adminSs, nil); rr.Code != http.StatusNoContent {
+		t.Fatalf("delete build: %d %s", rr.Code, rr.Body.String())
 	}
 	if b.fake.HasImage(a1.ImageID) {
-		t.Fatal("the deleted project's image is still there")
+		t.Fatal("the deleted build's image is still there")
 	}
 	if !b.fake.HasImage(b1.ImageID) {
 		t.Fatal("the running server's image was removed")
