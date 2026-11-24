@@ -2,8 +2,14 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"io/fs"
+	"path"
+	"path/filepath"
 	"testing"
+	"testing/fstest"
+	"time"
 )
 
 // Backups keep their row when what they reference is deleted; references
@@ -116,5 +122,90 @@ func TestVolumeHelperRecords(t *testing.T) {
 	}
 	if list, _ := s.ListVolumeHelpers(ctx); len(list) != 0 {
 		t.Fatalf("%+v", list)
+	}
+}
+
+// Migration 0011 keeps the stored backups and their id sequence, adds
+// omitted_entries and accepts the pre_delete kind.
+func TestBackupCompletenessMigration(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "m.db")+"?_foreign_keys=1&_txlock=immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{db: db, now: time.Now}
+	t.Cleanup(func() { _ = db.Close() })
+	old := fstest.MapFS{}
+	all, _ := fs.Glob(migrationFS, "migrations/*.sql")
+	for _, n := range all {
+		if path.Base(n) < "0011" {
+			body, _ := fs.ReadFile(migrationFS, n)
+			old[n] = &fstest.MapFile{Data: body}
+		}
+	}
+	if err := s.migrateFS(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	for i, f := range []string{"a.tar.gz", "b.tar.gz", "c.tar.gz"} {
+		if _, err := db.Exec(`INSERT INTO backups (kind, file, server_name, size_bytes, content_bytes, file_count, sha256, created_at)
+			VALUES ('manual', ?, 'x', 1, 2, ?, 's', '2026-01-01T00:00:00.000Z')`, f, i+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`DELETE FROM backups WHERE file = 'c.tar.gz'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListBackups(ctx, BackupFilter{})
+	if err != nil || len(list) != 2 || list[0].FileCount != 2 || list[0].OmittedEntries != 0 {
+		t.Fatalf("%+v %v", list, err)
+	}
+	b, err := s.CreateBackup(ctx, Backup{Kind: BackupPreDelete, File: "d.tar.gz", ServerName: "x", SHA256: "y", FileCount: 1, OmittedEntries: 4})
+	if err != nil || b.ID != 4 || b.OmittedEntries != 4 || b.Kind != BackupPreDelete {
+		t.Fatalf("%+v %v", b, err)
+	}
+	if _, err := db.Exec(`UPDATE backups SET omitted_entries = -1`); err == nil {
+		t.Fatal("negative omitted_entries accepted")
+	}
+}
+
+// A build's fingerprint is only filled in while empty; the scheduled
+// backup failure time round-trips.
+func TestFillBuildFingerprintAndBackupFailure(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	p, _ := s.CreateProject(ctx, Project{Name: "game", RepoURL: "https://example.com/g.git"}, nil)
+	b, _ := s.CreateBuild(ctx, NewBuild{ProjectID: p.ID})
+	if ok, err := s.FillBuildFingerprint(ctx, b.ID, "first"); !ok || err != nil {
+		t.Fatalf("%v %v", ok, err)
+	}
+	if ok, err := s.FillBuildFingerprint(ctx, b.ID, "second"); ok || err != nil {
+		t.Fatalf("%v %v", ok, err)
+	}
+	if got, _ := s.GetBuild(ctx, b.ID); got.SchemaFingerprint != "first" {
+		t.Fatalf("%q", got.SchemaFingerprint)
+	}
+	port := 7001
+	sv, _ := s.CreateServer(ctx, Server{Name: "arena", Port: &port}, nil)
+	if sv.BackupFailedAt != nil {
+		t.Fatalf("%+v", sv)
+	}
+	at := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	if err := s.SetServerBackupFailed(ctx, sv.ID, &at); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetServer(ctx, sv.ID); got.BackupFailedAt == nil || !got.BackupFailedAt.Equal(at) {
+		t.Fatalf("%+v", got.BackupFailedAt)
+	}
+	if err := s.SetServerBackupFailed(ctx, sv.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetServer(ctx, sv.ID); got.BackupFailedAt != nil {
+		t.Fatalf("%+v", got.BackupFailedAt)
+	}
+	if _, ok, err := s.LastServerBackup(ctx, sv.ID); ok || err != nil {
+		t.Fatalf("%v %v", ok, err)
 	}
 }

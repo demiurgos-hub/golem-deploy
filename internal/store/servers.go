@@ -47,8 +47,11 @@ type Server struct {
 	SnapshotIntervalSeconds int
 	BackupIntervalHours     int
 	BackupKeep              int
-	CreatedAt               time.Time
-	UpdatedAt               time.Time
+	// BackupFailedAt is when the server's last scheduled backup failed
+	// (nil after a success or when none failed).
+	BackupFailedAt *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Defaults of the saved data settings of a new server.
@@ -61,15 +64,16 @@ const (
 // caller read it (a concurrent update won); the caller re-reads and retries.
 var ErrStale = errors.New("store: server changed concurrently")
 
-const serverCols = `id, name, build_id, port, env, desired_state, container_id, allowed_origins, admin_port, admin_token, pending_launch, start_complete, data_volume, data_fingerprint, snapshot_interval_seconds, backup_interval_hours, backup_keep, created_at, updated_at`
+const serverCols = `id, name, build_id, port, env, desired_state, container_id, allowed_origins, admin_port, admin_token, pending_launch, start_complete, data_volume, data_fingerprint, snapshot_interval_seconds, backup_interval_hours, backup_keep, backup_failed_at, created_at, updated_at`
 
 func scanServer(r scanner) (Server, error) {
 	var sv Server
 	var buildID, port, adminPort sql.NullInt64
 	var containerID sql.NullString
 	var origins, created, updated string
+	var backupFailed sql.NullString
 	if err := r.Scan(&sv.ID, &sv.Name, &buildID, &port, &sv.Env, &sv.DesiredState, &containerID, &origins, &adminPort, &sv.AdminToken, &sv.PendingLaunch, &sv.StartComplete,
-		&sv.DataVolume, &sv.DataFingerprint, &sv.SnapshotIntervalSeconds, &sv.BackupIntervalHours, &sv.BackupKeep, &created, &updated); err != nil {
+		&sv.DataVolume, &sv.DataFingerprint, &sv.SnapshotIntervalSeconds, &sv.BackupIntervalHours, &sv.BackupKeep, &backupFailed, &created, &updated); err != nil {
 		return Server{}, err
 	}
 	sv.BuildID = int64Ptr(buildID)
@@ -91,6 +95,13 @@ func scanServer(r scanner) (Server, error) {
 	}
 	if sv.UpdatedAt, err = parseTime(updated); err != nil {
 		return Server{}, err
+	}
+	if backupFailed.Valid {
+		t, err := parseTime(backupFailed.String)
+		if err != nil {
+			return Server{}, err
+		}
+		sv.BackupFailedAt = &t
 	}
 	return sv, nil
 }
