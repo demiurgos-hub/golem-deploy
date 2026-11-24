@@ -34,6 +34,7 @@ const (
 	JobKindProjectClone  JobKind = "project.clone"
 	JobKindProjectPull   JobKind = "project.pull"
 	JobKindProjectBranch JobKind = "project.branch"
+	JobKindProjectBuild  JobKind = "project.build"
 	JobKindServerStart   JobKind = "server.start"
 	JobKindServerStop    JobKind = "server.stop"
 	JobKindServerRestart JobKind = "server.restart"

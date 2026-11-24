@@ -189,6 +189,94 @@ export interface CreateAPITokenResponse {
 }
 
 //////////
+// source: builds.go
+
+/**
+ * BuildStatus is the lifecycle state of a build. queued and running are
+ * active; the others are terminal.
+ */
+export const BuildStatusQueued = "queued";
+export const BuildStatusRunning = "running";
+export const BuildStatusSuccess = "success";
+export const BuildStatusError = "error";
+export const BuildStatusCancelled = "cancelled";
+/**
+ * Build statuses.
+ */
+export type BuildStatus = typeof BuildStatusQueued | typeof BuildStatusRunning | typeof BuildStatusSuccess | typeof BuildStatusError | typeof BuildStatusCancelled;
+/**
+ * Build is one build of a project's checkout into a managed image. Servers
+ * run the image of a successful build. The build's output is the log of the
+ * job JobID.
+ */
+export interface Build {
+  id: number /* int64 */;
+  project_id: number /* int64 */;
+  /**
+   * Branch and Commit (full hash) of the checkout that was built; Commit
+   * is empty while the build is queued.
+   */
+  branch: string;
+  commit: string;
+  status: BuildStatus;
+  /**
+   * Detail is a short, user-safe outcome message for terminal builds
+   * (empty on success).
+   */
+  detail: string;
+  /**
+   * JobID is the project.build job; null when that job record is gone.
+   */
+  job_id: number | null;
+  /**
+   * ImageID ("sha256:...") and ImageTag are set on success.
+   */
+  image_id: string;
+  image_tag: string;
+  /**
+   * EngineVersion is the Golem Engine version the game requires.
+   */
+  engine_version: string;
+  /**
+   * SchemaFingerprint is the game's schema fingerprint; empty until a
+   * server running this build has become ready once.
+   */
+  schema_fingerprint: string;
+  /**
+   * ServerIDs lists the servers configured with this build; a build that
+   * is in use cannot be deleted (409 conflict).
+   */
+  server_ids: number /* int64 */[];
+  created_by: number | null;
+  created_at: string /* RFC 3339, UTC */;
+  started_at: string | null;
+  finished_at: string | null;
+}
+/**
+ * BuildList is the body of GET /api/v1/projects/{id}/builds and of
+ * GET /api/v1/builds, newest first.
+ */
+export interface BuildList {
+  items: Build[];
+}
+/**
+ * CreateBuildRequest is the body of POST /api/v1/projects/{id}/builds. Pull
+ * first updates the checkout from the remote (like POST .../pull); without
+ * it the current checkout is built.
+ */
+export interface CreateBuildRequest {
+  pull?: boolean;
+}
+/**
+ * CreateBuildResponse is returned (202) by POST /api/v1/projects/{id}/builds:
+ * the queued build and the job that runs it.
+ */
+export interface CreateBuildResponse {
+  build: Build;
+  job: Job;
+}
+
+//////////
 // source: errors.go
 
 /**
@@ -478,6 +566,7 @@ export type SubjectType = typeof SubjectTypeProject | typeof SubjectTypeServer;
 export const JobKindProjectClone = "project.clone";
 export const JobKindProjectPull = "project.pull";
 export const JobKindProjectBranch = "project.branch";
+export const JobKindProjectBuild = "project.build";
 export const JobKindServerStart = "server.start";
 export const JobKindServerStop = "server.stop";
 export const JobKindServerRestart = "server.restart";
@@ -485,7 +574,7 @@ export const JobKindServerDelete = "server.delete";
 /**
  * Job kinds.
  */
-export type JobKind = typeof JobKindProjectClone | typeof JobKindProjectPull | typeof JobKindProjectBranch | typeof JobKindServerStart | typeof JobKindServerStop | typeof JobKindServerRestart | typeof JobKindServerDelete;
+export type JobKind = typeof JobKindProjectClone | typeof JobKindProjectPull | typeof JobKindProjectBranch | typeof JobKindProjectBuild | typeof JobKindServerStart | typeof JobKindServerStop | typeof JobKindServerRestart | typeof JobKindServerDelete;
 /**
  * Job is a long-running operation. Routes that start one respond 202 with the
  * Job; poll GET /api/v1/jobs/{id} or stream GET /api/v1/jobs/{id}/log?follow=1.
