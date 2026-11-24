@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { computeEnvDiff, emptyDraft, type EnvDraft } from "@/lib/env-diff";
+import { ApiError } from "@/api/errors";
+import { computeEnvDiff, emptyDraft, envErrorsFrom, type EnvDraft } from "@/lib/env-diff";
 
 describe("computeEnvDiff", () => {
   const keys = ["MAX_PLAYERS", "ADMIN_TOKEN", "REGION"];
@@ -62,7 +63,8 @@ describe("computeEnvDiff", () => {
         { id: "r1", key: "max_players", value: "1" },
         { id: "r2", key: "Token", value: "a" },
         { id: "r3", key: "TOKEN", value: "b" },
-        { id: "r4", key: "docker_host", value: "x" },
+        { id: "r4", key: "golem_port", value: "x" },
+        { id: "r5", key: "DOCKER_HOST", value: "x" },
       ],
     };
     const r = computeEnvDiff(keys, draft);
@@ -71,6 +73,40 @@ describe("computeEnvDiff", () => {
     expect(r.rowErrors.r2).toMatch(/listed twice/);
     expect(r.rowErrors.r3).toMatch(/listed twice/);
     expect(r.rowErrors.r4).toMatch(/reserved/);
-    expect(r.diff.env_set).toEqual({});
+    // DOCKER_* and PATH are ordinary container variables now.
+    expect(r.rowErrors.r5).toBeUndefined();
+    expect(r.diff.env_set).toEqual({ DOCKER_HOST: "x" });
+  });
+
+  it("checks values of new and replaced variables without echoing them", () => {
+    const r = computeEnvDiff(keys, {
+      existing: { REGION: { kind: "replace", value: "eu\nwest" } },
+      added: [
+        { id: "n1", key: "MOTD", value: "line1\r\nline2" },
+        { id: "n2", key: "BIG", value: "x".repeat(40_000) },
+        { id: "n3", key: "OK", value: "fine" },
+      ],
+    });
+    expect(r.valid).toBe(false);
+    expect(r.existingErrors.REGION).toBe("The value contains a line break (values must be a single line).");
+    expect(r.rowErrors.n1).toBe("The value contains a line break (values must be a single line).");
+    expect(r.rowErrors.n2).toMatch(/exceeds 32768 bytes/);
+    expect(JSON.stringify(r)).not.toContain("line1");
+    expect(r.diff.env_set).toEqual({ OK: "fine" });
+  });
+
+  it("checks the totals of a complete set (new server)", () => {
+    const added = Array.from({ length: 129 }, (_, i) => ({ id: `r${i}`, key: `K${i}`, value: "" }));
+    expect(computeEnvDiff([], { existing: {}, added }).general).toMatch(/At most 128 variables/);
+  });
+
+  it("routes the daemon's env errors to the row they name", () => {
+    const draft: EnvDraft = { existing: { REGION: { kind: "replace", value: "x" } }, added: [{ id: "n1", key: "MOTD", value: "x" }] };
+    const err = (field: string) => new ApiError({ status: 400, code: "validation_failed", message: "the value contains a NUL byte", field });
+    expect(envErrorsFrom(err("env.MOTD"), draft, keys)?.rowErrors).toEqual({ n1: "The value contains a NUL byte." });
+    expect(envErrorsFrom(err("env_set.REGION"), draft, keys)?.existingErrors).toEqual({ REGION: "The value contains a NUL byte." });
+    expect(envErrorsFrom(err("env_set"), draft, keys)?.general).toBe("The value contains a NUL byte.");
+    expect(envErrorsFrom(err("env_set.OTHER"), draft, keys)?.general).toBe("OTHER: The value contains a NUL byte.");
+    expect(envErrorsFrom(err("image"), draft, keys)).toBeNull();
   });
 });

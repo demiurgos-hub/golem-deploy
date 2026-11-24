@@ -71,7 +71,7 @@ export function ErrorText({ error, children }: { error: unknown; children?: Reac
   const requestId = isApiError(error) ? error.requestId : "";
   return (
     <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm">
-      <p className="text-foreground">{children ?? describeError(error)}</p>
+      <p className="whitespace-pre-wrap break-words text-foreground">{children ?? describeError(error)}</p>
       {requestId && <p className="mt-0.5 font-mono text-xs text-muted-foreground">Request id: {requestId}</p>}
     </div>
   );

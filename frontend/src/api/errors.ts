@@ -134,9 +134,33 @@ export function sentence(message: string): string {
   return /[.!?]$/.test(first) ? first : `${first}.`;
 }
 
-/** "Try again in N seconds." from Retry-After, or "" when the daemon sent none. */
-export function retryHint(err: ApiError, seconds = err.retryAfter): string {
-  return seconds !== undefined && seconds > 0 ? ` Try again in ${formatWait(seconds)}.` : "";
+// A trailing "try again later" / "try again in a moment" / "try again" clause of a daemon message.
+const TRY_AGAIN_CLAUSE = /[;,.]?\s*(?:please\s+)?try again(?:\s+later|\s+in a moment|\s+shortly)?\s*[.!]?$/i;
+
+/**
+ * The daemon's message with the wait from Retry-After, as one sentence: a
+ * message that already ends in "try again later" gets that clause replaced
+ * ("Too many attempts; try again in 6 minutes."), anything else gets the
+ * wait appended. Without a wait the message is returned as it is.
+ */
+export function withWait(message: string, seconds: number | undefined): string {
+  const m = message.trim();
+  if (seconds === undefined || seconds <= 0) return sentence(m);
+  if (TRY_AGAIN_CLAUSE.test(m)) {
+    const base = m.replace(TRY_AGAIN_CLAUSE, "");
+    return base ? sentence(`${base}; try again in ${formatWait(seconds)}`) : `Try again in ${formatWait(seconds)}.`;
+  }
+  return `${sentence(m)} Try again in ${formatWait(seconds)}.`;
+}
+
+/** The daemon's message once its wait is over ("Too many attempts; you can try again now."). */
+export function readyAgain(message: string): string {
+  const m = message.trim();
+  if (TRY_AGAIN_CLAUSE.test(m)) {
+    const base = m.replace(TRY_AGAIN_CLAUSE, "");
+    return base ? sentence(`${base}; you can try again now`) : "You can try again now.";
+  }
+  return `${sentence(m)} You can try again now.`;
 }
 
 /**
@@ -153,7 +177,7 @@ export function describeError(err: unknown): string {
     case "rate_limited":
       // Too many failed attempts, too many concurrent logins, or too many open log streams:
       // the daemon's message says which.
-      return sentence(err.message || "Too many requests") + retryHint(err);
+      return withWait(err.message || "Too many requests", err.retryAfter);
     case "invalid_credentials":
       return "Sign-in failed. Check the username and password. New accounts must be approved by an administrator first.";
     case "last_admin":
@@ -171,7 +195,7 @@ export function describeError(err: unknown): string {
       );
     case "service_unavailable":
       // Docker or git unreachable, a Git remote failing, shutdown, or busy checking passwords.
-      return sentence(err.message || "The daemon is not available right now") + retryHint(err);
+      return withWait(err.message || "The daemon is not available right now", err.retryAfter);
     default:
       return err.message ? sentence(err.message) : `The request failed (HTTP ${err.status}).`;
   }

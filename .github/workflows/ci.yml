@@ -65,6 +65,11 @@ jobs:
           sh scripts/gen-types.sh
           git diff --exit-code -- frontend/src/api/types.gen.ts
 
+      # Bidi controls, U+2028/U+2029, NUL and other control characters in
+      # tracked text files (allowlist: scripts/checkchars/main.go).
+      - name: No hidden control characters
+        run: go run ./scripts/checkchars
+
       - name: go vet
         run: go vet ./...
 

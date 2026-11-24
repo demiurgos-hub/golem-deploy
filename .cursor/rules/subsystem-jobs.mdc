@@ -6,7 +6,7 @@ alwaysApply: false
 
 # Jobs
 
-- `jobs.Runner.Start(ctx, kind, Subject{Type, ID}, createdBy, fn, opts...)` (option `jobs.Restricted(bool)`) persists a queued job, creates `logs/jobs/<id>.log` (0600) and runs `fn(ctx, log)` on a bounded worker pool. At most one job per subject is active (`ErrSubjectBusy`).
+- `jobs.Runner.Start(ctx, kind, Subject{Type, ID}, createdBy, fn, opts...)` (option `jobs.Restricted(bool)`) persists a queued job, creates `logs/jobs/<id>.log` (0600) and runs `fn(ctx, log)` on a bounded worker pool. At most one job per subject is active (`ErrSubjectBusy`). Workers are handed out under `Runner.mu` in start order (`queue`, `admitLocked`), never by goroutines racing for a slot; a job cancelled while queued, or at the moment it is admitted, ends `cancelled` without starting (no `started_at`).
 - `fn` must honour `ctx` (cancelled by `Cancel` and by shutdown) and write human-readable progress and full error output to `log`. `log` is capped (`Options.MaxLogBytes`, default 16 MiB): beyond it one truncation marker is written and the rest discarded without blocking or failing the job; the runner's own final lines bypass the cap. The `detail` shown to clients is empty on success, the message of a `jobs.Fail(msg, cause)` error, or a generic message; panics are recovered into `error`.
 - Status transitions are persisted (`queued`, `running`, then `success`, `error` or `cancelled`); final writes use a background context so they survive shutdown.
 - `Done(id)` closes when the job leaves this process; the log follow endpoint uses it to end streams.

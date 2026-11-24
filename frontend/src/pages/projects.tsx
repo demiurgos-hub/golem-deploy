@@ -11,6 +11,7 @@ import { InlineJob } from "@/components/jobs";
 import {
   ProjectAuthFields,
   authErrorsFrom,
+  authForUrl,
   emptyAuth,
   hasErrors,
   toProjectAuth,
@@ -229,12 +230,23 @@ function CreateProjectDialog({ onClose }: { onClose: () => void }) {
           error={errors.repoUrl}
           hint="https://host/owner/repo.git, ssh://git@host/owner/repo.git or git@host:owner/repo.git. Plain http:// is not allowed; put credentials below, not in the URL."
         >
-          {(p) => <Input {...p} spellCheck={false} autoComplete="off" value={repoUrl} onChange={(e) => setRepoUrl(e.target.value)} />}
+          {(p) => (
+            <Input
+              {...p}
+              spellCheck={false}
+              autoComplete="off"
+              value={repoUrl}
+              onChange={(e) => {
+                setRepoUrl(e.target.value);
+                setAuth((a) => authForUrl(a, e.target.value));
+              }}
+            />
+          )}
         </Field>
         <Field label="Branch" error={errors.branch} hint="Leave blank to use the repository's default branch.">
           {(p) => <Input {...p} spellCheck={false} value={branch} onChange={(e) => setBranch(e.target.value)} />}
         </Field>
-        <ProjectAuthFields draft={auth} onChange={setAuth} errors={authErrors} />
+        <ProjectAuthFields draft={auth} onChange={setAuth} errors={authErrors} repoUrl={repoUrl} />
         {create.isError && !inline && <ErrorText error={create.error} />}
       </form>
     </Dialog>

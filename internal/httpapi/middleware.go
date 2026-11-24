@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -25,7 +26,15 @@ type reqInfo struct {
 	id        string
 	accountID int64
 	clientIP  string
+	// clientGone is set when the request failed only because the client
+	// cancelled it (see writeError); the access log then reports 499.
+	clientGone bool
 }
+
+// StatusClientClosedRequest is the access-log status of a request the
+// client cancelled before a response could be written (nginx's 499). It is
+// never sent: there is nobody left to send it to.
+const StatusClientClosedRequest = 499
 
 // routeAccessFrom returns the access level of the route serving r.
 func routeAccessFrom(r *http.Request) (Access, bool) {
@@ -107,7 +116,14 @@ func (s *Server) outer(next http.Handler) http.Handler {
 				}
 			}
 			status := sw.status
-			if status == 0 {
+			level := slog.LevelInfo
+			switch {
+			case ri.clientGone:
+				status, level = StatusClientClosedRequest, slog.LevelDebug
+			case status == 0 && r.Context().Err() != nil:
+				// The handler noticed the client leaving and wrote nothing.
+				status, level = StatusClientClosedRequest, slog.LevelDebug
+			case status == 0:
 				status = http.StatusOK
 			}
 			attrs := []any{
@@ -122,7 +138,7 @@ func (s *Server) outer(next http.Handler) http.Handler {
 			if ri.accountID != 0 {
 				attrs = append(attrs, "account_id", ri.accountID)
 			}
-			s.logger.Info("http request", attrs...)
+			s.logger.Log(context.WithoutCancel(r.Context()), level, "http request", attrs...)
 		}()
 		if !s.hostAllowed(r.Host) {
 			s.logBadHost(r, ri.id)

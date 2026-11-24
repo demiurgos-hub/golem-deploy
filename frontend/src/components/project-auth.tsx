@@ -2,7 +2,7 @@ import { isApiError, sentence } from "@/api/errors";
 import type { ProjectAuth, ProjectAuthType } from "@/api/types.gen";
 import { Field, Input, Textarea } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import { checkRepoUrl } from "@/lib/validators";
+import { checkRepoUrl, type RepoKind } from "@/lib/validators";
 
 export interface AuthDraft {
   type: ProjectAuthType;
@@ -49,7 +49,10 @@ const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
 export function validateAuth(draft: AuthDraft, repoUrl: string): AuthErrors {
   const { kind } = checkRepoUrl(repoUrl.trim());
   const errors: AuthErrors = {};
-  if (draft.type === "https") {
+  if (draft.type === "none" && kind === "ssh") {
+    // The daemon's rule: without a key of its own, ssh would offer the daemon user's keys.
+    errors.type = "SSH repository URLs need a private key: choose SSH and paste a deploy key.";
+  } else if (draft.type === "https") {
     if (kind === "ssh") errors.type = "HTTPS credentials require an https:// repository URL.";
     if (!draft.username.trim()) errors.username = "Username is required for HTTPS authentication.";
     else if (SPACE_OR_CONTROL.test(draft.username.trim())) {
@@ -112,21 +115,43 @@ const TYPES: { value: ProjectAuthType; label: string; hint: string }[] = [
   { value: "ssh", label: "SSH", hint: "Deploy key" },
 ];
 
+/** The auth types the daemon accepts with a URL of this kind (all while the URL is not valid yet). */
+export function authTypesFor(kind: RepoKind | null): ProjectAuthType[] {
+  if (kind === "ssh") return ["ssh"];
+  if (kind === "https") return ["none", "https"];
+  return ["none", "https", "ssh"];
+}
+
+/** The draft adjusted to a (new) repository URL: an SSH URL needs a key, an https URL cannot use one. */
+export function authForUrl(draft: AuthDraft, repoUrl: string): AuthDraft {
+  const allowed = authTypesFor(checkRepoUrl(repoUrl.trim()).kind);
+  if (allowed.includes(draft.type)) return draft;
+  return { ...draft, type: allowed.includes("none") ? "none" : allowed[0] };
+}
+
 export function ProjectAuthFields({
   draft,
   onChange,
   errors,
+  repoUrl,
+  allowNone = true,
 }: {
   draft: AuthDraft;
   onChange: (d: AuthDraft) => void;
   errors: AuthErrors;
+  /** The URL the credentials are for: decides which types are offered. */
+  repoUrl: string;
+  /** False where "no credentials" is a separate choice (the edit dialog). */
+  allowNone?: boolean;
 }) {
+  const kind = checkRepoUrl(repoUrl.trim()).kind;
+  const types = TYPES.filter((t) => authTypesFor(kind).includes(t.value) && (allowNone || t.value !== "none"));
   return (
     <div className="flex flex-col gap-4">
       <fieldset>
         <legend className="mb-1.5 text-sm font-medium">Authentication</legend>
-        <div className="grid grid-cols-3 gap-2" role="radiogroup">
-          {TYPES.map((t) => (
+        <div className={cn("grid gap-2", types.length === 1 ? "grid-cols-1" : types.length === 2 ? "grid-cols-2" : "grid-cols-3")} role="radiogroup">
+          {types.map((t) => (
             <label
               key={t.value}
               className={cn(
@@ -147,6 +172,9 @@ export function ProjectAuthFields({
             </label>
           ))}
         </div>
+        {kind === "ssh" && (
+          <p className="mt-1.5 text-xs text-muted-foreground">SSH repositories always need a deploy key of their own.</p>
+        )}
         {errors.type && (
           <p className="mt-1.5 text-xs text-destructive" role="alert">
             {errors.type}

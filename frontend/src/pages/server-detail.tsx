@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { ArrowLeft, Pencil, RotateCw, Trash2 } from "lucide-react";
@@ -6,11 +6,11 @@ import { useApi } from "@/app/services";
 import { describeError, isApiError, sentence } from "@/api/errors";
 import { isJobActive, useImages, useProjects, useServer, useServerStats, useSubjectJobs } from "@/api/queries";
 import { qk } from "@/api/query-keys";
-import type { Server, UpdateServerRequest } from "@/api/types.gen";
+import type { Job, Server, UpdateServerRequest } from "@/api/types.gen";
 import { EnvEditor } from "@/components/env-editor";
 import { InlineJob, JobsPanel, useShownJob } from "@/components/jobs";
 import { ServerActions } from "@/components/server-actions";
-import { ServerStateBadge } from "@/components/status-badges";
+import { ServerStateBadge, portLocked, serverActionsBlocked } from "@/components/status-badges";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { ConfirmDialog, Dialog } from "@/components/ui/dialog";
@@ -20,7 +20,7 @@ import { DetailList, PageHeader, Section } from "@/components/ui/page";
 import { ErrorState, ErrorText, LoadingState, Notice } from "@/components/ui/states";
 import { useToast } from "@/components/ui/toast";
 import { useLogStream } from "@/hooks/use-log-stream";
-import { computeEnvDiff, emptyDraft, type EnvDraft } from "@/lib/env-diff";
+import { computeEnvDiff, emptyDraft, envErrorsFrom, mergeEnvErrors, noEnvErrors, type EnvDraft, type EnvErrors } from "@/lib/env-diff";
 import { formatBytes, formatDateTime, formatPercent, formatRelative } from "@/lib/format";
 import { imageLabel } from "@/lib/images";
 import { validatePort } from "@/lib/validators";
@@ -54,12 +54,58 @@ function ServerDetail({ id }: { id: number }) {
   const projects = useProjects();
   const images = useImages();
   const [dialog, setDialog] = useState<"edit" | "delete" | null>(null);
+  // The server.delete job of a deletion that did not answer 204 (failed, or still running after the wait).
+  const [deleteJob, setDeleteJob] = useState<Job | null>(null);
   const activeJob = jobs.data?.items.find(isJobActive) ?? null;
   const shown = useShownJob(activeJob);
+  const gone = server.isError && isApiError(server.error) && server.error.code === "not_found";
+  const deletedLate = gone && deleteJob !== null;
+  const serverName = server.data?.name;
+
+  // A deletion that outlasted the request finished later: the server is gone now.
+  useEffect(() => {
+    if (!deletedLate) return;
+    toast.success(serverName ? `Server ${serverName} deleted.` : "Server deleted.");
+    void queryClient.invalidateQueries({ queryKey: qk.servers.list });
+    void navigate({ to: "/servers" });
+  }, [deletedLate, serverName, toast, queryClient, navigate]);
+
+  async function remove(target: Server) {
+    try {
+      await api.servers.remove(target.id);
+    } catch (err) {
+      setDialog(null);
+      toast.error(err, `Could not delete ${target.name}`);
+      // DELETE runs a server.delete job; show it here so its outcome and log are visible.
+      if (!(isApiError(err) && err.code === "job_in_progress")) {
+        try {
+          const list = await api.jobs.list({ subject_type: "server", subject_id: String(target.id), limit: 5 });
+          const job = list.items.find((j) => j.kind === "server.delete");
+          if (job) {
+            queryClient.setQueryData(qk.jobs.detail(job.id), job);
+            setDeleteJob(job);
+            shown.show(job);
+          }
+        } catch {
+          // The toast already says what failed; the Jobs section lists the job too.
+        }
+      }
+      void queryClient.invalidateQueries({ queryKey: qk.servers.detail(target.id) });
+      void queryClient.invalidateQueries({ queryKey: qk.jobs.forSubject("server", target.id) });
+      return;
+    }
+    toast.success(`Server ${target.name} deleted: container removed and port ${target.port} freed.`);
+    queryClient.removeQueries({ queryKey: qk.servers.detail(target.id) });
+    void queryClient.invalidateQueries({ queryKey: qk.servers.list });
+    void queryClient.invalidateQueries({ queryKey: qk.volumes });
+    void queryClient.invalidateQueries({ queryKey: qk.status });
+    void navigate({ to: "/servers" });
+  }
 
   if (server.isPending) return <LoadingState label="Loading server" />;
   if (server.isError) {
-    if (isApiError(server.error) && server.error.code === "not_found") return <NotFoundPage />;
+    if (deletedLate) return <LoadingState label="Server deleted" />;
+    if (gone) return <NotFoundPage />;
     return (
       <>
         <PageHeader title="Server" back={<BackLink />} />
@@ -70,6 +116,7 @@ function ServerDetail({ id }: { id: number }) {
 
   const s = server.data;
   const currentJob = shown.job;
+  const blocked = serverActionsBlocked(s);
   const project = s.project_id !== null ? projects.data?.items.find((p) => p.id === s.project_id) : undefined;
   const address = `${window.location.hostname}:${s.port}`;
 
@@ -90,7 +137,12 @@ function ServerDetail({ id }: { id: number }) {
               <Pencil />
               Edit
             </Button>
-            <Button variant="outline" onClick={() => setDialog("delete")}>
+            <Button
+              variant="outline"
+              onClick={() => setDialog("delete")}
+              disabled={blocked !== null || activeJob !== null}
+              title={blocked ?? (activeJob !== null ? "Wait for the running job to finish." : undefined)}
+            >
               <Trash2 />
               Delete
             </Button>
@@ -106,7 +158,9 @@ function ServerDetail({ id }: { id: number }) {
         )}
         {s.state === "unknown" && (
           <Notice tone="warning" title="State unknown">
-            Docker could not be queried, so the actual state of this server is not known.
+            The server has a container, but Docker could not be queried, so its actual state is not known. Start, stop,
+            restart, delete and port changes are unavailable until the daemon reaches Docker again; this page checks every
+            few seconds.
           </Notice>
         )}
         {currentJob && (
@@ -187,15 +241,7 @@ function ServerDetail({ id }: { id: number }) {
         }
         confirmLabel="Delete server"
         destructive
-        onConfirm={async () => {
-          await api.servers.remove(s.id);
-          toast.success(`Server ${s.name} deleted.`);
-          queryClient.removeQueries({ queryKey: qk.servers.detail(s.id) });
-          void queryClient.invalidateQueries({ queryKey: qk.servers.list });
-          void queryClient.invalidateQueries({ queryKey: qk.volumes });
-          void queryClient.invalidateQueries({ queryKey: qk.status });
-          void navigate({ to: "/servers" });
-        }}
+        onConfirm={() => remove(s)}
       />
     </>
   );
@@ -243,8 +289,14 @@ function EnvSection({ server }: { server: Server }) {
   const api = useApi();
   const toast = useToast();
   const queryClient = useQueryClient();
-  const [draft, setDraft] = useState<EnvDraft>(emptyDraft());
+  const [draft, setDraftState] = useState<EnvDraft>(emptyDraft());
+  // The daemon's env errors (value errors name the key: env_set.<KEY>), until the draft changes.
+  const [serverErrors, setServerErrors] = useState<EnvErrors>(noEnvErrors());
   const result = computeEnvDiff(server.env_keys, draft);
+  const setDraft = (d: EnvDraft) => {
+    setDraftState(d);
+    setServerErrors(noEnvErrors());
+  };
   const save = useMutation({
     mutationFn: () => {
       const body: UpdateServerRequest = {};
@@ -258,7 +310,13 @@ function EnvSection({ server }: { server: Server }) {
       setDraft(emptyDraft());
       toast.success(s.state === "running" ? "Environment saved. Restart the server to apply it." : "Environment saved.");
     },
+    onError: (err) => {
+      const routed = envErrorsFrom(err, draft, server.env_keys);
+      if (routed) setServerErrors(routed);
+    },
   });
+  const routed = save.isError && envErrorsFrom(save.error, draft, server.env_keys) !== null;
+  const collided = save.isError && isApiError(save.error) && save.error.code === "conflict";
 
   return (
     <Section
@@ -280,10 +338,23 @@ function EnvSection({ server }: { server: Server }) {
       {server.env_keys.length === 0 && draft.added.length === 0 && (
         <p className="mb-3 text-sm text-muted-foreground">No environment variables set.</p>
       )}
-      <EnvEditor existingKeys={server.env_keys} draft={draft} onChange={setDraft} rowErrors={result.rowErrors} disabled={save.isPending} />
-      {save.isError && (
+      <EnvEditor
+        existingKeys={server.env_keys}
+        draft={draft}
+        onChange={setDraft}
+        errors={mergeEnvErrors(result, serverErrors)}
+        disabled={save.isPending}
+      />
+      {save.isError && !routed && (
         <div className="mt-3">
-          <ErrorText error={save.error} />
+          {collided ? (
+            <ErrorText error={save.error}>
+              Another change to this server&apos;s environment was saved at the same moment, so yours was not. Your edits are
+              still here: save again.
+            </ErrorText>
+          ) : (
+            <ErrorText error={save.error} />
+          )}
         </div>
       )}
     </Section>
@@ -297,18 +368,22 @@ function LogsSection({ server }: { server: Server }) {
   const api = useApi();
   const [tail, setTail] = useState<number>(1000);
   const [follow, setFollow] = useState(true);
+  // Without a container there is no log (409); while Docker is unreachable it cannot be read (503).
   const hasContainer = server.state !== "missing";
+  const readable = hasContainer && server.state !== "unknown";
   // Only a running container has output to follow; a stopped one still has its last output.
   const live = follow && (server.state === "running" || server.state === "restarting");
   // A restart or start creates a new container, whose output is a new log: reopen for it.
   const stream = useLogStream(
-    hasContainer ? api.servers.logsPath(server.id) : null,
+    readable ? api.servers.logsPath(server.id) : null,
     { tail, follow: live ? 1 : undefined },
     { resetKey: server.container_id },
   );
   const status = !hasContainer
     ? "No container"
-    : stream.state === "connecting"
+    : !readable
+      ? "Docker unreachable"
+      : stream.state === "connecting"
       ? "Connecting"
       : stream.state === "streaming"
         ? live
@@ -325,7 +400,10 @@ function LogsSection({ server }: { server: Server }) {
   const tooMany = isApiError(err) && err.code === "rate_limited";
 
   return (
-    <Section title="Logs" description="Container output. Long histories are trimmed to the newest 100,000 lines in the browser.">
+    <Section
+      title="Logs"
+      description="Container output, each line prefixed with its timestamp. Control characters such as colour codes arrive escaped (\x1b[31m) and are shown dimmed. Long histories are trimmed to the newest 100,000 lines in the browser."
+    >
       <div className="flex flex-col gap-2">
         <LogViewer
           buffer={stream.buffer}
@@ -333,7 +411,13 @@ function LogsSection({ server }: { server: Server }) {
           filename={`${server.name}.log`}
           heightClass="h-[28rem]"
           status={<span>{status}</span>}
-          emptyText={!hasContainer ? "The server has no container yet. Start it to see output." : "No output yet."}
+          emptyText={
+            !hasContainer
+              ? "The server has no container yet. Start it to see output."
+              : !readable
+                ? "Docker cannot be reached right now, so the container's output cannot be read."
+                : "No output yet."
+          }
           notice={
             err !== null ? (
               <div className="flex flex-wrap items-center justify-between gap-2" role="alert">
@@ -365,7 +449,7 @@ function LogsSection({ server }: { server: Server }) {
                 </Select>
               </label>
               <Checkbox label="Follow" checked={follow} onChange={(e) => setFollow(e.target.checked)} className="text-xs" />
-              {hasContainer && stream.state === "ended" && (
+              {readable && stream.state === "ended" && (
                 <Button size="sm" variant="outline" onClick={stream.restart}>
                   <RotateCw />
                   Reconnect
@@ -389,6 +473,8 @@ function EditServerDialog({ server, onClose }: { server: Server; onClose: () => 
   const [image, setImage] = useState(server.image);
   const [port, setPort] = useState(String(server.port));
   const [errors, setErrors] = useState<Partial<Record<"image" | "port", string | null>>>({});
+  const locked = portLocked(server);
+  const [sentPort, setSentPort] = useState(false);
   const update = useMutation({
     mutationFn: (body: UpdateServerRequest) => api.servers.update(server.id, body),
     onSuccess: (s) => {
@@ -399,6 +485,8 @@ function EditServerDialog({ server, onClose }: { server: Server; onClose: () => 
     },
     onError: (err) => {
       if (isApiError(err) && err.code === "port_in_use") setErrors({ port: sentence(err.message) });
+      // The container started meanwhile (another user, an API token): the port cannot change while it runs.
+      else if (isApiError(err) && err.code === "conflict" && sentPort) setErrors({ port: sentence(err.message) });
       else if (isApiError(err) && err.code === "validation_failed" && (err.field === "image" || err.field === "port")) {
         setErrors({ [err.field]: sentence(err.message) });
       }
@@ -407,12 +495,13 @@ function EditServerDialog({ server, onClose }: { server: Server; onClose: () => 
 
   function submit(e: FormEvent) {
     e.preventDefault();
-    const errs = { image: image ? null : "Choose an image.", port: validatePort(port, { optional: false }) };
+    const errs = { image: image ? null : "Choose an image.", port: locked ? null : validatePort(port, { optional: false }) };
     setErrors(errs);
     if (errs.image || errs.port) return;
     const body: UpdateServerRequest = {};
     if (image !== server.image) body.image = image;
-    if (Number(port) !== server.port) body.port = Number(port);
+    if (!locked && Number(port) !== server.port) body.port = Number(port);
+    setSentPort(body.port !== undefined);
     if (Object.keys(body).length === 0) {
       onClose();
       return;
@@ -420,7 +509,12 @@ function EditServerDialog({ server, onClose }: { server: Server; onClose: () => 
     update.mutate(body);
   }
 
-  const inline = isApiError(update.error) && (update.error.code === "port_in_use" || update.error.field === "image" || update.error.field === "port");
+  const inline =
+    isApiError(update.error) &&
+    (update.error.code === "port_in_use" ||
+      (update.error.code === "conflict" && sentPort) ||
+      update.error.field === "image" ||
+      update.error.field === "port");
   return (
     <Dialog
       open
@@ -462,8 +556,20 @@ function EditServerDialog({ server, onClose }: { server: Server; onClose: () => 
             )}
           </Field>
         )}
-        <Field label="Port" error={errors.port} hint="Published as UDP and TCP.">
-          {(p) => <Input {...p} inputMode="numeric" className="w-32" value={port} onChange={(e) => setPort(e.target.value)} />}
+        <Field
+          label="Port"
+          error={errors.port}
+          hint={
+            locked === "running"
+              ? "Stop the server to change its port: a running container keeps the port it was started with."
+              : locked === "unknown"
+                ? "Docker cannot be reached, so the daemon cannot tell whether the server is running. The port can be changed once Docker is reachable and the server is stopped."
+                : "Published as UDP and TCP."
+          }
+        >
+          {(p) => (
+            <Input {...p} inputMode="numeric" className="w-32" value={locked ? String(server.port) : port} disabled={locked !== null} onChange={(e) => setPort(e.target.value)} />
+          )}
         </Field>
         {update.isError && !inline && <ErrorText error={update.error} />}
       </form>

@@ -235,7 +235,7 @@ describe("static file uploads", () => {
       signedInAs: account(),
       routes: {
         "GET /static": () =>
-          jsonResponse(200, { items: [{ name: "maps.zip", size_bytes: 10, modified_at: "2026-11-01T00:00:00Z", is_zip: true }] }),
+          jsonResponse(200, { items: [{ name: "maps.zip", size_bytes: 10, modified_at: "2026-11-01T00:00:00Z", is_zip: true }], used_bytes: 10, quota_bytes: 0, file_count: 1, max_files: 2000 }),
       },
     });
     await screen.findByText("maps.zip");

@@ -29,7 +29,7 @@ describe("errorFromResponse", () => {
       JSON.stringify({ error: { code: "rate_limited", message: "too many attempts; try again later", request_id: "r" } }),
     );
     expect(err.retryAfter).toBe(42);
-    expect(describeError(err)).toBe("Too many attempts; try again later. Try again in 42 seconds.");
+    expect(describeError(err)).toBe("Too many attempts; try again in 42 seconds.");
   });
 
   it("says which limit was hit, from the daemon's message", () => {

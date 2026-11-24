@@ -16,6 +16,66 @@ export function stripAnsi(line: string): string {
   return line.includes("\u001b") ? line.replace(ANSI, "") : line;
 }
 
+/**
+ * Control characters the daemon shows escaped in container output (docs/SERVERS.md,
+ * Logs): an escaped colour or cursor sequence such as \x1b[31m as one unit,
+ * any other \xNN, and \uNNNN for C1 controls, line separators and bidi
+ * overrides. They are displayed dimmed, never interpreted.
+ */
+const ESCAPED = /\\x1b\[[0-9;?]*[ -/]*[@-~]|\\x[0-9a-f]{2}|\\u[0-9a-f]{4}/g;
+
+/** Every line of container output in a job log starts with this. */
+export const CONTAINER_PREFIX = "container | ";
+
+export type LogSegment = { text: string; kind: "text" | "escape" | "prefix" };
+
+/** Splits a line into plain text, escaped control sequences and the job log's container prefix. */
+export function logSegments(raw: string): LogSegment[] {
+  const line = stripAnsi(raw);
+  const out: LogSegment[] = [];
+  let rest = line;
+  if (rest.startsWith(CONTAINER_PREFIX)) {
+    out.push({ text: CONTAINER_PREFIX, kind: "prefix" });
+    rest = rest.slice(CONTAINER_PREFIX.length);
+  }
+  if (!rest.includes("\\")) {
+    if (rest) out.push({ text: rest, kind: "text" });
+    return out;
+  }
+  let last = 0;
+  for (const m of rest.matchAll(ESCAPED)) {
+    const at = m.index ?? 0;
+    if (at > last) out.push({ text: rest.slice(last, at), kind: "text" });
+    out.push({ text: m[0], kind: "escape" });
+    last = at + m[0].length;
+  }
+  if (last < rest.length) out.push({ text: rest.slice(last), kind: "text" });
+  return out;
+}
+
+function LogLine({ text }: { text: string }) {
+  const segments = logSegments(text);
+  if (segments.length === 0) return <> </>;
+  if (segments.length === 1 && segments[0].kind === "text") return <>{segments[0].text}</>;
+  return (
+    <>
+      {segments.map((seg, i) =>
+        seg.kind === "text" ? (
+          seg.text
+        ) : seg.kind === "prefix" ? (
+          <span key={i} className="select-none text-muted-foreground/70">
+            {seg.text}
+          </span>
+        ) : (
+          <span key={i} className="text-muted-foreground/60" title="Control character, shown escaped by the daemon">
+            {seg.text}
+          </span>
+        ),
+      )}
+    </>
+  );
+}
+
 interface LogViewerProps {
   buffer: LogBuffer;
   /** Pass the stream's version so new lines re-render the view. */
@@ -200,7 +260,7 @@ function LogLines({
               )}
               style={{ transform: `translateY(${item.start}px)`, lineHeight: `${LINE_HEIGHT}px`, minHeight: LINE_HEIGHT }}
             >
-              {stripAnsi(line(item.index)) || " "}
+              <LogLine text={line(item.index)} />
             </div>
           ))}
         </div>

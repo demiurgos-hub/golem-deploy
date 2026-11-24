@@ -21,8 +21,9 @@ import { EmptyState, ErrorState, ErrorText, LoadingState, Notice } from "@/compo
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/components/ui/toast";
 import { saveBlob } from "@/lib/download";
-import { computeEnvDiff, emptyDraft, type EnvDraft } from "@/lib/env-diff";
+import { computeEnvDiff, emptyDraft, envErrorsFrom, mergeEnvErrors, noEnvErrors, type EnvDraft, type EnvErrors } from "@/lib/env-diff";
 import { IMPORT_LIMIT_BYTES, checkServerImport, describeImportField } from "@/lib/server-import";
+import { formatBytes } from "@/lib/format";
 import { validatePort, validateResourceName } from "@/lib/validators";
 
 export function ServersPage() {
@@ -191,9 +192,15 @@ function CreateServerDialog({ onClose }: { onClose: () => void }) {
   const [projectId, setProjectId] = useState("");
   const [port, setPort] = useState("");
   const [start, setStart] = useState(false);
-  const [env, setEnv] = useState<EnvDraft>(emptyDraft());
+  const [env, setEnvDraft] = useState<EnvDraft>(emptyDraft());
+  // The daemon's env errors (value errors name the key: env.<KEY>), until the draft changes.
+  const [envServerErrors, setEnvServerErrors] = useState<EnvErrors>(noEnvErrors());
   const [errors, setErrors] = useState<Partial<Record<"name" | "image" | "port", string | null>>>({});
   const envResult = computeEnvDiff([], env);
+  const setEnv = (d: EnvDraft) => {
+    setEnvDraft(d);
+    setEnvServerErrors(noEnvErrors());
+  };
   const image = imageChoice || options[0]?.value || "";
   const noImages = images.isSuccess && options.length === 0;
 
@@ -216,7 +223,9 @@ function CreateServerDialog({ onClose }: { onClose: () => void }) {
     },
     onError: (err) => {
       if (!isApiError(err)) return;
-      if (err.code === "name_taken") setErrors({ name: "A server with this name exists." });
+      const envErrs = envErrorsFrom(err, env, []);
+      if (envErrs) setEnvServerErrors(envErrs);
+      else if (err.code === "name_taken") setErrors({ name: "A server with this name exists." });
       else if (err.code === "port_in_use") setErrors({ port: sentence(err.message) });
       else if (err.code === "validation_failed" && (err.field === "name" || err.field === "image" || err.field === "port")) {
         setErrors({ [err.field]: sentence(err.message) });
@@ -246,6 +255,7 @@ function CreateServerDialog({ onClose }: { onClose: () => void }) {
     isApiError(create.error) &&
     (create.error.code === "name_taken" ||
       create.error.code === "port_in_use" ||
+      envErrorsFrom(create.error, env, []) !== null ||
       ["name", "image", "port"].includes(create.error.field ?? ""));
 
   return (
@@ -276,7 +286,7 @@ function CreateServerDialog({ onClose }: { onClose: () => void }) {
         <Field label="Name" error={errors.name} hint="Lower-case letters, digits and '-'. Cannot be changed later.">
           {(p) => <Input {...p} spellCheck={false} value={name} onChange={(e) => setName(e.target.value)} autoFocus />}
         </Field>
-        <Field label="Image" error={errors.image} hint="Managed images only (built by Golem Deploy or labelled on the host).">
+        <Field label="Image" error={errors.image} hint="Managed images only (built by Golem Deploy or labelled on the host), declaring at most 8 volumes.">
           {(p) => (
             <Select {...p} value={image} onChange={(e) => pickImage(e.target.value)}>
               {options.map((o) => (
@@ -309,7 +319,7 @@ function CreateServerDialog({ onClose }: { onClose: () => void }) {
         <fieldset className="flex flex-col gap-2">
           <legend className="mb-1 text-sm font-medium">Environment</legend>
           <p className="text-xs text-muted-foreground">Values are stored encrypted and never shown again.</p>
-          <EnvEditor existingKeys={[]} draft={env} onChange={setEnv} rowErrors={envResult.rowErrors} />
+          <EnvEditor existingKeys={[]} draft={env} onChange={setEnv} errors={mergeEnvErrors(envResult, envServerErrors)} />
         </fieldset>
         <Checkbox label="Start the server after creating it" checked={start} onChange={(e) => setStart(e.target.checked)} />
         {create.isError && !inline && <ErrorText error={create.error} />}
@@ -373,7 +383,7 @@ function ImportDialog({ onClose }: { onClose: () => void }) {
     }
     setFileName(file.name);
     if (file.size > IMPORT_LIMIT_BYTES) {
-      setCheck({ value: null, errors: ["The file is larger than the 1 MiB the daemon accepts."] });
+      setCheck({ value: null, errors: [`The file is larger than the ${formatBytes(IMPORT_LIMIT_BYTES)} the daemon accepts in one import; split it.`] });
       return;
     }
     setCheck(checkServerImport(await file.text()));

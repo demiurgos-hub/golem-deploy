@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  sameRepoOrigin,
   utf8Length,
   validateEnvKey,
+  validateEnvTotals,
+  validateEnvValue,
   validatePassword,
   validatePort,
   validateRepoUrl,
@@ -100,11 +103,51 @@ describe("validateRepoUrl", () => {
 });
 
 describe("validateEnvKey reserved names", () => {
-  it.each(["PATH", "path", "Home", "DOCKER_HOST", "docker_anything", "BUILDKIT_X", "HTTP_PROXY", "SystemRoot", "x".repeat(129)])(
-    "rejects %j",
-    (k) => expect(validateEnvKey(k)).not.toBeNull(),
+  // Only GOLEM_ (any case) is reserved now; container variables never reach the docker CLI's environment.
+  it.each(["GOLEM_X", "golem_port", "Golem_", "x".repeat(129), "1X"])("rejects %j", (k) => expect(validateEnvKey(k)).not.toBeNull());
+  it.each(["PATH", "HOME", "DOCKER_HOST", "LD_PRELOAD", "HTTP_PROXY", "MY_GOLEM_X", "GOLEMX", "x".repeat(128)])("accepts %j", (k) =>
+    expect(validateEnvKey(k)).toBeNull(),
   );
-  it.each(["PATHS", "MY_HOME", "x".repeat(128)])("accepts %j", (k) => expect(validateEnvKey(k)).toBeNull());
+  it("explains the reservation", () => expect(validateEnvKey("golem_x")).toBe("Names starting with GOLEM_ are reserved for golem-deploy."));
+});
+
+describe("validateEnvValue", () => {
+  it("rejects line breaks and NUL like the daemon", () => {
+    expect(validateEnvValue("MOTD", "a\nb")).toBe("The value contains a line break (values must be a single line).");
+    expect(validateEnvValue("MOTD", "a\rb")).toBe("The value contains a line break (values must be a single line).");
+    expect(validateEnvValue("MOTD", "a\u0000b")).toBe("The value contains a NUL byte.");
+  });
+  it("accepts every other character", () => {
+    expect(validateEnvValue("V", " quotes \" ' # = $ \\ tab\t \u202e é ☃")).toBeNull();
+    expect(validateEnvValue("V", "")).toBeNull();
+  });
+  it("counts bytes of name and value against 32 KiB", () => {
+    expect(validateEnvValue("K", "x".repeat(32 * 1024 - 1))).toBeNull();
+    expect(validateEnvValue("K", "x".repeat(32 * 1024))).toMatch(/exceeds 32768 bytes/);
+    // é is 2 bytes in UTF-8.
+    expect(validateEnvValue("K", "é".repeat(16 * 1024))).toMatch(/exceeds 32768 bytes/);
+  });
+  it("limits count and total size", () => {
+    expect(validateEnvTotals(Object.fromEntries(Array.from({ length: 129 }, (_, i) => [`K${i}`, ""])))).toMatch(/At most 128 variables/);
+    expect(validateEnvTotals({ A: "x".repeat(32000), B: "x".repeat(32000), C: "x".repeat(2000) })).toMatch(/exceed 65536 bytes in total/);
+    expect(validateEnvTotals({ A: "x" })).toBeNull();
+  });
+});
+
+describe("sameRepoOrigin", () => {
+  it.each([
+    ["https://github.com/a/b.git", "https://github.com/c/d"],
+    ["https://GitHub.com/a/b", "https://github.com:443/a/b"],
+    ["ssh://git@host/a/b", "git@host:c/d"],
+    ["ssh://git@host:22/a", "ssh://other@host/b"],
+  ])("%s and %s share an origin", (a, b) => expect(sameRepoOrigin(a, b)).toBe(true));
+  it.each([
+    ["https://github.com/a/b", "https://gitlab.com/a/b"],
+    ["https://host/a", "https://host:8443/a"],
+    ["https://host/a", "ssh://git@host/a"],
+    ["ssh://git@host/a", "ssh://git@host:2222/a"],
+    ["https://host/a", "not a url"],
+  ])("%s and %s do not", (a, b) => expect(sameRepoOrigin(a, b)).toBe(false));
 });
 
 describe("validatePort", () => {
@@ -135,7 +178,7 @@ describe("checkServerImport", () => {
         format_version: 2,
         servers: [
           { name: "a", image: "", desired_state: "running", port: 7777 },
-          { name: "a", image: "x", desired_state: "maybe", port: 7777, env: { "1BAD": "v", path: "x", Key: "1", KEY: "2" }, extra: true },
+          { name: "a", image: "x", desired_state: "maybe", port: 7777, env: { "1BAD": "v", golem_x: "x", Key: "1", KEY: "2", MOTD: "a\nb" }, extra: true },
         ],
       }),
     );
@@ -148,11 +191,20 @@ describe("checkServerImport", () => {
         "Server 2 (a): port 7777 is also used by server 1.",
         'Server 2 (a): desired_state must be "running" or "stopped".',
         `Server 2 (a): environment variable "1BAD": Use up to 128 letters, digits and '_', not starting with a digit.`,
-        'Server 2 (a): environment variable "path": path is reserved by the daemon and cannot be used.',
+        'Server 2 (a): environment variable "golem_x": Names starting with GOLEM_ are reserved for golem-deploy.',
+        "Server 2 (a): environment variable MOTD: The value contains a line break (values must be a single line).",
         'Server 2 (a): environment variable "KEY" is listed twice (names are unique ignoring case).',
         'Server 2 (a): unknown field "extra".',
       ]),
     );
+  });
+
+  it("accepts at most 128 servers per document", () => {
+    const servers = Array.from({ length: 129 }, (_, i) => ({ name: `s${i}`, image: "x" }));
+    expect(checkServerImport(JSON.stringify({ format_version: 1, servers })).errors).toEqual([
+      "The file contains 129 servers; one import accepts at most 128. Split it into several files.",
+    ]);
+    expect(checkServerImport(JSON.stringify({ format_version: 1, servers: servers.slice(0, 128) })).errors).toEqual([]);
   });
 
   it("rejects non-JSON", () => {
@@ -166,6 +218,7 @@ describe("checkServerImport", () => {
   it("names the entry a daemon error points at", () => {
     const doc = { format_version: 1, servers: [{ name: "a", image: "x", desired_state: "stopped" as const }, { name: "b", image: "y", desired_state: "stopped" as const }] };
     expect(describeImportField("servers[1].image", doc)).toBe("Server 2 (b), image");
+    expect(describeImportField("servers[0].env.MOTD", doc)).toBe("Server 1 (a), environment variable MOTD");
     expect(describeImportField("format_version", doc)).toBe("format_version");
     expect(describeImportField(undefined, doc)).toBeNull();
   });

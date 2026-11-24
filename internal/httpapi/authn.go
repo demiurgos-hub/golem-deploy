@@ -113,7 +113,7 @@ func (s *Server) authenticate(r *http.Request) (*Identity, error) {
 			return nil, errUnauthenticated
 		}
 		if tok.LastUsedAt == nil || now.Sub(*tok.LastUsedAt) >= tokenTouchInterval {
-			if err := s.store.TouchAPIToken(ctx, tok.ID, now, tokenTouchInterval); err != nil {
+			if err := s.store.TouchAPIToken(ctx, tok.ID, now, tokenTouchInterval); err != nil && ctx.Err() == nil {
 				s.logger.Warn("record api token use failed", "request_id", requestIDFrom(ctx), "err", err)
 			}
 		}

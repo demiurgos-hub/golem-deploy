@@ -2,7 +2,7 @@ import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { Moon, Sun } from "lucide-react";
 import { useServices, useSession } from "@/app/services";
-import { describeError, isApiError, retryHint, sentence } from "@/api/errors";
+import { describeError, isApiError, readyAgain, withWait } from "@/api/errors";
 import { useAuthOptions } from "@/api/queries";
 import type { CurrentAccount } from "@/api/types.gen";
 import { qk } from "@/api/query-keys";
@@ -64,7 +64,7 @@ function waitsForRetry(err: unknown): boolean {
 /** The daemon's message with a live countdown instead of the static Retry-After. */
 function errorWithCountdown(err: unknown, wait: number): string {
   if (waitsForRetry(err) && isApiError(err)) {
-    return wait > 0 ? sentence(err.message) + retryHint(err, wait) : `${sentence(err.message)} You can try again now.`;
+    return wait > 0 ? withWait(err.message, wait) : readyAgain(err.message);
   }
   return describeError(err);
 }

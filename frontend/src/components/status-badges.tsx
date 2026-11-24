@@ -32,6 +32,32 @@ const SERVER_STATE: Record<string, { label: string; tone: BadgeTone }> = {
   unknown: { label: "Unknown", tone: "warning" },
 };
 
+/** States in which the server's container runs (the daemon refuses port changes then). */
+export function isContainerActive(state: Server["state"]): boolean {
+  return state === "running" || state === "restarting" || state === "paused";
+}
+
+/**
+ * Why the port cannot be changed now, or null: a running (or restarting or
+ * paused) container keeps its port (409 conflict), and with Docker
+ * unreachable the daemon cannot tell (it answers 503).
+ */
+export function portLocked(s: Pick<Server, "state">): "running" | "unknown" | null {
+  if (isContainerActive(s.state)) return "running";
+  if (s.state === "unknown") return "unknown";
+  return null;
+}
+
+/**
+ * Why start/stop/restart/delete are unavailable, or null. "unknown" only
+ * occurs for a server with a container while Docker is unreachable: every
+ * such action would fail. ("missing" means no container: start works,
+ * also while Docker is down it fails as a job with a clear detail.)
+ */
+export function serverActionsBlocked(s: Pick<Server, "state">): string | null {
+  return s.state === "unknown" ? "Docker is unreachable, so the server cannot be started, stopped, restarted or deleted right now." : null;
+}
+
 /** True when the observed state disagrees with what the operator asked for. */
 export function stateMismatch(s: Pick<Server, "desired_state" | "state">): boolean {
   if (s.state === "unknown") return false;
@@ -48,7 +74,13 @@ export function ServerStateBadge({ server }: { server: Pick<Server, "desired_sta
     <span className="inline-flex flex-wrap items-center gap-1.5">
       <Badge
         tone={tone}
-        title={server.state === "unknown" ? "Docker could not be queried, so the actual state is not known." : undefined}
+        title={
+          server.state === "unknown"
+            ? "The server has a container, but Docker could not be queried, so its actual state is not known."
+            : server.state === "missing"
+              ? "The server has no container: it was never started, or its container was removed. Start it to create one."
+              : undefined
+        }
       >
         {server.state === "unknown" && <AlertTriangle aria-hidden />}
         {s.label}

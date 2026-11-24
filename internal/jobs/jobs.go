@@ -92,9 +92,9 @@ const DefaultMaxLogBytes = 16 << 20
 type Runner struct {
 	store  *store.Store
 	logDir string
-	logger *slog.Logger
-	sem    chan struct{}
-	maxLog int64
+	logger  *slog.Logger
+	workers int
+	maxLog  int64
 
 	baseCtx    context.Context
 	cancelBase context.CancelFunc
@@ -104,12 +104,23 @@ type Runner struct {
 	closed   bool
 	subjects map[Subject]int64
 	active   map[int64]*activeJob
+	// queue holds the jobs waiting for a worker, in the order they were
+	// started; running counts the jobs holding one. Admission happens
+	// under mu (admitLocked), so jobs run in start order whatever order
+	// their goroutines are scheduled in.
+	queue   []*activeJob
+	running int
 }
 
 type activeJob struct {
 	subject Subject
 	cancel  context.CancelCauseFunc
 	done    chan struct{}
+	// admit is closed when the job is given a worker; admitted records it
+	// (under Runner.mu) so a job that is cancelled at that same moment can
+	// tell which happened.
+	admit    chan struct{}
+	admitted bool
 }
 
 var errCancelledByUser = errors.New("cancelled by user")
@@ -131,7 +142,7 @@ func New(st *store.Store, logDir string, opts Options) *Runner {
 		store:      st,
 		logDir:     logDir,
 		logger:     opts.Logger,
-		sem:        make(chan struct{}, opts.Workers),
+		workers:    opts.Workers,
 		maxLog:     opts.MaxLogBytes,
 		baseCtx:    ctx,
 		cancelBase: cancel,
@@ -192,7 +203,7 @@ func (r *Runner) Start(ctx context.Context, kind string, subject Subject, create
 	}
 
 	jctx, cancel := context.WithCancelCause(r.baseCtx)
-	aj := &activeJob{subject: subject, cancel: cancel, done: make(chan struct{})}
+	aj := &activeJob{subject: subject, cancel: cancel, done: make(chan struct{}), admit: make(chan struct{})}
 
 	r.mu.Lock()
 	if r.closed {
@@ -205,6 +216,8 @@ func (r *Runner) Start(ctx context.Context, kind string, subject Subject, create
 	}
 	r.subjects[subject] = job.ID
 	r.active[job.ID] = aj
+	r.queue = append(r.queue, aj)
+	r.admitLocked()
 	r.wg.Add(1)
 	r.mu.Unlock()
 
@@ -228,9 +241,22 @@ func (r *Runner) run(ctx context.Context, job store.Job, aj *activeJob, logFile 
 	}()
 
 	select {
-	case r.sem <- struct{}{}:
-		defer func() { <-r.sem }()
+	case <-aj.admit:
 	case <-ctx.Done():
+	}
+	r.mu.Lock()
+	if !aj.admitted {
+		// Cancelled while waiting for a worker.
+		r.dequeueLocked(aj)
+		r.mu.Unlock()
+		status, detail = store.JobCancelled, cancelDetail(ctx)
+		return
+	}
+	r.mu.Unlock()
+	defer r.releaseWorker()
+	if ctx.Err() != nil {
+		// Admitted at the moment it was cancelled (select picks either
+		// ready case): a cancelled job never starts.
 		status, detail = store.JobCancelled, cancelDetail(ctx)
 		return
 	}
@@ -288,6 +314,37 @@ func cancelDetail(ctx context.Context) string {
 		return DetailCancelled
 	}
 	return DetailShutdown
+}
+
+// admitLocked gives free workers to the oldest waiting jobs. r.mu must be
+// held.
+func (r *Runner) admitLocked() {
+	for r.running < r.workers && len(r.queue) > 0 {
+		aj := r.queue[0]
+		r.queue[0] = nil
+		r.queue = r.queue[1:]
+		aj.admitted = true
+		r.running++
+		close(aj.admit)
+	}
+}
+
+// dequeueLocked removes a job that gave up waiting. r.mu must be held.
+func (r *Runner) dequeueLocked(aj *activeJob) {
+	for i, q := range r.queue {
+		if q == aj {
+			r.queue = append(r.queue[:i], r.queue[i+1:]...)
+			return
+		}
+	}
+}
+
+// releaseWorker returns a worker and admits the next waiting job.
+func (r *Runner) releaseWorker() {
+	r.mu.Lock()
+	r.running--
+	r.admitLocked()
+	r.mu.Unlock()
 }
 
 func (r *Runner) finish(id int64, status store.JobStatus, detail string) {

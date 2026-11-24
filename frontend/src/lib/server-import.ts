@@ -1,13 +1,15 @@
 import type { ServerExport, ServerSpec } from "@/api/types.gen";
-import { RESOURCE_NAME_RE, validateEnvKey } from "@/lib/validators";
+import { RESOURCE_NAME_RE, validateEnvKey, validateEnvTotals, validateEnvValue } from "@/lib/validators";
 
 export interface ImportCheck {
   value: ServerExport | null;
   errors: string[];
 }
 
-/** The daemon reads at most 1 MiB of JSON per request. */
-export const IMPORT_LIMIT_BYTES = 1024 * 1024;
+/** POST /servers/import reads at most 64 MiB of JSON (docs/API.md). */
+export const IMPORT_LIMIT_BYTES = 64 * 1024 * 1024;
+/** One import document holds at most 128 servers. */
+export const IMPORT_MAX_SERVERS = 128;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -40,6 +42,10 @@ export function checkServerImport(text: string): ImportCheck {
     return { value: null, errors };
   }
   if (data.servers.length === 0) errors.push("The file contains no servers.");
+  if (data.servers.length > IMPORT_MAX_SERVERS) {
+    errors.push(`The file contains ${data.servers.length} servers; one import accepts at most ${IMPORT_MAX_SERVERS}. Split it into several files.`);
+    return { value: null, errors };
+  }
 
   const names = new Map<string, number>();
   const ports = new Map<number, number>();
@@ -85,7 +91,14 @@ export function checkServerImport(text: string): ImportCheck {
           else if (seen.has(k.toUpperCase())) errors.push(`${label}: environment variable "${k}" is listed twice (names are unique ignoring case).`);
           seen.add(k.toUpperCase());
           if (typeof v !== "string") errors.push(`${label}: the value of ${k} must be a string.`);
+          else if (!keyError) {
+            const valueError = validateEnvValue(k, v);
+            if (valueError) errors.push(`${label}: environment variable ${k}: ${valueError}`);
+          }
         }
+        const stringEnv = Object.fromEntries(Object.entries(raw.env).filter(([, v]) => typeof v === "string")) as Record<string, string>;
+        const totals = validateEnvTotals(stringEnv);
+        if (totals) errors.push(`${label}: environment: ${totals}`);
       }
     }
     servers.push(raw as unknown as ServerSpec);
@@ -104,5 +117,7 @@ export function describeImportField(field: string | undefined, doc: ServerExport
   if (!m) return field;
   const i = Number(m[1]);
   const name = doc?.servers[i]?.name;
-  return `Server ${i + 1}${name ? ` (${name})` : ""}${m[2] ? `, ${m[2]}` : ""}`;
+  // Value errors name the variable: servers[0].env.MOTD.
+  const attr = m[2]?.startsWith("env.") ? `environment variable ${m[2].slice(4)}` : m[2];
+  return `Server ${i + 1}${name ? ` (${name})` : ""}${attr ? `, ${attr}` : ""}`;
 }

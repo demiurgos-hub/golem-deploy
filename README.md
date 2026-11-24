@@ -17,7 +17,7 @@ A single `golem-deploy` binary serves a versioned HTTP API under `/api/v1` and t
 - **Projects:** Git repositories cloned over HTTPS or SSH into the data directory, with pull, branch switching and remote branch listing as jobs, encrypted credentials and hardened, non-interactive git. See [docs/REPOSITORIES.md](docs/REPOSITORIES.md).
 - **Game servers:** hardened containers from managed images, one host port per server published as UDP and TCP, start/stop/restart jobs, streamed logs, stats, export/import, and restart of servers that should be running when the daemon starts. Only objects labelled `dev.golemengine.deploy.managed=true` are ever touched; see [docs/SERVERS.md](docs/SERVERS.md) for the container hardening, the port model and firewall notes.
 - **Images, volumes, static files:** managed images and volumes can be listed and deleted; a static file store accepts uploads (streamed, never overwritten unless asked) for later builds.
-- **Web client:** sign-in (with a registration link only when registration is on), account (password change with optional token revocation, API tokens created with the current password and shown once), account administration including other accounts' API tokens, settings, projects (create, live clone/pull/branch job logs, edit credentials, repair a failed clone by pulling), servers (create from managed images, start/stop/restart/delete jobs, live logs with follow, stats, environment editing with a restart-required notice, JSON export/import), images, static files (upload with confirmed replacement, download, delete) and volumes. Job logs and cancel buttons follow the daemon's rules for restricted jobs and job ownership.
+- **Web client:** sign-in (with a registration link only when registration is on), account (password change with optional token revocation, API tokens created with the current password and shown once), account administration including other accounts' API tokens, settings, projects (create, live clone/pull/branch job logs, edit credentials, which must be re-entered when the URL moves to another host, repair a failed clone by pulling), servers (create from managed images, start/stop/restart/delete jobs with the delete outcome shown, live logs with follow, stats, environment editing with a restart-required notice, JSON export/import), images, static files (store usage against the quota, upload with confirmed replacement, download, delete) and volumes. Lists refresh on their own while the page is visible. Job logs and cancel buttons follow the daemon's rules for restricted jobs and job ownership.
 
 The HTTP contract is documented in [docs/API.md](docs/API.md).
 
@@ -48,6 +48,7 @@ Run the checks used in CI:
 ```sh
 (cd frontend && npm run lint && npm test && npm run build)
 go vet ./...
+go run ./scripts/checkchars          # no bidi controls, U+2028/U+2029, NUL or other control characters in tracked files
 go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 go test -race ./...

@@ -7,6 +7,23 @@ export function isJobActive(job: Pick<Job, "status"> | undefined): boolean {
   return job?.status === "queued" || job?.status === "running";
 }
 
+/**
+ * Polling of lists while the page is visible (the query client never polls
+ * in the background): fast while something is in progress, slowly otherwise
+ * so that changes made by other users or API tokens appear on their own.
+ */
+export const POLL_ACTIVE_MS = 2000;
+export const POLL_IDLE_MS = 10_000;
+
+export function listPollInterval(active: boolean): number {
+  return active ? POLL_ACTIVE_MS : POLL_IDLE_MS;
+}
+
+/** A server whose state is still settling (a start, stop or crash loop in progress). */
+function isServerSettling(s: Pick<Server, "state" | "desired_state">): boolean {
+  return s.state === "restarting" || (s.desired_state === "running" ? s.state !== "running" : s.state === "running");
+}
+
 export function isProjectBusy(p: Pick<Project, "status">): boolean {
   return p.status === "cloning" || p.status === "pulling" || p.status === "switching_branch";
 }
@@ -84,7 +101,7 @@ export function useSubjectJobs(type: SubjectType, id: number, limit = 20) {
     queryKey: [...qk.jobs.forSubject(type, id), limit],
     queryFn: ({ signal }) => api.jobs.list({ subject_type: type, subject_id: String(id), limit }, signal),
     // Fast while a job runs; slowly otherwise, to pick up jobs started elsewhere (other users, API tokens).
-    refetchInterval: (q) => (q.state.data?.items.some(isJobActive) ? 2000 : 10_000),
+    refetchInterval: (q) => listPollInterval(q.state.data?.items.some(isJobActive) ?? false),
   });
 }
 
@@ -93,7 +110,7 @@ export function useProjects() {
   return useQuery({
     queryKey: qk.projects.list,
     queryFn: ({ signal }) => api.projects.list(signal),
-    refetchInterval: (q) => (q.state.data?.items.some(isProjectBusy) ? 3000 : false),
+    refetchInterval: (q) => listPollInterval(q.state.data?.items.some(isProjectBusy) ?? false),
   });
 }
 
@@ -115,13 +132,13 @@ export function useBranches(id: number, enabled: boolean) {
   });
 }
 
-/** Server runtime state changes on its own (crashes, restarts), so lists poll while visible. */
+/** Server runtime state changes on its own (crashes, restarts) and through other users, so the list polls while visible. */
 export function useServers() {
   const api = useApi();
   return useQuery({
     queryKey: qk.servers.list,
     queryFn: ({ signal }) => api.servers.list(signal),
-    refetchInterval: 5000,
+    refetchInterval: (q) => listPollInterval(q.state.data?.items.some(isServerSettling) ?? false),
   });
 }
 

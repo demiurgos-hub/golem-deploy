@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,6 +86,23 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		ae = internal(err)
 	}
 	reqID := requestIDFrom(r.Context())
+	if canceledByCaller(r, err) {
+		select {
+		case <-s.shutdown:
+			// The daemon is going away and took the request with it: not
+			// the client's doing, so say so (and still try to answer).
+			s.logger.Warn("request aborted by daemon shutdown", "request_id", reqID, "method", r.Method, "path", r.URL.Path, "err", err.Error())
+			ae = errUnavailable
+		default:
+			// The client cancelled (navigated away, closed the tab): not a
+			// failure of the daemon, and nobody is left to read an answer.
+			// The access log records it once, at debug level, as 499.
+			if ri, ok := r.Context().Value(reqInfoKey).(*reqInfo); ok {
+				ri.clientGone = true
+			}
+			return
+		}
+	}
 	switch {
 	case ae.status >= 500 && ae.cause != nil:
 		s.logger.Error("request failed", "request_id", reqID, "method", r.Method, "path", r.URL.Path, "code", ae.code, "err", ae.cause.Error())
@@ -102,6 +120,16 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		RequestID: reqID,
 		Field:     ae.field,
 	}})
+}
+
+// canceledByCaller reports whether err is only the consequence of the
+// request's own context being cancelled: the error chain contains
+// context.Canceled and the request context is done. A dependency's own
+// timeout (context.DeadlineExceeded from the docker or git layer) or a
+// cancellation from anywhere else (a job, a shared operation) does not
+// qualify and stays an error.
+func canceledByCaller(r *http.Request, err error) bool {
+	return errors.Is(err, context.Canceled) && r.Context().Err() != nil
 }
 
 // decodeJSON strictly decodes a JSON request body into dst: the media type

@@ -29,7 +29,7 @@ import { ErrorState, ErrorText, LoadingState, Notice } from "@/components/ui/sta
 import { useToast } from "@/components/ui/toast";
 import { formatDateTime, formatRelative, shortCommit } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { checkRepoUrl, validateRepoUrl } from "@/lib/validators";
+import { checkRepoUrl, sameRepoOrigin, validateRepoUrl } from "@/lib/validators";
 import { NotFoundPage } from "@/pages/not-found";
 
 export function ProjectDetailPage() {
@@ -285,6 +285,14 @@ function SwitchBranchDialog({ project, onClose, onJob }: { project: Project; onC
 
 type CredentialMode = "keep" | "replace" | "clear";
 
+/** The credential type to offer for replacement with this URL ("none" is the separate "clear" choice). */
+function replaceTypeFor(draft: AuthDraft, repoUrl: string): AuthDraft {
+  const kind = checkRepoUrl(repoUrl.trim()).kind;
+  if (kind === "ssh" && draft.type !== "ssh") return { ...draft, type: "ssh" };
+  if (kind === "https" && draft.type !== "https") return { ...draft, type: "https" };
+  return draft;
+}
+
 function EditProjectDialog({ project, onClose }: { project: Project; onClose: () => void }) {
   const api = useApi();
   const toast = useToast();
@@ -293,7 +301,13 @@ function EditProjectDialog({ project, onClose }: { project: Project; onClose: ()
   const [mode, setMode] = useState<CredentialMode>("keep");
   const [auth, setAuth] = useState<AuthDraft>(emptyAuth(project.auth_type === "none" ? "https" : project.auth_type));
   const [urlError, setUrlError] = useState<string | null>(null);
+  const [modeError, setModeError] = useState<string | null>(null);
   const [authErrors, setAuthErrors] = useState<AuthErrors>({});
+
+  const url = repoUrl.trim();
+  const kind = checkRepoUrl(url).kind;
+  // A new URL on another scheme, host or port: the daemon never sends stored credentials there.
+  const originChanged = url !== project.repo_url && kind !== null && !sameRepoOrigin(project.repo_url, url);
 
   const update = useMutation({
     mutationFn: (body: UpdateProjectRequest) => api.projects.update(project.id, body),
@@ -307,23 +321,39 @@ function EditProjectDialog({ project, onClose }: { project: Project; onClose: ()
       const aErrs = authErrorsFrom(err);
       if (aErrs) setAuthErrors(aErrs);
       else if (isApiError(err) && err.code === "validation_failed" && err.field === "repo_url") setUrlError(sentence(err.message));
+      else if (isApiError(err) && err.code === "validation_failed" && err.field === "auth") setModeError(sentence(err.message));
     },
   });
+
+  function changeUrl(value: string) {
+    setRepoUrl(value);
+    setModeError(null);
+    setAuth((a) => replaceTypeFor(a, value));
+    // "No credentials" is not possible for SSH URLs.
+    if (checkRepoUrl(value.trim()).kind === "ssh" && mode === "clear") setMode("replace");
+  }
 
   function submit(e: FormEvent) {
     e.preventDefault();
     let uErr = validateRepoUrl(repoUrl);
-    const kind = checkRepoUrl(repoUrl.trim()).kind;
-    if (!uErr && mode === "keep" && project.auth_type !== "none" && kind !== null && kind !== project.auth_type) {
-      // The daemon's rule: stored credentials of the other kind cannot be kept with this URL.
+    let mErr: string | null = null;
+    if (!uErr && originChanged && mode === "keep") {
+      mErr =
+        kind === "ssh"
+          ? "The new URL is on another host, port or scheme. Stored credentials are never sent to a new host: paste a deploy key for it."
+          : "The new URL is on another host, port or scheme. Stored credentials are never sent to a new host: enter credentials for it, or choose No credentials for a public repository.";
+    } else if (!uErr && mode === "keep" && project.auth_type !== "none" && kind !== null && kind !== project.auth_type) {
       uErr =
         project.auth_type === "https"
           ? "HTTPS credentials require an https:// repository URL; replace or remove the credentials together with the URL."
           : "An SSH key requires an ssh:// or user@host:path repository URL; replace or remove the credentials together with the URL.";
+    } else if (!uErr && mode === "clear" && kind === "ssh") {
+      mErr = "SSH repository URLs need a private key: choose Replace and paste a deploy key.";
     }
     setUrlError(uErr);
+    setModeError(mErr);
     const body: UpdateProjectRequest = {};
-    if (repoUrl.trim() !== project.repo_url) body.repo_url = repoUrl.trim();
+    if (url !== project.repo_url) body.repo_url = url;
     if (mode === "replace") {
       const aErrs = validateAuth(auth, repoUrl);
       setAuthErrors(aErrs);
@@ -332,7 +362,7 @@ function EditProjectDialog({ project, onClose }: { project: Project; onClose: ()
     } else if (mode === "clear") {
       body.auth = { type: "none" };
     }
-    if (uErr) return;
+    if (uErr || mErr) return;
     if (Object.keys(body).length === 0) {
       onClose();
       return;
@@ -340,10 +370,17 @@ function EditProjectDialog({ project, onClose }: { project: Project; onClose: ()
     update.mutate(body);
   }
 
-  const modes: { value: CredentialMode; label: string; hint: string }[] = [
-    { value: "keep", label: "Keep current", hint: authSummary(project) },
-    { value: "replace", label: "Replace", hint: "Enter new credentials" },
-    ...(project.auth_type !== "none" ? [{ value: "clear" as const, label: "Remove", hint: "Use no credentials" }] : []),
+  const modes: { value: CredentialMode; label: string; hint: string; disabled?: boolean }[] = [
+    {
+      value: "keep",
+      label: "Keep current",
+      hint: originChanged ? "Not possible for a new host" : authSummary(project),
+      disabled: originChanged,
+    },
+    { value: "replace", label: project.auth_type === "none" && !originChanged ? "Add" : "Replace", hint: "Enter new credentials" },
+    ...(kind !== "ssh" && (project.auth_type !== "none" || originChanged)
+      ? [{ value: "clear" as const, label: project.auth_type !== "none" ? "Remove" : "No credentials", hint: "Public https repository" }]
+      : []),
   ];
 
   return (
@@ -366,36 +403,59 @@ function EditProjectDialog({ project, onClose }: { project: Project; onClose: ()
     >
       <form id="edit-project" onSubmit={submit} noValidate className="flex flex-col gap-4">
         <Field label="Repository URL" error={urlError}>
-          {(p) => <Input {...p} spellCheck={false} value={repoUrl} onChange={(e) => setRepoUrl(e.target.value)} />}
+          {(p) => <Input {...p} spellCheck={false} value={repoUrl} onChange={(e) => changeUrl(e.target.value)} />}
         </Field>
+        {originChanged && (
+          <Notice tone="info" title="Credentials needed for the new host">
+            The new URL uses another scheme, host or port than <span className="break-all font-mono text-xs">{project.repo_url}</span>.
+            Credentials stored for the old host are never sent to a new one, so they cannot be kept:{" "}
+            {kind === "ssh"
+              ? "paste a deploy key for the new host."
+              : "enter credentials for the new host, or choose No credentials for a public repository."}
+          </Notice>
+        )}
         <fieldset>
           <legend className="mb-1.5 text-sm font-medium">Credentials</legend>
           <div className="grid gap-2 sm:grid-cols-3" role="radiogroup">
-            {modes.map((m) => (
-              <label
-                key={m.value}
-                className={cn(
-                  "flex cursor-pointer flex-col rounded-md border px-3 py-2 text-sm focus-within:ring-2 focus-within:ring-ring",
-                  mode === m.value ? "border-primary bg-accent" : "border-input",
-                )}
-              >
-                <input
-                  type="radio"
-                  name="credential-mode"
-                  className="sr-only"
-                  checked={mode === m.value}
-                  onChange={() => setMode(m.value)}
-                />
-                <span className="font-medium">{m.label}</span>
-                <span className="text-xs text-muted-foreground">{m.hint}</span>
-              </label>
-            ))}
+            {modes.map((m) => {
+              const checked = mode === m.value && !m.disabled;
+              return (
+                <label
+                  key={m.value}
+                  className={cn(
+                    "flex flex-col rounded-md border px-3 py-2 text-sm focus-within:ring-2 focus-within:ring-ring",
+                    m.disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+                    checked ? "border-primary bg-accent" : "border-input",
+                  )}
+                >
+                  <input
+                    type="radio"
+                    name="credential-mode"
+                    className="sr-only"
+                    checked={checked}
+                    disabled={m.disabled}
+                    onChange={() => {
+                      setMode(m.value);
+                      setModeError(null);
+                    }}
+                  />
+                  <span className="font-medium">{m.label}</span>
+                  <span className="text-xs text-muted-foreground">{m.hint}</span>
+                </label>
+              );
+            })}
           </div>
+          {modeError && (
+            <p className="mt-1.5 text-xs text-destructive" role="alert">
+              {modeError}
+            </p>
+          )}
         </fieldset>
-        {mode === "replace" && <ProjectAuthFields draft={auth} onChange={setAuth} errors={authErrors} />}
-        {update.isError && !(isApiError(update.error) && (update.error.field === "repo_url" || authErrorsFrom(update.error))) && (
-          <ErrorText error={update.error} />
-        )}
+        {mode === "replace" && <ProjectAuthFields draft={auth} onChange={setAuth} errors={authErrors} repoUrl={repoUrl} allowNone={false} />}
+        {update.isError &&
+          !(isApiError(update.error) && (update.error.field === "repo_url" || update.error.field === "auth" || authErrorsFrom(update.error))) && (
+            <ErrorText error={update.error} />
+          )}
       </form>
     </Dialog>
   );

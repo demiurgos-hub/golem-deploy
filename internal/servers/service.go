@@ -258,10 +258,21 @@ func (s *Service) view(sv store.Server, ct *docker.Container, dockerOK bool) (ap
 	return out, nil
 }
 
-func (s *Service) dockerFailed(op string, err error) {
+// dockerFailed logs a failed runtime query whose result is reported as
+// state "unknown". When the failure is only ctx being cancelled by its
+// caller it logs at debug level and returns an error, so the request ends
+// as cancelled instead of reporting an unknown state to nobody.
+func (s *Service) dockerFailed(ctx context.Context, op string, err error) error {
+	if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+		// The caller (an HTTP client that went away) cancelled the query:
+		// nothing failed, and nobody is left to see an unknown state.
+		s.logger.Debug("docker query cancelled with its caller", "op", op)
+		return fmt.Errorf("%s: %w", op, err)
+	}
 	if !errors.Is(err, docker.ErrUnavailable) {
 		s.logger.Warn("docker query failed; reporting unknown state", "op", op, "err", err)
 	}
+	return nil
 }
 
 // containers indexes managed containers by id and logs the ones that are
@@ -296,7 +307,9 @@ func (s *Service) List(ctx context.Context) ([]apitypes.Server, error) {
 	}
 	cts, derr := s.docker.ManagedContainers(ctx)
 	if derr != nil {
-		s.dockerFailed("list servers", derr)
+		if err := s.dockerFailed(ctx, "list servers", derr); err != nil {
+			return nil, err
+		}
 	}
 	byServer := s.containers(rows, cts)
 	out := make([]apitypes.Server, 0, len(rows))
@@ -342,7 +355,9 @@ func (s *Service) Get(ctx context.Context, id int64) (apitypes.Server, error) {
 	}
 	ct, derr := s.container(ctx, sv)
 	if derr != nil {
-		s.dockerFailed("get server", derr)
+		if err := s.dockerFailed(ctx, "get server", derr); err != nil {
+			return apitypes.Server{}, err
+		}
 	}
 	return s.view(sv, ct, derr == nil)
 }
@@ -593,7 +608,8 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 		"env_set", len(req.EnvSet), "env_unset", len(req.EnvUnset))
 	ct, derr := s.container(ctx, updated)
 	if derr != nil {
-		s.dockerFailed("update server", derr)
+		// The update is stored; a cancelled caller only loses the view.
+		_ = s.dockerFailed(ctx, "update server", derr)
 	}
 	return s.view(updated, ct, derr == nil)
 }

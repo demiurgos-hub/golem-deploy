@@ -85,7 +85,7 @@ describe("login page and /auth/options", () => {
     expect(await screen.findByText(/Too many concurrent logins from your address/)).toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: "Sign in" })).toBeEnabled(), { timeout: 3000 });
     await user.click(screen.getByRole("button", { name: "Sign in" }));
-    expect(await screen.findByText(/The server is busy; try again\. Try again in 2 seconds\./)).toBeInTheDocument();
+    expect(await screen.findByText(/The server is busy; try again in 2 seconds\./)).toBeInTheDocument();
   });
 });
 
@@ -269,13 +269,13 @@ describe("static file replace semantics", () => {
       path: "/static",
       signedInAs: account(),
       routes: {
-        "GET /static": () => jsonResponse(200, { items: [{ name: "maps.zip", size_bytes: 10, modified_at: "2026-11-01T00:00:00Z", is_zip: true }] }),
+        "GET /static": () => jsonResponse(200, { items: [{ name: "maps.zip", size_bytes: 10, modified_at: "2026-11-01T00:00:00Z", is_zip: true }], used_bytes: 10, quota_bytes: 0, file_count: 1, max_files: 2000 }),
         "POST /static": (req) => {
           const name = (req.body as FormData).get("files") instanceof File ? ((req.body as FormData).get("files") as File).name : "";
           const replace = req.query.get("replace") === "1";
           uploads.push(`${name}${replace ? " replace" : ""}`);
           if (name === "late.bin" && !replace) return errorResponse(409, "conflict", "a file with that name already exists; upload with replace=1 to overwrite it");
-          return jsonResponse(201, { items: [{ name, size_bytes: 1, modified_at: "2026-11-02T00:00:00Z", is_zip: false }] });
+          return jsonResponse(201, { items: [{ name, size_bytes: 1, modified_at: "2026-11-02T00:00:00Z", is_zip: false }], used_bytes: 11, quota_bytes: 0, file_count: 2, max_files: 2000 });
         },
       },
     });

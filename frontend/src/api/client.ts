@@ -7,6 +7,49 @@ import {
 
 export const API_BASE = "/api/v1";
 
+/** POST /static: the daemon runs at most 2 uploads at a time per account (more: 429 rate_limited). */
+export const MAX_CONCURRENT_UPLOADS = 2;
+
+/** A counting semaphore: run() waits for a free slot (in call order) and releases it when fn settles. */
+export function createLimiter(slots: number) {
+  let free = slots;
+  const waiting: (() => void)[] = [];
+  const release = () => {
+    const next = waiting.shift();
+    if (next) next();
+    else free++;
+  };
+  return {
+    get active() {
+      return slots - free;
+    },
+    async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+      if (free > 0) free--;
+      else {
+        await new Promise<void>((resolve, reject) => {
+          const go = () => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve();
+          };
+          const onAbort = () => {
+            const i = waiting.indexOf(go);
+            if (i >= 0) waiting.splice(i, 1);
+            reject(abortedError());
+          };
+          if (signal?.aborted) return onAbort();
+          signal?.addEventListener("abort", onAbort, { once: true });
+          waiting.push(go);
+        });
+      }
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    },
+  };
+}
+
 export interface HeaderReader {
   get(name: string): string | null;
 }
@@ -63,6 +106,8 @@ export interface ApiClientOptions {
   /** Called with the token that a request was rejected for (401 unauthenticated). */
   onUnauthenticated: (tokenUsed: string) => void;
   baseUrl?: string;
+  /** Upload requests in flight at once from this client (default MAX_CONCURRENT_UPLOADS); further ones wait. */
+  maxConcurrentUploads?: number;
 }
 
 export function buildUrl(base: string, path: string, query?: Query): string {
@@ -95,6 +140,10 @@ function filenameFromDisposition(value: string | null): string | null {
 export function createApiClient(options: ApiClientOptions): ApiClient {
   const base = options.baseUrl ?? API_BASE;
   const { transport } = options;
+  // Every upload of this app instance goes through one limiter, so the web
+  // client itself never exceeds the daemon's per-account cap; uploads from
+  // other tabs or tools can still get 429, which callers handle.
+  const uploads = createLimiter(options.maxConcurrentUploads ?? MAX_CONCURRENT_UPLOADS);
 
   function authHeaders(auth: boolean): { headers: Record<string, string>; token: string | null } {
     const headers: Record<string, string> = {};
@@ -202,13 +251,17 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
       headers.Accept = "application/json";
       let raw: RawResponse;
       try {
-        raw = await transport.upload({
-          url: buildUrl(base, path),
-          body,
-          headers,
-          onProgress: opts.onProgress,
-          signal: opts.signal,
-        });
+        raw = await uploads.run(
+          () =>
+            transport.upload({
+              url: buildUrl(base, path),
+              body,
+              headers,
+              onProgress: opts.onProgress,
+              signal: opts.signal,
+            }),
+          opts.signal,
+        );
       } catch (err) {
         if (err instanceof ApiError) throw err;
         if (opts.signal?.aborted) throw abortedError();

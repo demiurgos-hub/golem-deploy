@@ -267,7 +267,9 @@ export function InlineJob({
         </div>
       </div>
       {job.detail && (
-        <p className={job.status === "error" ? "text-sm text-destructive" : "text-sm text-muted-foreground"}>{job.detail}</p>
+        <p className={(job.status === "error" ? "text-destructive" : "text-muted-foreground") + " whitespace-pre-wrap break-words text-sm"}>
+          {job.detail}
+        </p>
       )}
       {error && <ErrorText error={error} />}
       {showLog && <JobLog job={job} />}
@@ -309,7 +311,16 @@ export function JobsPanel({ subjectType, subjectId }: { subjectType: SubjectType
               <span className="text-xs text-muted-foreground" title={formatDateTime(job.created_at)}>
                 {formatRelative(job.created_at)} by {by}
               </span>
-              {job.detail && <span className="min-w-0 truncate text-xs text-muted-foreground">{job.detail}</span>}
+              {job.detail && (
+                <span
+                  className={
+                    "w-full min-w-0 whitespace-pre-wrap break-words pl-7 text-xs " +
+                    (job.status === "error" ? "text-destructive" : "text-muted-foreground")
+                  }
+                >
+                  {job.detail}
+                </span>
+              )}
             </button>
             {expanded && (
               <div className="px-3 pb-3">

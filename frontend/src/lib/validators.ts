@@ -59,54 +59,46 @@ export const validateResourceName: Validator = (value) => {
   return null;
 };
 
-/**
- * Names that would steer the docker CLI the daemon runs (internal/docker),
- * compared case-insensitively like the daemon does.
- */
-const RESERVED_ENV = new Set([
-  "PATH",
-  "HOME",
-  "XDG_RUNTIME_DIR",
-  "HTTP_PROXY",
-  "HTTPS_PROXY",
-  "NO_PROXY",
-  "ALL_PROXY",
-  "SSH_AUTH_SOCK",
-  "SYSTEMROOT",
-  "SYSTEMDRIVE",
-  "WINDIR",
-  "COMSPEC",
-  "PATHEXT",
-  "TEMP",
-  "TMP",
-  "USERPROFILE",
-  "APPDATA",
-  "LOCALAPPDATA",
-  "PROGRAMDATA",
-  "PROGRAMFILES",
-  "PROGRAMFILES(X86)",
-  "PROGRAMW6432",
-  "HOMEDRIVE",
-  "HOMEPATH",
-  "USERNAME",
-  "USERDOMAIN",
-  "COMPUTERNAME",
-  "NUMBER_OF_PROCESSORS",
-  "PROCESSOR_ARCHITECTURE",
-  "OS",
-]);
+/** Env names starting with this (any case) are reserved for variables the daemon injects. */
+export const RESERVED_ENV_PREFIX = "GOLEM_";
+/** Limits on server environment (docs/API.md, Servers); sizes count UTF-8 bytes of key plus value. */
+export const ENV_MAX_VARS = 128;
+export const ENV_MAX_VAR_BYTES = 32 * 1024;
+export const ENV_MAX_TOTAL_BYTES = 64 * 1024;
 
 export function isReservedEnvKey(key: string): boolean {
-  const up = key.toUpperCase();
-  return up.startsWith("DOCKER_") || up.startsWith("BUILDKIT_") || RESERVED_ENV.has(up);
+  return key.toUpperCase().startsWith(RESERVED_ENV_PREFIX);
 }
 
 export const validateEnvKey: Validator = (value) => {
   if (!value) return "Enter a variable name.";
   if (!ENV_KEY_RE.test(value)) return "Use up to 128 letters, digits and '_', not starting with a digit.";
-  if (isReservedEnvKey(value)) return `${value} is reserved by the daemon and cannot be used.`;
+  if (isReservedEnvKey(value)) return `Names starting with ${RESERVED_ENV_PREFIX} are reserved for golem-deploy.`;
   return null;
 };
+
+/**
+ * A value as the daemon checks it (internal/docker ValidateEnvValue): one
+ * line of UTF-8, at most 32 KiB together with its name. The wording follows
+ * the daemon's; values are never echoed.
+ */
+export function validateEnvValue(key: string, value: string): string | null {
+  if (utf8Length(key) + utf8Length(value) > ENV_MAX_VAR_BYTES) {
+    return `The variable exceeds ${ENV_MAX_VAR_BYTES} bytes (name and value, currently ${utf8Length(key) + utf8Length(value)}).`;
+  }
+  if (value.includes("\0")) return "The value contains a NUL byte.";
+  if (/[\r\n]/.test(value)) return "The value contains a line break (values must be a single line).";
+  return null;
+}
+
+/** Limits over the whole set (count and total size), or null. */
+export function validateEnvTotals(env: Record<string, string>): string | null {
+  const keys = Object.keys(env);
+  if (keys.length > ENV_MAX_VARS) return `At most ${ENV_MAX_VARS} variables are allowed (currently ${keys.length}).`;
+  const total = keys.reduce((n, k) => n + utf8Length(k) + utf8Length(env[k]), 0);
+  if (total > ENV_MAX_TOTAL_BYTES) return `The variables exceed ${ENV_MAX_TOTAL_BYTES} bytes in total (currently ${total}).`;
+  return null;
+}
 
 const WINDOWS_DEVICES = new Set(["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]);
 
@@ -229,6 +221,48 @@ export function checkRepoUrl(raw: string): { kind: RepoKind; error: null } | { k
   if (path.replace(/\//g, "") === "") return fail("repository URL must include a repository path");
   if (path.startsWith("-")) return fail("repository path must not start with '-'");
   return { kind: "ssh", error: null };
+}
+
+/**
+ * Scheme kind, lower-case host and port (default port made explicit; an
+ * scp-style URL is SSH on port 22) of a URL checkRepoUrl accepts, like the
+ * daemon's git.SameOrigin. Null for invalid URLs.
+ */
+export function repoOrigin(raw: string): { kind: RepoKind; host: string; port: string } | null {
+  const url = raw.trim();
+  const { kind } = checkRepoUrl(url);
+  if (kind === null) return null;
+  const def = kind === "ssh" ? "22" : "443";
+  const sep = url.indexOf("://");
+  if (sep >= 0) {
+    const rest = url.slice(sep + 3);
+    const slash = rest.indexOf("/");
+    const authority = slash < 0 ? rest : rest.slice(0, slash);
+    const hostPort = authority.slice(authority.lastIndexOf("@") + 1);
+    if (hostPort.startsWith("[")) {
+      const close = hostPort.indexOf("]");
+      const port = hostPort.slice(close + 2);
+      return { kind, host: hostPort.slice(1, close).toLowerCase(), port: port || def };
+    }
+    const colon = hostPort.indexOf(":");
+    return colon < 0
+      ? { kind, host: hostPort.toLowerCase(), port: def }
+      : { kind, host: hostPort.slice(0, colon).toLowerCase(), port: hostPort.slice(colon + 1) || def };
+  }
+  const rest = url.slice(url.indexOf("@") + 1);
+  const host = rest.startsWith("[") ? rest.slice(1, rest.indexOf("]")) : rest.slice(0, rest.indexOf(":"));
+  return { kind, host: host.toLowerCase(), port: def };
+}
+
+/**
+ * Whether two repository URLs share scheme, host and port. Stored
+ * credentials are only kept for a new URL with the same origin; otherwise
+ * the daemon requires auth in the same request (validation_failed, field auth).
+ */
+export function sameRepoOrigin(a: string, b: string): boolean {
+  const oa = repoOrigin(a);
+  const ob = repoOrigin(b);
+  return oa !== null && ob !== null && oa.kind === ob.kind && oa.host === ob.host && Number(oa.port) === Number(ob.port);
 }
 
 export const validateRepoUrl: Validator = (value) => {

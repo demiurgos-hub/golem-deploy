@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,6 +177,78 @@ func TestQueuedJobCancelledBeforeRunning(t *testing.T) {
 	got := getJob(t, st, j2.ID)
 	if ran || got.Status != store.JobCancelled || got.StartedAt != nil {
 		t.Fatalf("queued job ran=%v %+v", ran, got)
+	}
+}
+
+// Jobs get workers in the order they were started, whatever order their
+// goroutines happen to be scheduled in (with one worker, a later job used
+// to be able to take the worker before an earlier one had asked for it).
+func TestJobsRunInStartOrder(t *testing.T) {
+	r, _ := newRunner(t, 1)
+	block := make(chan struct{})
+	first, err := r.Start(context.Background(), "k", subj, nil, func(context.Context, io.Writer) error { <-block; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var order []int
+	var ids []int64
+	for i := 0; i < 20; i++ {
+		j, err := r.Start(context.Background(), "k", Subject{Type: "server", ID: SubjectID(int64(i))}, nil, func(context.Context, io.Writer) error {
+			mu.Lock()
+			order = append(order, i)
+			mu.Unlock()
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, j.ID)
+	}
+	close(block)
+	waitDone(t, r, first.ID)
+	for _, id := range ids {
+		waitDone(t, r, id)
+	}
+	for i, got := range order {
+		if got != i {
+			t.Fatalf("jobs ran in order %v, want start order", order)
+		}
+	}
+}
+
+// A queued job that is cancelled at the moment a worker becomes free for
+// it never starts, whichever of the two the runner notices first.
+func TestJobCancelledWhileBeingAdmittedNeverStarts(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		r, st := newRunner(t, 1)
+		block := make(chan struct{})
+		j1, _ := r.Start(context.Background(), "k", subj, nil, func(context.Context, io.Writer) error { <-block; return nil })
+		var ran atomic.Bool
+		j2, err := r.Start(context.Background(), "k", Subject{Type: "project", ID: "2"}, nil, func(context.Context, io.Writer) error { ran.Store(true); return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Cancel j2 and give it a worker in one step, so both of its wake-up
+		// conditions are ready when its goroutine looks.
+		r.mu.Lock()
+		r.active[j2.ID].cancel(errCancelledByUser)
+		r.workers = 2
+		r.admitLocked()
+		r.mu.Unlock()
+		waitDone(t, r, j2.ID)
+		close(block)
+		waitDone(t, r, j1.ID)
+		got := getJob(t, st, j2.ID)
+		if ran.Load() || got.Status != store.JobCancelled || got.StartedAt != nil || got.Detail != DetailCancelled {
+			t.Fatalf("job cancelled during admission: ran=%v %+v", ran.Load(), got)
+		}
+		r.mu.Lock()
+		running, queued := r.running, len(r.queue)
+		r.mu.Unlock()
+		if running != 0 || queued != 0 {
+			t.Fatalf("worker accounting after cancellation: running=%d queued=%d", running, queued)
+		}
 	}
 }
 

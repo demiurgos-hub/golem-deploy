@@ -7,9 +7,9 @@ alwaysApply: false
 # Toolchain and CI
 
 - `go.mod` sets the minimum Go version; CI derives the Go minor version from its `go` line and installs the latest patch of that minor. `ignore ./frontend/node_modules` keeps npm-shipped Go packages out of `./...`.
-- `.github/workflows/ci.yml` runs the frontend job (`npm ci`, `npm run lint`, `npm test`, `npm run build`) first, then the Go job with the built `frontend/dist` artifact: the generated-types freshness check (`scripts/gen-types.sh` + `git diff --exit-code`), `go vet`, `staticcheck`, `govulncheck`, `go test -race`. Keep local verification aligned with it.
+- `.github/workflows/ci.yml` runs the frontend job (`npm ci`, `npm run lint`, `npm test`, `npm run build`) first, then the Go job with the built `frontend/dist` artifact: the generated-types freshness check (`scripts/gen-types.sh` + `git diff --exit-code`), the hidden-character check, `go vet`, `staticcheck`, `govulncheck`, `go test -race`. Keep local verification aligned with it.
 - ESLint uses the flat config in `frontend/eslint.config.js` (`typescript-eslint`, `eslint-plugin-react-hooks`) with `--max-warnings=0`. Disable a rule only on the specific line, with a comment explaining why.
 - `frontend/package-lock.json` must stay `npm ci`-compatible; commit it with dependency changes.
 - Vite empties `frontend/dist` on build; the `keep-dist-placeholder` plugin in `vite.config.ts` restores the committed `.gitkeep`.
 - `scripts/build.sh` builds the web client then `bin/golem-deploy` (extra arguments go to `go build`, e.g. `-ldflags "-X main.version=..."`). `scripts/gen-types.sh` regenerates `frontend/src/api/types.gen.ts` with tygo at the version pinned in the script; bump it there only.
-- Text files use LF line endings (`.gitattributes`).
+- Text files use LF line endings (`.gitattributes`). `go run ./scripts/checkchars` (CI and locally, any OS) fails on bidi controls (U+202A–U+202E, U+2066–U+2069, U+200E/U+200F, U+061C), U+2028/U+2029, NUL and other C0 controls except tab/LF/CR in tracked files (binary extensions skipped). Write such characters as escapes in tests; its `allowlist` (with a reason per file) stays empty unless a fixture truly needs them.
