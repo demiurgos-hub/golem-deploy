@@ -142,3 +142,55 @@ describe("mock transport contract", () => {
     expect(imported.body.created[0]).toMatchObject({ build_id: 4, project_id: 2, desired_state: "stopped" });
   });
 });
+
+describe("mock transport: saved data and backups", () => {
+  async function finished(t: Transport, id: number) {
+    let j = (await call(t, "GET", `/jobs/${id}`)).body;
+    for (let i = 0; i < 60 && (j.status === "queued" || j.status === "running"); i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      j = (await call(t, "GET", `/jobs/${id}`)).body;
+    }
+    return j;
+  }
+
+  it("refuses to start a server whose world has another schema and restores a matching backup", async () => {
+    const t = createMockTransport(real);
+    // "staging" runs build 1, but its world was saved by build 3.
+    expect((await call(t, "GET", "/servers/12")).body.data).toMatchObject({ schema_mismatch: true, schema_fingerprint: "3b6f0c2a91d4e8f7" });
+    const start = await call(t, "POST", "/servers/12/start");
+    expect(await finished(t, start.body.id)).toMatchObject({ status: "error", detail: expect.stringContaining("restore a matching backup") });
+    expect(await call(t, "POST", "/servers/12/restore", { backup_id: 6 })).toMatchObject({ status: 409, body: { error: { code: "schema_mismatch" } } });
+    expect(await call(t, "POST", "/servers/12/restore", { backup_id: 999 })).toMatchObject({ status: 400, body: { error: { field: "backup_id" } } });
+    const restore = await call(t, "POST", "/servers/12/restore", { backup_id: 5 });
+    expect(restore).toMatchObject({ status: 202, body: { kind: "server.restore", restricted: true } });
+    expect(await call(t, "POST", "/servers/12/backups", {})).toMatchObject({ status: 409, body: { error: { code: "job_in_progress" } } });
+    expect(await call(t, "DELETE", "/backups/5")).toMatchObject({ status: 409, body: { error: { code: "conflict" } } });
+    expect(await finished(t, restore.body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", "/servers/12")).body).toMatchObject({ state: "running", data: { schema_mismatch: false, schema_fingerprint: "a0c3d9e1f2b47c55" } });
+    // The replaced world was kept as a safety backup.
+    expect((await call(t, "GET", "/backups?server_id=12")).body.items[0]).toMatchObject({ kind: "pre_restore", server_id: 12, schema_fingerprint: "3b6f0c2a91d4e8f7" });
+  }, 30_000);
+
+  it("validates the settings, protects current volumes and keeps the backups of deleted servers", async () => {
+    const t = createMockTransport(real);
+    expect(await call(t, "PATCH", "/servers/11", { snapshot_interval_seconds: 5 })).toMatchObject({ body: { error: { field: "snapshot_interval_seconds" } } });
+    expect(await call(t, "PATCH", "/servers/11", { backup_schedule: { interval_hours: 1, keep: 0 } })).toMatchObject({ body: { error: { field: "backup_schedule.keep" } } });
+    expect(await call(t, "POST", "/servers", { name: "n", build_id: 3, backup_schedule: { interval_hours: 721, keep: 7 } })).toMatchObject({
+      body: { error: { field: "backup_schedule.interval_hours" } },
+    });
+    expect((await call(t, "PATCH", "/servers/16", { snapshot_interval_seconds: 0, backup_schedule: { interval_hours: 12, keep: 3 } })).body).toMatchObject({
+      snapshot_interval_seconds: 0,
+      backup_schedule: { interval_hours: 12, keep: 3 },
+    });
+    expect(await call(t, "POST", "/servers/16/backups", { note: "a\nb" })).toMatchObject({ body: { error: { field: "note" } } });
+    const volumes = (await call(t, "GET", "/volumes")).body.items as { name: string; current: boolean }[];
+    expect(volumes.find((v) => v.name === "golem-deploy-data-11-1")?.current).toBe(true);
+    expect(await call(t, "DELETE", "/volumes/golem-deploy-data-11-1")).toMatchObject({ status: 409 });
+    expect((await call(t, "DELETE", "/volumes/golem-deploy-data-11-0")).status).toBe(204);
+    expect((await call(t, "DELETE", "/servers/11")).status).toBe(204);
+    const backups = (await call(t, "GET", "/backups")).body;
+    expect(backups.items.filter((b: { server_name: string }) => b.server_name === "eu-arena").every((b: { server_id: number | null }) => b.server_id === null)).toBe(true);
+    expect(backups.total_bytes).toBeGreaterThan(0);
+    expect((await call(t, "GET", "/volumes")).body.items.some((v: { name: string }) => v.name === "golem-deploy-data-11-1")).toBe(false);
+  }, 20_000);
+});
