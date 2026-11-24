@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -67,7 +66,7 @@ func TestRunReconcilesServers(t *testing.T) {
 	}
 	b, _ := st.CreateBuild(ctx0, store.NewBuild{ProjectID: proj.ID})
 	_ = st.MarkBuildRunning(ctx0, b.ID, "main", strings.Repeat("a", 40))
-	if err := st.FinishBuild(ctx0, b.ID, store.BuildResult{Status: store.BuildStatusSuccess, ImageID: img}); err != nil {
+	if err := st.FinishBuild(ctx0, b.ID, store.BuildResult{Status: store.BuildStatusSuccess, ImageID: img, EngineVersion: "v0.4.0-rc.1"}); err != nil {
 		t.Fatal(err)
 	}
 	port := 7401
@@ -91,7 +90,7 @@ func TestRunReconcilesServers(t *testing.T) {
 		s.ExpectToken = func() string { return fake.LatestEnv("GOLEM_ADMIN_TOKEN") }
 	})
 	fake.AddImage(dockertest.Image{ID: img, AssignPort: admin.Port,
-		Labels: dockertest.ManagedLabels(docker.LabelInstance, instance, docker.LabelBuildID, strconv.FormatInt(b.ID, 10))})
+		Labels: docker.BuildRef{ImageID: img, BuildID: b.ID, ProjectID: proj.ID, Commit: strings.Repeat("a", 40), EngineVersion: "v0.4.0-rc.1"}.Labels(instance)})
 	orphan := fake.AddContainer(dockertest.Container{Name: "golem-deploy-gone", Image: img,
 		Labels: dockertest.ManagedLabels(docker.LabelInstance, instance, docker.LabelServerID, "999", docker.LabelServer, "gone")})
 	// Claims to be server 1 with every label, but is not its recorded container.

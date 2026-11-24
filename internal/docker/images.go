@@ -154,33 +154,36 @@ func (c *Client) ManagedImage(ctx context.Context, ref string) (Image, error) {
 	return list[0], nil
 }
 
-// BuildImage verifies that image id (a full immutable id, the image_id of
-// a successful builds row) exists and carries the managed label, this
-// installation's instance label and the build-id label buildID. It returns
-// ErrNotFound when the image is gone, ErrNotManaged when the managed or
-// instance label is missing or different, and ErrNotOurs when the build-id
-// label names another build. The store row is what makes an image
-// trusted; the labels are a second check that the id still names the
+// BuildImage verifies the image of a successful build before a server
+// runs it: ref.ImageID (a full immutable id, the image_id of a success row
+// of the builds table) must exist and carry the managed label, this
+// installation's instance label and exactly the build labels the build
+// pipeline set (build id, project id, commit, engine version; no other
+// label in the namespace), the same check BuiltImage made when the build
+// finished. It returns ErrNotFound when the image is gone, ErrNotManaged
+// when the managed or instance label is missing or different, and
+// ErrNotOurs when the build labels differ. The store row is what makes an
+// image trusted; the labels are a second check that the id still names the
 // image that build produced.
-func (c *Client) BuildImage(ctx context.Context, id string, buildID int64) (Image, error) {
+func (c *Client) BuildImage(ctx context.Context, ref BuildRef) (Image, error) {
 	if err := c.needInstance(); err != nil {
 		return Image{}, err
 	}
-	if !imageIDRE.MatchString(id) || buildID <= 0 {
+	if !imageIDRE.MatchString(ref.ImageID) || ref.BuildID <= 0 {
 		return Image{}, invalid("image", "image must be a full image id of a build")
 	}
-	list, err := c.inspectImages(ctx, []string{id})
+	list, err := c.inspectImages(ctx, []string{ref.ImageID})
 	if err != nil {
 		return Image{}, err
 	}
-	if len(list) != 1 || list[0].ID != id {
+	if len(list) != 1 || list[0].ID != ref.ImageID {
 		return Image{}, ErrNotFound
 	}
 	img := list[0]
 	if !c.ours(img.Labels) {
 		return Image{}, ErrNotManaged
 	}
-	if img.Labels[LabelBuildID] != strconv.FormatInt(buildID, 10) {
+	if !matchBuildLabels(img.Labels, ref.Labels(c.instance)) {
 		return Image{}, ErrNotOurs
 	}
 	return img, nil

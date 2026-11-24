@@ -68,6 +68,11 @@ func (s *Service) failDocker(ctx context.Context, sv store.Server, action string
 	return jobs.Fail("Docker could not "+action+ref, nil)
 }
 
+// buildRef is what build b recorded about its image.
+func buildRef(b store.Build) docker.BuildRef {
+	return docker.BuildRef{ImageID: b.ImageID, BuildID: b.ID, ProjectID: b.ProjectID, Commit: b.Commit, EngineVersion: b.EngineVersion}
+}
+
 func shortID(id string) string {
 	id = strings.TrimPrefix(id, "sha256:")
 	if len(id) > 12 {
@@ -172,7 +177,7 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 		fmt.Fprintf(log, "warning: the game certificate does not cover the game host %s; clients will refuse it\n", p.gameHost)
 	}
 
-	img, err := s.docker.BuildImage(ctx, b.ImageID, b.ID)
+	img, err := s.docker.BuildImage(ctx, buildRef(b))
 	switch {
 	case errors.Is(err, docker.ErrNotFound):
 		return jobs.Fail(fmt.Sprintf("the image of build %d no longer exists; build the project again", b.ID), nil)

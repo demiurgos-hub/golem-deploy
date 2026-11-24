@@ -155,6 +155,9 @@ type BuildOutcome struct {
 	// store.
 	NoMetadata      bool
 	ContainerdStore bool
+	// AssignPort is the image's Image.AssignPort (for example the port of
+	// a fake game admin endpoint for containers run from it).
+	AssignPort int
 }
 
 // SetBuildHook installs fn as the decision of every "docker build"; nil
@@ -188,10 +191,15 @@ func ManagedLabels(kv ...string) map[string]string {
 	return m
 }
 
-// BuildLabels returns OurLabels plus the build-id label buildID and extra
-// key/value pairs: what an image built by the tested installation carries.
-func BuildLabels(buildID int64, kv ...string) map[string]string {
-	return OurLabels(append([]string{docker.LabelBuildID, strconv.FormatInt(buildID, 10)}, kv...)...)
+// BuildLabels returns the labels an image built by the tested installation
+// for ref carries (exactly what docker build sets from the command line),
+// plus extra key/value pairs.
+func BuildLabels(ref docker.BuildRef, kv ...string) map[string]string {
+	m := ref.Labels(InstanceID)
+	for i := 0; i+1 < len(kv); i += 2 {
+		m[kv[i]] = kv[i+1]
+	}
+	return m
 }
 
 // OurLabels returns the managed label, the instance label (InstanceID) and
@@ -1171,7 +1179,7 @@ func (f *Fake) build(ctx context.Context, a []string, stdout, stderr io.Writer) 
 	if old := f.findImage(call.Tag); old != nil {
 		old.Tags = slices.DeleteFunc(old.Tags, func(t string) bool { return t == call.Tag })
 	}
-	f.images[id] = &Image{ID: id, Tags: []string{call.Tag}, Labels: labels, Size: 1234}
+	f.images[id] = &Image{ID: id, Tags: []string{call.Tag}, Labels: labels, Size: 1234, AssignPort: out.AssignPort}
 	f.mu.Unlock()
 	iid := id
 	if out.ContainerdStore {

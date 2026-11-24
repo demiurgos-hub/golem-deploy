@@ -70,14 +70,53 @@ func (s BuildSpec) Tag() string {
 // are exactly the dev.golemengine.deploy.* labels the built image must
 // carry.
 func (s BuildSpec) Labels(instance string) map[string]string {
+	return buildLabels(instance, s.ProjectID, s.Commit, s.BuildID, s.EngineVersion)
+}
+
+// BuildRef is what a successful build recorded about its image (the builds
+// row): the image a server may run and the values its labels must have.
+type BuildRef struct {
+	// ImageID is the full immutable image id recorded on the build.
+	ImageID       string
+	BuildID       int64
+	ProjectID     int64
+	Commit        string
+	EngineVersion string
+}
+
+// Labels returns the dev.golemengine.deploy.* labels the build's image
+// carries: the same set BuildSpec.Labels gave docker build.
+func (r BuildRef) Labels(instance string) map[string]string {
+	return buildLabels(instance, r.ProjectID, r.Commit, r.BuildID, r.EngineVersion)
+}
+
+func buildLabels(instance string, projectID int64, commit string, buildID int64, engineVersion string) map[string]string {
 	return map[string]string{
 		LabelManaged:       ManagedValue,
 		LabelInstance:      instance,
-		LabelProjectID:     strconv.FormatInt(s.ProjectID, 10),
-		LabelCommit:        s.Commit,
-		LabelBuildID:       strconv.FormatInt(s.BuildID, 10),
-		LabelEngineVersion: s.EngineVersion,
+		LabelProjectID:     strconv.FormatInt(projectID, 10),
+		LabelCommit:        commit,
+		LabelBuildID:       strconv.FormatInt(buildID, 10),
+		LabelEngineVersion: engineVersion,
 	}
+}
+
+// matchBuildLabels reports whether labels carry exactly the
+// dev.golemengine.deploy.* labels in want: every one with its value, and no
+// other label in the namespace. Both the build (BuiltImage) and every
+// server start (BuildImage) verify an image with it.
+func matchBuildLabels(labels, want map[string]string) bool {
+	for k, v := range labels {
+		if strings.HasPrefix(k, LabelPrefix) && want[k] != v {
+			return false
+		}
+	}
+	for k, v := range want {
+		if labels[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // hostPathOK accepts an absolute, clean host path without control
@@ -211,16 +250,8 @@ func (c *Client) BuiltImage(ctx context.Context, spec BuildSpec) (Image, error) 
 			continue
 		}
 		img := list[0]
-		want := spec.Labels(c.instance)
-		for k, v := range img.Labels {
-			if strings.HasPrefix(k, LabelPrefix) && want[k] != v {
-				return img, ErrLabelMismatch
-			}
-		}
-		for k, v := range want {
-			if img.Labels[k] != v {
-				return img, ErrLabelMismatch
-			}
+		if !matchBuildLabels(img.Labels, spec.Labels(c.instance)) {
+			return img, ErrLabelMismatch
 		}
 		return img, nil
 	}

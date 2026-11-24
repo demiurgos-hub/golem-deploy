@@ -103,9 +103,9 @@ func (fx *fixture) build(t *testing.T, n int, commit string) store.Build {
 		EngineVersion: "v0.4.0-rc.1"}); err != nil {
 		t.Fatal(err)
 	}
-	fx.f.AddImage(dockertest.Image{ID: img, Tags: []string{"golem-deploy/game:" + commit}, AssignPort: fx.admin.Port,
-		Labels: dockertest.BuildLabels(b.ID, docker.LabelProjectID, "1", docker.LabelCommit, commit)})
 	b, _ = fx.st.GetBuild(ctx, b.ID)
+	fx.f.AddImage(dockertest.Image{ID: img, Tags: []string{"golem-deploy/game:" + commit}, AssignPort: fx.admin.Port,
+		Labels: dockertest.BuildLabels(buildRef(b))})
 	return b
 }
 
@@ -336,7 +336,7 @@ func TestStartFailures(t *testing.T) {
 		b := fx.build(t, 1, commitA)
 		sv, _ := fx.svc.Create(ctx, apitypes.CreateServerRequest{Name: "a", BuildID: b.ID, Env: map[string]string{"K": marker}})
 		fx.admin.Set(func(s *gameadmintest.Server) { s.NeverReady = true })
-		fx.f.AddImage(dockertest.Image{ID: b.ImageID, AssignPort: fx.admin.Port, Labels: dockertest.BuildLabels(b.ID),
+		fx.f.AddImage(dockertest.Image{ID: b.ImageID, AssignPort: fx.admin.Port, Labels: dockertest.BuildLabels(buildRef(b)),
 			Logs: []string{"booting with " + marker}})
 		log, err := startJob(t, fx, sv.ID)
 		d := failDetail(err)
@@ -358,7 +358,7 @@ func TestStartFailures(t *testing.T) {
 		ln, _ := net.Listen("tcp4", "127.0.0.1:0")
 		closed := ln.Addr().(*net.TCPAddr).Port
 		_ = ln.Close()
-		fx.f.AddImage(dockertest.Image{ID: b.ImageID, AssignPort: closed, Labels: dockertest.BuildLabels(b.ID)})
+		fx.f.AddImage(dockertest.Image{ID: b.ImageID, AssignPort: closed, Labels: dockertest.BuildLabels(buildRef(b))})
 		sv, _ := fx.svc.Create(ctx, apitypes.CreateServerRequest{Name: "a", BuildID: b.ID})
 		_, err := startJob(t, fx, sv.ID)
 		if d := failDetail(err); !strings.Contains(d, "admin endpoint never answered") || !strings.Contains(d, "Runtime.Host") {
@@ -369,7 +369,7 @@ func TestStartFailures(t *testing.T) {
 		fx := newFixture(t, Config{})
 		b := fx.build(t, 1, commitA)
 		code := 3
-		fx.f.AddImage(dockertest.Image{ID: b.ImageID, AssignPort: fx.admin.Port, Labels: dockertest.BuildLabels(b.ID), ExitOnRun: &code})
+		fx.f.AddImage(dockertest.Image{ID: b.ImageID, AssignPort: fx.admin.Port, Labels: dockertest.BuildLabels(buildRef(b)), ExitOnRun: &code})
 		sv, _ := fx.svc.Create(ctx, apitypes.CreateServerRequest{Name: "a", BuildID: b.ID})
 		_, err := startJob(t, fx, sv.ID)
 		if d := failDetail(err); !strings.Contains(d, "exited before the game became ready (exit code 3)") {
@@ -400,8 +400,18 @@ func TestImageTrust(t *testing.T) {
 		"wrong instance": func(b store.Build) map[string]string {
 			return dockertest.ManagedLabels(docker.LabelInstance, dockertest.IntegrationInstanceID, docker.LabelBuildID, itoa(b.ID))
 		},
-		"wrong build": func(b store.Build) map[string]string { return dockertest.BuildLabels(b.ID + 1) },
-		"no build":    func(store.Build) map[string]string { return dockertest.OurLabels() },
+		"wrong build": func(b store.Build) map[string]string {
+			r := buildRef(b)
+			r.BuildID++
+			return dockertest.BuildLabels(r)
+		},
+		"wrong commit": func(b store.Build) map[string]string {
+			return dockertest.BuildLabels(buildRef(b), docker.LabelCommit, strings.Repeat("f", 40))
+		},
+		"extra namespace label": func(b store.Build) map[string]string {
+			return dockertest.BuildLabels(buildRef(b), docker.LabelConfigHash, "x")
+		},
+		"no build": func(store.Build) map[string]string { return dockertest.OurLabels() },
 	} {
 		t.Run(name, func(t *testing.T) {
 			fx := newFixture(t, Config{})

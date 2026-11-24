@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
+	"maps"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -516,40 +519,91 @@ func TestImagesAndVolumesManagedOnly(t *testing.T) {
 }
 
 // A server image is trusted only as the image of a build: full id, our
-// managed and instance labels and the build's id.
+// managed and instance labels and exactly the build's labels.
 func TestBuildImage(t *testing.T) {
 	c, f, _ := newClient(t)
 	ctx := context.Background()
 	good := dockertest.ImageID(1)
-	f.AddImage(dockertest.Image{ID: good, Tags: []string{"golem-deploy/game:abc"}, Labels: dockertest.BuildLabels(7)})
-	f.AddImage(dockertest.Image{ID: dockertest.ImageID(2), Labels: dockertest.ManagedLabels(docker.LabelBuildID, "7")})
-	f.AddImage(dockertest.Image{ID: dockertest.ImageID(3), Labels: dockertest.ManagedLabels(docker.LabelInstance, dockertest.IntegrationInstanceID, docker.LabelBuildID, "7")})
-	f.AddImage(dockertest.Image{ID: dockertest.ImageID(4), Labels: dockertest.BuildLabels(8)})
-	f.AddImage(dockertest.Image{ID: dockertest.ImageID(5), Labels: dockertest.OurLabels()})
-	if img, err := c.BuildImage(ctx, good, 7); err != nil || img.ID != good || img.BuildID != 7 {
+	ref := docker.BuildRef{ImageID: good, BuildID: 7, ProjectID: 2, Commit: strings.Repeat("c", 40), EngineVersion: "v0.4.0-rc.1"}
+	with := func(id string, labels map[string]string) docker.BuildRef {
+		f.AddImage(dockertest.Image{ID: id, Labels: labels})
+		r := ref
+		r.ImageID = id
+		return r
+	}
+	f.AddImage(dockertest.Image{ID: good, Tags: []string{"golem-deploy/game:abc"}, Labels: dockertest.BuildLabels(ref)})
+	if img, err := c.BuildImage(ctx, ref); err != nil || img.ID != good || img.BuildID != 7 {
 		t.Fatalf("%+v %v", img, err)
 	}
-	for _, tc := range []struct {
-		id   string
+	other := ref
+	other.BuildID = 8
+	otherCommit := ref
+	otherCommit.Commit = strings.Repeat("d", 40)
+	noInstance := dockertest.BuildLabels(ref)
+	delete(noInstance, docker.LabelInstance)
+	otherInstance := dockertest.BuildLabels(ref, docker.LabelInstance, dockertest.IntegrationInstanceID)
+	noEngine := dockertest.BuildLabels(ref)
+	delete(noEngine, docker.LabelEngineVersion)
+	for name, tc := range map[string]struct {
+		ref  docker.BuildRef
 		want error
 	}{
-		{dockertest.ImageID(2), docker.ErrNotManaged}, // label-only, no instance
-		{dockertest.ImageID(3), docker.ErrNotManaged}, // another installation
-		{dockertest.ImageID(4), docker.ErrNotOurs},    // another build
-		{dockertest.ImageID(5), docker.ErrNotOurs},    // no build label
-		{dockertest.ImageID(9), docker.ErrNotFound},
+		"label only":         {with(dockertest.ImageID(2), dockertest.ManagedLabels(docker.LabelBuildID, "7")), docker.ErrNotManaged},
+		"no instance":        {with(dockertest.ImageID(3), noInstance), docker.ErrNotManaged},
+		"other installation": {with(dockertest.ImageID(4), otherInstance), docker.ErrNotManaged},
+		"another build":      {with(dockertest.ImageID(5), dockertest.BuildLabels(other)), docker.ErrNotOurs},
+		"another commit":     {with(dockertest.ImageID(6), dockertest.BuildLabels(otherCommit)), docker.ErrNotOurs},
+		"label missing":      {with(dockertest.ImageID(7), noEngine), docker.ErrNotOurs},
+		"extra label":        {with(dockertest.ImageID(8), dockertest.BuildLabels(ref, docker.LabelPrefix+"server-id", "1")), docker.ErrNotOurs},
+		"no build labels":    {with(dockertest.ImageID(9), dockertest.OurLabels()), docker.ErrNotOurs},
+		"gone":               {docker.BuildRef{ImageID: dockertest.ImageID(10), BuildID: 7}, docker.ErrNotFound},
 	} {
-		if _, err := c.BuildImage(ctx, tc.id, 7); !errors.Is(err, tc.want) {
-			t.Errorf("%s: got %v, want %v", tc.id, err, tc.want)
+		if _, err := c.BuildImage(ctx, tc.ref); !errors.Is(err, tc.want) {
+			t.Errorf("%s: got %v, want %v", name, err, tc.want)
 		}
 	}
-	for _, ref := range []string{"golem-deploy/game:abc", good[7:19], ""} {
-		if _, err := c.BuildImage(ctx, ref, 7); err == nil {
-			t.Errorf("reference %q accepted", ref)
+	for _, id := range []string{"golem-deploy/game:abc", good[7:19], ""} {
+		r := ref
+		r.ImageID = id
+		if _, err := c.BuildImage(ctx, r); err == nil {
+			t.Errorf("reference %q accepted", id)
 		}
 	}
-	if _, err := c.BuildImage(ctx, good, 0); err == nil {
+	r := ref
+	r.BuildID = 0
+	if _, err := c.BuildImage(ctx, r); err == nil {
 		t.Error("build id 0 accepted")
+	}
+}
+
+// BuiltImage (end of a build) and BuildImage (every server start) accept
+// exactly the same image: the one docker build labelled from BuildSpec,
+// with the classic and with the containerd image store.
+func TestBuiltImageAndBuildImageAgree(t *testing.T) {
+	c, f, _ := newClient(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	spec := docker.BuildSpec{ContextDir: dir, Dockerfile: filepath.Join(dir, "Dockerfile"), StaticDir: dir,
+		IIDFile: filepath.Join(dir, "iid"), MetadataFile: filepath.Join(dir, "md.json"), ProjectName: "game", ProjectID: 3,
+		Commit: strings.Repeat("e", 40), BuildID: 11, EngineVersion: "v0.4.0"}
+	for _, containerd := range []bool{false, true} {
+		f.SetBuildHook(func(dockertest.BuildCall) dockertest.BuildOutcome {
+			return dockertest.BuildOutcome{ContainerdStore: containerd}
+		})
+		if err := c.Build(ctx, spec, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		img, err := c.BuiltImage(ctx, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref := docker.BuildRef{ImageID: img.ID, BuildID: spec.BuildID, ProjectID: spec.ProjectID, Commit: spec.Commit, EngineVersion: spec.EngineVersion}
+		if _, err := c.BuildImage(ctx, ref); err != nil {
+			t.Fatalf("containerd %v: %v", containerd, err)
+		}
+		if !maps.Equal(dockertest.BuildLabels(ref), img.Labels) {
+			t.Fatalf("labels %v", img.Labels)
+		}
 	}
 }
 
@@ -559,7 +613,7 @@ func TestDynamicAdminPort(t *testing.T) {
 	c, f, _ := newClient(t)
 	ctx := context.Background()
 	img := dockertest.ImageID(1)
-	f.AddImage(dockertest.Image{ID: img, Labels: dockertest.BuildLabels(3), AssignPort: 45678})
+	f.AddImage(dockertest.Image{ID: img, Labels: dockertest.BuildLabels(docker.BuildRef{BuildID: 3}), AssignPort: 45678})
 	s := spec(img)
 	s.AdminPort = 7778
 	s.GroupAdd = []int{1000}

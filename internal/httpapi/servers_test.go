@@ -171,7 +171,8 @@ func (d *dockerHarness) buildImage(n int, img dockertest.Image) builtImage {
 	if err := d.st.FinishBuild(ctx, b.ID, store.BuildResult{Status: store.BuildStatusSuccess, ImageID: img.ID, EngineVersion: "v0.4.0-rc.1"}); err != nil {
 		d.t.Fatal(err)
 	}
-	img.Labels = dockertest.BuildLabels(b.ID, docker.LabelCommit, testCommit(n))
+	b, _ = d.st.GetBuild(ctx, b.ID)
+	img.Labels = dockertest.BuildLabels(docker.BuildRef{ImageID: img.ID, BuildID: b.ID, ProjectID: b.ProjectID, Commit: b.Commit, EngineVersion: b.EngineVersion})
 	if img.AssignPort == 0 {
 		img.AssignPort = d.gameAdmin.Port
 	}
