@@ -98,7 +98,7 @@ The unit grants only `CAP_NET_BIND_SERVICE`, which lets the daemon bind ports be
 
 ### Configuration
 
-`/etc/golem-deploy/golem-deploy.env` holds one `KEY=value` per line (no quotes) for the `GOLEM_DEPLOY_*` variables of `golem-deploy serve`, listed in the [README](../README.md#run): data directory, HTTPS and optional HTTP listener addresses, public hosts, port range and optional certificate paths. Change settings by editing it, then:
+`/etc/golem-deploy/golem-deploy.env` holds one `KEY=value` per line (no quotes) for the `GOLEM_DEPLOY_*` variables of `golem-deploy serve`, listed in the [README](../README.md#run): data directory, HTTPS and optional HTTP listener addresses, public hosts, port range, optional certificate paths and limits such as `GOLEM_DEPLOY_BACKUP_MAX_MB` (the largest data directory a server backup accepts, default 1024 MiB; see [BACKUPS.md](BACKUPS.md)). Change settings by editing it, then:
 
 ```sh
 sudo systemctl restart golem-deploy
@@ -130,7 +130,7 @@ Build or copy the new binary and the matching checkout, then run the installer a
 sudo scripts/install.sh /path/to/new/golem-deploy
 ```
 
-It replaces the binary and the unit, keeps the user, the settings file and the data directory (it says what it kept) and restarts the service. Running game servers keep running during the restart. Before upgrading, back up the data directory (at least `golem-deploy.db` and `keys/`), preferably with the service stopped; there are no migration paths between development versions yet.
+It replaces the binary and the unit, keeps the user, the settings file and the data directory (it says what it kept) and restarts the service. Running game servers keep running during the restart. Before upgrading, back up the data directory (at least `golem-deploy.db`, `keys/` and `backups/`), preferably with the service stopped; there are no migration paths between development versions yet. Game worlds live in the servers' data volumes in Docker (see [BACKUPS.md](BACKUPS.md)); take a backup of each server first if you want a copy in the data directory.
 
 ## Uninstall
 
@@ -151,7 +151,7 @@ rm -r /var/lib/golem-deploy /etc/golem-deploy
 userdel golem-deploy        # also removes the golem-deploy group if nothing else uses it
 ```
 
-Game server containers, images, volumes and the `golem-deploy` network stay in Docker. List and remove them by label if you no longer need them:
+Game server containers, images, volumes (the servers' saved worlds) and the `golem-deploy` network stay in Docker. List and remove them by label if you no longer need them:
 
 ```sh
 docker ps -a --filter label=dev.golemengine.deploy.managed=true
