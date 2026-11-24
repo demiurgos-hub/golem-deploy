@@ -12,11 +12,12 @@ const (
 	BackupKindManual BackupKind = "manual"
 	// BackupKindScheduled: taken by the server's backup schedule.
 	BackupKindScheduled BackupKind = "scheduled"
-	// BackupKindPreRestore and BackupKindPreReset are the safety backups the
-	// daemon takes of a server's current data before a restore replaces it
-	// or a reset discards it.
+	// BackupKindPreRestore, BackupKindPreReset and BackupKindPreDelete are the
+	// safety backups the daemon takes of a server's current data before a
+	// restore replaces it, a reset discards it or the server is deleted.
 	BackupKindPreRestore BackupKind = "pre_restore"
 	BackupKindPreReset   BackupKind = "pre_reset"
+	BackupKindPreDelete  BackupKind = "pre_delete"
 )
 
 // Backup is a stored copy of a server's data directory (the entity snapshot
@@ -58,6 +59,10 @@ type Backup struct {
 	SizeBytes    int64 `json:"size_bytes"`
 	ContentBytes int64 `json:"content_bytes"`
 	FileCount    int   `json:"file_count"`
+	// OmittedEntries counts what the data directory held that the backup
+	// leaves out: links, pipes, devices and entries whose names are not
+	// allowed. 0 means the backup is a complete copy of the directory.
+	OmittedEntries int `json:"omitted_entries"`
 	// SHA256 is the lower-case hex SHA-256 of the archive
 	// (GET /api/v1/backups/{id}/download returns exactly these bytes).
 	SHA256 string `json:"sha256"`
@@ -97,7 +102,9 @@ type CreateBackupRequest struct {
 // fingerprint of the server's build are both known and differ (409
 // schema_mismatch otherwise): such a server will not load the snapshot.
 // SkipSafetyBackup restores even though the current data is not backed up
-// first.
+// first. A safety backup that would leave entries out (OmittedEntries) is
+// stored and then fails the job before anything is replaced; repeating the
+// request with SkipSafetyBackup goes ahead.
 type RestoreServerRequest struct {
 	BackupID         int64 `json:"backup_id"`
 	Force            bool  `json:"force,omitempty"`
