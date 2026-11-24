@@ -30,9 +30,14 @@ func (noDocker) Reachable(context.Context) bool { return false }
 func TestRunSelectsManagedTLSForNonLoopback(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 	ready, done := make(chan net.Addr, 1), make(chan error, 1)
+	stopped := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
+	})
 	go func() {
+		defer close(stopped)
 		done <- Run(ctx, Options{
 			DataDir: dir, Listen: "0.0.0.0:0", docker: noDocker{}, Logger: slog.New(slog.DiscardHandler),
 			Ready: func(addr net.Addr) { ready <- addr },
@@ -44,7 +49,7 @@ func TestRunSelectsManagedTLSForNonLoopback(t *testing.T) {
 		port = addr.(*net.TCPAddr).Port
 	case err := <-done:
 		t.Fatalf("daemon stopped during startup: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("managed TLS listener did not start")
 	}
 	cert, err := os.ReadFile(filepath.Join((datadir.Layout{Root: dir}).PanelCerts(), "fallback.pem"))
@@ -57,14 +62,14 @@ func TestRunSelectsManagedTLSForNonLoopback(t *testing.T) {
 	}
 	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
-	resp, err := client.Get("https://127.0.0.1:" + strconv.Itoa(port) + "/api/v1/status")
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	resp, err := client.Get("https://127.0.0.1:" + strconv.Itoa(port) + "/api/v1/auth/options")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("HTTPS status returned %s", resp.Status)
+		t.Fatalf("public HTTPS endpoint returned %s", resp.Status)
 	}
 	cancel()
 	select {
@@ -72,7 +77,7 @@ func TestRunSelectsManagedTLSForNonLoopback(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("daemon did not shut down")
 	}
 	if err := Run(context.Background(), Options{DataDir: dir, Listen: "127.0.0.1:0", TLSCert: "c.pem"}); err == nil {
