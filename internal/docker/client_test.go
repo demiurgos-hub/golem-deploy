@@ -91,6 +91,7 @@ func TestRunSpecArgvExact(t *testing.T) {
 		"--label", "dev.golemengine.deploy.engine-version=",
 		"--label", "dev.golemengine.deploy.config-hash=abc",
 		"--label", "dev.golemengine.deploy.launch-id=",
+		"--label", "dev.golemengine.deploy.helper=",
 		"--restart", "no", "--init", "--no-healthcheck", "--stop-signal", "SIGTERM", "--stop-timeout", "30",
 		"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512",
 		"--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",

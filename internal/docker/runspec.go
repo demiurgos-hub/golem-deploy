@@ -304,6 +304,7 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 		"--label", LabelEngineVersion + "=" + s.EngineVersion,
 		"--label", LabelConfigHash + "=" + s.ConfigHash,
 		"--label", LabelLaunchID + "=" + s.LaunchID,
+		"--label", LabelHelper + "=",
 		"--restart", "no",
 		"--init",
 		"--no-healthcheck",
