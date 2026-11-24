@@ -62,7 +62,7 @@ describe("browser connection probes", () => {
     const { results, done } = probe();
     await done;
     expect([...results.values()].map((r) => r.status)).toEqual(["passed", "passed", "passed", "passed"]);
-    expect(b.fetch).toHaveBeenCalledWith(page, expect.objectContaining({ mode: "no-cors", credentials: "omit", cache: "no-store", redirect: "manual" }));
+    expect(b.fetch).toHaveBeenCalledWith(page, expect.objectContaining({ mode: "no-cors", credentials: "omit", cache: "no-store", redirect: "follow" }));
     expect(b.socket).toHaveBeenCalledWith("wss://game.example.com:7810/custom/ws");
     expect(b.transport).toHaveBeenCalledWith(`${page}custom/wt`, { serverCertificateHashes: undefined });
     expect(b.fetch).toHaveBeenCalledBefore(b.socket);

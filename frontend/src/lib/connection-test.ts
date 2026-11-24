@@ -184,7 +184,10 @@ export async function runConnectionTest(
     const https = await run("https", () => timed(signal, (stepSignal) => fetch(page.href, {
       mode: "no-cors",
       credentials: "omit",
-      redirect: "manual",
+      // A no-cors request must follow redirects: browsers reject any other
+      // redirect mode with a TypeError before sending anything. The page's
+      // connect-src policy still limits where a redirect can lead.
+      redirect: "follow",
       referrerPolicy: "no-referrer",
       cache: "no-store",
       signal: stepSignal,
