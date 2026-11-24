@@ -119,6 +119,7 @@ func TestBuiltImageLabelChecks(t *testing.T) {
 		"foreign namespace label": {docker.LabelServerID: "4"},
 		"config hash label":       {docker.LabelConfigHash: "x"},
 		"unknown namespace label": {"dev.golemengine.deploy.anything": "x"},
+		"empty namespace label":   {"dev.golemengine.deploy.anything": ""},
 	}
 	for name, extra := range cases {
 		dc, fake, s := newBuildClient(t)
@@ -155,6 +156,53 @@ func TestBuiltImageLabelChecks(t *testing.T) {
 	}
 	if len(fake.Calls()) != 0 {
 		t.Fatalf("calls: %v", fake.Calls())
+	}
+}
+
+func TestBuildClientConfigIsolation(t *testing.T) {
+	_, fake, spec := newBuildClient(t)
+	original := t.TempDir()
+	dedicated := filepath.Join(t.TempDir(), "docker-build")
+	const oldConfig = `{"auths":{"private.invalid":{"auth":"a-marker"}},"proxies":{"default":{"httpProxy":"http://proxy.invalid"}}}`
+	if err := os.WriteFile(filepath.Join(original, "config.json"), []byte(oldConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dc := docker.New(docker.Options{Runner: fake, InstanceID: dockertest.InstanceID, BuildConfigDir: dedicated,
+		LookupEnv: func(key string) (string, bool) {
+			value, ok := map[string]string{
+				"DOCKER_CONFIG": original, "BUILDX_CONFIG": original,
+				"BUILDKIT_SYNTAX": "external", "HTTP_PROXY": "http://proxy.invalid",
+			}[key]
+			return value, ok
+		}})
+	if err := dc.Build(t.Context(), spec, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	env := strings.Join(fake.CallsTo("build")[0].Env, "\n")
+	if !strings.Contains(env, "DOCKER_CONFIG="+dedicated) || strings.Contains(env, "BUILDX_CONFIG") ||
+		strings.Contains(env, "BUILDKIT_SYNTAX") || strings.Contains(env, "HTTP_PROXY") || strings.Contains(env, "DOCKER_CONFIG="+original) {
+		t.Fatalf("build config leaked: %s", env)
+	}
+	data, err := os.ReadFile(filepath.Join(dedicated, "config.json"))
+	if err != nil || strings.Contains(string(data), "private.invalid") || strings.Contains(string(data), "proxy.invalid") || !strings.Contains(string(data), "cli-plugins") {
+		t.Fatalf("dedicated config %s: %v", data, err)
+	}
+	if err := os.WriteFile(filepath.Join(dedicated, "config.json"), []byte(oldConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := dc.Build(t.Context(), spec, &strings.Builder{}); !errors.Is(err, docker.ErrBuildConfig) || len(fake.CallsTo("build")) != 1 {
+		t.Fatalf("build accepted proxies in dedicated config: %v", err)
+	}
+}
+
+func TestBuildOutputCleanupRequiresTagOwnership(t *testing.T) {
+	dc, fake, spec := newBuildClient(t)
+	other := spec
+	other.BuildID++
+	foreignID := dockertest.ImageID(231)
+	fake.AddImage(dockertest.Image{ID: foreignID, Tags: []string{spec.Tag()}, Labels: other.Labels(dockertest.InstanceID)})
+	if err := dc.RemoveBuildOutput(t.Context(), spec); !errors.Is(err, docker.ErrNotOurs) || len(fake.CallsTo("image", "rm")) != 0 || !fake.HasImage(foreignID) {
+		t.Fatalf("unowned tag was eligible for cleanup: %v", err)
 	}
 }
 

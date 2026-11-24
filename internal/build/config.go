@@ -19,7 +19,7 @@ const ConfigFile = "golem-deploy.yaml"
 
 // Limits on the repository build configuration.
 const (
-	maxConfigBytes = 64 << 10
+	maxConfigBytes = 32 << 10
 	maxWords       = 32
 	maxWordBytes   = 1024
 	maxPathBytes   = 255
@@ -142,6 +142,9 @@ func ParseConfig(data []byte) (Config, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return cfg, nil
 	}
+	if err := checkYAML(ConfigFile, data); err != nil {
+		return Config{}, err
+	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	var raw rawConfig
@@ -150,10 +153,6 @@ func ParseConfig(data []byte) (Config, error) {
 			return cfg, nil
 		}
 		return Config{}, userErr("%s is not valid: %s", ConfigFile, yamlMessage(err))
-	}
-	var extra yaml.Node
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		return Config{}, userErr("%s must contain a single YAML document", ConfigFile)
 	}
 	var err error
 	if raw.Root != nil {
@@ -284,6 +283,9 @@ var segmentRE = regexp.MustCompile(`^[A-Za-z0-9_.][A-Za-z0-9_.-]*$`)
 // only when allowDot. The allowlist keeps every path safe to place in a
 // Dockerfile instruction and a docker argument without quoting.
 func cleanPath(field, p string, allowDot bool) (string, error) {
+	if strings.HasPrefix(p, "/") {
+		return "", fieldErr(field, "must be a relative path with '/' separators")
+	}
 	orig := p
 	p = strings.TrimSuffix(strings.TrimPrefix(p, "./"), "/")
 	if p == "" || p == "." {
@@ -342,7 +344,8 @@ func checkWords(field string, words []string, nonEmpty bool) error {
 		}
 		for _, r := range w {
 			if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == 0x2028 || r == 0x2029 ||
-				(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) || r == 0xfeff {
+				(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) ||
+				r == 0x061c || r == 0x200e || r == 0x200f || r == 0xfeff {
 				return fieldErr(field, "items must be single-line text without control characters")
 			}
 		}

@@ -48,6 +48,8 @@ type Cmd struct {
 	// Stdout and Stderr receive the output. They may be the same writer.
 	Stdout io.Writer
 	Stderr io.Writer
+	// ProcessTree keeps CLI plugins in the command's lifetime.
+	ProcessTree bool
 }
 
 // Runner executes docker CLI invocations. ExecRunner is the real one; tests
@@ -56,7 +58,8 @@ type Runner interface {
 	Run(ctx context.Context, path string, cmd Cmd) error
 }
 
-// ExecRunner runs commands with os/exec. Cancelling ctx kills the process.
+// ExecRunner runs commands with os/exec and optionally scopes cancellation
+// to the whole process tree.
 type ExecRunner struct{}
 
 // Run implements Runner.
@@ -70,6 +73,10 @@ func (ExecRunner) Run(ctx context.Context, path string, c Cmd) error {
 	cmd.Stdout = c.Stdout
 	cmd.Stderr = c.Stderr
 	cmd.WaitDelay = 5 * time.Second
+	if c.ProcessTree {
+		defer closeFiles(c.ExtraFiles)
+		return runProcessTree(ctx, cmd)
+	}
 	err := cmd.Start()
 	// The child holds its own copies now. Closing ours means a pipe writer
 	// gets EPIPE instead of blocking if the child exits without reading.
@@ -106,20 +113,23 @@ type Options struct {
 	// TempDir holds env files on platforms without the pipe mechanism
 	// (the data directory's tmp/; default os.TempDir()).
 	TempDir string
+	// BuildConfigDir is the dedicated Docker client configuration for builds.
+	BuildConfigDir string
 	// Now overrides the clock (tests).
 	Now func() time.Time
 }
 
 // Client talks to Docker through the CLI. It is safe for concurrent use.
 type Client struct {
-	bin      string
-	binErr   error
-	runner   Runner
-	logger   *slog.Logger
-	baseEnv  []string
-	now      func() time.Time
-	instance string
-	envFile  envFileFunc
+	bin            string
+	binErr         error
+	runner         Runner
+	logger         *slog.Logger
+	baseEnv        []string
+	now            func() time.Time
+	instance       string
+	envFile        envFileFunc
+	buildConfigDir string
 
 	probeMu sync.Mutex
 	probeAt time.Time
@@ -161,7 +171,7 @@ func New(o Options) *Client {
 		o.Now = time.Now
 	}
 	c := &Client{runner: o.Runner, logger: o.Logger, now: o.Now, bin: o.Binary, instance: o.InstanceID,
-		envFile: newEnvFileFunc(runtime.GOOS, o.TempDir)}
+		envFile: newEnvFileFunc(runtime.GOOS, o.TempDir), buildConfigDir: o.BuildConfigDir}
 	if _, real := o.Runner.(ExecRunner); real && !strings.ContainsAny(o.Binary, `/\`) {
 		// Resolve once so later PATH changes cannot swap the binary.
 		// exec.LookPath never returns a path relative to the working
@@ -250,12 +260,12 @@ func (b *capBuffer) Write(p []byte) (int, error) {
 // inherited by the child (the runner closes them). stdout may be nil to
 // discard. When stderr is nil, it is captured for error classification.
 func (c *Client) exec(ctx context.Context, timeout time.Duration, args []string, extra []*os.File, stdout, stderr io.Writer) error {
-	return c.execEnv(ctx, timeout, args, nil, extra, stdout, stderr)
+	return c.execEnv(ctx, timeout, args, c.baseEnv, extra, stdout, stderr, false)
 }
 
-// execEnv is exec with fixed extra variables appended to the base
-// environment (constants of this package, never request-derived).
-func (c *Client) execEnv(ctx context.Context, timeout time.Duration, args, env []string, extra []*os.File, stdout, stderr io.Writer) error {
+// execEnv is exec with a caller-selected client environment. Its callers
+// use the base allowlist or the dedicated build environment.
+func (c *Client) execEnv(ctx context.Context, timeout time.Duration, args, env []string, extra []*os.File, stdout, stderr io.Writer, tree bool) error {
 	if c.binErr != nil {
 		closeFiles(extra)
 		return &CmdError{Op: opName(args), Kind: ErrUnavailable, Detail: "docker CLI not found"}
@@ -274,8 +284,7 @@ func (c *Client) execEnv(ctx context.Context, timeout time.Duration, args, env [
 		stdout = io.Discard
 	}
 	c.logger.Debug("docker", "op", opName(args))
-	childEnv := append(slices.Clone(c.baseEnv), env...)
-	err := c.runner.Run(ctx, c.bin, Cmd{Args: args, Env: childEnv, ExtraFiles: extra, Stdout: stdout, Stderr: stderr})
+	err := c.runner.Run(ctx, c.bin, Cmd{Args: args, Env: slices.Clone(env), ExtraFiles: extra, Stdout: stdout, Stderr: stderr, ProcessTree: tree})
 	if err == nil {
 		return nil
 	}

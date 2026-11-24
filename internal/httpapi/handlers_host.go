@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/servers"
 	"github.com/demiurgos-hub/golem-deploy/internal/staticfiles"
 )
@@ -35,6 +36,9 @@ func (s *Server) handleDeleteImage(w http.ResponseWriter, r *http.Request) error
 	}
 	id := r.PathValue("id")
 	if err := s.servers.RemoveImage(r.Context(), id); err != nil {
+		if errors.Is(err, docker.ErrImageMultipleTags) {
+			return conflict(apitypes.ErrorCodeConflict, docker.ErrImageMultipleTags.Error())
+		}
 		var ob *servers.ImageOfBuildError
 		if errors.As(err, &ob) {
 			return conflict(apitypes.ErrorCodeConflict, "the image belongs to build "+joinIDs(ob.BuildIDs)+"; delete the build instead (DELETE /api/v1/builds/{id})")
@@ -221,11 +225,12 @@ func (s *Server) handleUploadStatic(w http.ResponseWriter, r *http.Request) erro
 			_ = part.Close()
 			return invalidField("files", err.Error())
 		}
-		if names[name] {
+		key := staticfiles.NameKey(name)
+		if names[key] {
 			_ = part.Close()
 			return invalidField("files", "the same file name appears twice in the upload")
 		}
-		names[name] = true
+		names[key] = true
 		if len(names) > staticfiles.MaxFilesPerUpload {
 			_ = part.Close()
 			return invalidField("files", "too many files in one upload")
@@ -243,7 +248,11 @@ func (s *Server) handleUploadStatic(w http.ResponseWriter, r *http.Request) erro
 	if len(staged) == 0 {
 		return invalidField("files", "no files were uploaded")
 	}
-	files, err := s.static.Commit(staged, replace)
+	files, err := s.commitStatic(r, staged, replace)
+	var apiErr *apiError
+	if errors.As(err, &apiErr) {
+		return err
+	}
 	var ne *staticfiles.NameError
 	switch {
 	case errors.Is(err, staticfiles.ErrExists):
@@ -262,6 +271,23 @@ func (s *Server) handleUploadStatic(w http.ResponseWriter, r *http.Request) erro
 	s.logger.Info("static files uploaded", "request_id", requestIDFrom(r.Context()), "account_id", identityFrom(r).Account.ID, "count", len(files), "replace", replace)
 	writeJSON(w, http.StatusCreated, out)
 	return nil
+}
+
+func (s *Server) commitStatic(r *http.Request, staged []*staticfiles.Staged, replace bool) ([]staticfiles.File, error) {
+	s.proj.addonsMu.Lock()
+	defer s.proj.addonsMu.Unlock()
+	if replace {
+		for _, file := range staged {
+			users, err := s.store.ProjectsUsingStatic(r.Context(), file.Name)
+			if err != nil {
+				return nil, internal(err)
+			}
+			if err := authorizeStaticMutation(r, users); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return s.static.Commit(staged, replace)
 }
 
 // deadlineResponseWriter extends the write deadline per write, for large
@@ -299,9 +325,17 @@ func (s *Server) handleDeleteStatic(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 	name := r.PathValue("name")
+	if err := staticfiles.ValidateName(name); err != nil {
+		return staticError(err)
+	}
+	s.proj.addonsMu.Lock()
+	defer s.proj.addonsMu.Unlock()
 	users, err := s.store.ProjectsUsingStatic(r.Context(), name)
 	if err != nil {
 		return internal(err)
+	}
+	if err := authorizeStaticMutation(r, users); err != nil {
+		return err
 	}
 	if len(users) > 0 {
 		return conflict(apitypes.ErrorCodeConflict, "the file is a static add-on of project "+strings.Join(users, ", ")+"; remove it from the project first")

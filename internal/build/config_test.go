@@ -207,3 +207,13 @@ func TestParseConfigTransport(t *testing.T) {
 	_, err = ParseConfig([]byte("transport:\n  webtransport_path: [a]\n"))
 	wantUserErr(t, err, "not valid")
 }
+func TestConfigRejectsAbsoluteRootAndBidiMarks(t *testing.T) {
+	if _, err := ParseConfig([]byte("root: /\n")); err == nil {
+		t.Fatal("accepted a bare slash as the game root")
+	}
+	for _, mark := range []rune{'\u061c', '\u200e', '\u200f'} {
+		if err := checkWords("server.args", []string{"word" + string(mark)}, false); err == nil {
+			t.Fatalf("accepted mark %U", mark)
+		}
+	}
+}

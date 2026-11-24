@@ -1,6 +1,7 @@
 package build
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -45,10 +46,11 @@ func ValidateAddons(in []Addon) ([]Addon, error) {
 			return nil, &FieldError{Field: field + ".target", Msg: "target must be a relative path below the game root of letters, digits, '.', '_', '-' and '/' (no '..', no .git)"}
 		}
 		n := Addon{Name: a.Name, Target: t}
-		if seen[n] {
+		key := Addon{Name: staticfiles.NameKey(n.Name), Target: n.Target}
+		if seen[key] {
 			return nil, &FieldError{Field: field, Msg: "the same add-on and target appear twice"}
 		}
-		seen[n] = true
+		seen[key] = true
 		out = append(out, n)
 	}
 	return out, nil
@@ -67,13 +69,17 @@ func (e *FieldError) Error() string { return e.Field + ": " + e.Msg }
 // dest at their targets. Extraction happens in fresh directories below
 // tmpRoot (same file system as dest). Two add-ons may not provide the same
 // file. Problems with the add-ons are *UserError values.
-func stageAddons(addons []Addon, staticDir, tmpRoot, dest string, lim extract.Limits) (int64, error) {
+func stageAddons(ctx context.Context, addons []Addon, staticDir, tmpRoot, dest string, lim extract.Limits) (int64, error) {
 	addons, err := ValidateAddons(addons)
 	if err != nil {
 		return 0, userErr("the project's static add-ons are invalid: %s", err.Error())
 	}
 	var total int64
+	left := lim
 	for _, a := range addons {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		src := filepath.Join(staticDir, a.Name)
 		fi, err := os.Lstat(src)
 		switch {
@@ -84,38 +90,37 @@ func stageAddons(addons []Addon, staticDir, tmpRoot, dest string, lim extract.Li
 		case !fi.Mode().IsRegular():
 			return 0, userErr("the static add-on %q is not a regular file", a.Name)
 		}
-		left := lim
-		left.MaxTotalBytes = lim.MaxTotalBytes - total
-		if left.MaxTotalBytes <= 0 {
-			return 0, userErr("the static add-ons exceed %d MiB in total", lim.MaxTotalBytes>>20)
-		}
-		dir, err := extract.Zip(src, tmpRoot, left)
+		extracted, err := extract.Zip(ctx, src, tmpRoot, left)
 		if err != nil {
 			if errors.Is(err, extract.ErrUnsafe) {
 				return 0, userErr("the static add-on %q was refused: %s", a.Name, clip(logsafe.String(strings.TrimPrefix(err.Error(), extract.ErrUnsafe.Error()+": ")), 200))
 			}
-			if strings.Contains(err.Error(), "zip: ") {
-				return 0, userErr("the static add-on %q is not a valid ZIP archive", a.Name)
+			if errors.Is(err, staticfiles.ErrNoSpace) {
+				return 0, userErr("there is not enough free disk space to extract the static add-on %q", a.Name)
 			}
 			return 0, err
 		}
-		n, err := mergeTree(dir, filepath.Join(dest, filepath.FromSlash(a.Target)), a.Name)
-		_ = os.RemoveAll(dir)
+		err = mergeTree(ctx, extracted.Dir, filepath.Join(dest, filepath.FromSlash(a.Target)), a.Name)
+		_ = os.RemoveAll(extracted.Dir)
 		if err != nil {
 			return 0, err
 		}
-		total += n
+		left.MaxEntries -= extracted.Entries
+		left.MaxTotalBytes -= extracted.Bytes
+		total += extracted.Bytes
 	}
 	return total, nil
 }
 
 // mergeTree moves the regular files and directories of src into dst
-// (created as needed) and returns the bytes moved. An existing file at a
+// (created as needed). An existing file at a
 // destination path, or a file where a directory is needed, is a conflict.
-func mergeTree(src, dst, name string) (int64, error) {
-	var total int64
-	err := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+func mergeTree(ctx context.Context, src, dst, name string) error {
+	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		rel, err := filepath.Rel(src, p)
@@ -145,17 +150,8 @@ func mergeTree(src, dst, name string) (int64, error) {
 			if _, err := os.Lstat(target); err == nil {
 				return conflict()
 			}
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			if err := os.Rename(p, target); err != nil {
-				return err
-			}
-			total += info.Size()
-			return nil
+			return os.Rename(p, target)
 		}
 		return fmt.Errorf("unexpected entry type in extracted add-on")
 	})
-	return total, err
 }

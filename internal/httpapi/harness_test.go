@@ -49,13 +49,15 @@ type harness struct {
 	hasher   *auth.Hasher
 	runner   *jobs.Runner
 	clock    *fakeClock
+	dbPath   string
 }
 
 func newHarness(t *testing.T, mutate ...func(*Config)) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	clock := &fakeClock{t: time.Now().UTC().Truncate(time.Second)}
-	st, err := store.Open(context.Background(), filepath.Join(dir, "t.db"), store.WithClock(clock.Now))
+	dbPath := filepath.Join(dir, "t.db")
+	st, err := store.Open(context.Background(), dbPath, store.WithClock(clock.Now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +97,7 @@ func newHarness(t *testing.T, mutate ...func(*Config)) *harness {
 		_ = runner.Shutdown(ctx)
 		_ = st.Close()
 	})
-	return &harness{t: t, srv: srv, st: st, sessions: sessions, hasher: hasher, runner: runner, clock: clock}
+	return &harness{t: t, srv: srv, st: st, sessions: sessions, hasher: hasher, runner: runner, clock: clock, dbPath: dbPath}
 }
 
 func (h *harness) account(name string, role store.Role, approved bool) store.Account {

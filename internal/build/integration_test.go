@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -155,7 +156,8 @@ func TestIntegrationBuildFixtureGame(t *testing.T) {
 
 	dc := docker.New(docker.Options{InstanceID: dockertest.IntegrationInstanceID, TempDir: filepath.Join(dir, "tmp")})
 	svc := build.New(build.Options{Store: st, Docker: dc, InstanceID: dockertest.IntegrationInstanceID,
-		RepoDir: repoDir, TempDir: filepath.Join(dir, "tmp"), StaticDir: staticDir, Timeout: 20 * time.Minute})
+		HeadCommit: func(context.Context, string) (string, error) { return p.LastCommit, nil },
+		RepoDir:    repoDir, TempDir: filepath.Join(dir, "tmp"), StaticDir: staticDir, Timeout: 20 * time.Minute})
 	b, err := st.CreateBuild(ctx, store.NewBuild{ProjectID: p.ID, Branch: "main"})
 	if err != nil {
 		t.Fatal(err)
@@ -254,6 +256,148 @@ func TestIntegrationBuildFixtureGame(t *testing.T) {
 
 func itoa(n int) string { return strconv.Itoa(n) }
 
+func TestIntegrationCancelDuringBuildStep(t *testing.T) {
+	requireDocker(t)
+	dir := t.TempDir()
+	suffix := make([]byte, 4)
+	_, _ = rand.Read(suffix)
+	name := "gdm3b-cancel-" + hex.EncodeToString(suffix)
+	commit := strings.Repeat("73", 20)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	st, err := store.Open(ctx, filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	p, err := st.CreateProject(ctx, store.Project{Name: name, RepoURL: "https://git.example.com/x.git",
+		Branch: "main", LastCommit: commit, AllowCustomDockerfile: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repos := filepath.Join(dir, "repositories")
+	checkout := filepath.Join(repos, strconv.FormatInt(p.ID, 10))
+	copyTree(t, filepath.Join("testdata", "game"), checkout)
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for file, contents := range map[string]string{
+		"golem-deploy.yaml": "dockerfile: Dockerfile.custom\n",
+		"Dockerfile.custom": "FROM busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec\n" +
+			"RUN echo " + name + "-started; sleep 5; echo done >/test-result\n",
+	} {
+		if err := os.WriteFile(filepath.Join(checkout, file), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := st.CreateBuild(ctx, store.NewBuild{ProjectID: p.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dc := docker.New(docker.Options{InstanceID: dockertest.IntegrationInstanceID, BuildConfigDir: filepath.Join(dir, "docker-build")})
+	spec := docker.BuildSpec{ProjectName: p.Name, ProjectID: p.ID, Commit: commit, BuildID: b.ID, EngineVersion: "v0.4.0-rc.1"}
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := dc.RemoveBuildOutput(cctx, spec); err != nil && !errors.Is(err, docker.ErrNotFound) {
+			t.Errorf("cleanup cancelled fixture: %v", err)
+		}
+	})
+	svc := build.New(build.Options{Store: st, Docker: dc, InstanceID: dockertest.IntegrationInstanceID, RepoDir: repos,
+		TempDir: filepath.Join(dir, "tmp"), HeadCommit: func(context.Context, string) (string, error) { return commit, nil }})
+	jobCtx, stopJob := context.WithCancel(ctx)
+	defer stopJob()
+	out := &lockedBuf{}
+	done := make(chan error, 1)
+	go func() { done <- svc.Run(jobCtx, b.ID, out, nil) }()
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	var started bool
+	for !started {
+		select {
+		case err := <-done:
+			t.Fatalf("build exited before the cancellation point: %v\n%s", err, out.String())
+		case <-ctx.Done():
+			stopJob()
+			<-done
+			t.Fatalf("RUN step did not start\n%s", out.String())
+		case <-tick.C:
+			for line := range strings.SplitSeq(out.String(), "\n") {
+				if strings.HasSuffix(line, " "+name+"-started") && !strings.Contains(line, "RUN ") {
+					started = true
+					break
+				}
+			}
+		}
+	}
+	stopJob()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run after cancellation: %v\n%s", err, out.String())
+	}
+	got, err := st.GetBuild(ctx, b.ID)
+	if err != nil || got.Status != store.BuildStatusCancelled || got.ImageID != "" {
+		t.Fatalf("cancelled build %+v: %v", got, err)
+	}
+	// Wait past the point at which an orphaned buildx would finish and
+	// export. Inspect the tag before running another cleanup attempt.
+	time.Sleep(6 * time.Second)
+	if _, err := dc.ManagedImage(ctx, spec.Tag()); !errors.Is(err, docker.ErrNotFound) {
+		t.Fatalf("cancelled build exported its image: %v\n%s", err, out.String())
+	}
+}
+
+func TestIntegrationLibraryPackageFailsBuild(t *testing.T) {
+	requireDocker(t)
+	dir := t.TempDir()
+	ctx := t.Context()
+	st, err := store.Open(ctx, filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	suffix := make([]byte, 4)
+	_, _ = rand.Read(suffix)
+	p, err := st.CreateProject(ctx, store.Project{Name: "gdm3b-lib-" + hex.EncodeToString(suffix),
+		RepoURL: "https://git.example.com/x.git", Branch: "main", LastCommit: strings.Repeat("37", 20)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repos := filepath.Join(dir, "repos")
+	checkout := filepath.Join(repos, "1")
+	copyTree(t, filepath.Join("testdata", "game"), checkout)
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "cmd", "server", "main.go"), []byte("package library\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dc := docker.New(docker.Options{InstanceID: dockertest.IntegrationInstanceID, BuildConfigDir: filepath.Join(dir, "docker-build")})
+	svc := build.New(build.Options{Store: st, Docker: dc, InstanceID: dockertest.IntegrationInstanceID, RepoDir: repos,
+		TempDir: filepath.Join(dir, "tmp"), HeadCommit: func(context.Context, string) (string, error) { return p.LastCommit, nil }})
+	b, err := st.CreateBuild(ctx, store.NewBuild{ProjectID: p.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		spec := docker.BuildSpec{ProjectName: p.Name, ProjectID: p.ID, Commit: p.LastCommit, BuildID: b.ID, EngineVersion: "v0.4.0-rc.1"}
+		if err := dc.RemoveBuildOutput(context.Background(), spec); err != nil && !errors.Is(err, docker.ErrNotFound) {
+			t.Errorf("cleanup library fixture: %v", err)
+		}
+	})
+	out := &lockedBuf{}
+	runErr := svc.Run(ctx, b.ID, out, nil)
+	got, err := st.GetBuild(ctx, b.ID)
+	found := false
+	for line := range strings.SplitSeq(out.String(), "\n") {
+		if strings.HasPrefix(line, "#") && strings.HasSuffix(line, " the server must be a package main") {
+			found = true
+		}
+	}
+	if err != nil || runErr == nil || got.Status != store.BuildStatusError || !found {
+		t.Fatalf("library build %+v: %v, %v\n%s", got, err, runErr, out.String())
+	}
+}
+
 // TestIntegrationCustomDockerfile runs repository Dockerfiles (opt-in
 // dockerfile:) through the real pipeline: the context never contains .git
 // or node_modules, host networking is refused (no entitlements are
@@ -261,12 +405,21 @@ func itoa(n int) string { return strconv.Itoa(n) }
 func TestIntegrationCustomDockerfile(t *testing.T) {
 	requireDocker(t)
 	const busybox = "busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec"
+	host, err := dockerCLI(t, "context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ambient := t.TempDir()
+	const proxyConfig = `{"proxies":{"default":{"httpProxy":"http://build-test-proxy.invalid:8123","httpsProxy":"http://build-test-proxy.invalid:8123"}}}`
+	if err := os.WriteFile(filepath.Join(ambient, "config.json"), []byte(proxyConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name   string
 		extra  string
 		detail string
 	}{
-		{"context is clean", "", ""},
+		{"context and proxy environment are clean", "RUN case \"${HTTP_PROXY:-}${HTTPS_PROXY:-}\" in *build-test-proxy.invalid*) exit 67;; esac\n", ""},
 		{"host network refused", "RUN --network=host true\n", build.DetailBuildFailed},
 		{"reserved label refused", "LABEL dev.golemengine.deploy.server-id=1\n", "reserved for golem-deploy"},
 	}
@@ -282,7 +435,7 @@ func TestIntegrationCustomDockerfile(t *testing.T) {
 			suffix := make([]byte, 4)
 			_, _ = rand.Read(suffix)
 			p, err := st.CreateProject(ctx, store.Project{Name: "gdm3b-" + hex.EncodeToString(suffix), RepoURL: "https://git.example.com/x.git",
-				Branch: "main", LastCommit: strings.Repeat("cd", 20)}, nil)
+				Branch: "main", LastCommit: strings.Repeat("cd", 20), AllowCustomDockerfile: true}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -301,9 +454,22 @@ func TestIntegrationCustomDockerfile(t *testing.T) {
 			_ = os.MkdirAll(filepath.Join(checkout, "deploy"), 0o755)
 			_ = os.WriteFile(filepath.Join(checkout, "deploy", "Dockerfile"), []byte(df), 0o644)
 
-			dc := docker.New(docker.Options{InstanceID: dockertest.IntegrationInstanceID, TempDir: filepath.Join(dir, "tmp")})
+			dc := docker.New(docker.Options{InstanceID: dockertest.IntegrationInstanceID, TempDir: filepath.Join(dir, "tmp"),
+				BuildConfigDir: filepath.Join(dir, "docker-build"), LookupEnv: func(key string) (string, bool) {
+					switch key {
+					case "DOCKER_CONFIG":
+						return ambient, true
+					case "DOCKER_CONTEXT":
+						return "", false
+					case "DOCKER_HOST":
+						return host, true
+					default:
+						return os.LookupEnv(key)
+					}
+				}})
 			svc := build.New(build.Options{Store: st, Docker: dc, InstanceID: dockertest.IntegrationInstanceID,
-				RepoDir: repoDir, TempDir: filepath.Join(dir, "tmp"), StaticDir: filepath.Join(dir, "static"), Timeout: 5 * time.Minute})
+				HeadCommit: func(context.Context, string) (string, error) { return p.LastCommit, nil },
+				RepoDir:    repoDir, TempDir: filepath.Join(dir, "tmp"), StaticDir: filepath.Join(dir, "static"), Timeout: 5 * time.Minute})
 			b, _ := st.CreateBuild(ctx, store.NewBuild{ProjectID: p.ID})
 			log := &lockedBuf{}
 			runErr := svc.Run(ctx, b.ID, log, nil)
@@ -323,10 +489,12 @@ func TestIntegrationCustomDockerfile(t *testing.T) {
 			if strings.Contains(log.String(), "SECRET-MARKER") {
 				t.Fatal("log leaks .git content")
 			}
-			// No image of a refused build is left behind.
-			if out, _ := dockerCLI(t, "image", "ls", "--quiet", "--filter", "label=dev.golemengine.deploy.project-id="+strconv.FormatInt(p.ID, 10),
-				"--filter", "label=dev.golemengine.deploy.instance="+dockertest.IntegrationInstanceID, "--filter", "label=dev.golemengine.deploy.build-id="+strconv.FormatInt(b.ID, 10)); out != "" && tc.name == "reserved label refused" {
-				t.Fatalf("image kept: %s", out)
+			// Inspect only this test's tag. Concurrent integration suites
+			// can use the same numeric project and build IDs.
+			spec := docker.BuildSpec{ProjectName: p.Name, ProjectID: p.ID, BuildID: b.ID, Commit: p.LastCommit, EngineVersion: "v0.4.0-rc.1"}
+			if _, err := dc.ManagedImage(ctx, spec.Tag()); !errors.Is(err, docker.ErrNotFound) {
+				_ = dc.RemoveBuildOutput(ctx, spec)
+				t.Fatalf("rejected export cleanup: %v", err)
 			}
 		})
 	}

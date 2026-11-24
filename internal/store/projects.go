@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -25,9 +26,10 @@ type Project struct {
 	Status       string
 	// StaticAddons are ZIP files of the static store extracted into the
 	// game root at build time (never nil when read).
-	StaticAddons []StaticAddon
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	StaticAddons          []StaticAddon
+	AllowCustomDockerfile bool
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 // StaticAddon is a static store ZIP extracted at Target (a clean relative
@@ -42,14 +44,14 @@ type StaticAddon struct {
 // is only known after insert. Returning nil stores NULL.
 type SealFunc func(id int64) ([]byte, error)
 
-const projectCols = `id, name, repo_url, branch, auth_type, auth_username, auth_secret, last_commit, last_pulled_at, status, static_addons, created_at, updated_at`
+const projectCols = `id, name, repo_url, branch, auth_type, auth_username, auth_secret, last_commit, last_pulled_at, status, static_addons, allow_custom_dockerfile, created_at, updated_at`
 
 func scanProject(r scanner) (Project, error) {
 	var p Project
 	var lastPulled sql.NullString
 	var created, updated, addons string
 	if err := r.Scan(&p.ID, &p.Name, &p.RepoURL, &p.Branch, &p.AuthType, &p.AuthUsername, &p.AuthSecret,
-		&p.LastCommit, &lastPulled, &p.Status, &addons, &created, &updated); err != nil {
+		&p.LastCommit, &lastPulled, &p.Status, &addons, &p.AllowCustomDockerfile, &created, &updated); err != nil {
 		return Project{}, err
 	}
 	if err := json.Unmarshal([]byte(addons), &p.StaticAddons); err != nil {
@@ -94,9 +96,9 @@ func (s *Store) CreateProject(ctx context.Context, p Project, seal SealFunc) (Pr
 		now := formatTime(s.nowUTC())
 		var err error
 		out, err = scanProject(tx.QueryRowContext(ctx,
-			`INSERT INTO projects (name, repo_url, branch, auth_type, auth_username, auth_secret, last_commit, last_pulled_at, status, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?) RETURNING `+projectCols,
-			p.Name, p.RepoURL, p.Branch, p.AuthType, p.AuthUsername, p.LastCommit, formatTimePtr(p.LastPulledAt), p.Status, now, now))
+			`INSERT INTO projects (name, repo_url, branch, auth_type, auth_username, auth_secret, last_commit, last_pulled_at, status, allow_custom_dockerfile, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?) RETURNING `+projectCols,
+			p.Name, p.RepoURL, p.Branch, p.AuthType, p.AuthUsername, p.LastCommit, formatTimePtr(p.LastPulledAt), p.Status, p.AllowCustomDockerfile, now, now))
 		if err != nil {
 			return mapErr("create project", err)
 		}
@@ -166,10 +168,10 @@ func (s *Store) CountProjects(ctx context.Context) (int, error) {
 func (s *Store) UpdateProject(ctx context.Context, p Project) (Project, error) {
 	out, err := scanProject(s.db.QueryRowContext(ctx,
 		`UPDATE projects SET repo_url = ?, branch = ?, auth_type = ?, auth_username = ?, auth_secret = ?,
-		 last_commit = ?, last_pulled_at = ?, status = ?, updated_at = ?
+		 last_commit = ?, last_pulled_at = ?, status = ?, allow_custom_dockerfile = ?, updated_at = ?
 		 WHERE id = ? RETURNING `+projectCols,
 		p.RepoURL, p.Branch, p.AuthType, p.AuthUsername, blobArg(p.AuthSecret),
-		p.LastCommit, formatTimePtr(p.LastPulledAt), p.Status, formatTime(s.nowUTC()), p.ID))
+		p.LastCommit, formatTimePtr(p.LastPulledAt), p.Status, p.AllowCustomDockerfile, formatTime(s.nowUTC()), p.ID))
 	if err != nil {
 		return Project{}, mapErr("update project", err)
 	}
@@ -202,9 +204,10 @@ func (s *Store) SetProjectCheckout(ctx context.Context, id int64, c ProjectCheck
 // static add-ons (the columns PATCH /projects/{id} writes). Nil fields are
 // unchanged.
 type ProjectRemoteUpdate struct {
-	RepoURL      *string
-	Auth         *ProjectAuthUpdate
-	StaticAddons *[]StaticAddon
+	RepoURL               *string
+	Auth                  *ProjectAuthUpdate
+	StaticAddons          *[]StaticAddon
+	AllowCustomDockerfile *bool
 }
 
 // ProjectAuthUpdate replaces a project's credentials. Secret must already
@@ -240,6 +243,10 @@ func (s *Store) UpdateProjectRemote(ctx context.Context, id int64, u ProjectRemo
 		sets = append(sets, "static_addons = ?")
 		args = append(args, string(raw))
 	}
+	if u.AllowCustomDockerfile != nil {
+		sets = append(sets, "allow_custom_dockerfile = ?")
+		args = append(args, *u.AllowCustomDockerfile)
+	}
 	args = append(args, id)
 	out, err := scanProject(s.db.QueryRowContext(ctx,
 		`UPDATE projects SET `+strings.Join(sets, ", ")+` WHERE id = ? RETURNING `+projectCols, args...))
@@ -262,9 +269,14 @@ func (s *Store) SetProjectStatus(ctx context.Context, id int64, status string) e
 // ProjectsUsingStatic returns the names of the projects whose static
 // add-ons include the static file name, sorted.
 func (s *Store) ProjectsUsingStatic(ctx context.Context, name string) ([]string, error) {
+	collation := ""
+	if runtime.GOOS == "windows" {
+		// Static store names are ASCII.
+		collation = " COLLATE NOCASE"
+	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT DISTINCT p.name FROM projects p, json_each(p.static_addons) a
-		 WHERE json_extract(a.value, '$.name') = ? ORDER BY p.name`, name)
+		 WHERE json_extract(a.value, '$.name') = ?`+collation+` ORDER BY p.name`, name)
 	if err != nil {
 		return nil, mapErr("projects using static file", err)
 	}

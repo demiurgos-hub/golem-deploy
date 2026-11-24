@@ -189,6 +189,10 @@ func (c *Client) BuildImage(ctx context.Context, ref BuildRef) (Image, error) {
 	return img, nil
 }
 
+// ErrImageMultipleTags means the operator needs to untag aliases before
+// the immutable image id can be removed safely.
+var ErrImageMultipleTags = errors.New("remove additional tags from the image before deleting it")
+
 // RemoveImage deletes a managed image. It refuses unmanaged images
 // (ErrNotManaged) and images used by any container (ErrInUse); callers
 // check their own references (server rows) first.
@@ -207,16 +211,12 @@ func (c *Client) RemoveImage(ctx context.Context, id string) error {
 	if len(used) > 0 {
 		return ErrInUse
 	}
-	// Always by the immutable id that was checked, never by a tag (a tag
-	// can be moved to another image in between). An image with several
-	// tags needs --force to be removed by id; --force never removes an
-	// image a running container uses, and no container used it a moment
-	// ago.
-	args := []string{"image", "rm"}
 	if len(img.Tags) > 1 {
-		args = append(args, "--force")
+		return ErrImageMultipleTags
 	}
-	args = append(args, "--", img.ID)
+	// Use the checked immutable id without forcing removal: Docker must
+	// also protect references created after our container check.
+	args := []string{"image", "rm", "--", img.ID}
 	c.logger.Info("docker image rm", "image", img.ID, "tags", len(img.Tags))
 	if err := c.exec(ctx, quickTimeout, args, nil, nil, nil); err != nil {
 		if errors.Is(err, ErrConflict) {

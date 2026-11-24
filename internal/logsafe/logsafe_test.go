@@ -23,8 +23,18 @@ func TestWriterCapsLines(t *testing.T) {
 	w := NewWriter(&out, "")
 	_, _ = w.Write([]byte(strings.Repeat("x", 3*MaxLine) + "\nnext\n"))
 	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
-	if len(lines) != 2 || !strings.HasSuffix(lines[0], TruncatedMarker) || len(lines[0]) != MaxLine+len(TruncatedMarker) || lines[1] != "next" {
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], TruncatedMarker) || len(lines[0]) != MaxLine || lines[1] != "next" {
 		t.Fatalf("%d lines, first %d bytes", len(lines), len(lines[0]))
+	}
+}
+
+func TestWriterCapsRenderedLine(t *testing.T) {
+	var out strings.Builder
+	w := NewWriter(&out, "docker | ")
+	_, _ = w.Write([]byte(strings.Repeat("\u061c\x1b", MaxLine/5) + "\n"))
+	line := strings.TrimSuffix(out.String(), "\n")
+	if len(line) > MaxLine || !strings.HasSuffix(line, TruncatedMarker) || strings.ContainsAny(line, "\u061c\x1b") {
+		t.Fatalf("unsafe rendered line of %d bytes", len(line))
 	}
 }
 

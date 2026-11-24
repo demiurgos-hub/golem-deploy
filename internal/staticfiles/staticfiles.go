@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -87,6 +88,15 @@ func ValidateName(name string) error {
 		return &NameError{Msg: "invalid file name"}
 	}
 	return nil
+}
+
+// NameKey compares validated ASCII names using the static store's host
+// filesystem conventions.
+func NameKey(name string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(name)
+	}
+	return name
 }
 
 // File describes a stored file.
@@ -341,14 +351,23 @@ func (s *Store) Remove(name string) error {
 // checkFree fails with ErrNoSpace when fewer than need+reserve bytes are
 // free (when the free space is known and the reserve enabled).
 func (s *Store) checkFree(need int64) error {
-	if s.opt.ReserveBytes < 0 {
+	return checkFree(s.dir, need, s.opt.ReserveBytes, s.opt.FreeSpace)
+}
+
+// CheckFreeSpace verifies that a write will leave the filesystem reserve.
+func CheckFreeSpace(dir string, need, reserve int64) error {
+	return checkFree(dir, need, reserve, freeSpace)
+}
+
+func checkFree(dir string, need, reserve int64, available func(string) (int64, error)) error {
+	if reserve < 0 {
 		return nil
 	}
-	free, err := s.opt.FreeSpace(s.dir)
+	free, err := available(dir)
 	if err != nil || free < 0 {
 		return nil // unknown: the quota still bounds the store
 	}
-	if free-need < s.opt.ReserveBytes {
+	if free-need < reserve {
 		return ErrNoSpace
 	}
 	return nil

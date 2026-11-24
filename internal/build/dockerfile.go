@@ -152,7 +152,11 @@ func Dockerfile(p *Plan, prm DockerfileParams) ([]byte, error) {
 	if p.ServerPackage != "." {
 		pkg = "./" + p.ServerPackage
 	}
-	line("RUN %s %s", goCache, execForm("go", "build", "-trimpath", "-ldflags=-s -w", "-o", "/out/golem-server", pkg))
+	line("RUN %s %s", goCache, execForm("sh", "-ec",
+		`name=$(go list -f '{{.Name}}' "$1"); if [ "$name" != main ]; then echo 'the server must be a package main' >&2; exit 1; fi
+go build -trimpath '-ldflags=-s -w' -o /out/golem-server "$1"
+if [ ! -f /out/golem-server ] || [ ! -x /out/golem-server ]; then echo 'the server build did not produce an executable' >&2; exit 1; fi`,
+		"golem-deploy", pkg))
 	line("RUN %s", execForm("mkdir", "-p", "/out/data"))
 	line("")
 	line("FROM %s", RuntimeImage)

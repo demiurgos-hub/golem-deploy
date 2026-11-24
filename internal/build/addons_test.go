@@ -3,6 +3,7 @@ package build
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -60,7 +61,7 @@ func TestStageAddons(t *testing.T) {
 	if err := os.Mkdir(dest, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	n, err := stageAddons([]Addon{{"maps.zip", "assets/maps"}, {"sounds.zip", ""}, {"more.zip", "assets/maps"}}, static, tmp, dest, extract.DefaultLimits())
+	n, err := stageAddons(context.Background(), []Addon{{"maps.zip", "assets/maps"}, {"sounds.zip", ""}, {"more.zip", "assets/maps"}}, static, tmp, dest, extract.DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +118,7 @@ func TestStageAddonsRejects(t *testing.T) {
 			tmp := t.TempDir()
 			dest := filepath.Join(tmp, "static")
 			_ = os.Mkdir(dest, 0o700)
-			_, err := stageAddons(tc.addons, static, tmp, dest, tc.lim)
+			_, err := stageAddons(context.Background(), tc.addons, static, tmp, dest, tc.lim)
 			wantUserErr(t, err, tc.want)
 			if strings.Contains(err.Error(), static) || strings.Contains(err.Error(), tmp) {
 				t.Fatalf("message contains a host path: %v", err)
@@ -154,5 +155,24 @@ func TestValidateAddons(t *testing.T) {
 	}
 	if _, err := ValidateAddons(many); err == nil {
 		t.Error("too many add-ons accepted")
+	}
+}
+
+func TestStageAddonsSharesEntryAndByteBudgets(t *testing.T) {
+	static := t.TempDir()
+	makeZip(t, filepath.Join(static, "a.zip"), map[string]string{"a": "abc"})
+	makeZip(t, filepath.Join(static, "b.zip"), map[string]string{"b": "def"})
+	for _, entryLimited := range []bool{false, true} {
+		lim := extract.DefaultLimits()
+		want := "byte total limit"
+		if entryLimited {
+			lim.MaxEntries = 1
+			want = "remaining build entry limit"
+		} else {
+			lim.MaxTotalBytes = 5
+		}
+		tmp := t.TempDir()
+		_, err := stageAddons(t.Context(), []Addon{{"a.zip", "."}, {"b.zip", "."}}, static, tmp, filepath.Join(tmp, "staging"), lim)
+		wantUserErr(t, err, want)
 	}
 }

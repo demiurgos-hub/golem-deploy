@@ -76,7 +76,8 @@ func newEnv(t *testing.T, mutate ...func(*Options)) *env {
 		t.Fatal(err)
 	}
 	o := Options{Store: st, Docker: dc, InstanceID: dockertest.InstanceID, RepoDir: e.repoDir, TempDir: e.tmpDir,
-		StaticDir: e.static, Logger: logger, Timeout: time.Minute}
+		StaticDir: e.static, Logger: logger, Timeout: time.Minute,
+		HeadCommit: func(context.Context, string) (string, error) { return strings.Repeat("c", 40), nil }}
 	for _, m := range mutate {
 		m(&o)
 	}
@@ -209,7 +210,7 @@ func TestRunSuccess(t *testing.T) {
 		t.Fatalf("build dir %s not below tmp", buildDir)
 	}
 	calls := e.fake.CallsTo("build")
-	for _, v := range docker.BuildEnv {
+	for _, v := range []string{"DOCKER_BUILDKIT=1", "BUILDX_GIT_INFO=false", "BUILDX_GIT_LABELS=false", "BUILDX_NO_DEFAULT_ATTESTATIONS=1", "BUILDX_METADATA_PROVENANCE=disabled", "BUILDX_METADATA_WARNINGS=false"} {
 		if !slices.Contains(calls[0].Env, v) {
 			t.Errorf("CLI env lacks %s: %v", v, calls[0].Env)
 		}

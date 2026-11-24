@@ -36,14 +36,11 @@ RestartSec=5s
 # outlive the stop. 30 s covers both grace periods plus closing the database.
 TimeoutStopSec=30s
 
-# The docker CLI keeps its client state (buildx metadata and activity,
-# contexts, registry logins) in $DOCKER_CONFIG, otherwise in $HOME/.docker,
-# and $HOME is the data directory, which is dedicated to Golem Deploy.
-# CacheDirectory= creates /var/cache/golem-deploy owned by the service user
-# and makes it writable below ProtectSystem=strict; nothing in it needs a
-# backup except registry logins made there. "docker build" also writes its
-# --iidfile and --metadata-file below the data directory's tmp/ and its own
-# scratch files to the private /tmp; the build runs inside dockerd.
+# CacheDirectory= gives non-build Docker commands a writable client config.
+# For builds the daemon overrides DOCKER_CONFIG with <data-dir>/docker-build,
+# including buildx state and any registry logins deliberately added there.
+# The build writes its iid/metadata files below the data directory's tmp/ and
+# its own scratch files to the private /tmp. Build steps run inside dockerd.
 CacheDirectory=golem-deploy
 CacheDirectoryMode=0700
 Environment=DOCKER_CONFIG=/var/cache/golem-deploy/docker

@@ -85,15 +85,11 @@ func (r *repoFS) readFile(rel string, limit int64) ([]byte, error) {
 	if fi.Size() > limit {
 		return nil, userErr("%s is larger than %d KiB", safePath(rel), limit>>10)
 	}
-	f, err := r.root.Open(filepath.FromSlash(rel))
+	f, err := r.openChecked(rel, fi)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	// Check what was opened, not what was looked at.
-	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() || !os.SameFile(st, fi) {
-		return nil, userErr("%s changed while it was read", safePath(rel))
-	}
 	data, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, err
@@ -144,7 +140,7 @@ func (r *repoFS) readDir(rel string) ([]fs.DirEntry, error) {
 	if !fi.IsDir() {
 		return nil, errMissing
 	}
-	f, err := r.root.Open(filepath.FromSlash(rel))
+	f, err := r.openChecked(rel, fi)
 	if err != nil {
 		return nil, err
 	}
@@ -157,6 +153,18 @@ func (r *repoFS) readDir(rel string) ([]fs.DirEntry, error) {
 		return nil, userErr("%s has more than %d entries", safePath(rel), maxDirEntries)
 	}
 	return entries, nil
+}
+
+func (r *repoFS) openChecked(rel string, checked fs.FileInfo) (*os.File, error) {
+	f, err := r.root.Open(filepath.FromSlash(rel))
+	if err != nil {
+		return nil, err
+	}
+	if st, err := f.Stat(); err != nil || st.Mode().Type() != checked.Mode().Type() || !os.SameFile(st, checked) {
+		f.Close()
+		return nil, userErr("%s changed before it could be read", safePath(rel))
+	}
+	return f, nil
 }
 
 // join joins slash paths below base ("." is the root).

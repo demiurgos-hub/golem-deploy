@@ -271,7 +271,11 @@ func Run(ctx context.Context, o Options) (err error) {
 	if err := build.SweepTemp(layout.Tmp()); err != nil {
 		logger.Warn("could not remove build directories left by a previous run", "err", err)
 	}
-	dockerClient := docker.New(docker.Options{Runner: o.dockerCLI, Logger: logger, InstanceID: instanceID, TempDir: layout.Tmp()})
+	dockerClient := docker.New(docker.Options{Runner: o.dockerCLI, Logger: logger, InstanceID: instanceID,
+		TempDir: layout.Tmp(), BuildConfigDir: layout.BuildDockerConfig()})
+	if err := dockerClient.PrepareBuildConfig(); err != nil {
+		return fmt.Errorf("prepare dedicated Docker build configuration: %w", err)
+	}
 	if err := docker.ValidateBindSource(layout.GameCerts()); err != nil {
 		return fmt.Errorf("the data directory %q cannot be bind-mounted into server containers (its path must not contain , \" ' or =): %w", layout.Root, err)
 	}
@@ -284,6 +288,10 @@ func Run(ctx context.Context, o Options) (err error) {
 		logger.Warn("the game server port range overlaps the host's ephemeral port range; outgoing connections and Docker can take those ports at any time: "+
 			"choose another --port-range or raise net.ipv4.ip_local_port_range", "port_range", srvCfg.Ports.String(), "ephemeral_range", eph.String())
 	}
+	var headCommit func(context.Context, string) (string, error)
+	if gitRunner, ok := gitClient.(*git.Runner); ok {
+		headCommit = gitRunner.HeadCommit
+	}
 	builds := build.New(build.Options{
 		Store:      st,
 		Docker:     dockerClient,
@@ -291,6 +299,7 @@ func Run(ctx context.Context, o Options) (err error) {
 		RepoDir:    layout.Repositories(),
 		TempDir:    layout.Tmp(),
 		StaticDir:  static.Dir(),
+		HeadCommit: headCommit,
 		Timeout:    o.BuildTimeout,
 		Retention:  o.BuildRetention,
 		Logger:     logger,
@@ -359,6 +368,26 @@ func Run(ctx context.Context, o Options) (err error) {
 	defer func() {
 		cancelRec()
 		<-recDone
+	}()
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			cctx, cancel := context.WithTimeout(recCtx, 2*time.Minute)
+			builds.CleanupImages(cctx)
+			cancel()
+			select {
+			case <-recCtx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	defer func() {
+		cancelRec()
+		<-cleanupDone
 	}()
 	// The certificate check runs hourly until shutdown, before the store
 	// closes.

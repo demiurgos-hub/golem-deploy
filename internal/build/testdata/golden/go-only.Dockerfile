@@ -4,7 +4,7 @@ ENV CGO_ENABLED=0 GOWORK=off GOFLAGS=-mod=mod NPM_CONFIG_UPDATE_NOTIFIER=false N
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p1-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-beabf00ccfad-p1-gobuild,target=/root/.cache/go-build ["go","run","github.com/demiurgos-hub/golem-engine/cmd/golem-bake@v0.4.0-rc.1"]
-RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p1-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-beabf00ccfad-p1-gobuild,target=/root/.cache/go-build ["go","build","-trimpath","-ldflags=-s -w","-o","/out/golem-server","."]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p1-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-beabf00ccfad-p1-gobuild,target=/root/.cache/go-build ["sh","-ec","name=$(go list -f '{{.Name}}' \"$1\"); if [ \"$name\" != main ]; then echo 'the server must be a package main' >&2; exit 1; fi\ngo build -trimpath '-ldflags=-s -w' -o /out/golem-server \"$1\"\nif [ ! -f /out/golem-server ] || [ ! -x /out/golem-server ]; then echo 'the server build did not produce an executable' >&2; exit 1; fi","golem-deploy","."]
 RUN ["mkdir","-p","/out/data"]
 
 FROM gcr.io/distroless/static-debian12:nonroot

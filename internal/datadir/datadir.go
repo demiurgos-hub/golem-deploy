@@ -52,6 +52,9 @@ func (l Layout) GameCerts() string { return filepath.Join(l.Root, "certs", "game
 // Tmp is scratch space on the same filesystem as the other directories.
 func (l Layout) Tmp() string { return filepath.Join(l.Root, "tmp") }
 
+// BuildDockerConfig is the Docker client configuration used only by builds.
+func (l Layout) BuildDockerConfig() string { return filepath.Join(l.Root, "docker-build") }
+
 // Marker is the file that identifies a data directory initialised by Golem
 // Deploy.
 func (l Layout) Marker() string { return filepath.Join(l.Root, MarkerName) }
@@ -69,7 +72,7 @@ const markerFormat = 1
 // existed can contain (see checkDedicated).
 var legacyEntries = map[string]bool{
 	"golem-deploy.db": true, "golem-deploy.db-wal": true, "golem-deploy.db-shm": true, "golem-deploy.db-journal": true,
-	"keys": true, "repositories": true, "static": true, "logs": true, "tmp": true, "known_hosts": true, ".lock": true,
+	"keys": true, "repositories": true, "static": true, "logs": true, "tmp": true, "known_hosts": true, ".lock": true, "docker-build": true,
 }
 
 // Prepare resolves root to an absolute path and initialises or reuses the

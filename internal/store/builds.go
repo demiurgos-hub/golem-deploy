@@ -68,6 +68,8 @@ type BuildFilter struct {
 	Status string
 	// Limit caps the result (default 50, maximum 500).
 	Limit int
+	// BeforeID is the exclusive cursor for internal callers walking all builds.
+	BeforeID int64
 }
 
 const buildCols = `id, project_id, branch, commit_hash, status, detail, job_id, image_id, image_tag, engine_version, schema_fingerprint, webtransport_path, websocket_path, created_by, created_at, started_at, finished_at`
@@ -182,6 +184,10 @@ func (s *Store) ListBuilds(ctx context.Context, f BuildFilter) ([]Build, error) 
 	if f.Status != "" {
 		q += ` AND status = ?`
 		args = append(args, f.Status)
+	}
+	if f.BeforeID > 0 {
+		q += ` AND id < ?`
+		args = append(args, f.BeforeID)
 	}
 	q += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)

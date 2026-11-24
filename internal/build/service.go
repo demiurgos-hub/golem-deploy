@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
@@ -58,11 +59,13 @@ const (
 
 // User-facing details of build outcomes.
 const (
-	DetailCancelled   = "cancelled"
-	DetailNoCheckout  = "the project has no checkout yet; pull it first (or build with pull)"
-	DetailDockerDown  = "Docker is not reachable on the host"
-	DetailBuildFailed = "docker build failed; see the build log"
-	DetailVanished    = "the build job ended unexpectedly; see the build log"
+	DetailCancelled        = "cancelled"
+	DetailNoCheckout       = "the project has no checkout yet; pull it first (or build with pull)"
+	DetailCheckoutNotIdle  = "the project checkout is not idle; pull it first (or build with pull)"
+	DetailCheckoutMismatch = "the checkout HEAD could not be verified against the recorded commit; pull the project first"
+	DetailDockerDown       = "Docker is not reachable on the host"
+	DetailBuildFailed      = "docker build failed; see the build log"
+	DetailVanished         = "the build job ended unexpectedly; see the build log"
 )
 
 // ErrImageInUse means a build's image is used by a container. Errors that
@@ -92,6 +95,7 @@ var ErrTooManyBuilds = errors.New("build: too many builds are queued")
 type Docker interface {
 	Build(ctx context.Context, spec docker.BuildSpec, out io.Writer) error
 	BuiltImage(ctx context.Context, spec docker.BuildSpec) (docker.Image, error)
+	RemoveBuildOutput(ctx context.Context, spec docker.BuildSpec) error
 	ContainersUsingImage(ctx context.Context, id string) ([]string, error)
 	RemoveImage(ctx context.Context, id string) error
 }
@@ -107,6 +111,8 @@ type Options struct {
 	RepoDir   string
 	TempDir   string
 	StaticDir string
+	// HeadCommit reads the checkout's actual HEAD through the hardened git runner.
+	HeadCommit func(context.Context, string) (string, error)
 	// Timeout bounds one build (default DefaultTimeout); Retention is how
 	// many successful builds are kept per project (default
 	// DefaultRetention).
@@ -129,7 +135,6 @@ type Service struct {
 
 	activeMu sync.Mutex
 	active   int
-	finished map[int64]bool
 }
 
 // New returns a Service.
@@ -147,7 +152,7 @@ func New(o Options) *Service {
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.DiscardHandler)
 	}
-	return &Service{o: o, slot: make(chan struct{}, 1), finished: map[int64]bool{}}
+	return &Service{o: o, slot: make(chan struct{}, 1)}
 }
 
 // Timeout returns the per-build time limit.
@@ -182,13 +187,6 @@ func (s *Service) Watch(id int64, done <-chan struct{}, release func()) {
 	go func() {
 		<-done
 		release()
-		s.activeMu.Lock()
-		recorded := s.finished[id]
-		delete(s.finished, id)
-		s.activeMu.Unlock()
-		if recorded {
-			return
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), finalTimeout)
 		defer cancel()
 		b, err := s.o.Store.GetBuild(ctx, id)
@@ -202,50 +200,49 @@ func (s *Service) Watch(id int64, done <-chan struct{}, release func()) {
 			}
 		}
 		if err := s.o.Store.FinishBuild(ctx, id, store.BuildResult{Status: status, Detail: detail}); err != nil && !errors.Is(err, store.ErrNotFound) {
-			s.o.Logger.Error("record build outcome failed", "build_id", id, "err", err)
+			s.o.Logger.Error("record build outcome failed", "build_id", id, "error", safeBuildError(err))
 		}
 	}()
 }
 
-func (s *Service) markRecorded(id int64) {
-	s.activeMu.Lock()
-	s.finished[id] = true
-	s.activeMu.Unlock()
-}
-
 // run is one build in progress.
 type run struct {
-	s       *Service
-	id      int64
-	log     io.Writer
-	engine  string
-	project int64
+	s      *Service
+	id     int64
+	log    io.Writer
+	engine string
 }
 
-// finish records the outcome with a fresh context (the job's may be done).
-func (r *run) finish(res store.BuildResult) {
-	ctx, cancel := context.WithTimeout(context.Background(), finalTimeout)
-	defer cancel()
+func (r *run) finish(ctx context.Context, res store.BuildResult) error {
 	if res.EngineVersion == "" {
 		res.EngineVersion = r.engine
 	}
-	if err := r.s.o.Store.FinishBuild(ctx, r.id, res); err != nil && !errors.Is(err, store.ErrNotFound) {
-		r.s.o.Logger.Error("record build outcome failed", "build_id", r.id, "err", err)
+	if err := r.s.o.Store.FinishBuild(ctx, r.id, res); err != nil {
+		r.s.o.Logger.Error("record build outcome failed", "build_id", r.id, "error", safeBuildError(err))
+		return jobs.Fail("the build result could not be recorded", nil)
 	}
-	r.s.markRecorded(r.id)
+	return nil
 }
 
-// fail records a failed build and returns the job error. msg must be safe
-// to show; cause goes to the job log only.
-func (r *run) fail(msg string, cause error) error {
-	r.finish(store.BuildResult{Status: store.BuildStatusError, Detail: msg})
-	return jobs.Fail(msg, cause)
+// fail records a failed build. The job log and detail get the same safe
+// message. Raw process errors and internal file errors never reach them.
+func (r *run) fail(msg string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), finalTimeout)
+	defer cancel()
+	if err := r.finish(ctx, store.BuildResult{Status: store.BuildStatusError, Detail: msg}); err != nil {
+		return err
+	}
+	return jobs.Fail(msg, nil)
 }
 
 // cancelled records a cancelled build and returns the context error, so
 // the job ends cancelled too.
 func (r *run) cancelled(ctx context.Context) error {
-	r.finish(store.BuildResult{Status: store.BuildStatusCancelled, Detail: DetailCancelled})
+	finalCtx, cancel := context.WithTimeout(context.Background(), finalTimeout)
+	defer cancel()
+	if err := r.finish(finalCtx, store.BuildResult{Status: store.BuildStatusCancelled, Detail: DetailCancelled}); err != nil {
+		return err
+	}
 	return ctx.Err()
 }
 
@@ -257,10 +254,8 @@ func (s *Service) Run(ctx context.Context, id int64, log io.Writer, prepare jobs
 	r := &run{s: s, id: id, log: log}
 	b, err := s.o.Store.GetBuild(ctx, id)
 	if err != nil {
-		s.markRecorded(id)
-		return jobs.Fail("the build record no longer exists", err)
+		return jobs.Fail("the build record could not be read", nil)
 	}
-	r.project = b.ProjectID
 	if prepare != nil {
 		if err := prepare(ctx, log); err != nil {
 			if ctx.Err() != nil {
@@ -271,17 +266,23 @@ func (s *Service) Run(ctx context.Context, id int64, log io.Writer, prepare jobs
 			if errors.As(err, &se) && se.Msg != "" {
 				msg = "updating the checkout failed: " + se.Msg
 			}
-			return r.fail(msg, err)
+			return r.fail(msg)
 		}
 		fmt.Fprintln(log)
 	}
 	p, err := s.o.Store.GetProject(ctx, b.ProjectID)
 	if err != nil {
-		return r.fail("the project no longer exists", err)
+		if ctx.Err() != nil {
+			return r.cancelled(ctx)
+		}
+		return r.fail("the project could not be read")
 	}
 	checkout := git.CheckoutDir(s.o.RepoDir, p.ID)
 	if p.LastCommit == "" || !git.HasCheckout(checkout) {
-		return r.fail(DetailNoCheckout, nil)
+		return r.fail(DetailNoCheckout)
+	}
+	if p.Status != "idle" {
+		return r.fail(DetailCheckoutNotIdle)
 	}
 	fmt.Fprintf(log, "Build %d of project %s: branch %s, commit %s\n", id, p.Name, p.Branch, p.LastCommit)
 
@@ -300,7 +301,7 @@ func (s *Service) Run(ctx context.Context, id int64, log io.Writer, prepare jobs
 		if ctx.Err() != nil {
 			return r.cancelled(ctx)
 		}
-		return r.fail("the build could not be started", err)
+		return r.fail("the build could not be started")
 	}
 	start := time.Now()
 	bctx, cancel := context.WithTimeout(ctx, s.o.Timeout)
@@ -314,26 +315,33 @@ func (s *Service) Run(ctx context.Context, id int64, log io.Writer, prepare jobs
 	case ctx.Err() != nil:
 		return r.cancelled(ctx)
 	case errors.Is(bctx.Err(), context.DeadlineExceeded):
-		return r.fail(fmt.Sprintf("the build exceeded the time limit of %s", s.o.Timeout), err)
+		return r.fail(fmt.Sprintf("the build exceeded the time limit of %s", s.o.Timeout))
 	}
 	var ue *UserError
 	var se *jobs.SafeError
 	switch {
 	case errors.As(err, &ue):
 		fmt.Fprintf(log, "error: %s\n", ue.Msg)
-		return r.fail(ue.Msg, nil)
+		return r.fail(ue.Msg)
 	case errors.As(err, &se):
-		return r.fail(se.Msg, se.Err)
+		return r.fail(se.Msg)
 	}
-	s.o.Logger.Error("build failed", "build_id", id, "project_id", p.ID, "err", err)
-	return r.fail("the build failed because of an internal error; see the daemon log", nil)
+	s.o.Logger.Error("build failed", "build_id", id, "project_id", p.ID, "error", safeBuildError(err))
+	return r.fail("the build failed because of an internal error; see the daemon log")
 }
 
 // build inspects the checkout, prepares the private build directory, runs
 // docker build and records the verified image.
 func (r *run) build(ctx context.Context, p store.Project, checkout string) error {
 	log := r.log
-	plan, err := Inspect(checkout)
+	if r.s.o.HeadCommit == nil {
+		return userErr("git is not available to verify the project checkout")
+	}
+	head, err := r.s.o.HeadCommit(ctx, checkout)
+	if err != nil || head != p.LastCommit {
+		return userErr("%s", DetailCheckoutMismatch)
+	}
+	plan, err := Inspect(checkout, p.AllowCustomDockerfile)
 	if err != nil {
 		return err
 	}
@@ -352,7 +360,7 @@ func (r *run) build(ctx context.Context, p store.Project, checkout string) error
 	}
 	defer func() {
 		if err := os.RemoveAll(dir); err != nil {
-			r.s.o.Logger.Warn("could not remove build directory; it is swept at the next startup", "build_id", r.id, "err", err)
+			r.s.o.Logger.Warn("could not remove build directory; it is swept at the next startup", "build_id", r.id, "error", safeBuildError(err))
 		}
 	}()
 	staticDir := filepath.Join(dir, "static")
@@ -370,7 +378,7 @@ func (r *run) build(ctx context.Context, p store.Project, checkout string) error
 		if r.s.o.StaticDir == "" {
 			return userErr("the project has static add-ons but the static store is not available")
 		}
-		n, err := stageAddons(addons, r.s.o.StaticDir, dir, staticDir, *r.s.o.AddonLimits)
+		n, err := stageAddons(ctx, addons, r.s.o.StaticDir, dir, staticDir, *r.s.o.AddonLimits)
 		if err != nil {
 			return err
 		}
@@ -413,6 +421,24 @@ func (r *run) build(ctx context.Context, p store.Project, checkout string) error
 		BuildID:       r.id,
 		EngineVersion: plan.EngineVersion,
 	}
+	export := store.BuildExport{
+		BuildID: spec.BuildID, ProjectID: spec.ProjectID, ProjectName: spec.ProjectName,
+		Commit: spec.Commit, EngineVersion: spec.EngineVersion,
+	}
+	if err := r.s.o.Store.RecordBuildExport(ctx, export); err != nil {
+		return err
+	}
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		// The build process tree has ended. Use a fresh context to check
+		// the unique tag even when the job's context was cancelled.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), finalTimeout)
+		defer cancel()
+		r.s.removeExport(cleanupCtx, export)
+	}()
 	fmt.Fprintf(log, "\nRunning docker build (time limit %s)\n", r.s.o.Timeout)
 	out := logsafe.NewWriter(log, "", redactions(dir, checkout, r.s.o.TempDir, r.s.o.RepoDir, r.s.o.StaticDir)...)
 	err = r.s.o.Docker.Build(ctx, spec, out)
@@ -424,15 +450,15 @@ func (r *run) build(ctx context.Context, p store.Project, checkout string) error
 		if errors.Is(err, docker.ErrUnavailable) {
 			return jobs.Fail(DetailDockerDown, err)
 		}
+		if errors.Is(err, docker.ErrBuildConfig) {
+			return jobs.Fail(docker.ErrBuildConfig.Error(), nil)
+		}
 		return jobs.Fail(DetailBuildFailed, err)
 	}
-	vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalTimeout)
+	vctx, cancel := context.WithTimeout(ctx, finalTimeout)
 	defer cancel()
 	img, err := r.s.o.Docker.BuiltImage(vctx, spec)
 	if errors.Is(err, docker.ErrLabelMismatch) {
-		if rerr := r.s.o.Docker.RemoveImage(vctx, img.ID); rerr != nil {
-			r.s.o.Logger.Warn("could not remove an image with foreign labels", "build_id", r.id, "image", img.ID, "err", rerr)
-		}
 		return userErr("the image sets labels in the %s namespace, which is reserved for golem-deploy; remove those LABEL instructions", strings.TrimSuffix(docker.LabelPrefix, "."))
 	}
 	if err != nil {
@@ -441,13 +467,33 @@ func (r *run) build(ctx context.Context, p store.Project, checkout string) error
 		}
 		return jobs.Fail("the built image could not be found or verified", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := r.finish(ctx, store.BuildResult{Status: store.BuildStatusSuccess, ImageID: img.ID, ImageTag: spec.Tag(), EngineVersion: plan.EngineVersion,
+		WebTransportPath: plan.WebTransportPath, WebSocketPath: plan.WebSocketPath}); err != nil {
+		return err
+	}
+	published = true
 	fmt.Fprintf(log, "Built image %s (%s, %s)\n", img.ID, spec.Tag(), byteSize(img.SizeBytes))
 	if plan.WebTransportPath != DefaultWebTransportPath || plan.WebSocketPath != DefaultWebSocketPath {
 		fmt.Fprintf(log, "Transport paths: WebTransport %s, WebSocket %s\n", plan.WebTransportPath, plan.WebSocketPath)
 	}
-	r.finish(store.BuildResult{Status: store.BuildStatusSuccess, ImageID: img.ID, ImageTag: spec.Tag(), EngineVersion: plan.EngineVersion,
-		WebTransportPath: plan.WebTransportPath, WebSocketPath: plan.WebSocketPath})
 	return nil
+}
+
+// safeBuildError gives the daemon a diagnostic category without including
+// CLI stderr or paths embedded in filesystem and database errors.
+func safeBuildError(err error) string {
+	var cmd *docker.CmdError
+	if errors.As(err, &cmd) {
+		return fmt.Sprintf("docker %s (exit %d)", cmd.Op, cmd.ExitCode)
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return fmt.Sprintf("%T: %s", err, errno)
+	}
+	return fmt.Sprintf("%T", err)
 }
 
 // redactions maps host paths that may appear in docker output to
@@ -493,19 +539,18 @@ func (s *Service) retain(projectID int64, log io.Writer) {
 	defer s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	list, err := s.o.Store.ListBuilds(ctx, store.BuildFilter{ProjectID: &projectID, Limit: 500})
-	if err != nil {
-		s.o.Logger.Warn("build retention skipped", "project_id", projectID, "err", err)
-		return
-	}
 	used, err := s.o.Store.ServerIDsByBuild(ctx)
 	if err != nil {
-		s.o.Logger.Warn("build retention skipped", "project_id", projectID, "err", err)
+		s.o.Logger.Warn("build retention skipped", "project_id", projectID, "error", safeBuildError(err))
 		return
 	}
 	success, failed := 0, 0
 	removed := 0
-	for _, b := range list { // newest first
+	for b, err := range s.o.Store.ProjectBuilds(ctx, projectID) {
+		if err != nil {
+			s.o.Logger.Warn("could not finish build retention", "project_id", projectID, "error", safeBuildError(err))
+			break
+		}
 		switch b.Status {
 		case store.BuildStatusSuccess:
 			success++
@@ -513,7 +558,7 @@ func (s *Service) retain(projectID int64, log io.Writer) {
 				continue
 			}
 			if err := s.deleteLocked(ctx, b); err != nil {
-				s.o.Logger.Info("old build kept", "build_id", b.ID, "reason", err)
+				s.o.Logger.Info("old build kept", "build_id", b.ID, "reason", safeBuildError(err))
 				continue
 			}
 			removed++
@@ -523,7 +568,7 @@ func (s *Service) retain(projectID int64, log io.Writer) {
 				continue
 			}
 			if _, err := s.o.Store.DeleteBuildUnused(ctx, b.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
-				s.o.Logger.Info("old failed build kept", "build_id", b.ID, "reason", err)
+				s.o.Logger.Info("old failed build kept", "build_id", b.ID, "reason", safeBuildError(err))
 				continue
 			}
 			removed++
@@ -563,24 +608,16 @@ func (s *Service) deleteLocked(ctx context.Context, b store.Build) error {
 	} else if len(ids) > 0 {
 		return store.ErrInUse
 	}
-	removeImage := false
 	if b.Status == store.BuildStatusSuccess && b.ImageID != "" {
-		shared, err := s.o.Store.CountBuildsWithImage(ctx, b.ImageID, b.ID)
-		if err != nil {
+		if err := s.imageUsers(ctx, b.ImageID); err != nil {
 			return err
-		}
-		if shared == 0 {
-			if err := s.imageUsers(ctx, b.ImageID); err != nil {
-				return err
-			}
-			removeImage = true
 		}
 	}
 	if _, err := s.o.Store.DeleteBuildUnused(ctx, b.ID); err != nil {
 		return err
 	}
-	if removeImage {
-		s.removeImage(ctx, b.ID, b.ImageID)
+	if b.Status == store.BuildStatusSuccess && b.ImageID != "" {
+		s.removeImage(ctx, b.ImageID)
 	}
 	return nil
 }
@@ -608,20 +645,22 @@ func (s *Service) imageUsers(ctx context.Context, imageID string) error {
 	return e
 }
 
-// CheckProjectImages returns an *ImageInUseError (servers of all builds
-// merged) when containers use the image of one of builds, a project's
-// builds about to be deleted with it. Call it before deleting the project.
-func (s *Service) CheckProjectImages(ctx context.Context, builds []store.Build) error {
+// CheckProjectImages returns an *ImageInUseError when containers use an
+// image of any build of the project about to be deleted.
+func (s *Service) CheckProjectImages(ctx context.Context, projectID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var all *ImageInUseError
 	seen := map[string]bool{}
-	for _, b := range builds {
+	for b, err := range s.o.Store.ProjectBuilds(ctx, projectID) {
+		if err != nil {
+			return err
+		}
 		if b.Status != store.BuildStatusSuccess || b.ImageID == "" || seen[b.ImageID] {
 			continue
 		}
 		seen[b.ImageID] = true
-		err := s.imageUsers(ctx, b.ImageID)
+		err = s.imageUsers(ctx, b.ImageID)
 		var e *ImageInUseError
 		switch {
 		case errors.As(err, &e):
@@ -642,36 +681,6 @@ func (s *Service) CheckProjectImages(ctx context.Context, builds []store.Build) 
 	return all
 }
 
-// removeImage deletes a build's image, tolerating an image that is already
-// gone; other failures are logged (the image then shows up under
-// /images, where an admin can delete it).
-func (s *Service) removeImage(ctx context.Context, buildID int64, imageID string) {
-	err := s.o.Docker.RemoveImage(ctx, imageID)
-	switch {
-	case err == nil:
-		s.o.Logger.Info("build image removed", "build_id", buildID, "image", imageID)
-	case errors.Is(err, docker.ErrNotFound), errors.Is(err, docker.ErrNotManaged):
-	default:
-		s.o.Logger.Warn("could not remove a deleted build's image", "build_id", buildID, "image", imageID, "err", err)
-	}
-}
-
-// RemoveImages deletes the images of builds whose records are already gone
-// (a deleted project's), skipping images another build still records.
-func (s *Service) RemoveImages(ctx context.Context, builds []store.Build) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, b := range builds {
-		if b.Status != store.BuildStatusSuccess || b.ImageID == "" {
-			continue
-		}
-		if n, err := s.o.Store.CountBuildsWithImage(ctx, b.ImageID, b.ID); err != nil || n > 0 {
-			continue
-		}
-		s.removeImage(ctx, b.ID, b.ImageID)
-	}
-}
-
 // SweepTemp removes private build directories left by a previous daemon
 // process (call at startup, before builds can run).
 func SweepTemp(tmp string) error {
@@ -680,13 +689,13 @@ func SweepTemp(tmp string) error {
 		return nil
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("list stale build directories: %s", safeBuildError(err))
 	}
 	var errs []error
 	for _, e := range entries {
 		if e.IsDir() && strings.HasPrefix(e.Name(), TempPrefix) {
 			if err := os.RemoveAll(filepath.Join(tmp, e.Name())); err != nil {
-				errs = append(errs, err)
+				errs = append(errs, fmt.Errorf("remove stale build directory: %s", safeBuildError(err)))
 			}
 		}
 	}
