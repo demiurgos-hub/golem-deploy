@@ -76,7 +76,6 @@ type Config struct {
 	PanelPublicHosts []string
 	PanelTLS         bool
 	PanelLoopback    bool
-	PanelBehindProxy bool
 	// BindAddress is the host IP game ports are published on ("" = all).
 	BindAddress string
 	// MemoryMB and CPUs are per-container limits (0 = unlimited).

@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
@@ -87,6 +86,8 @@ type Options struct {
 	docker      httpapi.DockerProbe // tests only
 	dockerCLI   docker.Runner       // tests only; nil runs the docker CLI
 	storeClosed func(error)         // tests only
+	readyRunner func(*jobs.Runner)  // tests only
+	stopTimeout time.Duration       // tests only
 }
 
 // serverConfig validates the game server settings.
@@ -142,8 +143,8 @@ func defaultGameHost(publicHosts []string) string {
 	return ""
 }
 
-// jobShutdownGrace bounds how long running jobs get to stop.
-const jobShutdownGrace = 10 * time.Second
+// shutdownGrace covers HTTP shutdown, jobs and certificate maintenance together.
+const shutdownGrace = 20 * time.Second
 
 // Run serves until ctx is cancelled, then shuts down gracefully and closes
 // the store. It returns configuration and startup errors immediately.
@@ -210,7 +211,6 @@ func Run(ctx context.Context, o Options) (err error) {
 	srvCfg.PanelPublicHosts = publicHosts
 	srvCfg.PanelLoopback = httpapi.CheckListen(o.Listen, false, false) == nil
 	srvCfg.PanelTLS = panelTLS
-	srvCfg.PanelBehindProxy = o.InsecureHTTP
 	if o.MaxRepoSizeMB < 0 {
 		return errors.New("--max-repo-size-mb must be 0 (unlimited) or positive")
 	}
@@ -234,14 +234,38 @@ func Run(ctx context.Context, o Options) (err error) {
 	if err != nil {
 		return err
 	}
-	// Held until Run returns (released last, after the store is closed);
-	// taken before reconciliation and the startup sweeps, which would
-	// otherwise fail or delete the live state of another daemon.
+	// Held until all store users have returned, including on a shutdown timeout.
 	lock, err := datadir.AcquireLock(layout)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = lock.Release() }()
+	var drain <-chan struct{}
+	var closeStore func() error
+	release := func() error {
+		defer func() { _ = lock.Release() }()
+		if closeStore != nil {
+			return closeStore()
+		}
+		return nil
+	}
+	defer func() {
+		if drain != nil {
+			// A stuck publication may still be using both the files and the
+			// store. In the CLI, process exit releases the OS lock and the
+			// next start recovers the durable stage. If embedded, retain both
+			// until the remaining work returns.
+			go func() {
+				<-drain
+				if err := release(); err != nil {
+					logger.Warn("close store after shutdown timeout", "err", err)
+				}
+			}()
+			return
+		}
+		if cerr := release(); cerr != nil && err == nil {
+			err = fmt.Errorf("close store: %w", cerr)
+		}
+	}()
 	jwtKey, err := datadir.LoadOrCreateKey(layout.JWTKey(), auth.JWTKeySize)
 	if err != nil {
 		return err
@@ -268,15 +292,13 @@ func Run(ctx context.Context, o Options) (err error) {
 	if err != nil {
 		return err
 	}
-	defer func() {
+	closeStore = func() error {
 		cerr := st.Close()
 		if o.storeClosed != nil {
 			o.storeClosed(cerr)
 		}
-		if cerr != nil && err == nil {
-			err = fmt.Errorf("close store: %w", cerr)
-		}
-	}()
+		return cerr
+	}
 
 	rec, err := st.Reconcile(ctx)
 	if err != nil {
@@ -430,23 +452,19 @@ func Run(ctx context.Context, o Options) (err error) {
 	if o.Ready != nil {
 		o.Ready(ln.Addr())
 	}
+	if o.readyRunner != nil {
+		o.readyRunner(runner)
+	}
 
-	// On cancellation, HTTP shutdown and job cancellation proceed together;
-	// the store is closed (deferred above) only after both have finished.
-	var wg sync.WaitGroup
-	var jobErr error
-	// Startup reconciliation uses the store; it is cancelled and awaited
-	// before the store closes on every exit path.
+	// Cancel all background work with HTTP shutdown. Keep their completion
+	// signals, since cancelling a context does not join the goroutine.
 	recCtx, cancelRec := context.WithCancel(ctx)
 	recDone := make(chan struct{})
 	go func() {
 		defer close(recDone)
 		reconcileServers(recCtx, svc, runner, logger)
 	}()
-	defer func() {
-		cancelRec()
-		<-recDone
-	}()
+	defer cancelRec()
 	cleanupDone := make(chan struct{})
 	go func() {
 		defer close(cleanupDone)
@@ -463,47 +481,46 @@ func Run(ctx context.Context, o Options) (err error) {
 			}
 		}
 	}()
-	defer func() {
-		cancelRec()
-		<-cleanupDone
-	}()
-	// The certificate check runs hourly until shutdown, before the store
-	// closes.
+	// Certificate maintenance runs until shutdown, including mount retries.
 	certDone := make(chan struct{})
 	go func() {
 		defer close(certDone)
 		automation.Maintain(recCtx)
 	}()
-	defer func() {
-		cancelRec()
-		<-certDone
-	}()
 	runCtx, stopRun := context.WithCancel(ctx)
 	defer stopRun()
-	wg.Add(1)
+	finished := make(chan struct{})
+	deadline := make(chan time.Time, 1)
 	go func() {
-		defer wg.Done()
 		<-runCtx.Done()
-		jctx, cancel := context.WithTimeout(context.Background(), jobShutdownGrace)
-		defer cancel()
-		jobErr = runner.Shutdown(jctx)
+		grace := shutdownGrace
+		if o.stopTimeout > 0 {
+			grace = o.stopTimeout
+		}
+		deadline <- time.Now().Add(grace)
+		jobsDone := runner.Stop()
+		for _, done := range []<-chan struct{}{srv.Drained(), jobsDone, certDone, recDone, cleanupDone} {
+			<-done
+		}
+		close(finished)
 	}()
 	serveErr := srv.Serve(runCtx, ln, httpLn)
 	stopRun()
 	cancelRec()
-	wg.Wait()
-	if jobErr != nil {
-		// A timed-out shutdown must still wait for any certificate job
-		// before the store closes, including its final job status write.
-		if id, ok := runner.ActiveFor(jobs.Subject{Type: string(apitypes.SubjectTypeCertificate), ID: "acme"}); ok {
-			<-runner.Done(id)
-		}
-	}
+	drain, err = awaitShutdown(<-deadline, finished)
 	logger.Info("golem-deploy stopped")
-	if serveErr != nil {
-		return serveErr
+	return errors.Join(serveErr, err)
+}
+
+func awaitShutdown(deadline time.Time, finished <-chan struct{}) (<-chan struct{}, error) {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-finished:
+		return nil, nil
+	case <-timer.C:
+		return finished, fmt.Errorf("daemon work did not finish before the shutdown deadline: %w", context.DeadlineExceeded)
 	}
-	return jobErr
 }
 
 // prepareGit sweeps git scratch files and orphaned checkouts left by a

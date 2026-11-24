@@ -110,6 +110,7 @@ func (s *Server) handlePutGameCertificate(w http.ResponseWriter, r *http.Request
 func certificateError(err error) error {
 	var ve *certs.ValidationError
 	var ae *apiError
+	var publication *certs.PublicationError
 	switch {
 	case errors.As(err, &ae):
 		return ae
@@ -117,8 +118,10 @@ func certificateError(err error) error {
 		return invalidField(ve.Field, ve.Msg)
 	case errors.Is(err, jobs.ErrSubjectBusy):
 		return conflict(apitypes.ErrorCodeJobInProgress, "another certificate operation is in progress")
-	case errors.Is(err, certs.ErrPanelFixed), errors.Is(err, certs.ErrStagingManaged), errors.Is(err, certs.ErrNothingManaged):
+	case errors.Is(err, certs.ErrPanelFixed), errors.Is(err, certs.ErrStagingManaged), errors.Is(err, certs.ErrTermsManaged), errors.Is(err, certs.ErrNothingManaged):
 		return conflict(apitypes.ErrorCodeConflict, err.Error())
+	case errors.As(err, &publication):
+		return newError(http.StatusServiceUnavailable, errUnavailable.code, publication.Error())
 	case errors.Is(err, jobs.ErrShuttingDown):
 		return errUnavailable
 	default:

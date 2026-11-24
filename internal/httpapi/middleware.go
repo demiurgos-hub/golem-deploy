@@ -142,11 +142,6 @@ func (s *Server) outer(next http.Handler) http.Handler {
 			}
 			s.logger.Log(context.WithoutCancel(r.Context()), level, "http request", attrs...)
 		}()
-		if !s.hostAllowed(r.Host) {
-			s.logBadHost(r, ri.id)
-			s.writeError(sw, r, errBadHost)
-			return
-		}
 		next.ServeHTTP(sw, r)
 	})
 }
@@ -191,6 +186,8 @@ func (s *Server) allowGameConnections(h http.Header, ctx context.Context) {
 		// CSP host source expressions cannot express IPv6 literals.
 		return
 	}
+	// CSP cannot express a port range, and games may acquire new ports
+	// while the page is open. Allow any port on the effective game host.
 	connect := "connect-src 'self' https://" + host + ":* wss://" + host + ":*"
 	h.Set("Content-Security-Policy", strings.Replace(cspSPA, "connect-src 'self'", connect, 1))
 }

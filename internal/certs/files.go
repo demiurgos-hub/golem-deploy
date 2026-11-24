@@ -83,6 +83,9 @@ func (m *Manager) generate(host string, otherHosts ...string) ([]byte, []byte, I
 // poll until the certificate rename completes. A crash between the renames
 // is completed by recoverPending on the next start.
 func (m *Manager) install(dir string, certPEM, keyPEM []byte) error {
+	if m.starting[dir] {
+		return errors.New("a game server is loading its certificate")
+	}
 	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
 		return fmt.Errorf("certs: refusing to install an invalid pair: %w", err)
 	}

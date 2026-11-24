@@ -57,8 +57,9 @@ type NewJob struct {
 
 // JobFilter selects jobs in ListJobs. Empty fields match everything.
 type JobFilter struct {
-	SubjectType string
-	SubjectID   string
+	SubjectType        string
+	SubjectID          string
+	ExcludeSubjectType string
 	// Limit caps the result (default 50, maximum 500).
 	Limit int
 }
@@ -132,6 +133,10 @@ func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 	if f.SubjectType != "" {
 		q += ` AND jobs.subject_type = ?`
 		args = append(args, f.SubjectType)
+	}
+	if f.ExcludeSubjectType != "" {
+		q += ` AND jobs.subject_type <> ?`
+		args = append(args, f.ExcludeSubjectType)
 	}
 	if f.SubjectID != "" {
 		q += ` AND jobs.subject_id = ?`

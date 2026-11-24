@@ -266,6 +266,12 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 		return jobs.Fail("could not record the new container", err)
 	}
 	sv.ContainerID = cid
+	releasePair, err := s.cfg.Certs.HoldForStart(ctx, sv.ID, p.certMode)
+	if err != nil {
+		s.logger.Warn("could not verify the game certificate before container start", "job_id", jobIDFrom(ctx), "err", err)
+		return jobs.Fail("could not verify the game certificate before container start; see the daemon log and retry", nil)
+	}
+	defer releasePair()
 	if err := s.docker.StartServer(ctx, ref(sv)); err != nil {
 		var commandErr *docker.CmdError
 		if errors.As(err, &commandErr) {

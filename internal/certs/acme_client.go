@@ -1,10 +1,15 @@
 package certs
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +20,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -26,8 +32,6 @@ import (
 	"github.com/mholt/acmez/v3"
 	"github.com/mholt/acmez/v3/acme"
 	"github.com/miekg/dns"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 // ACMEClient separates ACME traffic and storage from the mode and install logic.
@@ -83,7 +87,7 @@ func LoadACMERoots(path string) (*x509.CertPool, error) {
 	return roots, nil
 }
 
-type magicClient struct {
+type acmeClient struct {
 	dir       string
 	roots     *x509.CertPool
 	logger    *slog.Logger
@@ -92,152 +96,272 @@ type magicClient struct {
 }
 
 type activeChallenge struct {
-	host string
+	acme.Challenge
 	log  io.Writer
 	once sync.Once
 }
 
 func NewACMEClient(dir string, roots *x509.CertPool, logger *slog.Logger, listeners ACMEListeners) ACMEClient {
-	return &magicClient{dir: dir, roots: roots, logger: logger, listeners: listeners}
+	return &acmeClient{dir: dir, roots: roots, logger: logger, listeners: listeners}
 }
 
-// The data-directory process lock and Automation's operation lock already
-// serialize every storage writer. Avoid disk lease files that can delay crash
-// recovery and that FileStorage creates with mode 0644.
-type localACMEStorage struct{ *certmagic.FileStorage }
+const maxACMEResponseBytes = 2 << 20
 
-func (localACMEStorage) Lock(ctx context.Context, _ string) error { return ctx.Err() }
-func (localACMEStorage) Unlock(context.Context, string) error     { return nil }
-func (s localACMEStorage) Store(ctx context.Context, key string, value []byte) error {
-	// CertMagic still supplies its embedded solvers, but a single daemon
-	// needs only the library's active in-memory challenges. Leave its
-	// distributed mode enabled to disable blind fallback, without retaining
-	// challenge state that could outlive the current process.
-	if strings.Contains(key, "/challenge_tokens/") {
-		return ctx.Err()
-	}
-	return s.FileStorage.Store(ctx, key, value)
+// Acmez accepts a custom HTTP client. Bound the decoded body before the
+// library reads it, including responses without a Content-Length.
+type acmeTransport struct {
+	base       http.RoundTripper
+	retryAfter *atomic.Pointer[time.Time]
 }
 
-// Using an empty contact must not prompt on stdin or discover a previously
-// configured email from another account. The issuer starts with empty email.
-type contactlessIssuer struct{ *certmagic.ACMEIssuer }
-
-func (contactlessIssuer) PreCheck(context.Context, []string, bool) error { return nil }
-
-func (m *magicClient) config(account ACMEAccount, host string, retryAfter *atomic.Pointer[time.Time]) (*certmagic.Config, *certmagic.ACMEIssuer, func()) {
-	var profile string
-	if _, err := netip.ParseAddr(host); err == nil {
-		profile = "shortlived"
-	}
-	log := zap.New(acmeLogCore{logger: m.logger, retryAfter: retryAfter})
-	// The cache stays empty: Automation drives renewal and publishes pairs
-	// itself. CertMagic's independent maintenance never contacts the CA.
-	cache := certmagic.NewCache(certmagic.CacheOptions{
-		Logger: log,
-		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
-			return nil, errors.New("ACME cache is not used to serve certificates")
-		},
-	})
-	cfg := certmagic.New(cache, certmagic.Config{
-		Storage: m.storage(account),
-		Issuers: []certmagic.Issuer{}, Logger: log, RenewalWindowRatio: 0.5,
-	})
-	httpHost, httpPort := listenerParts(m.listeners.HTTP)
-	alpnHost, alpnPort := listenerParts(m.listeners.ALPN)
-	listenHost := httpHost
-	if httpPort == 0 {
-		listenHost = alpnHost
-	} else if alpnPort != 0 && alpnHost != httpHost {
-		listenHost = ""
-	}
-	issuer := certmagic.NewACMEIssuer(cfg, certmagic.ACMEIssuer{
-		CA: account.Directory, TestCA: account.Directory, Profile: profile,
-		Email: account.Email, Agreed: true, TrustedRoots: m.roots, Logger: log,
-		DisableHTTPChallenge: httpPort == 0, DisableTLSALPNChallenge: alpnPort == 0,
-		ListenHost: listenHost, AltHTTPPort: httpPort, AltTLSALPNPort: alpnPort,
-	})
-	if account.Email == "" {
-		cfg.Issuers = []certmagic.Issuer{contactlessIssuer{issuer}}
-	} else {
-		cfg.Issuers = []certmagic.Issuer{issuer}
-	}
-	return cfg, issuer, cache.Stop
-}
-
-func listenerParts(address string) (string, int) {
-	host, port, err := net.SplitHostPort(address)
+func (t acmeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
 	if err != nil {
-		return "", 0
+		return nil, err
 	}
-	n, _ := strconv.Atoi(port)
-	return host, n
+	if t.retryAfter != nil && resp.StatusCode == http.StatusTooManyRequests {
+		raw := resp.Header.Get("Retry-After")
+		if n, err := strconv.ParseUint(raw, 10, 32); err == nil {
+			when := time.Now().Add(time.Duration(n) * time.Second)
+			t.retryAfter.Store(&when)
+		} else if when, err := http.ParseTime(raw); err == nil {
+			t.retryAfter.Store(&when)
+		}
+	}
+	if resp.ContentLength > maxACMEResponseBytes {
+		_ = resp.Body.Close()
+		return nil, &http.MaxBytesError{Limit: maxACMEResponseBytes}
+	}
+	resp.Body = http.MaxBytesReader(nil, resp.Body, maxACMEResponseBytes)
+	return resp, nil
 }
 
-func (m *magicClient) storage(account ACMEAccount) localACMEStorage {
+func (m *acmeClient) client(account ACMEAccount, retryAfter *atomic.Pointer[time.Time]) (*acme.Client, func()) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: m.roots}
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	return &acme.Client{Directory: account.Directory, UserAgent: "golem-deploy",
+		HTTPClient: &http.Client{Timeout: 30 * time.Second, Transport: acmeTransport{transport, retryAfter}},
+	}, transport.CloseIdleConnections
+}
+
+func (m *acmeClient) storage(account ACMEAccount) (*certmagic.FileStorage, string) {
 	dir := filepath.Join(m.dir, fmt.Sprintf("%x", sha256.Sum256([]byte(account.Directory))))
-	return localACMEStorage{&certmagic.FileStorage{Path: dir}}
+	issuer := certmagic.ACMEIssuer{CA: account.Directory}
+	return &certmagic.FileStorage{Path: dir}, issuer.IssuerKey()
 }
 
-func storedPair(ctx context.Context, storage certmagic.Storage, issuerKey, host string) ([]byte, []byte, error) {
-	chain, err := storage.Load(ctx, certmagic.StorageKeys.SiteCert(issuerKey, host))
+func pairStorageKey(issuer, host string) string {
+	return path.Join(certmagic.StorageKeys.CertsSitePrefix(issuer, host), "pair.pem")
+}
+
+func (m *acmeClient) Load(ctx context.Context, account ACMEAccount, host string) ([]byte, []byte, error) {
+	storage, issuer := m.storage(account)
+	pem, err := storage.Load(ctx, pairStorageKey(issuer, host))
+	if !errors.Is(err, fs.ErrNotExist) {
+		if err != nil {
+			return nil, nil, err
+		}
+		// The key is last. Split it from the leaf and intermediates.
+		i := bytes.LastIndex(pem, []byte("-----BEGIN"))
+		if i < 0 {
+			return nil, nil, ErrNoCertificate
+		}
+		return pem[:i], pem[i:], nil
+	}
+	// Older installations saved the certificate and key separately.
+	chain, err := storage.Load(ctx, certmagic.StorageKeys.SiteCert(issuer, host))
 	if err != nil {
 		return nil, nil, err
 	}
-	key, err := storage.Load(ctx, certmagic.StorageKeys.SitePrivateKey(issuerKey, host))
+	key, err := storage.Load(ctx, certmagic.StorageKeys.SitePrivateKey(issuer, host))
 	return chain, key, err
 }
 
-func (m *magicClient) Load(ctx context.Context, account ACMEAccount, host string) ([]byte, []byte, error) {
-	issuer := certmagic.ACMEIssuer{CA: account.Directory}
-	return storedPair(ctx, m.storage(account), issuer.IssuerKey(), host)
+func profileFor(host string) string {
+	if _, err := netip.ParseAddr(host); err == nil {
+		return "shortlived"
+	}
+	return ""
 }
 
-func (m *magicClient) Issue(ctx context.Context, account ACMEAccount, host string, force bool, log io.Writer) (issueErr error) {
-	var retryAfter atomic.Pointer[time.Time]
-	cfg, issuer, stop := m.config(account, host, &retryAfter)
-	defer stop()
-	defer func() {
-		retry := retryAfter.Load()
-		if issueErr == nil || retry == nil {
-			return
-		}
-		failure := summarizeACME(issueErr)
-		if failure.retry.IsZero() {
-			failure.retry = *retry
-			failure.message += " The CA rate limited this request. Retry after " + retry.UTC().Format(time.RFC3339) + "."
-		}
-		issueErr = failure
-	}()
-	chain, key, err := storedPair(ctx, cfg.Storage, issuer.IssuerKey(), host)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+func (m *acmeClient) Issue(ctx context.Context, account ACMEAccount, host string, force bool, log io.Writer) error {
+	chain, key, err := m.Load(ctx, account, host)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, ErrNoCertificate) {
 		return err
 	}
-	if err == nil {
-		pair, parseErr := parsePair(chain, key)
-		if parseErr == nil && pair.info.Covers(host) {
-			if force || !pair.info.NotAfter.After(time.Now()) || pair.info.NotBefore.After(time.Now()) {
-				m.active.Store(&activeChallenge{host: host, log: log})
-				defer m.active.Store(nil)
-				return cfg.RenewCertSync(ctx, host, true)
-			}
-			return nil
-		}
-		// A hard stop between CertMagic's resource writes can leave an
-		// incomplete pair. Keep serving the installed copy and re-obtain.
-		if err := cfg.Storage.Delete(ctx, certmagic.StorageKeys.CertsSitePrefix(issuer.IssuerKey(), host)); err != nil {
-			return err
-		}
+	prior, _ := parsePair(chain, key)
+	if prior != nil && prior.info.Covers(host) && !force &&
+		time.Now().Before(prior.info.NotAfter) && !time.Now().Before(prior.info.NotBefore) {
+		return nil
 	}
-	m.active.Store(&activeChallenge{host: host, log: log})
-	defer m.active.Store(nil)
-	return cfg.ObtainCertSync(ctx, host)
+	var retryAfter atomic.Pointer[time.Time]
+	client, stop := m.client(account, &retryAfter)
+	defer stop()
+	err = m.order(ctx, client, account, host, prior, log)
+	if err != nil {
+		if retry := retryAfter.Load(); retry != nil {
+			failure := summarizeACME(err)
+			if failure.retry.IsZero() {
+				failure.retry = *retry
+				failure.message += " The CA rate limited this request. Retry after " + retry.UTC().Format(time.RFC3339) + "."
+			}
+			return failure
+		}
+		return err
+	}
+	return nil
 }
 
-func (m *magicClient) RenewalInfo(ctx context.Context, account ACMEAccount, host string, leaf *x509.Certificate) (time.Time, time.Time, error) {
-	_, issuer, stop := m.config(account, host, nil)
+func (m *acmeClient) order(ctx context.Context, client *acme.Client, account ACMEAccount, host string, prior *certificatePair, log io.Writer) error {
+	storage, issuer := m.storage(account)
+	acct, err := m.loadAccount(ctx, client, storage, issuer, account.Email)
+	if err != nil {
+		return err
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	template := &x509.CertificateRequest{DNSNames: []string{host}}
+	if ip := net.ParseIP(host); ip != nil {
+		template.DNSNames, template.IPAddresses = nil, []net.IP{ip}
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, template, key)
+	if err != nil {
+		return err
+	}
+	csr, err := x509.ParseCertificateRequest(der)
+	if err != nil {
+		return err
+	}
+	params, err := acmez.OrderParametersFromCSR(acct, csr)
+	if err != nil {
+		return err
+	}
+	params.Profile = profileFor(host)
+	if prior != nil && prior.info.Covers(host) {
+		dir, err := client.GetDirectory(ctx)
+		if err != nil {
+			return err
+		}
+		if _, err := acme.ARIUniqueIdentifier(prior.info.leaf); dir.RenewalInfo != "" && err == nil {
+			params.Replaces = prior.info.leaf
+		}
+	}
+	solver := challengeSolver{client: m, host: host, log: log}
+	solvers := make(map[string]acmez.Solver, 2)
+	if m.listeners.HTTP != "" {
+		solvers[acme.ChallengeTypeHTTP01] = solver
+	}
+	if m.listeners.ALPN != "" {
+		solvers[acme.ChallengeTypeTLSALPN01] = solver
+	}
+	orders := &acmez.Client{Client: client, ChallengeSolvers: solvers}
+	chains, err := orders.ObtainCertificate(ctx, params)
+	var problem acme.Problem
+	if errors.As(err, &problem) {
+		switch {
+		case problem.Type == acme.ProblemTypeAccountDoesNotExist:
+			// A private CA can lose its registrations on restart. Reuse the
+			// local signing key and register again with the configured contact.
+			_, regPath := accountStoragePaths(issuer, account.Email)
+			if err := storage.Delete(ctx, regPath); err != nil {
+				return err
+			}
+			params.Account, err = m.loadAccount(ctx, client, storage, issuer, account.Email)
+			if err != nil {
+				return err
+			}
+			params.Replaces = nil
+			chains, err = orders.ObtainCertificate(ctx, params)
+		case problem.Type == acme.ProblemTypeAlreadyReplaced && params.Replaces != nil:
+			// The CA may have completed the last order before a crash could save it.
+			params.Replaces = nil
+			chains, err = orders.ObtainCertificate(ctx, params)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if len(chains) == 0 {
+		return ErrNoCertificate
+	}
+	keyPEM, err := certmagic.PEMEncodePrivateKey(key)
+	if err != nil {
+		return err
+	}
+	pair, err := parsePair(chains[0].ChainPEM, keyPEM)
+	if err != nil || !pair.info.Covers(host) {
+		return ErrNoCertificate
+	}
+	// Once the CA has issued a valid pair, save it even if the job was
+	// cancelled. Maintenance can install it from the atomic saved copy.
+	data := append(append(pair.chain, '\n'), pair.key...)
+	return storage.Store(context.WithoutCancel(ctx), pairStorageKey(issuer, host), data)
+}
+
+func accountStoragePaths(issuer, email string) (key, registration string) {
+	// Keep the existing CertMagic account path and encoding so upgrades
+	// reuse the same registration and signing key for each directory/email.
+	user := strings.ToLower(email)
+	if user == "" {
+		user = "default"
+	}
+	name, _, _ := strings.Cut(user, "@")
+	dir := path.Join("acme", certmagic.StorageKeys.Safe(issuer), "users", certmagic.StorageKeys.Safe(user))
+	name = certmagic.StorageKeys.Safe(name)
+	return path.Join(dir, name+".key"), path.Join(dir, name+".json")
+}
+
+func (m *acmeClient) loadAccount(ctx context.Context, client *acme.Client, storage *certmagic.FileStorage, issuer, email string) (acme.Account, error) {
+	keyPath, regPath := accountStoragePaths(issuer, email)
+	acct := acme.Account{TermsOfServiceAgreed: true}
+	if email != "" {
+		acct.Contact = []string{"mailto:" + email}
+	}
+	key, err := storage.Load(ctx, keyPath)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		acct.PrivateKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err == nil {
+			key, err = certmagic.PEMEncodePrivateKey(acct.PrivateKey)
+		}
+		if err == nil {
+			err = storage.Store(ctx, keyPath, key)
+		}
+	case err == nil:
+		reg, readErr := storage.Load(ctx, regPath)
+		if readErr == nil {
+			err = json.Unmarshal(reg, &acct)
+		} else if !errors.Is(readErr, fs.ErrNotExist) {
+			err = readErr
+		}
+		if err == nil {
+			acct.PrivateKey, err = certmagic.PEMDecodePrivateKey(key)
+		}
+	}
+	if err != nil || acct.Status != "" {
+		return acct, err
+	}
+	acct, err = client.NewAccount(ctx, acct)
+	if err != nil {
+		return acct, err
+	}
+	reg, err := json.Marshal(acct)
+	if err == nil {
+		err = storage.Store(context.WithoutCancel(ctx), regPath, reg)
+	}
+	if err == nil {
+		m.logger.Info("new ACME account registered")
+	}
+	return acct, err
+}
+
+func (m *acmeClient) RenewalInfo(ctx context.Context, account ACMEAccount, _ string, leaf *x509.Certificate) (time.Time, time.Time, error) {
+	client, stop := m.client(account, nil)
 	defer stop()
-	info, err := issuer.GetRenewalInfo(ctx, certmagic.Certificate{Certificate: tls.Certificate{Leaf: leaf}})
+	info, err := client.GetRenewalInfo(ctx, leaf)
 	if err != nil {
 		return time.Time{}, time.Time{}, err
 	}
@@ -248,34 +372,55 @@ func (m *magicClient) RenewalInfo(ctx context.Context, account ACMEAccount, host
 	return info.SelectedTime, refresh, nil
 }
 
+type challengeSolver struct {
+	client *acmeClient
+	host   string
+	log    io.Writer
+}
+
+func (s challengeSolver) Present(ctx context.Context, challenge acme.Challenge) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if challenge.Identifier.Value != s.host {
+		return errors.New("ACME challenge identifier does not match the order")
+	}
+	s.client.active.Store(&activeChallenge{Challenge: challenge, log: s.log})
+	return nil
+}
+
+func (s challengeSolver) CleanUp(context.Context, acme.Challenge) error {
+	s.client.active.Store(nil)
+	return nil
+}
+
 // HTTPChallenge only accepts the current authorization's exact GET path and
 // identifier. In particular, never invoke CertMagic's blind HTTP solver.
-func (m *magicClient) HTTPChallenge(w http.ResponseWriter, r *http.Request) bool {
+func (m *acmeClient) HTTPChallenge(w http.ResponseWriter, r *http.Request) bool {
 	attempt := m.active.Load()
 	if attempt == nil || r.Method != http.MethodGet || m.listeners.HTTP == "" {
 		return false
 	}
 	host := certificateHost(r.Host)
-	if host != attempt.host {
+	if host != attempt.Identifier.Value {
 		return false
 	}
-	challenge, ok := certmagic.GetACMEChallenge(host)
-	if !ok || challenge.Type != acme.ChallengeTypeHTTP01 || r.URL.EscapedPath() != challenge.HTTP01ResourcePath() {
+	if attempt.Type != acme.ChallengeTypeHTTP01 || r.URL.EscapedPath() != attempt.HTTP01ResourcePath() {
 		return false
 	}
 	attempt.once.Do(func() { fmt.Fprintf(attempt.log, "Answering HTTP-01 for %s\n", host) })
 	w.Header().Set("Content-Type", "text/plain")
-	_, _ = io.WriteString(w, challenge.KeyAuthorization)
+	_, _ = io.WriteString(w, attempt.KeyAuthorization)
 	return true
 }
 
-func (m *magicClient) TLSChallenge(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func (m *acmeClient) TLSChallenge(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	attempt := m.active.Load()
 	if attempt == nil || m.listeners.ALPN == "" {
 		return nil, nil
 	}
 	name := certificateHost(hello.ServerName)
-	want := attempt.host
+	want := attempt.Identifier.Value
 	if ip, err := netip.ParseAddr(want); err == nil {
 		reversed, _ := dns.ReverseAddr(ip.String())
 		want = strings.TrimSuffix(reversed, ".")
@@ -283,12 +428,11 @@ func (m *magicClient) TLSChallenge(hello *tls.ClientHelloInfo) (*tls.Certificate
 	if name != want {
 		return nil, nil
 	}
-	challenge, ok := certmagic.GetACMEChallenge(name)
-	if !ok || challenge.Type != acme.ChallengeTypeTLSALPN01 {
+	if attempt.Type != acme.ChallengeTypeTLSALPN01 {
 		return nil, nil
 	}
-	attempt.once.Do(func() { fmt.Fprintf(attempt.log, "Answering TLS-ALPN-01 for %s\n", attempt.host) })
-	return acmez.TLSALPN01ChallengeCert(challenge.Challenge)
+	attempt.once.Do(func() { fmt.Fprintf(attempt.log, "Answering TLS-ALPN-01 for %s\n", attempt.Identifier.Value) })
+	return acmez.TLSALPN01ChallengeCert(attempt.Challenge)
 }
 
 func certificateHost(host string) string {
@@ -300,56 +444,4 @@ func certificateHost(host string) string {
 		return ip.Unmap().String()
 	}
 	return host
-}
-
-// acmeLogCore forwards known lifecycle messages only. Upstream fields can
-// contain raw CA responses, request metadata or certificate material.
-type acmeLogCore struct {
-	logger     *slog.Logger
-	retryAfter *atomic.Pointer[time.Time]
-}
-
-func (c acmeLogCore) Enabled(level zapcore.Level) bool {
-	return c.retryAfter != nil || level >= zapcore.InfoLevel
-}
-func (c acmeLogCore) With([]zapcore.Field) zapcore.Core { return c }
-func (c acmeLogCore) Sync() error                       { return nil }
-func (c acmeLogCore) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
-	if c.Enabled(e.Level) {
-		return ce.AddCore(e, c)
-	}
-	return ce
-}
-func (c acmeLogCore) Write(e zapcore.Entry, fields []zapcore.Field) error {
-	switch e.Message {
-	case "obtaining certificate", "renewing certificate", "certificate obtained successfully", "certificate renewed successfully", "new ACME account registered":
-		c.logger.Info(e.Message)
-	case "http request":
-		// Acmez exposes the header only in its debug HTTP event. Read
-		// the retry time without forwarding the request or the headers.
-		if c.retryAfter == nil {
-			break
-		}
-		var status int64
-		var headers http.Header
-		for _, field := range fields {
-			switch field.Key {
-			case "status_code":
-				status = field.Integer
-			case "response_headers":
-				headers, _ = field.Interface.(http.Header)
-			}
-		}
-		if status == http.StatusTooManyRequests {
-			raw := headers.Get("Retry-After")
-			if n, err := strconv.ParseUint(raw, 10, 32); err == nil {
-				t := time.Now().Add(time.Duration(n) * time.Second)
-				c.retryAfter.Store(&t)
-			} else if t, err := http.ParseTime(raw); err == nil {
-				c.retryAfter.Store(&t)
-			}
-		}
-	}
-	// Automation logs failures with a bounded, user-safe summary.
-	return nil
 }

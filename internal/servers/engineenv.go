@@ -134,13 +134,16 @@ func (c Config) testOrigins(gameHost string) []string {
 		for _, host := range c.PanelPublicHosts {
 			add(scheme, host, c.PanelPort)
 		}
-		add(scheme, gameHost, c.PanelPort)
+		if len(c.PanelPublicHosts) == 0 {
+			add(scheme, gameHost, c.PanelPort)
+		}
 		if c.PanelLoopback && !c.PanelTLS {
 			add("http", "localhost", c.PanelPort)
 			add("http", "127.0.0.1", c.PanelPort)
 		}
 	}
-	if c.PanelBehindProxy {
+	// A plaintext panel can be reached through a TLS-terminating proxy.
+	if !c.PanelTLS {
 		for _, host := range c.PanelPublicHosts {
 			add("https", host, 443)
 		}

@@ -20,6 +20,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
+	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -681,13 +682,45 @@ func TestF6_JobAccessMatrix(t *testing.T) {
 	}
 	jp := func(j apitypes.Job) string { return "/api/v1/jobs/" + strconv.FormatInt(j.ID, 10) }
 
+	certificate, err := h.runner.Start(t.Context(), "certificate.renew", jobs.Subject{Type: "certificate", ID: "acme"},
+		&admin.ID, func(ctx context.Context, log io.Writer) error { <-ctx.Done(); return ctx.Err() }, jobs.Restricted(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificatePath := jp(toAPIJob(certificate))
+
 	for name, tok := range idents {
 		// Everyone sees both jobs and their flag.
 		if got := decode[apitypes.Job](t, h.do("GET", jp(restricted), tok, nil)); !got.Restricted {
 			t.Errorf("%s: restricted flag missing", name)
 		}
-		if list := decode[apitypes.JobList](t, h.do("GET", "/api/v1/jobs", tok, nil)); len(list.Items) != 2 {
-			t.Errorf("%s: list has %d jobs", name, len(list.Items))
+		adminSession := name == "admin session"
+		wantAll, wantCertificates := 2, 0
+		if adminSession {
+			wantAll, wantCertificates = 3, 1
+		}
+		for query, n := range map[string]int{"": wantAll, "?subject_type=certificate&subject_id=acme": wantCertificates} {
+			if list := decode[apitypes.JobList](t, h.do("GET", "/api/v1/jobs"+query, tok, nil)); len(list.Items) != n {
+				t.Errorf("%s: %s has %d jobs, want %d", name, query, len(list.Items), n)
+			}
+		}
+		latest := decode[apitypes.JobList](t, h.do("GET", "/api/v1/jobs?limit=1", tok, nil))
+		wantLatest := open.ID
+		if adminSession {
+			wantLatest = certificate.ID
+		}
+		if len(latest.Items) != 1 || latest.Items[0].ID != wantLatest {
+			t.Errorf("%s: incorrect limit after visibility filter: %+v", name, latest)
+		}
+		for _, tc := range []struct{ method, suffix string }{{"GET", ""}, {"GET", "/log"}, {"POST", "/cancel"}} {
+			rec := h.do(tc.method, certificatePath+tc.suffix, tok, nil)
+			if adminSession {
+				if rec.Code != http.StatusOK && !(tc.suffix == "/cancel" && rec.Code == http.StatusAccepted) {
+					t.Errorf("admin certificate job %s: %d", tc.suffix, rec.Code)
+				}
+			} else {
+				errBody(t, rec, http.StatusForbidden, apitypes.ErrorCodeForbidden)
+			}
 		}
 		// Logs.
 		rr := h.do("GET", jp(restricted)+"/log", tok, nil)

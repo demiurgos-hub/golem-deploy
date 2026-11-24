@@ -94,7 +94,7 @@ After restarting the service it waits up to 30 seconds for the daemon to log `go
 
 The unit runs `golem-deploy serve` as `golem-deploy` with the settings file as its environment, restarts it on failure (5 s apart, at most 5 times in 5 minutes) and gives it 30 seconds to stop. Stopping or restarting the panel **does not stop game servers**: their containers belong to Docker, not to the service, and keep running; the daemon only finishes open requests and cancels running jobs.
 
-The unit is sandboxed with systemd's hardening options: no capabilities and no privilege escalation, a read-only file system except the data directory, no access to home directories, a private `/tmp` and `/dev`, kernel settings protected, and a system call filter. Each option is explained in the unit file. This limits what a bug in the daemon or in git can do directly; it does not limit what the service can do through Docker (see [Security notes](#security-notes)). Because the service has no capabilities, the panel cannot listen on ports below 1024.
+The unit grants only `CAP_NET_BIND_SERVICE`, which lets the daemon bind ports below 1024. With no listen override or TLS files and both ports free, a fresh install uses TCP 443 for the panel and TCP 80 for ACME HTTP-01 and HTTPS redirection. The unit also disables privilege escalation, protects the kernel settings, uses a read-only filesystem except for the data and cache directories, and gives the service private `/tmp` and `/dev` directories. The unit file explains each setting. Docker access retains the privileges described in [Security notes](#security-notes).
 
 ### Configuration
 

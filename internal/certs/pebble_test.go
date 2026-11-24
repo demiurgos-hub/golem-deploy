@@ -180,12 +180,9 @@ func TestPebbleCertificates(t *testing.T) {
 	// omits a profile. Assert the issuer configuration as well as the IP
 	// lifetime so the random choice cannot make an incorrect request pass.
 	for _, tc := range []struct{ name, profile string }{{ip, "shortlived"}, {"panel.example.test", ""}} {
-		_, issuer, stop := hclient.(*magicClient).config(ACMEAccount{Directory: directory}, tc.name, nil)
-		if issuer.Profile != tc.profile {
-			stop()
-			t.Fatalf("profile for %s was %q, want %q", tc.name, issuer.Profile, tc.profile)
+		if got := profileFor(tc.name); got != tc.profile {
+			t.Fatalf("profile for %s was %q, want %q", tc.name, got, tc.profile)
 		}
-		stop()
 	}
 	a := NewAutomation(AutomationOptions{Game: game, GameHost: fixedHost(ip), PanelMode: apitypes.PanelCertificateModeNone,
 		Directory: directory, Client: hclient, HTTP01: true})

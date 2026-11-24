@@ -52,11 +52,12 @@ func (s *Server) loadJob(r *http.Request) (store.Job, error) {
 	return j, nil
 }
 
-// jobAction is something a caller may do with a job beyond seeing it.
+// jobAction is something a caller may do with a job.
 type jobAction int
 
 const (
-	jobReadLog jobAction = iota + 1
+	jobView jobAction = iota + 1
+	jobReadLog
 	jobCancel
 )
 
@@ -68,11 +69,14 @@ func authorizeJob(id *Identity, j store.Job, action jobAction) error {
 	if id.IsAdmin() {
 		return nil
 	}
-	if j.Restricted {
+	if j.SubjectType == string(apitypes.SubjectTypeCertificate) {
+		return errForbidden
+	}
+	if j.Restricted && action != jobView {
 		return newError(http.StatusForbidden, apitypes.ErrorCodeForbidden, "this job was started by an administrator action; only admins can read its log or cancel it")
 	}
 	switch action {
-	case jobReadLog:
+	case jobView, jobReadLog:
 		return nil
 	case jobCancel:
 		if j.CreatedBy != nil && *j.CreatedBy == id.Account.ID {
@@ -101,6 +105,9 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if err := authorizeJob(identityFrom(r), j, jobView); err != nil {
+		return err
+	}
 	writeJSON(w, http.StatusOK, toAPIJob(j))
 	return nil
 }
@@ -108,6 +115,9 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) error {
 func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) error {
 	q := r.URL.Query()
 	f := store.JobFilter{SubjectType: q.Get("subject_type"), SubjectID: q.Get("subject_id"), Limit: 50}
+	if !identityFrom(r).IsAdmin() {
+		f.ExcludeSubjectType = string(apitypes.SubjectTypeCertificate)
+	}
 	if len(f.SubjectType) > 32 || len(f.SubjectID) > 64 {
 		return badRequest("subject filter too long")
 	}

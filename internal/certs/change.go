@@ -14,6 +14,15 @@ import (
 
 const generationFile = "generation"
 
+// PublicationError reports a committed game change whose files still need copying.
+type PublicationError struct{ cause error }
+
+func (e *PublicationError) Error() string {
+	return "The new game certificate mode is active. Copying certificate files to game servers did not finish and the daemon will retry automatically."
+}
+
+func (e *PublicationError) Unwrap() error { return e.cause }
+
 func (m *Manager) stagingDir() string {
 	return filepath.Join(filepath.Dir(m.dir), ".game-change")
 }
@@ -64,10 +73,23 @@ func (m *Manager) change(ctx context.Context, mode Mode, stagePairs func(string,
 	if err := m.settings.SetSetting(commitCtx, SettingMode, value); err != nil {
 		// Read the persisted decision in case the save had an ambiguous
 		// result. A stage for an uncommitted value is never published.
-		_, recoveryErr := m.state(commitCtx)
-		return errors.Join(err, recoveryErr)
+		saved, _, readErr := m.settings.GetSetting(commitCtx, SettingMode)
+		if readErr != nil {
+			return errors.Join(err, readErr)
+		}
+		if saved != value {
+			return errors.Join(err, os.RemoveAll(stage))
+		}
 	}
-	return m.publish(mode)
+	if err := m.publish(mode); err != nil {
+		m.logger.Warn("committed game certificate publication incomplete", "mode", mode, "err", err)
+		select {
+		case m.publicationWake <- struct{}{}:
+		default:
+		}
+		return &PublicationError{cause: err}
+	}
+	return nil
 }
 
 // state recovers the committed generation before returning a mode to any

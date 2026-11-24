@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -193,6 +194,19 @@ func (p *panelState) selectPair(now time.Time, name, localIP string) *certificat
 			if pair := p.usable(now, localIP); pair != nil {
 				return pair
 			}
+			var ipHost string
+			for _, host := range p.hosts {
+				if _, err := netip.ParseAddr(host); err == nil && p.issued[host] != nil {
+					if ipHost != "" {
+						ipHost = ""
+						break
+					}
+					ipHost = host
+				}
+			}
+			if pair := p.usable(now, ipHost); pair != nil {
+				return pair
+			}
 			if len(p.hosts) != 0 {
 				if pair := p.usable(now, p.hosts[0]); pair != nil {
 					return pair
@@ -294,7 +308,7 @@ func (a *Automation) commitPanel(ctx context.Context, p *panelState) error {
 	}
 	a.panel.Store(p)
 	a.wakeup()
-	return err
+	return nil
 }
 
 func (a *Automation) setPanelPair(host string, pair *certificatePair) error {

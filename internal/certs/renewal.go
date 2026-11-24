@@ -108,25 +108,26 @@ func (a *Automation) obtain(ctx context.Context, account ACMEAccount, host strin
 			return pair, nil
 		}
 		err = &acmeFailure{message: "The CA did not provide a usable certificate for " + host + "."}
-		a.recordFailure(ctx, account, host, at, err)
+		a.recordFailure(ctx, account, host, at, err, false)
 		return nil, err
 	}
 	failure := summarizeACME(err)
-	a.recordFailure(ctx, account, host, at, failure)
+	a.recordFailure(ctx, account, host, at, failure, false)
 	return nil, failure
 }
 
-func (a *Automation) recordFailure(ctx context.Context, account ACMEAccount, host string, at time.Time, err error) {
+func (a *Automation) recordFailure(ctx context.Context, account ACMEAccount, host string, at time.Time, err error, install bool) {
 	last, _ := a.attempt(context.WithoutCancel(ctx), account, host)
 	count := min(last.Failures+1, 7)
-	wait := time.Minute << (count - 1)
+	// Leave room for repeated attempts even in the minimum 12-hour margin.
+	wait := min(time.Minute<<(count-1), 30*time.Minute)
 	next := a.now().Add(wait)
 	var failure *acmeFailure
 	if errors.As(err, &failure) && failure.retry.After(next) {
 		next = failure.retry
 	}
 	message := operationError(err)
-	a.record(ctx, account, host, attemptState{At: &at, Detail: message, Failures: count, Retry: next})
+	a.record(ctx, account, host, attemptState{At: &at, Detail: message, Failures: count, Retry: next, Install: install, BlockReason: last.BlockReason})
 	a.logger.Warn("ACME certificate attempt failed", "identifier", host, "detail", message)
 }
 
@@ -150,8 +151,13 @@ func (a *Automation) run(ctx context.Context, action Action, requested []string,
 		if err == nil && action == RenewAll {
 			_, err = a.installManaged(ctx, host, pair, false)
 			if err != nil && ctx.Err() == nil {
-				a.recordFailure(ctx, account, host, at, err)
+				a.recordFailure(ctx, account, host, at, err, true)
 			}
+		}
+		var pending *PublicationError
+		if errors.As(err, &pending) && ctx.Err() != nil {
+			fmt.Fprintln(log, pending.Error())
+			return nil // The committed install survives cancellation.
 		}
 		if err != nil {
 			if action != RenewAll {
@@ -192,6 +198,11 @@ func (a *Automation) run(ctx context.Context, action Action, requested []string,
 		host := names[0]
 		pair := issued[host]
 		if _, err := a.Game.useShared(ctx, ModeACME, pair.chain, pair.key); err != nil {
+			var pending *PublicationError
+			if errors.As(err, &pending) && ctx.Err() != nil {
+				fmt.Fprintln(log, pending.Error())
+				return nil
+			}
 			return err
 		}
 		// If this identifier is shared, reconciliation also publishes
@@ -264,8 +275,14 @@ func (a *Automation) Maintain(ctx context.Context) {
 	defer hourly.Stop()
 	retry := time.NewTicker(time.Minute)
 	defer retry.Stop()
+	var publicationRetry <-chan time.Time
 	for {
-		a.maintainOnce(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if publicationRetry == nil {
+			a.maintainOnce(ctx)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -273,8 +290,19 @@ func (a *Automation) Maintain(ctx context.Context) {
 			a.Game.Check(ctx, a.GameHost)
 		case <-retry.C:
 		case <-a.wake:
+		case <-a.Game.publicationWake:
+			publicationRetry = a.retryPublication(ctx)
+		case <-publicationRetry:
+			publicationRetry = a.retryPublication(ctx)
 		}
 	}
+}
+
+func (a *Automation) retryPublication(ctx context.Context) <-chan time.Time {
+	if _, err := a.Game.Mode(ctx); err != nil && ctx.Err() == nil {
+		return time.After(time.Second)
+	}
+	return nil
 }
 
 func (a *Automation) maintainOnce(ctx context.Context) {
@@ -347,33 +375,49 @@ func (a *Automation) check(ctx context.Context, network bool) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		err := a.checkIdentifier(ctx, account, host, network && a.precheck(s, []string{host}) == nil)
+		err := a.checkIdentifier(ctx, account, host, network, a.precheck(s, []string{host}))
 		failures = errors.Join(failures, err)
 	}
 	return failures
 }
 
-func (a *Automation) checkIdentifier(ctx context.Context, account ACMEAccount, host string, network bool) error {
-	pair, err := a.loadACME(ctx, account, host)
-	var reconciled bool
-	if err == nil {
-		reconciled, err = a.installManaged(ctx, host, pair, true)
-		if err != nil {
-			return err
-		}
-	}
-	if !network && !reconciled {
-		return nil
-	}
+func (a *Automation) checkIdentifier(ctx context.Context, account ACMEAccount, host string, network bool, blocked error) error {
 	last, err := a.attempt(ctx, account, host)
 	if err != nil {
 		return err
 	}
-	if reconciled && last.Detail != "" {
-		last = attemptState{At: last.At}
+	var reason string
+	if blocked != nil {
+		reason = operationError(blocked)
+	}
+	if reason != last.BlockReason {
+		if blocked != nil {
+			at := a.now().UTC()
+			last.At = &at
+			a.logger.Warn("automatic certificate renewal blocked", "identifier", host, "detail", reason)
+		}
+		last.BlockReason = reason
 		a.record(ctx, account, host, last)
 	}
-	if !network || last.Retry.After(a.now()) {
+	if last.Install && last.Retry.After(a.now()) {
+		return nil
+	}
+	pair, err := a.loadACME(ctx, account, host)
+	if err == nil {
+		reconciled, err := a.installManaged(ctx, host, pair, true)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			a.recordFailure(ctx, account, host, a.now().UTC(), err, true)
+			return nil
+		}
+		if last.Install || (reconciled && last.Detail != "") {
+			last = attemptState{At: last.At, BlockReason: last.BlockReason}
+			a.record(ctx, account, host, last)
+		}
+	}
+	if !network || blocked != nil || last.Retry.After(a.now()) {
 		return nil
 	}
 	if pair != nil && !a.renewalDue(ctx, account, host, pair) {
@@ -385,8 +429,8 @@ func (a *Automation) checkIdentifier(ctx context.Context, account ACMEAccount, h
 		return nil // already recorded and logged safely
 	}
 	if _, err := a.installManaged(ctx, host, pair, false); err != nil {
-		a.recordFailure(ctx, account, host, at, err)
-		return err
+		a.recordFailure(ctx, account, host, at, err, true)
+		return nil
 	}
 	a.record(ctx, account, host, attemptState{At: &at})
 	a.logger.Info("installed automatic certificate", slog.String("identifier", host))
@@ -412,8 +456,12 @@ func (a *Automation) renewalDue(ctx context.Context, account ACMEAccount, host s
 	}
 	halfLife := info.NotBefore.Add(info.NotAfter.Sub(info.NotBefore) / 2)
 	when := schedule.when
-	if when.IsZero() || when.After(info.NotAfter.Add(-time.Hour)) {
+	if when.IsZero() {
 		when = halfLife
+	}
+	margin := min(max(info.NotAfter.Sub(info.NotBefore)/4, 12*time.Hour), 7*24*time.Hour)
+	if latest := info.NotAfter.Add(-margin); when.After(latest) {
+		when = latest
 	}
 	return !now.Before(when)
 }
