@@ -139,9 +139,19 @@ func TestCacheIDsArePerProject(t *testing.T) {
 			t.Fatalf("cache mounts:\n%s", df)
 		}
 	}
-	if !strings.Contains(string(a), "id=golem-deploy-0123456789ab-p1-gomod") || !strings.Contains(string(b), "id=golem-deploy-0123456789ab-p2-gomod") ||
-		!strings.Contains(string(c), "id=golem-deploy-fedcba987654-p1-gomod") {
-		t.Fatalf("cache ids not scoped:\n%s\n%s\n%s", a, b, c)
+	ida := cacheID(DockerfileParams{ProjectID: 1, InstanceID: testInstance}, "gomod")
+	idb := cacheID(DockerfileParams{ProjectID: 2, InstanceID: testInstance}, "gomod")
+	idc := cacheID(DockerfileParams{ProjectID: 1, InstanceID: "fedcba9876543210fedcba9876543210"}, "gomod")
+	if ida == idb || ida == idc || !strings.HasSuffix(ida, "-p1-gomod") || !strings.HasSuffix(idb, "-p2-gomod") ||
+		!strings.Contains(string(a), "id="+ida+",") || !strings.Contains(string(b), "id="+idb+",") || !strings.Contains(string(c), "id="+idc+",") {
+		t.Fatalf("cache ids not scoped: %s %s %s", ida, idb, idc)
+	}
+	// The instance id itself never appears (the Dockerfile is shown in build
+	// logs, which developers read).
+	for _, df := range [][]byte{a, b} {
+		if strings.Contains(string(df), testInstance[:8]) {
+			t.Fatalf("instance id in the Dockerfile:\n%s", df)
+		}
 	}
 }
 

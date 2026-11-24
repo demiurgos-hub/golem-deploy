@@ -8,6 +8,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/demiurgos-hub/golem-deploy/internal/logsafe"
 )
 
 // repoFS reads a few files of an untrusted checkout. Every access is
@@ -40,7 +42,7 @@ func (r *repoFS) lstatChain(rel string) (fs.FileInfo, error) {
 		return r.root.Lstat(".")
 	}
 	if !filepath.IsLocal(filepath.FromSlash(rel)) || path.Clean(rel) != rel {
-		return nil, userErr("%s is not a path inside the repository", clip(rel, 120))
+		return nil, userErr("%s is not a path inside the repository", safePath(rel))
 	}
 	var info fs.FileInfo
 	segs := strings.Split(rel, "/")
@@ -54,7 +56,7 @@ func (r *repoFS) lstatChain(rel string) (fs.FileInfo, error) {
 			return nil, err
 		}
 		if fi.Mode()&fs.ModeSymlink != 0 {
-			return nil, userErr("%s is a symbolic link; symbolic links are not followed", clip(p, 120))
+			return nil, userErr("%s is a symbolic link; symbolic links are not followed", safePath(p))
 		}
 		if i < len(segs)-1 && !fi.IsDir() {
 			return nil, errMissing
@@ -78,10 +80,10 @@ func (r *repoFS) readFile(rel string, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	if !fi.Mode().IsRegular() {
-		return nil, userErr("%s is not a regular file", clip(rel, 120))
+		return nil, userErr("%s is not a regular file", safePath(rel))
 	}
 	if fi.Size() > limit {
-		return nil, userErr("%s is larger than %d KiB", clip(rel, 120), limit>>10)
+		return nil, userErr("%s is larger than %d KiB", safePath(rel), limit>>10)
 	}
 	f, err := r.root.Open(filepath.FromSlash(rel))
 	if err != nil {
@@ -90,14 +92,14 @@ func (r *repoFS) readFile(rel string, limit int64) ([]byte, error) {
 	defer f.Close()
 	// Check what was opened, not what was looked at.
 	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() || !os.SameFile(st, fi) {
-		return nil, userErr("%s changed while it was read", clip(rel, 120))
+		return nil, userErr("%s changed while it was read", safePath(rel))
 	}
 	data, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, err
 	}
 	if int64(len(data)) > limit {
-		return nil, userErr("%s is larger than %d KiB", clip(rel, 120), limit>>10)
+		return nil, userErr("%s is larger than %d KiB", safePath(rel), limit>>10)
 	}
 	return data, nil
 }
@@ -126,7 +128,7 @@ func (r *repoFS) kind(rel string) (entryKind, error) {
 	case fi.IsDir():
 		return kindDir, nil
 	}
-	return kindMissing, userErr("%s is neither a regular file nor a directory", clip(rel, 120))
+	return kindMissing, userErr("%s is neither a regular file nor a directory", safePath(rel))
 }
 
 // maxDirEntries bounds directory listings.
@@ -152,7 +154,7 @@ func (r *repoFS) readDir(rel string) ([]fs.DirEntry, error) {
 		return nil, err
 	}
 	if len(entries) > maxDirEntries {
-		return nil, userErr("%s has more than %d entries", clip(rel, 120), maxDirEntries)
+		return nil, userErr("%s has more than %d entries", safePath(rel), maxDirEntries)
 	}
 	return entries, nil
 }
@@ -161,3 +163,7 @@ func (r *repoFS) readDir(rel string) ([]fs.DirEntry, error) {
 func join(base string, elem ...string) string {
 	return path.Clean(path.Join(append([]string{base}, elem...)...))
 }
+
+// safePath renders a repository path for a user message: control and
+// bidirectional characters escaped, clipped.
+func safePath(p string) string { return clip(logsafe.String(p), 120) }

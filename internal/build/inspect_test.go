@@ -304,4 +304,10 @@ func TestRepoFSContainment(t *testing.T) {
 	if _, err := r.readFile("a/b.txt/c", 10); err != errMissing {
 		t.Fatalf("file used as directory: %v", err)
 	}
+	// Repository-derived names are escaped in messages.
+	_, err = r.readFile("../evil"+string(rune(0x1b))+"[31m"+string(rune(0x202e))+"\nnext", 10)
+	wantUserErr(t, err, "not a path inside the repository")
+	if !strings.Contains(err.Error(), `\x1b[31m`) || !strings.Contains(err.Error(), `\u`+"202e") || strings.ContainsRune(err.Error(), 0x202e) {
+		t.Fatalf("not escaped: %q", err.Error())
+	}
 }

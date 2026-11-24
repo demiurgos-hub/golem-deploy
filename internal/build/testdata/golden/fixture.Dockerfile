@@ -9,11 +9,11 @@ ENV PATH=$PATH:/src/node_modules/.bin
 WORKDIR /src
 COPY . .
 COPY --from=static / /src/
-RUN --mount=type=cache,id=golem-deploy-0123456789ab-p7-npm,target=/root/.npm ["npm","ci"]
-RUN --mount=type=cache,id=golem-deploy-0123456789ab-p7-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-0123456789ab-p7-gobuild,target=/root/.cache/go-build ["go","run","github.com/demiurgos-hub/golem-engine/cmd/golem-bake@v0.4.0-rc.1"]
-RUN --mount=type=cache,id=golem-deploy-0123456789ab-p7-npm,target=/root/.npm ["npm","run","build"]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p7-npm,target=/root/.npm ["npm","ci"]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p7-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-beabf00ccfad-p7-gobuild,target=/root/.cache/go-build ["go","run","github.com/demiurgos-hub/golem-engine/cmd/golem-bake@v0.4.0-rc.1"]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p7-npm,target=/root/.npm ["npm","run","build"]
 RUN test -d web/dist || { echo "golem-deploy: the web client directory web/dist (web.dist) does not exist after the web build" >&2; exit 1; }
-RUN --mount=type=cache,id=golem-deploy-0123456789ab-p7-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-0123456789ab-p7-gobuild,target=/root/.cache/go-build ["go","build","-trimpath","-ldflags=-s -w","-o","/out/golem-server","./cmd/server"]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p7-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-beabf00ccfad-p7-gobuild,target=/root/.cache/go-build ["go","build","-trimpath","-ldflags=-s -w","-o","/out/golem-server","./cmd/server"]
 RUN ["mkdir","-p","/out/data"]
 
 FROM gcr.io/distroless/static-debian12:nonroot

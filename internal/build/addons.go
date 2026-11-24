@@ -124,7 +124,7 @@ func mergeTree(src, dst, name string) (int64, error) {
 		}
 		target := filepath.Join(dst, rel)
 		conflict := func() error {
-			return userErr("the static add-on %q provides %s, which an earlier add-on already provides", name, clip(filepath.ToSlash(rel), 120))
+			return userErr("the static add-on %q provides %s, which an earlier add-on already provides", name, safePath(filepath.ToSlash(rel)))
 		}
 		switch {
 		case d.IsDir():

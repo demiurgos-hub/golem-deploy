@@ -9,16 +9,16 @@ ENV PATH=$PATH:/src/games/arena/node_modules/.bin:/src/games/arena/client/node_m
 WORKDIR /src
 COPY . .
 WORKDIR /src/games/arena
-RUN --mount=type=cache,id=golem-deploy-0123456789ab-p12-npm,target=/root/.npm ["npm","ci"]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-npm,target=/root/.npm ["npm","ci"]
 WORKDIR /src/games/arena/client
-RUN --mount=type=cache,id=golem-deploy-0123456789ab-p12-npm,target=/root/.npm ["npm","install"]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-npm,target=/root/.npm ["npm","install"]
 WORKDIR /src/games/arena
-RUN --mount=type=cache,id=golem-deploy-0123456789ab-p12-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-0123456789ab-p12-gobuild,target=/root/.cache/go-build ["go","run","github.com/demiurgos-hub/golem-engine/cmd/golem-bake@v0.4.2","--check"]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-gobuild,target=/root/.cache/go-build ["go","run","github.com/demiurgos-hub/golem-engine/cmd/golem-bake@v0.4.2","--check"]
 WORKDIR /src/games/arena/client
-RUN --mount=type=cache,id=golem-deploy-0123456789ab-p12-npm,target=/root/.npm ["npm","run","build:prod","--","--base=/game/"]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-npm,target=/root/.npm ["npm","run","build:prod","--","--base=/game/"]
 WORKDIR /src/games/arena
 RUN test -d client/dist || { echo "golem-deploy: the web client directory client/dist (web.dist) does not exist after the web build" >&2; exit 1; }
-RUN --mount=type=cache,id=golem-deploy-0123456789ab-p12-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-0123456789ab-p12-gobuild,target=/root/.cache/go-build ["go","build","-trimpath","-ldflags=-s -w","-o","/out/golem-server","./cmd/arena"]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-gobuild,target=/root/.cache/go-build ["go","build","-trimpath","-ldflags=-s -w","-o","/out/golem-server","./cmd/arena"]
 RUN ["mkdir","-p","/out/data"]
 
 FROM gcr.io/distroless/static-debian12:nonroot

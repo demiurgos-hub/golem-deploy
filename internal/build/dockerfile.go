@@ -2,6 +2,8 @@ package build
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -45,8 +47,11 @@ var hexRE = regexp.MustCompile(`^[0-9a-f]{12,64}$`)
 
 // cacheID scopes a BuildKit cache mount to one project of one
 // installation, so one project cannot read or poison another's caches.
+// The installation part is a hash of the instance id (the generated
+// Dockerfile appears in build logs; the instance id itself is never shown).
 func cacheID(prm DockerfileParams, what string) string {
-	return "golem-deploy-" + prm.InstanceID[:12] + "-p" + strconv.FormatInt(prm.ProjectID, 10) + "-" + what
+	sum := sha256.Sum256([]byte("golem-deploy build cache\x00" + prm.InstanceID))
+	return "golem-deploy-" + hex.EncodeToString(sum[:6]) + "-p" + strconv.FormatInt(prm.ProjectID, 10) + "-" + what
 }
 
 // Dockerfile renders the generated multi-stage Dockerfile for p. Every
