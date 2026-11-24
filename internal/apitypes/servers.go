@@ -199,3 +199,30 @@ type ServerTickStats struct {
 	// Overruns counts ticks that took longer than the budget.
 	Overruns int64 `json:"overruns"`
 }
+
+// ServerConnectivity is the body of GET /api/v1/servers/{id}/connectivity:
+// what a browser needs to test the path players take to the server (the
+// panel's connection test opens these URLs from the admin's browser and
+// reports which step fails).
+type ServerConnectivity struct {
+	// Running reports whether the server's container is running.
+	Running bool `json:"running"`
+	// PageURL is the game's own page (https://<game host>:<port>/),
+	// WebTransportURL the WebTransport endpoint (UDP) and WebSocketURL the
+	// WebSocket fallback (TCP). All are "" without a game host or port.
+	PageURL         string `json:"page_url"`
+	WebTransportURL string `json:"webtransport_url"`
+	WebSocketURL    string `json:"websocket_url"`
+	// Pinned reports whether the server uses a self-signed certificate that
+	// browsers accept only through WebTransport serverCertificateHashes
+	// (Certificate.FingerprintSHA256); HTTPS and WebSocket to it cannot be
+	// tested from a browser then.
+	Pinned      bool             `json:"pinned"`
+	Certificate *CertificateInfo `json:"certificate" tstype:"CertificateInfo | null,required"`
+	// TestOrigins are the panel origins the daemon adds to the allowed
+	// origins of every server so that this test can connect; the test only
+	// works from a page at one of them. TestOriginsActive is false while the
+	// running container was created without them (restart the server).
+	TestOrigins       []string `json:"test_origins"`
+	TestOriginsActive bool     `json:"test_origins_active"`
+}

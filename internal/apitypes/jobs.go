@@ -23,6 +23,9 @@ type SubjectType string
 const (
 	SubjectTypeProject SubjectType = "project"
 	SubjectTypeServer  SubjectType = "server"
+	// SubjectTypeCertificate is the installation's automatic (ACME)
+	// certificates as a whole; its subject id is "acme".
+	SubjectTypeCertificate SubjectType = "certificate"
 )
 
 // JobKind names what a job does. New kinds may be added; clients should
@@ -39,6 +42,11 @@ const (
 	JobKindServerStop    JobKind = "server.stop"
 	JobKindServerRestart JobKind = "server.restart"
 	JobKindServerDelete  JobKind = "server.delete"
+	// JobKindCertificateIssue obtains the certificates a mode change to
+	// "acme" needs and then commits that change; JobKindCertificateRenew
+	// replaces every managed certificate now. Both are restricted (admin).
+	JobKindCertificateIssue JobKind = "certificate.issue"
+	JobKindCertificateRenew JobKind = "certificate.renew"
 )
 
 // Job is a long-running operation. Routes that start one respond 202 with the

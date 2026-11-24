@@ -226,6 +226,7 @@ A server is a container run from the image of a successful build, its host `port
 | GET | `/servers/{id}/logs` | developer | query `tail=N` (1–5000, default 200), `follow=1` | 200 `text/plain` | implemented |
 | GET | `/servers/{id}/stats` | developer | — | 200 `ServerStats` | implemented |
 | GET | `/servers/{id}/runtime` | developer | — | 200 `ServerRuntime` | implemented |
+| GET | `/servers/{id}/connectivity` | developer | — | 200 `ServerConnectivity` | planned |
 
 - `name`: `^[a-z0-9][a-z0-9-]{0,62}$`, unique, immutable; the container is named `golem-deploy-<name>`.
 - `build_id`: required on create; the id of a build with status `success` (otherwise `validation_failed`, `field: build_id`). PATCH with `build_id` switches the server to another successful build of the same project (`validation_failed`, `field: build_id` for a different project). Docker is not asked here: the build's image is verified (it must exist and carry the managed label, this installation's instance label and a `build-id` label equal to the build's id) when the server starts. Servers created before servers ran builds have `build_id: null` and cannot start until one is assigned. The first assignment fixes the project for those legacy servers. Clear any saved environment before assigning the first build, or clear it with `env_unset` in the same request.
@@ -249,7 +250,12 @@ A server is a container run from the image of a successful build, its host `port
 | Method | Path | Access | Request | Response | Status |
 |--------|------|--------|---------|----------|--------|
 | GET | `/certificates/game` | admin | — | 200 `GameCertificate` | implemented |
-| PUT | `/certificates/game` | admin | `UpdateGameCertificateRequest` `{mode, certificate_pem?, private_key_pem?}` (at most 160 KiB) | 200 `GameCertificate` | implemented |
+| PUT | `/certificates/game` | admin | `UpdateGameCertificateRequest` `{mode, certificate_pem?, private_key_pem?}` (at most 160 KiB) | 200 or 202 `UpdateGameCertificateResponse` `{certificate, job}` | implemented; mode `acme` and the response shape are planned |
+| GET | `/certificates/panel` | admin | — | 200 `PanelCertificate` | planned |
+| PUT | `/certificates/panel` | admin | `UpdatePanelCertificateRequest` `{mode}` | 200 or 202 `UpdatePanelCertificateResponse` `{certificate, job}` | planned |
+| GET | `/certificates/acme` | admin | — | 200 `ACME` | planned |
+| PUT | `/certificates/acme` | admin | `UpdateACMERequest` `{email?, staging?, terms_agreed?}` | 200 `ACME` | planned |
+| POST | `/certificates/acme/renew` | admin | — | 202 `Job` (`certificate.renew`) | planned |
 
 Game servers use TLS for WebTransport and HTTPS. See [CERTIFICATES.md](CERTIFICATES.md) for storage and rotation.
 
@@ -258,6 +264,7 @@ Game servers use TLS for WebTransport and HTTPS. See [CERTIFICATES.md](CERTIFICA
 - `Server.certificate` describes the server's individual self-signed certificate after it is generated, or the shared custom certificate in custom mode. It is `null` if the applicable certificate is missing.
 - PUT `{"mode":"self_signed"}` generates new pairs for the existing servers. PEM fields in this mode produce `validation_failed` on `certificate_pem`. In `custom` mode upload a PEM chain (leaf first, at most 8 certificates and 64 KiB) and an unencrypted PEM key (PKCS#8, PKCS#1 or SEC 1, at most 16 KiB, RSA of at least 2048 bits or ECDSA P-256/P-384/P-521). The key must match the leaf. The leaf must be valid now for TLS servers and each certificate must be signed by the next one in the chain. Invalid input produces `validation_failed` with `field` set to `mode`, `certificate_pem` or `private_key_pem`.
 - Running servers pick up certificate replacements through the engine's file poll. Switching modes reports `restart_required` because the running game's pinning setting changes only on restart.
+- Planned (milestone 4), see the types in `internal/apitypes/certificates.go`: game mode `acme` obtains and renews one publicly trusted certificate for the game host, shared by all servers like a custom one. `PanelCertificate` is `{mode, configurable, hosts, certificate, covers_hosts}` with modes `none`, `files`, `self_signed`, `acme`. `ACME` is `{email, staging, terms_agreed, directory_url, http01_available, tls_alpn01_available, certificates}` and `ACMECertificate` `{identifier, used_by, status, certificate, last_error, last_attempt_at}`. A change to `acme` runs a restricted `certificate.issue` job (subject `certificate`/`acme`) and takes effect only when it succeeds; `POST /certificates/acme/renew` runs `certificate.renew`.
 - Expected errors: `validation_failed`, `service_unavailable`.
 
 ### Images, static files, volumes

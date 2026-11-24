@@ -302,9 +302,16 @@ export const CertificateModeSelfSigned = "self_signed";
  */
 export const CertificateModeCustom = "custom";
 /**
+ * CertificateModeACME: the daemon obtains and renews a publicly trusted
+ * certificate for the game host from an ACME certificate authority
+ * (Let's Encrypt by default). A DNS name gets an ordinary certificate;
+ * an IP address gets a short-lived one (about 6 days).
+ */
+export const CertificateModeACME = "acme";
+/**
  * Certificate modes.
  */
-export type CertificateMode = typeof CertificateModeSelfSigned | typeof CertificateModeCustom;
+export type CertificateMode = typeof CertificateModeSelfSigned | typeof CertificateModeCustom | typeof CertificateModeACME;
 /**
  * CertificateInfo describes a TLS certificate a game server serves for
  * WebTransport and HTTPS. The private key is never returned.
@@ -344,8 +351,9 @@ export interface CertificateInfo {
  * In mode "self_signed" every server has its own short-lived certificate and
  * private key, generated and rotated by the daemon, so no game holds another
  * game's key; Certificate is null and each server's certificate is
- * Server.Certificate. In mode "custom" all servers share the uploaded
- * certificate, described by Certificate (null while none is installed).
+ * Server.Certificate. In modes "custom" and "acme" all servers share one
+ * certificate and private key (uploaded, or obtained by the daemon),
+ * described by Certificate (null while none is installed).
  */
 export interface GameCertificate {
   mode: CertificateMode;
@@ -362,13 +370,206 @@ export interface GameCertificate {
  * at most 8 certificates and 64 KiB) and PrivateKeyPEM (unencrypted PKCS#8,
  * PKCS#1 or SEC 1; RSA of at least 2048 bits or ECDSA P-256/P-384/P-521; at
  * most 16 KiB), which must match, be currently valid and be usable for TLS
- * servers. Running servers pick up the new certificate within a minute
- * without a restart; switching modes marks them restart_required.
+ * servers. Mode "acme" (no PEM fields) starts a certificate.issue job that
+ * obtains a certificate for the game host; the mode changes only when that
+ * job succeeds, so servers keep their current certificate until then and
+ * when it fails. Running servers pick up the new certificate within a
+ * minute without a restart; a switch between self_signed and another mode
+ * marks them restart_required.
  */
 export interface UpdateGameCertificateRequest {
   mode: CertificateMode;
   certificate_pem?: string;
   private_key_pem?: string;
+}
+/**
+ * UpdateGameCertificateResponse is returned by PUT /api/v1/certificates/game:
+ * 200 with Job null when the change is complete (self_signed, custom), 202
+ * with the certificate.issue job when it continues in the background
+ * (acme). Certificate is the state at the time of the response.
+ */
+export interface UpdateGameCertificateResponse {
+  certificate: GameCertificate;
+  job: Job | null;
+}
+/**
+ * PanelCertificateMode is where the panel's own TLS certificate comes from.
+ */
+/**
+ * PanelCertificateModeNone: the panel serves plain HTTP (a loopback
+ * listen address, or --insecure-http behind a proxy that terminates TLS).
+ */
+export const PanelCertificateModeNone = "none";
+/**
+ * PanelCertificateModeFiles: the operator's --tls-cert and --tls-key.
+ */
+export const PanelCertificateModeFiles = "files";
+/**
+ * PanelCertificateModeSelfSigned: a certificate the daemon generates;
+ * browsers show a warning. This is the default when the panel listens
+ * on a non-loopback address without --tls-cert.
+ */
+export const PanelCertificateModeSelfSigned = "self_signed";
+/**
+ * PanelCertificateModeACME: the daemon obtains and renews a publicly
+ * trusted certificate for every panel host.
+ */
+export const PanelCertificateModeACME = "acme";
+/**
+ * Panel certificate modes.
+ */
+export type PanelCertificateMode = typeof PanelCertificateModeNone | typeof PanelCertificateModeFiles | typeof PanelCertificateModeSelfSigned | typeof PanelCertificateModeACME;
+/**
+ * PanelCertificate is the body of GET /api/v1/certificates/panel (admin).
+ */
+export interface PanelCertificate {
+  mode: PanelCertificateMode;
+  /**
+   * Configurable is false in modes "none" and "files", which are decided
+   * by the serve flags; PUT then answers 409 conflict.
+   */
+  configurable: boolean;
+  /**
+   * Hosts are the names the panel's certificate is issued for: the
+   * --public-host values, or the effective game host when there are none.
+   */
+  hosts: string[];
+  /**
+   * Certificate is what the panel serves now for the first of Hosts (null
+   * in mode "none"). Its CoversGameHost is about the game host; CoversHosts
+   * reports whether it is valid for every one of Hosts.
+   */
+  certificate: CertificateInfo | null;
+  covers_hosts: boolean;
+}
+/**
+ * UpdatePanelCertificateRequest is the body of PUT /api/v1/certificates/panel.
+ * Mode must be "self_signed" or "acme". "acme" starts a certificate.issue
+ * job; the mode changes only when that job succeeds.
+ */
+export interface UpdatePanelCertificateRequest {
+  mode: PanelCertificateMode;
+}
+/**
+ * UpdatePanelCertificateResponse is returned by PUT
+ * /api/v1/certificates/panel: 200 with Job null (self_signed), 202 with the
+ * certificate.issue job (acme).
+ */
+export interface UpdatePanelCertificateResponse {
+  certificate: PanelCertificate;
+  job: Job | null;
+}
+/**
+ * ACMECertificateStatus is the state of one certificate the daemon manages
+ * through ACME.
+ */
+/**
+ * ACMECertificateStatusPending: not obtained yet, no attempt has failed.
+ */
+export const ACMECertificateStatusPending = "pending";
+/**
+ * ACMECertificateStatusIssued: a certificate is installed and the last
+ * attempt (if any) succeeded.
+ */
+export const ACMECertificateStatusIssued = "issued";
+/**
+ * ACMECertificateStatusError: the last attempt to obtain or renew
+ * failed; LastError says why. An earlier certificate stays in use until
+ * it expires and the daemon keeps retrying.
+ */
+export const ACMECertificateStatusError = "error";
+/**
+ * ACME certificate states.
+ */
+export type ACMECertificateStatus = typeof ACMECertificateStatusPending | typeof ACMECertificateStatusIssued | typeof ACMECertificateStatusError;
+/**
+ * ACMECertificateUse says what a managed certificate is used for.
+ */
+export const ACMECertificateUseGame = "game";
+export const ACMECertificateUsePanel = "panel";
+/**
+ * ACME certificate uses.
+ */
+export type ACMECertificateUse = typeof ACMECertificateUseGame | typeof ACMECertificateUsePanel;
+/**
+ * ACMECertificate is one certificate the daemon manages through ACME: one
+ * per identifier. When the game host is also a panel host, both use the
+ * same certificate and key.
+ */
+export interface ACMECertificate {
+  /**
+   * Identifier is the DNS name or IP address the certificate is for.
+   */
+  identifier: string;
+  /**
+   * UsedBy lists what uses it (never empty).
+   */
+  used_by: ACMECertificateUse[];
+  status: ACMECertificateStatus;
+  /**
+   * Certificate is the installed certificate; null until one is obtained.
+   */
+  certificate: CertificateInfo | null;
+  /**
+   * LastError is a short, user-safe description of the last failed
+   * attempt ("" when the last attempt succeeded or none was made).
+   */
+  last_error: string;
+  /**
+   * LastAttemptAt is when the daemon last tried to obtain or renew it.
+   */
+  last_attempt_at: string | null;
+}
+/**
+ * ACME is the body of GET and PUT /api/v1/certificates/acme (admin): the
+ * account settings shared by every automatic certificate, what the host can
+ * answer challenges with, and the managed certificates.
+ */
+export interface ACME {
+  /**
+   * Email is the optional contact address given to the certificate
+   * authority.
+   */
+  email: string;
+  /**
+   * Staging uses the authority's staging environment: certificates are
+   * not trusted by browsers and the generous staging limits apply. It has
+   * no effect when --acme-directory is set.
+   */
+  staging: boolean;
+  /**
+   * TermsAgreed records that an admin accepted the authority's subscriber
+   * agreement; no certificate is requested without it.
+   */
+  terms_agreed: boolean;
+  /**
+   * DirectoryURL is the ACME directory in use.
+   */
+  directory_url: string;
+  /**
+   * HTTP01Available: the daemon answers HTTP-01 challenges (it listens on
+   * --http-listen, which must be reachable as port 80 of every identifier).
+   * TLSALPN01Available: it answers TLS-ALPN-01 challenges (the panel
+   * serves TLS on port 443). Automatic certificates need at least one.
+   */
+  http01_available: boolean;
+  tls_alpn01_available: boolean;
+  /**
+   * Certificates are the managed certificates, sorted by identifier
+   * (empty when neither the game nor the panel uses ACME).
+   */
+  certificates: ACMECertificate[];
+}
+/**
+ * UpdateACMERequest is the body of PUT /api/v1/certificates/acme. Absent
+ * fields are left unchanged. Email is "" or one address (at most 254
+ * bytes). Staging cannot change while a certificate is managed
+ * (409 conflict): switch the game and the panel away from "acme" first.
+ */
+export interface UpdateACMERequest {
+  email?: string;
+  staging?: boolean;
+  terms_agreed?: boolean;
 }
 
 //////////
@@ -657,9 +858,14 @@ export type JobStatus = typeof JobStatusQueued | typeof JobStatusRunning | typeo
 export const SubjectTypeProject = "project";
 export const SubjectTypeServer = "server";
 /**
+ * SubjectTypeCertificate is the installation's automatic (ACME)
+ * certificates as a whole; its subject id is "acme".
+ */
+export const SubjectTypeCertificate = "certificate";
+/**
  * Subject types.
  */
-export type SubjectType = typeof SubjectTypeProject | typeof SubjectTypeServer;
+export type SubjectType = typeof SubjectTypeProject | typeof SubjectTypeServer | typeof SubjectTypeCertificate;
 /**
  * JobKind names what a job does. New kinds may be added; clients should
  * display unknown kinds verbatim.
@@ -673,9 +879,16 @@ export const JobKindServerStop = "server.stop";
 export const JobKindServerRestart = "server.restart";
 export const JobKindServerDelete = "server.delete";
 /**
+ * JobKindCertificateIssue obtains the certificates a mode change to
+ * "acme" needs and then commits that change; JobKindCertificateRenew
+ * replaces every managed certificate now. Both are restricted (admin).
+ */
+export const JobKindCertificateIssue = "certificate.issue";
+export const JobKindCertificateRenew = "certificate.renew";
+/**
  * Job kinds.
  */
-export type JobKind = typeof JobKindProjectClone | typeof JobKindProjectPull | typeof JobKindProjectBranch | typeof JobKindProjectBuild | typeof JobKindServerStart | typeof JobKindServerStop | typeof JobKindServerRestart | typeof JobKindServerDelete;
+export type JobKind = typeof JobKindProjectClone | typeof JobKindProjectPull | typeof JobKindProjectBranch | typeof JobKindProjectBuild | typeof JobKindServerStart | typeof JobKindServerStop | typeof JobKindServerRestart | typeof JobKindServerDelete | typeof JobKindCertificateIssue | typeof JobKindCertificateRenew;
 /**
  * Job is a long-running operation. Routes that start one respond 202 with the
  * Job; poll GET /api/v1/jobs/{id} or stream GET /api/v1/jobs/{id}/log?follow=1.
@@ -1115,6 +1328,42 @@ export interface ServerTickStats {
    * Overruns counts ticks that took longer than the budget.
    */
   overruns: number /* int64 */;
+}
+/**
+ * ServerConnectivity is the body of GET /api/v1/servers/{id}/connectivity:
+ * what a browser needs to test the path players take to the server (the
+ * panel's connection test opens these URLs from the admin's browser and
+ * reports which step fails).
+ */
+export interface ServerConnectivity {
+  /**
+   * Running reports whether the server's container is running.
+   */
+  running: boolean;
+  /**
+   * PageURL is the game's own page (https://<game host>:<port>/),
+   * WebTransportURL the WebTransport endpoint (UDP) and WebSocketURL the
+   * WebSocket fallback (TCP). All are "" without a game host or port.
+   */
+  page_url: string;
+  webtransport_url: string;
+  websocket_url: string;
+  /**
+   * Pinned reports whether the server uses a self-signed certificate that
+   * browsers accept only through WebTransport serverCertificateHashes
+   * (Certificate.FingerprintSHA256); HTTPS and WebSocket to it cannot be
+   * tested from a browser then.
+   */
+  pinned: boolean;
+  certificate: CertificateInfo | null;
+  /**
+   * TestOrigins are the panel origins the daemon adds to the allowed
+   * origins of every server so that this test can connect; the test only
+   * works from a page at one of them. TestOriginsActive is false while the
+   * running container was created without them (restart the server).
+   */
+  test_origins: string[];
+  test_origins_active: boolean;
 }
 
 //////////
