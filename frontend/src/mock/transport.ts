@@ -1,7 +1,8 @@
 /**
  * Dev-only stand-in for the Docker-, git- and file-backed routes (projects,
- * builds, servers and their runtime view, images, static files, volumes, the
- * certificate settings and their jobs), so the web client can be developed
+ * builds, servers and their runtime view and saved data, backups, images,
+ * static files, volumes, the certificate settings and their jobs), so the
+ * web client can be developed
  * without Docker, git or network access. It follows the API v1 contract
  * (docs/API.md) and the generated wire types: access levels, restricted
  * jobs, error codes and messages, the follow stream cap, tail bounds, static
@@ -18,10 +19,14 @@ import type { RawResponse, Transport, UploadRequest } from "@/api/client";
 import type {
   ACME,
   ACMECertificateUse,
+  Backup,
+  BackupKind,
+  BackupSchedule,
   Build,
   BuildStatus,
   CertificateInfo,
   CertificateMode,
+  CreateBackupRequest,
   CreateBuildRequest,
   CreateProjectRequest,
   CreateServerRequest,
@@ -34,6 +39,8 @@ import type {
   PanelCertificate,
   Project,
   ProjectAuth,
+  ResetServerDataRequest,
+  RestoreServerRequest,
   Server,
   ServerConnectivity,
   ServerExport,
@@ -66,6 +73,7 @@ const MAX_IMPORT = 128;
 const MAX_ACTIVE_BUILDS = 4;
 const MAX_ADDONS = 16;
 const MAX_ORIGINS = 16;
+const BACKUP_MAX_CONTENT = 2048 * 1024 * 1024;
 
 interface MockState {
   projects: Project[];
@@ -82,6 +90,9 @@ interface MockState {
   images: Image[];
   statics: Map<string, { meta: StaticFile; blob: Blob }>;
   volumes: Volume[];
+  backups: Backup[];
+  /** The backup each active restore job reads (it cannot be deleted meanwhile). */
+  restoreReads: Map<number, number>;
   jobs: Job[];
   jobLogs: Map<number, string[]>;
   follows: Map<number, number>;
@@ -89,6 +100,8 @@ interface MockState {
   nextId: number;
   nextBuildId: number;
   nextJobId: number;
+  nextBackupId: number;
+  volumeSeq: number;
   requestSeq: number;
 }
 
@@ -109,6 +122,7 @@ const COMMIT_ARENA_OLD = "0d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e";
 const COMMIT_KART = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b";
 const ENGINE = "v0.4.0-rc.1";
 const FINGERPRINT = "3b6f0c2a91d4e8f7";
+const FINGERPRINT_OLD = "a0c3d9e1f2b47c55";
 
 /** The game host servers use: the page's host name (the real one comes from the daemon's settings). */
 function gameHost(): string {
@@ -238,7 +252,7 @@ function seed(): MockState {
     "build succeeded",
   ];
   const builds: Build[] = [
-    build(1, 1, "success", 9 * DAY, { commit: COMMIT_ARENA_OLD, image_id: IMG_ARENA_OLD, schema_fingerprint: "a0c3d9e1f2b47c55" }, okLog("arena-shooter")),
+    build(1, 1, "success", 9 * DAY, { commit: COMMIT_ARENA_OLD, image_id: IMG_ARENA_OLD, schema_fingerprint: FINGERPRINT_OLD }, okLog("arena-shooter")),
     build(2, 1, "error", 3 * DAY, { detail: "docker build failed; see the build log" }, [
       "#14 [build 8/9] RUN CGO_ENABLED=0 go build -trimpath ./cmd/server",
       "#14 0.912 cmd/server/main.go:41:2: undefined: host.Run",
@@ -278,23 +292,87 @@ function seed(): MockState {
     exit_code: state === "exited" ? 0 : null,
     restart_required: false,
     certificate: null,
+    // A server gets its data volume on its first start.
+    data: {
+      volume: state === "missing" ? "" : `golem-deploy-data-${id}-1`,
+      schema_fingerprint: state === "missing" ? "" : FINGERPRINT,
+      schema_mismatch: false,
+      last_backup_at: null,
+    },
+    snapshot_interval_seconds: 300,
+    backup_schedule: { interval_hours: 0, keep: 7 },
     created_at: iso(10 * DAY),
     updated_at: iso(6 * HOUR),
     ...extra,
   });
   const kart = { build_id: 4, project_id: 2, image: IMG_KART, commit: COMMIT_KART };
   const servers: Server[] = [
-    server(11, "eu-arena", 7000, "running", "running", { allowed_origins: ["https://play.example.com"] }),
+    server(11, "eu-arena", 7000, "running", "running", { allowed_origins: ["https://play.example.com"], backup_schedule: { interval_hours: 24, keep: 7 } }),
+    // Runs the old build, but its world was saved by the newer one: it cannot start (schema mismatch).
     server(12, "staging", 7001, "stopped", "exited", { build_id: 1, image: IMG_ARENA_OLD, commit: COMMIT_ARENA_OLD }),
     server(13, "crashy", 7002, "running", "exited", { exit_code: 137, updated_at: iso(HOUR) }),
     // Its game's admin endpoint never answers: the runtime view answers 503.
-    server(14, "flood-test", 7003, "running", "running", { env_keys: [] }),
-    server(15, "kart-eu", 7004, "running", "running", { ...kart, restart_required: true }),
+    server(14, "flood-test", 7003, "running", "running", { env_keys: [], snapshot_interval_seconds: 0 }),
+    server(15, "kart-eu", 7004, "running", "running", { ...kart, restart_required: true, snapshot_interval_seconds: 60, backup_schedule: { interval_hours: 6, keep: 3 } }),
     server(16, "fresh", 7005, "stopped", "missing", { env_keys: [] }),
     // Has a container, but "Docker" cannot be queried for it: every action fails, delete answers 503.
     server(17, "docker-lost", 7006, "running", "unknown", { env_keys: [], started_at: null }),
     // Created before servers ran builds: cannot start until a build is assigned.
     server(18, "legacy", 7007, "stopped", "missing", { build_id: null, project_id: null, image: "", commit: "", engine_version: "", env_keys: [] }),
+  ];
+  for (const s of servers) if (s.id === 15 || s.id === 14) s.data.schema_fingerprint = "";
+  const backup = (id: number, s: Pick<Server, "id" | "name"> | { id: null; name: string }, kind: BackupKind, ageMs: number, extra: Partial<Backup> = {}): Backup => ({
+    id,
+    kind,
+    server_id: s.id,
+    server_name: s.name,
+    project_id: 1,
+    project_name: "arena-shooter",
+    build_id: 3,
+    commit: COMMIT_ARENA,
+    engine_version: ENGINE,
+    schema_fingerprint: FINGERPRINT,
+    live: true,
+    note: "",
+    size_bytes: 4_200_000 + id * 37_000,
+    content_bytes: 11_800_000 + id * 91_000,
+    file_count: 3,
+    sha256: fakeFingerprint(`backup-${id}`),
+    job_id: null,
+    created_by: kind === "scheduled" ? null : 1,
+    created_by_username: kind === "scheduled" ? null : "admin",
+    created_at: iso(ageMs),
+    ...extra,
+  });
+  const arena = { id: 11, name: "eu-arena" };
+  const old = { build_id: 1, commit: COMMIT_ARENA_OLD, schema_fingerprint: FINGERPRINT_OLD };
+  const backups: Backup[] = [
+    backup(9, arena, "scheduled", 2 * HOUR),
+    backup(8, { id: 15, name: "kart-eu" }, "scheduled", 4 * HOUR, {
+      project_id: 2, project_name: "kart-racer", build_id: 4, commit: COMMIT_KART, schema_fingerprint: "", size_bytes: 1_100_000,
+    }),
+    backup(7, arena, "scheduled", 26 * HOUR),
+    backup(6, arena, "manual", 3 * DAY, { note: "before the map update" }),
+    // A world saved by build 1: what "staging" (which runs build 1) can load again.
+    backup(5, { id: 12, name: "staging" }, "manual", 4 * DAY, { ...old, note: "last good staging world", live: false }),
+    backup(4, arena, "pre_restore", 5 * DAY, old),
+    // The server was deleted since; its backups stay.
+    backup(3, { id: null, name: "old-arena" }, "manual", 8 * DAY, { ...old, note: "season 1 final" }),
+    backup(2, { id: null, name: "old-arena" }, "scheduled", 9 * DAY, { ...old, build_id: null }),
+  ];
+  const volume = (name: string, s: Pick<Server, "id" | "name"> | null, ageMs: number, serverName = s?.name ?? ""): Volume => ({
+    name,
+    server_id: s?.id ?? null,
+    server_name: serverName,
+    current: false,
+    created_at: iso(ageMs),
+    in_use: false,
+  });
+  const volumes: Volume[] = [
+    ...servers.filter((s) => s.data.volume).map((s) => volume(s.data.volume, s, 10 * DAY)),
+    // Left over after an earlier restore of eu-arena, and from the deleted old-arena.
+    volume("golem-deploy-data-11-0", arena, 12 * DAY),
+    volume("golem-deploy-data-9-1", null, 20 * DAY, "old-arena"),
   ];
   const serverCerts = new Map<number, CertificateInfo>();
   for (const s of servers) {
@@ -327,7 +405,6 @@ function seed(): MockState {
   ] as const) {
     statics.set(name, { meta: { name, size_bytes: size, modified_at: iso(5 * DAY), is_zip: name.endsWith(".zip") }, blob: new Blob([text]) });
   }
-  // Servers have no data volumes yet (a later milestone), so the list starts empty like on a real host.
   return {
     projects,
     builds,
@@ -344,7 +421,9 @@ function seed(): MockState {
     env,
     images,
     statics,
-    volumes: [],
+    volumes,
+    backups,
+    restoreReads: new Map(),
     jobs: jobs.reverse(),
     jobLogs,
     follows: new Map(),
@@ -352,6 +431,8 @@ function seed(): MockState {
     nextId: 100,
     nextBuildId: 6,
     nextJobId,
+    nextBackupId: 10,
+    volumeSeq: 2,
     requestSeq: 0,
   };
 }
@@ -576,6 +657,24 @@ function envError(env: Record<string, string> | undefined, field: string): { fie
   return null;
 }
 
+/** Like the daemon's checks of the autosave period and backup schedule; `prefix` is "" or "servers[i].". */
+function dataSettingsError(req: { snapshot_interval_seconds?: number; backup_schedule?: BackupSchedule }, prefix = ""): { field: string; message: string } | null {
+  const snap = req.snapshot_interval_seconds;
+  if (snap !== undefined && snap !== null && (!Number.isInteger(snap) || (snap !== 0 && (snap < 10 || snap > 86_400)))) {
+    return { field: `${prefix}snapshot_interval_seconds`, message: "snapshot_interval_seconds must be 0 or 10 to 86400" };
+  }
+  const b = req.backup_schedule;
+  if (b !== undefined && b !== null) {
+    if (!Number.isInteger(b.interval_hours) || b.interval_hours < 0 || b.interval_hours > 720) {
+      return { field: `${prefix}backup_schedule.interval_hours`, message: "backup_schedule.interval_hours must be 0 (off) or 1 to 720" };
+    }
+    if (!Number.isInteger(b.keep) || b.keep < 1 || b.keep > 100) {
+      return { field: `${prefix}backup_schedule.keep`, message: "backup_schedule.keep must be 1 to 100" };
+    }
+  }
+  return null;
+}
+
 function portError(port: number): string | null {
   return port < PORT_RANGE[0] || port > PORT_RANGE[1] ? `port must be within the configured range ${PORT_RANGE[0]}-${PORT_RANGE[1]}` : null;
 }
@@ -600,7 +699,7 @@ function authError(auth: ProjectAuth | undefined, kind: "https" | "ssh"): { fiel
 export function createMockTransport(real: Transport): Transport {
   const st = seed();
   const identities = new Map<string, Me>();
-  console.info(`${MOCK_MARKER}: VITE_API_MOCK=1, projects/builds/servers/images/static/volumes/certificates are simulated in the browser.`);
+  console.info(`${MOCK_MARKER}: VITE_API_MOCK=1, projects/builds/servers/backups/images/static/volumes/certificates are simulated in the browser.`);
 
   /** The caller, as the real daemon sees the bearer token; null lets the request through to the daemon (which answers 401). */
   async function identify(init: RequestInit | { headers: Record<string, string> }): Promise<Me | null> {
@@ -628,7 +727,59 @@ export function createMockTransport(real: Transport): Transport {
     }
     for (const s of st.servers) {
       s.certificate = st.certMode === "self_signed" ? (st.serverCerts.get(s.id) ?? null) : gameCertificate().certificate;
+      const buildFp = st.builds.find((b) => b.id === s.build_id)?.schema_fingerprint ?? "";
+      s.data.schema_mismatch = s.data.schema_fingerprint !== "" && buildFp !== "" && s.data.schema_fingerprint !== buildFp;
+      s.data.last_backup_at = st.backups.find((b) => b.server_id === s.id)?.created_at ?? null;
     }
+    for (const v of st.volumes) {
+      const owner = st.servers.find((s) => s.id === v.server_id);
+      if (!owner) v.server_id = null;
+      v.current = owner !== undefined && owner.data.volume === v.name;
+      // A server's container mounts its current data volume, also while stopped.
+      v.in_use = v.current && owner !== undefined && owner.container_id !== "";
+    }
+  }
+
+  /** A new data volume for the server (first start, restore, or a start after a reset). */
+  function newVolume(s: Server) {
+    const name = `golem-deploy-data-${s.id}-${++st.volumeSeq}`;
+    st.volumes.push({ name, server_id: s.id, server_name: s.name, current: true, created_at: iso(), in_use: false });
+    s.data.volume = name;
+  }
+
+  function dropVolume(name: string) {
+    st.volumes = st.volumes.filter((v) => v.name !== name);
+  }
+
+  /** Stores a backup of the server's current data, as the jobs below do. */
+  function addBackup(s: Server, kind: BackupKind, job: Job | null, me: Me | null, extra: Partial<Backup> = {}): Backup {
+    const b = st.builds.find((x) => x.id === s.build_id);
+    const id = st.nextBackupId++;
+    const backup: Backup = {
+      id,
+      kind,
+      server_id: s.id,
+      server_name: s.name,
+      project_id: s.project_id,
+      project_name: st.projects.find((p) => p.id === s.project_id)?.name ?? "",
+      build_id: s.build_id,
+      commit: b?.commit ?? "",
+      engine_version: b?.engine_version ?? "",
+      schema_fingerprint: s.data.schema_fingerprint,
+      live: s.state === "running",
+      note: "",
+      size_bytes: 3_000_000 + Math.round(Math.random() * 2_000_000),
+      content_bytes: 9_000_000 + Math.round(Math.random() * 4_000_000),
+      file_count: 3,
+      sha256: fakeFingerprint(`backup-${id}-${Date.now()}`),
+      job_id: job?.id ?? null,
+      created_by: me?.id ?? null,
+      created_by_username: me?.username ?? null,
+      created_at: iso(),
+      ...extra,
+    };
+    st.backups.unshift(backup);
+    return backup;
   }
 
   /** Servers whose container was created from the image (a server keeps its container until its next start). */
@@ -781,7 +932,7 @@ export function createMockTransport(real: Transport): Transport {
     const body = <T,>(): T => JSON.parse(typeof init.body === "string" ? init.body : "{}") as T;
     let m: RegExpMatchArray | null;
     const mocked =
-      /^\/(projects|builds|servers|images|static|volumes)(\/|$)/.test(path) ||
+      /^\/(projects|builds|servers|backups|images|static|volumes)(\/|$)/.test(path) ||
       /^\/certificates\/(game|panel|acme|acme\/renew)$/.test(path) ||
       (path === "/jobs" && ["project", "server", "certificate"].includes(query.get("subject_type") ?? "")) ||
       (/^\/jobs\/\d+(\/log|\/cancel)?$/.test(path) && st.jobs.some((j) => path.split("/")[2] === String(j.id)));
@@ -1007,10 +1158,14 @@ export function createMockTransport(real: Transport): Transport {
       if ("message" in oe) return fail(st, 400, "validation_failed", oe.message, oe.field);
       const ee = envError(req.env, "env");
       if (ee) return fail(st, 400, "validation_failed", ee.message, ee.field);
+      const de = dataSettingsError(req);
+      if (de) return fail(st, 400, "validation_failed", de.message, de.field);
       if (st.servers.some((s) => s.name === req.name)) return fail(st, 409, "name_taken", "a server with that name already exists");
       const port = req.port ?? nextPort(st);
       if (port === null || st.servers.some((s) => s.port === port)) return fail(st, 409, "port_in_use", "that port is already assigned to another server (or the port range is full)");
       const s = newServer(req.name, port, oe.value, req.env, req.desired_state ?? "stopped");
+      if (req.snapshot_interval_seconds !== undefined) s.snapshot_interval_seconds = req.snapshot_interval_seconds;
+      if (req.backup_schedule) s.backup_schedule = { ...req.backup_schedule };
       applyBuild(s, be.build);
       st.servers.push(s);
       if (s.desired_state === "running") startServerAction(s, "start", me);
@@ -1031,6 +1186,8 @@ export function createMockTransport(real: Transport): Transport {
             allowed_origins: s.allowed_origins,
             env: st.env.get(s.id) ?? {},
             desired_state: s.desired_state,
+            snapshot_interval_seconds: s.snapshot_interval_seconds,
+            backup_schedule: s.backup_schedule,
           };
         }),
       };
@@ -1041,7 +1198,9 @@ export function createMockTransport(real: Transport): Transport {
       const req = body<ServerExport & { servers?: Record<string, unknown>[] }>();
       // Unknown fields are a decode error (400 bad_request), e.g. the image of a version 1 document.
       for (const spec of req.servers ?? []) {
-        const extra = Object.keys(spec).find((k) => !["name", "project", "commit", "port", "allowed_origins", "env", "desired_state"].includes(k));
+        const extra = Object.keys(spec).find(
+          (k) => !["name", "project", "commit", "port", "allowed_origins", "env", "desired_state", "snapshot_interval_seconds", "backup_schedule"].includes(k),
+        );
         if (extra) return fail(st, 400, "bad_request", `unknown field "${extra}"`, extra);
       }
       if (req.format_version !== 2) return fail(st, 400, "validation_failed", "format_version must be 2", "format_version");
@@ -1062,6 +1221,8 @@ export function createMockTransport(real: Transport): Transport {
         if (ee) return fail(st, 400, "validation_failed", ee.message, ee.field);
         const oe = originsError(spec.allowed_origins, f("allowed_origins"));
         if ("message" in oe) return fail(st, 400, "validation_failed", oe.message, oe.field);
+        const de = dataSettingsError(spec, `servers[${i}].`);
+        if (de) return fail(st, 400, "validation_failed", de.message, de.field);
         if (!spec.project) return fail(st, 400, "validation_failed", "project is required (the server runs a build of that project)", f("project"));
         if (spec.commit && !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(spec.commit)) return fail(st, 400, "validation_failed", "commit must be a full lower-case commit hash", f("commit"));
         const p = st.projects.find((x) => x.name === spec.project);
@@ -1083,6 +1244,8 @@ export function createMockTransport(real: Transport): Transport {
       }
       const created = req.servers.map((spec, i) => {
         const s = newServer(spec.name, spec.port ?? nextPort(st) ?? 0, resolved[i].origins, spec.env, "stopped");
+        if (spec.snapshot_interval_seconds !== undefined) s.snapshot_interval_seconds = spec.snapshot_interval_seconds;
+        if (spec.backup_schedule) s.backup_schedule = { ...spec.backup_schedule };
         applyBuild(s, resolved[i].build);
         st.servers.push(s);
         return s;
@@ -1090,7 +1253,7 @@ export function createMockTransport(real: Transport): Transport {
       refreshDerived();
       return json(st, 201, { created });
     }
-    if ((m = path.match(/^\/servers\/(\d+)(\/start|\/stop|\/restart|\/logs|\/stats|\/runtime|\/connectivity)?$/))) {
+    if ((m = path.match(/^\/servers\/(\d+)(\/start|\/stop|\/restart|\/logs|\/stats|\/runtime|\/connectivity|\/backups|\/restore|\/data\/reset)?$/))) {
       const s = st.servers.find((x) => x.id === Number(m?.[1]));
       if (!s) return fail(st, 404, "not_found", "server not found");
       const sub = m[2];
@@ -1116,6 +1279,8 @@ export function createMockTransport(real: Transport): Transport {
         }
         const ee = envError(req.env_set, "env_set");
         if (ee) return fail(st, 400, "validation_failed", ee.message, ee.field);
+        const de = dataSettingsError(req);
+        if (de) return fail(st, 400, "validation_failed", de.message, de.field);
         let build: Build | null = st.builds.find((b) => b.id === s.build_id) ?? null;
         if (req.build_id !== undefined) {
           const be = buildError(st, req.build_id);
@@ -1152,7 +1317,12 @@ export function createMockTransport(real: Transport): Transport {
         for (const k of req.env_unset ?? []) delete env[k];
         Object.assign(env, req.env_set ?? {});
         const originsChanged = origins.join(",") !== s.allowed_origins.join(",");
-        const changed = buildChange || portChange || originsChanged || Object.keys(req.env_set ?? {}).length > 0 || (req.env_unset ?? []).length > 0;
+        // The autosave period is part of the container's definition; the backup schedule is not.
+        const snapshotChange = req.snapshot_interval_seconds !== undefined && req.snapshot_interval_seconds !== s.snapshot_interval_seconds;
+        const changed =
+          buildChange || portChange || originsChanged || snapshotChange || Object.keys(req.env_set ?? {}).length > 0 || (req.env_unset ?? []).length > 0;
+        if (req.snapshot_interval_seconds !== undefined) s.snapshot_interval_seconds = req.snapshot_interval_seconds;
+        if (req.backup_schedule) s.backup_schedule = { ...req.backup_schedule };
         st.env.set(s.id, env);
         // The current container keeps the old build's image until the next start.
         if (buildChange && s.container_id && !containerImage.has(s.id)) containerImage.set(s.id, s.image);
@@ -1187,6 +1357,9 @@ export function createMockTransport(real: Transport): Transport {
         while (isActive(job)) await sleep(200);
         if (lost) return fail(st, 503, "service_unavailable", "Docker is unreachable");
         st.servers = st.servers.filter((x) => x.id !== s.id);
+        // Its data volume goes with it; its backups stay, without the server id.
+        if (s.data.volume) dropVolume(s.data.volume);
+        for (const b of st.backups) if (b.server_id === s.id) b.server_id = null;
         st.env.delete(s.id);
         st.serverCerts.delete(s.id);
         containerImage.delete(s.id);
@@ -1195,6 +1368,37 @@ export function createMockTransport(real: Transport): Transport {
       if ((sub === "/start" || sub === "/stop" || sub === "/restart") && method === "POST") {
         if (activeJobFor(st, "server", s.id)) return fail(st, 409, "job_in_progress", "another job is already running for this server");
         return json(st, 202, startServerAction(s, sub.slice(1) as "start" | "stop" | "restart", me));
+      }
+      if (sub === "/backups" && method === "POST") {
+        const req = typeof init.body === "string" && init.body ? body<CreateBackupRequest>() : {};
+        const note = req.note ?? "";
+        if (/[\r\n]/.test(note) || [...note].length > 200) return fail(st, 400, "validation_failed", "note must be a single line of at most 200 characters", "note");
+        if (activeJobFor(st, "server", s.id)) return fail(st, 409, "job_in_progress", "another job is already running for this server");
+        return json(st, 202, backupJob(s, note, me));
+      }
+      if (sub === "/restore" && method === "POST") {
+        if (!admin) return forbidden();
+        const req = body<RestoreServerRequest>();
+        const b = st.backups.find((x) => x.id === req.backup_id);
+        if (!b) return fail(st, 400, "validation_failed", `backup ${req.backup_id} does not exist`, "backup_id");
+        const build = st.builds.find((x) => x.id === s.build_id && x.status === "success");
+        if (!build) return fail(st, 409, "conflict", "the server has no successful build; assign one before restoring a backup into it");
+        if (activeJobFor(st, "server", s.id)) return fail(st, 409, "job_in_progress", "another job is already running for this server");
+        if (!req.force && b.schema_fingerprint && build.schema_fingerprint && b.schema_fingerprint !== build.schema_fingerprint) {
+          return fail(
+            st,
+            409,
+            "schema_mismatch",
+            `the backup was saved with schema ${b.schema_fingerprint.slice(0, 12)}, but build ${build.id} has schema ${build.schema_fingerprint.slice(0, 12)}; the server would not load it (restore with force to do it anyway)`,
+          );
+        }
+        return json(st, 202, restoreJob(s, b, req.skip_safety_backup === true, me));
+      }
+      if (sub === "/data/reset" && method === "POST") {
+        if (!admin) return forbidden();
+        const req = typeof init.body === "string" && init.body ? body<ResetServerDataRequest>() : {};
+        if (activeJobFor(st, "server", s.id)) return fail(st, 409, "job_in_progress", "another job is already running for this server");
+        return json(st, 202, resetJob(s, req.skip_safety_backup === true, me));
       }
       if (sub === "/logs" && method === "GET") {
         let tail = 200;
@@ -1370,10 +1574,49 @@ export function createMockTransport(real: Transport): Transport {
       }
       return null;
     }
-    if (path === "/volumes" && method === "GET") return json(st, 200, { items: st.volumes });
+    if (path === "/volumes" && method === "GET") {
+      refreshDerived();
+      return json(st, 200, { items: st.volumes });
+    }
     if ((m = path.match(/^\/volumes\/([^/]+)$/)) && method === "DELETE") {
       if (!admin) return forbidden();
-      return fail(st, 404, "not_found", "volume not found");
+      refreshDerived();
+      const v = st.volumes.find((x) => x.name === decodeURIComponent(m?.[1] ?? ""));
+      if (!v) return fail(st, 404, "not_found", "volume not found");
+      if (v.in_use) return fail(st, 409, "conflict", "the volume is in use by a container");
+      if (v.current) return fail(st, 409, "conflict", `the volume holds the current data of server ${v.server_name}; delete the server or reset its data instead`);
+      dropVolume(v.name);
+      return json(st, 204, null);
+    }
+
+    // Backups.
+    if (path === "/backups" && method === "GET") {
+      const sid = query.get("server_id");
+      if (sid !== null && sid !== "" && !/^[1-9]\d*$/.test(sid)) return fail(st, 400, "bad_request", "server_id must be a positive integer");
+      const items = st.backups.filter((b) => !sid || b.server_id === Number(sid));
+      return json(st, 200, { items, total_bytes: st.backups.reduce((n, b) => n + b.size_bytes, 0), max_content_bytes: BACKUP_MAX_CONTENT });
+    }
+    if ((m = path.match(/^\/backups\/(\d+)(\/download)?$/))) {
+      const b = st.backups.find((x) => x.id === Number(m?.[1]));
+      if (!b) return fail(st, 404, "not_found", "backup not found");
+      if (method === "GET" && !m[2]) return json(st, 200, b);
+      if (method === "GET" && m[2]) {
+        // Not a real archive: the gzip magic and a line of text.
+        const bytes = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, ...new TextEncoder().encode(` pretend backup ${b.id} of ${b.server_name}`)]);
+        return new Response(new Blob([bytes]), {
+          status: 200,
+          headers: headers(st, { "Content-Type": "application/gzip", "Content-Disposition": `attachment; filename="${b.server_name || "server"}-backup-${b.id}.tar.gz"` }),
+        });
+      }
+      if (method === "DELETE") {
+        if (!admin) return forbidden();
+        if ([...st.restoreReads].some(([jobId, backupId]) => backupId === b.id && st.jobs.some((j) => j.id === jobId && isActive(j)))) {
+          return fail(st, 409, "conflict", "a restore is reading this backup; wait for it to finish");
+        }
+        st.backups = st.backups.filter((x) => x.id !== b.id);
+        return json(st, 204, null);
+      }
+      return null;
     }
     return null;
   }
@@ -1403,6 +1646,9 @@ export function createMockTransport(real: Transport): Transport {
       exit_code: null,
       restart_required: false,
       certificate: null,
+      data: { volume: "", schema_fingerprint: "", schema_mismatch: false, last_backup_at: null },
+      snapshot_interval_seconds: 300,
+      backup_schedule: { interval_hours: 0, keep: 7 },
       created_at: iso(),
       updated_at: iso(),
     };
@@ -1593,6 +1839,11 @@ export function createMockTransport(real: Transport): Transport {
       steps.splice(2, steps.length, "container | panic: listen udp :7777: \\x1b[31mbind: address already in use\\x1b[0m", "container | exit status 1", "FAIL");
       failDetail = "the game exited with code 1 before it reported ready; see GET /servers/{id}/logs";
     }
+    refreshDerived();
+    if (action !== "stop" && build && s.data.schema_mismatch) {
+      steps.splice(0, steps.length, "checking the saved data's schema", "FAIL");
+      failDetail = `the saved data has schema ${s.data.schema_fingerprint.slice(0, 12)}, but build ${build.id} has schema ${build.schema_fingerprint.slice(0, 12)}; assign a build with the saved schema, restore a matching backup or reset the data`;
+    }
     if (s.state === "unknown") {
       steps.splice(0, steps.length, `${action} server "${s.name}"`, "FAIL");
       failDetail = "Docker is unreachable";
@@ -1602,17 +1853,96 @@ export function createMockTransport(real: Transport): Transport {
         if (ok && s.state !== "unknown") Object.assign(s, { state: "exited", exit_code: 0, started_at: null, restart_required: false });
         return;
       }
-      if (!build || s.state === "unknown") return;
+      // A start refused for the saved data's schema never touched the container.
+      if (!build || s.state === "unknown" || (!ok && s.data.schema_mismatch)) return;
       // A start replaces the container: it now runs the configured build's image.
       containerImage.delete(s.id);
       if (st.certMode === "self_signed" && !st.serverCerts.has(s.id)) st.serverCerts.set(s.id, selfSignedCert(`server-${s.id}-${Date.now()}`));
       if (ok) {
         Object.assign(s, { state: "running", exit_code: null, started_at: iso(), restart_required: false, container_id: s.container_id || `c0ffee${s.id}0000` });
         if (!build.schema_fingerprint) build.schema_fingerprint = FINGERPRINT;
+        // The game reports its schema when it becomes ready; a new world gets the build's.
+        if (!s.data.volume) newVolume(s);
+        if (!s.data.schema_fingerprint) s.data.schema_fingerprint = build.schema_fingerprint;
       } else {
         Object.assign(s, { state: "exited", exit_code: 1, started_at: null, container_id: s.container_id || `c0ffee${s.id}0000` });
       }
     }, failDetail);
+  }
+
+  /** POST /servers/{id}/backups: a fresh snapshot from a running game, or the files as they are. */
+  function backupJob(s: Server, note: string, me: Me): Job {
+    const running = s.state === "running";
+    const steps = running
+      ? ["asking the game for a fresh snapshot", "copying the data directory", "writing the archive"]
+      : ["copying the data directory (the server is not running)", "writing the archive"];
+    let detail = "";
+    if (!s.data.volume) {
+      steps.splice(0, steps.length, "FAIL");
+      detail = "the server has no saved data yet; start it once so that the game creates its world";
+    } else if (s.state === "unknown") {
+      steps.splice(0, steps.length, "FAIL");
+      detail = "Docker is unreachable";
+    }
+    const job: Job = startJob(st, me, false, "server.backup", "server", s.id, steps, (ok) => {
+      if (ok) addBackup(s, "manual", job, me, { note, live: running });
+    }, detail);
+    return job;
+  }
+
+  /** POST /servers/{id}/restore: stop, safety backup, replace the data, start again if meant to run. */
+  function restoreJob(s: Server, b: Backup, skipSafety: boolean, me: Me): Job {
+    const wasActive = s.state === "running" || s.state === "restarting";
+    const safety = !skipSafety && s.data.volume !== "";
+    const steps = [
+      ...(wasActive ? [`stopping container golem-deploy-${s.name}`] : []),
+      ...(safety ? ["taking a safety backup of the current data"] : []),
+      `replacing the data with backup ${b.id}`,
+      ...(s.desired_state === "running" ? [`starting container golem-deploy-${s.name}`, "waiting for the game to report ready"] : []),
+    ];
+    const job: Job = startJob(st, me, true, "server.restore", "server", s.id, steps, (ok) => {
+      if (!ok) return;
+      if (safety) addBackup(s, "pre_restore", job, me);
+      if (s.data.volume) dropVolume(s.data.volume);
+      newVolume(s);
+      s.data.schema_fingerprint = b.schema_fingerprint;
+      refreshDerived();
+      // A forced restore of another schema leaves the server unable to start.
+      const start = s.desired_state === "running" && !s.data.schema_mismatch;
+      Object.assign(s, start
+        ? { state: "running", started_at: iso(), exit_code: null, container_id: s.container_id || `c0ffee${s.id}0000`, restart_required: false }
+        : { state: s.container_id ? "exited" : "missing", started_at: null });
+    });
+    st.restoreReads.set(job.id, b.id);
+    return job;
+  }
+
+  /** POST /servers/{id}/data/reset: stop, safety backup, discard the data, start with an empty world if meant to run. */
+  function resetJob(s: Server, skipSafety: boolean, me: Me): Job {
+    const wasActive = s.state === "running" || s.state === "restarting";
+    const safety = !skipSafety && s.data.volume !== "";
+    const steps = [
+      ...(wasActive ? [`stopping container golem-deploy-${s.name}`] : []),
+      ...(safety ? ["taking a safety backup of the current data"] : []),
+      "discarding the saved data",
+      ...(s.desired_state === "running" ? [`starting container golem-deploy-${s.name}`, "waiting for the game to report ready"] : []),
+    ];
+    const job: Job = startJob(st, me, true, "server.data_reset", "server", s.id, steps, (ok) => {
+      if (!ok) return;
+      if (safety) addBackup(s, "pre_reset", job, me);
+      if (s.data.volume) dropVolume(s.data.volume);
+      s.data.volume = "";
+      s.data.schema_fingerprint = "";
+      if (s.desired_state === "running") {
+        newVolume(s);
+        s.data.schema_fingerprint = st.builds.find((x) => x.id === s.build_id)?.schema_fingerprint ?? "";
+        Object.assign(s, { state: "running", started_at: iso(), exit_code: null, container_id: s.container_id || `c0ffee${s.id}0000`, restart_required: false });
+      } else {
+        Object.assign(s, { state: s.container_id ? "exited" : "missing", started_at: null });
+      }
+      refreshDerived();
+    });
+    return job;
   }
 
   return {

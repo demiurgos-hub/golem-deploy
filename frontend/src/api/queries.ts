@@ -46,6 +46,8 @@ export function invalidateJobSubject(queryClient: QueryClient, job: Job) {
     void queryClient.invalidateQueries({ queryKey: qk.builds.all });
     void queryClient.invalidateQueries({ queryKey: qk.volumes });
     void queryClient.invalidateQueries({ queryKey: qk.images });
+    // Backups, restores and resets add backups; a deletion orphans them.
+    void queryClient.invalidateQueries({ queryKey: qk.backups.all });
   } else if (job.subject_type === "certificate") {
     void queryClient.invalidateQueries({ queryKey: qk.certificates.all });
     void queryClient.invalidateQueries({ queryKey: qk.servers.all });
@@ -263,4 +265,17 @@ export function useStaticFiles() {
 export function useVolumes() {
   const api = useApi();
   return useQuery({ queryKey: qk.volumes, queryFn: ({ signal }) => api.volumes.list(signal) });
+}
+
+/**
+ * Backups of the installation, or of one server, newest first. Scheduled
+ * backups appear on their own, so the list is polled slowly while visible.
+ */
+export function useBackups(serverId: number | null = null) {
+  const api = useApi();
+  return useQuery({
+    queryKey: qk.backups.list(serverId),
+    queryFn: ({ signal }) => api.backups.list(serverId === null ? {} : { server_id: serverId }, signal),
+    refetchInterval: POLL_IDLE_MS,
+  });
 }

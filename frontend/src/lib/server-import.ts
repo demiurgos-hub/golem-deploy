@@ -1,5 +1,14 @@
 import type { ServerExport, ServerSpec } from "@/api/types.gen";
-import { RESOURCE_NAME_RE, validateEnvKey, validateEnvTotals, validateEnvValue } from "@/lib/validators";
+import {
+  BACKUP_INTERVAL_MAX_HOURS,
+  BACKUP_KEEP_MAX,
+  RESOURCE_NAME_RE,
+  SNAPSHOT_INTERVAL_MAX,
+  SNAPSHOT_INTERVAL_MIN,
+  validateEnvKey,
+  validateEnvTotals,
+  validateEnvValue,
+} from "@/lib/validators";
 
 export interface ImportCheck {
   value: ServerExport | null;
@@ -19,7 +28,11 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-const SPEC_FIELDS = new Set(["name", "project", "commit", "port", "allowed_origins", "env", "desired_state"]);
+const SPEC_FIELDS = new Set(["name", "project", "commit", "port", "allowed_origins", "env", "desired_state", "snapshot_interval_seconds", "backup_schedule"]);
+
+function isWhole(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v);
+}
 
 /**
  * Checks a JSON export (GET /servers/export) before anything is sent, listing
@@ -102,6 +115,24 @@ export function checkServerImport(text: string): ImportCheck {
     }
     if (raw.desired_state !== undefined && raw.desired_state !== "" && raw.desired_state !== "running" && raw.desired_state !== "stopped") {
       errors.push(`${label}: desired_state must be "running" or "stopped".`);
+    }
+    // Optional since the saved data milestone; an import without them uses the defaults.
+    const snap = raw.snapshot_interval_seconds;
+    if (snap !== undefined && snap !== null && (!isWhole(snap) || (snap !== 0 && (snap < SNAPSHOT_INTERVAL_MIN || snap > SNAPSHOT_INTERVAL_MAX)))) {
+      errors.push(`${label}: snapshot_interval_seconds must be 0 or ${SNAPSHOT_INTERVAL_MIN} to ${SNAPSHOT_INTERVAL_MAX}.`);
+    }
+    const sched = raw.backup_schedule;
+    if (sched !== undefined && sched !== null) {
+      if (!isRecord(sched)) errors.push(`${label}: backup_schedule must be an object with interval_hours and keep.`);
+      else {
+        for (const k of Object.keys(sched)) if (k !== "interval_hours" && k !== "keep") errors.push(`${label}: backup_schedule has an unknown field "${k}".`);
+        if (!isWhole(sched.interval_hours) || sched.interval_hours < 0 || sched.interval_hours > BACKUP_INTERVAL_MAX_HOURS) {
+          errors.push(`${label}: backup_schedule.interval_hours must be 0 (off) or 1 to ${BACKUP_INTERVAL_MAX_HOURS}.`);
+        }
+        if (!isWhole(sched.keep) || sched.keep < 1 || sched.keep > BACKUP_KEEP_MAX) {
+          errors.push(`${label}: backup_schedule.keep must be 1 to ${BACKUP_KEEP_MAX}.`);
+        }
+      }
     }
     if (raw.env !== undefined && raw.env !== null) {
       if (!isRecord(raw.env)) errors.push(`${label}: env must be an object of names to values.`);

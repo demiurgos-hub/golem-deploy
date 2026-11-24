@@ -278,3 +278,48 @@ export function validatePort(value: string, { optional }: { optional: boolean })
   if (n < 1024 || n > 32767) return "Use a port from the daemon's port range (always within 1024 to 32767).";
   return null;
 }
+
+/** Server.snapshot_interval_seconds: 0 (autosave off) or 10 to 86400; the daemon's default is 300. */
+export const SNAPSHOT_INTERVAL_DEFAULT = 300;
+export const SNAPSHOT_INTERVAL_MIN = 10;
+export const SNAPSHOT_INTERVAL_MAX = 86_400;
+/** BackupSchedule: interval_hours 0 (off) or 1 to 720; keep 1 to 100, default 7. */
+export const BACKUP_INTERVAL_MAX_HOURS = 720;
+export const BACKUP_KEEP_DEFAULT = 7;
+export const BACKUP_KEEP_MAX = 100;
+/** CreateBackupRequest.note: one line of at most 200 characters. */
+export const BACKUP_NOTE_MAX = 200;
+
+function wholeNumber(value: string): number | null {
+  const v = value.trim();
+  return /^\d+$/.test(v) ? Number(v) : null;
+}
+
+export const validateSnapshotInterval: Validator = (value) => {
+  const n = wholeNumber(value);
+  if (n === null) return "Enter a whole number of seconds.";
+  if (n !== 0 && (n < SNAPSHOT_INTERVAL_MIN || n > SNAPSHOT_INTERVAL_MAX)) {
+    return `Use 0 to turn autosave off, or ${SNAPSHOT_INTERVAL_MIN} to ${SNAPSHOT_INTERVAL_MAX.toLocaleString("en-US")} seconds (24 hours).`;
+  }
+  return null;
+};
+
+export const validateBackupInterval: Validator = (value) => {
+  const n = wholeNumber(value);
+  if (n === null) return "Enter a whole number of hours.";
+  if (n > BACKUP_INTERVAL_MAX_HOURS) return `Use 0 to turn scheduled backups off, or 1 to ${BACKUP_INTERVAL_MAX_HOURS} hours (30 days).`;
+  return null;
+};
+
+export const validateBackupKeep: Validator = (value) => {
+  const n = wholeNumber(value);
+  if (n === null) return "Enter a whole number.";
+  if (n < 1 || n > BACKUP_KEEP_MAX) return `Keep 1 to ${BACKUP_KEEP_MAX} scheduled backups.`;
+  return null;
+};
+
+export const validateBackupNote: Validator = (value) => {
+  if (/[\r\n]/.test(value)) return "Use a single line.";
+  if ([...value].length > BACKUP_NOTE_MAX) return `Use at most ${BACKUP_NOTE_MAX} characters.`;
+  return null;
+};
