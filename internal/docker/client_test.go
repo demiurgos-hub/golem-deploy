@@ -39,7 +39,7 @@ func newClient(t *testing.T) (*docker.Client, *dockertest.Fake, *bytes.Buffer) {
 
 func managedImage(f *dockertest.Fake, n int, tags ...string) string {
 	id := dockertest.ImageID(n)
-	f.AddImage(dockertest.Image{ID: id, Tags: tags, Labels: dockertest.ManagedLabels(), Logs: []string{"hello"}})
+	f.AddImage(dockertest.Image{ID: id, Tags: tags, Labels: dockertest.OurLabels(), Logs: []string{"hello"}})
 	return id
 }
 
@@ -80,6 +80,8 @@ func TestRunSpecArgvExact(t *testing.T) {
 		"--label", "dev.golemengine.deploy.server=arena",
 		"--label", "dev.golemengine.deploy.project-id=4",
 		"--label", "dev.golemengine.deploy.commit=",
+		"--label", "dev.golemengine.deploy.build-id=",
+		"--label", "dev.golemengine.deploy.engine-version=",
 		"--label", "dev.golemengine.deploy.config-hash=abc",
 		"--restart", "no", "--init", "--no-healthcheck", "--stop-signal", "SIGTERM", "--stop-timeout", "30",
 		"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512",
@@ -109,6 +111,8 @@ func TestRunSpecOptionsAndExtensionPoints(t *testing.T) {
 	s.ReadOnlyBinds = []docker.BindMount{{Source: "/srv/certs", Target: "/certs"}}
 	s.DataVolume = &docker.VolumeMount{Name: "golem-deploy-arena-data", Target: "/data"}
 	s.AdminPort, s.AdminHostPort = 9000, 19000
+	s.GroupAdd = []int{1001}
+	s.BuildID, s.Commit, s.EngineVersion = 31, "abc123", "v0.4.0"
 	s.DaemonEnv = map[string]string{"mode": "daemon", "GOLEM_ENGINE_PORT": "7777"} // overrides MODE ignoring case; may use GOLEM_
 	args, err := s.Args(instance, "/tmp/env")
 	if err != nil {
@@ -119,6 +123,9 @@ func TestRunSpecOptionsAndExtensionPoints(t *testing.T) {
 		"--memory 512m --memory-swap 512m", "--cpus 1.5", "--pids-limit 64", "--user 65532:1000",
 		"--publish [::1]:7005:7777/udp", "--publish [::1]:7005:7777/tcp",
 		"--publish 127.0.0.1:19000:9000/tcp",
+		"--user 65532:1000 --group-add 1001 --network golem-deploy",
+		"--label dev.golemengine.deploy.build-id=31", "--label dev.golemengine.deploy.commit=abc123",
+		"--label dev.golemengine.deploy.engine-version=v0.4.0",
 		"--mount type=bind,source=/srv/certs,target=/certs,readonly",
 		"--mount type=volume,source=golem-deploy-arena-data,target=/data",
 	} {
@@ -129,6 +136,11 @@ func TestRunSpecOptionsAndExtensionPoints(t *testing.T) {
 	envFile, _ := s.EnvFile()
 	if string(envFile) != "A_FIRST=x\nGOLEM_ENGINE_PORT=7777\nmode=daemon\n" {
 		t.Fatalf("env %q", envFile)
+	}
+	// Without a host port Docker assigns one on loopback.
+	s.AdminHostPort = 0
+	if args, err := s.Args(instance, "/tmp/env"); err != nil || !strings.Contains(strings.Join(args, " "), "--publish 127.0.0.1::9000/tcp") {
+		t.Fatalf("dynamic admin port: %v %q", err, args)
 	}
 
 	bad := []func(*docker.RunSpec){
@@ -147,6 +159,11 @@ func TestRunSpecOptionsAndExtensionPoints(t *testing.T) {
 		func(s *docker.RunSpec) { s.DataVolume = &docker.VolumeMount{Name: "-x", Target: "/d"} },
 		func(s *docker.RunSpec) { s.ServerID = 0 },
 		func(s *docker.RunSpec) { s.Commit = "a\nb" },
+		func(s *docker.RunSpec) { s.EngineVersion = "v1\r" },
+		func(s *docker.RunSpec) { s.GroupAdd = []int{0} },
+		func(s *docker.RunSpec) { s.GroupAdd = []int{-5} },
+		func(s *docker.RunSpec) { s.BuildID = -1 },
+		func(s *docker.RunSpec) { s.AdminPort = docker.GamePort },
 	}
 	for i, mut := range bad {
 		s := spec(dockertest.ImageID(1))
@@ -434,6 +451,15 @@ func TestImagesAndVolumesManagedOnly(t *testing.T) {
 	managed := managedImage(f, 1, "game:v1")
 	unmanaged := dockertest.ImageID(2)
 	f.AddImage(dockertest.Image{ID: unmanaged, Tags: []string{"postgres:16"}})
+	// Managed by hand or by another installation: not ours.
+	f.AddImage(dockertest.Image{ID: dockertest.ImageID(3), Tags: []string{"hand:1"}, Labels: dockertest.ManagedLabels()})
+	f.AddImage(dockertest.Image{ID: dockertest.ImageID(4), Tags: []string{"other:1"},
+		Labels: dockertest.ManagedLabels(docker.LabelInstance, dockertest.IntegrationInstanceID)})
+	for _, ref := range []string{"hand:1", "other:1"} {
+		if _, err := c.ManagedImage(ctx, ref); !errors.Is(err, docker.ErrNotManaged) {
+			t.Fatalf("%s resolved: %v", ref, err)
+		}
+	}
 
 	imgs, err := c.ListImages(ctx)
 	if err != nil || len(imgs) != 1 || imgs[0].ID != managed || imgs[0].Tags[0] != "game:v1" {
@@ -486,6 +512,71 @@ func TestImagesAndVolumesManagedOnly(t *testing.T) {
 	}
 	if len(f.CallsTo("volume", "rm")) != 0 || !f.HasVolume("pixel_pgdata") {
 		t.Fatal("volume rm issued")
+	}
+}
+
+// A server image is trusted only as the image of a build: full id, our
+// managed and instance labels and the build's id.
+func TestBuildImage(t *testing.T) {
+	c, f, _ := newClient(t)
+	ctx := context.Background()
+	good := dockertest.ImageID(1)
+	f.AddImage(dockertest.Image{ID: good, Tags: []string{"golem-deploy/game:abc"}, Labels: dockertest.BuildLabels(7)})
+	f.AddImage(dockertest.Image{ID: dockertest.ImageID(2), Labels: dockertest.ManagedLabels(docker.LabelBuildID, "7")})
+	f.AddImage(dockertest.Image{ID: dockertest.ImageID(3), Labels: dockertest.ManagedLabels(docker.LabelInstance, dockertest.IntegrationInstanceID, docker.LabelBuildID, "7")})
+	f.AddImage(dockertest.Image{ID: dockertest.ImageID(4), Labels: dockertest.BuildLabels(8)})
+	f.AddImage(dockertest.Image{ID: dockertest.ImageID(5), Labels: dockertest.OurLabels()})
+	if img, err := c.BuildImage(ctx, good, 7); err != nil || img.ID != good || img.BuildID != 7 {
+		t.Fatalf("%+v %v", img, err)
+	}
+	for _, tc := range []struct {
+		id   string
+		want error
+	}{
+		{dockertest.ImageID(2), docker.ErrNotManaged}, // label-only, no instance
+		{dockertest.ImageID(3), docker.ErrNotManaged}, // another installation
+		{dockertest.ImageID(4), docker.ErrNotOurs},    // another build
+		{dockertest.ImageID(5), docker.ErrNotOurs},    // no build label
+		{dockertest.ImageID(9), docker.ErrNotFound},
+	} {
+		if _, err := c.BuildImage(ctx, tc.id, 7); !errors.Is(err, tc.want) {
+			t.Errorf("%s: got %v, want %v", tc.id, err, tc.want)
+		}
+	}
+	for _, ref := range []string{"golem-deploy/game:abc", good[7:19], ""} {
+		if _, err := c.BuildImage(ctx, ref, 7); err == nil {
+			t.Errorf("reference %q accepted", ref)
+		}
+	}
+	if _, err := c.BuildImage(ctx, good, 0); err == nil {
+		t.Error("build id 0 accepted")
+	}
+}
+
+// The admin port is published on loopback with a Docker-assigned port that
+// is read back from inspect.
+func TestDynamicAdminPort(t *testing.T) {
+	c, f, _ := newClient(t)
+	ctx := context.Background()
+	img := dockertest.ImageID(1)
+	f.AddImage(dockertest.Image{ID: img, Labels: dockertest.BuildLabels(3), AssignPort: 45678})
+	s := spec(img)
+	s.AdminPort = 7778
+	s.GroupAdd = []int{1000}
+	ref := run(t, c, s)
+	ct, err := c.ServerContainer(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := ct.LoopbackPort(7778); p != 45678 {
+		t.Fatalf("admin port %d (%+v)", p, ct.Ports)
+	}
+	if p := ct.LoopbackPort(docker.GamePort); p != 0 {
+		t.Fatalf("game port reported as loopback admin port %d", p)
+	}
+	fc, _ := f.Container(ref.ContainerID)
+	if !slices.Equal(fc.GroupAdd, []string{"1000"}) || fc.Labels[docker.LabelBuildID] != "" {
+		t.Fatalf("%+v", fc)
 	}
 }
 

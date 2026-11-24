@@ -9,7 +9,8 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 )
 
-// Images returns the managed images with the servers that use them.
+// Images returns this installation's managed images with the builds that
+// produced them and the servers whose build uses them.
 func (s *Service) Images(ctx context.Context) ([]apitypes.Image, error) {
 	imgs, err := s.docker.ListImages(ctx)
 	if err != nil {
@@ -19,9 +20,24 @@ func (s *Service) Images(ctx context.Context) ([]apitypes.Image, error) {
 	if err != nil {
 		return nil, err
 	}
+	byImage, err := s.store.BuildsByImage(ctx)
+	if err != nil {
+		return nil, err
+	}
 	cts, err := s.docker.ManagedContainers(ctx)
 	if err != nil {
 		return nil, err
+	}
+	bc := s.builds()
+	serverImage := map[int64]string{}
+	for _, r := range rows {
+		b, err := bc.get(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		if b != nil {
+			serverImage[r.ID] = b.ImageID
+		}
 	}
 	out := make([]apitypes.Image, 0, len(imgs))
 	for _, img := range imgs {
@@ -33,21 +49,22 @@ func (s *Service) Images(ctx context.Context) ([]apitypes.Image, error) {
 			SizeBytes: img.SizeBytes,
 			CreatedAt: img.Created,
 			ServerIDs: []int64{},
+			BuildIDs:  append([]int64{}, byImage[img.ID]...),
 		}
 		for _, r := range rows {
-			if r.Image == img.ID {
+			if serverImage[r.ID] == img.ID {
 				v.ServerIDs = append(v.ServerIDs, r.ID)
 			}
 		}
-		v.InUse = len(v.ServerIDs) > 0 || slices.ContainsFunc(cts, func(c docker.Container) bool { return c.ImageID == img.ID })
+		v.InUse = len(v.ServerIDs) > 0 || len(v.BuildIDs) > 0 || slices.ContainsFunc(cts, func(c docker.Container) bool { return c.ImageID == img.ID })
 		out = append(out, v)
 	}
 	return out, nil
 }
 
-// RemoveImage deletes a managed image no server references and no
-// container uses. Unknown and unmanaged images are both ErrNotFound so the
-// API does not reveal unmanaged images.
+// RemoveImage deletes a managed image that no successful build records
+// (delete the build instead) and no container uses. Unknown and unmanaged
+// images are both ErrNotFound so the API does not reveal unmanaged images.
 func (s *Service) RemoveImage(ctx context.Context, id string) error {
 	if err := docker.ValidateImageID(id); err != nil {
 		return fieldErr("id", "invalid image id")
@@ -59,14 +76,12 @@ func (s *Service) RemoveImage(ctx context.Context, id string) error {
 	case err != nil:
 		return err
 	}
-	rows, err := s.store.ListServers(ctx)
+	byImage, err := s.store.BuildsByImage(ctx)
 	if err != nil {
 		return err
 	}
-	for _, r := range rows {
-		if r.Image == img.ID {
-			return ErrInUse
-		}
+	if len(byImage[img.ID]) > 0 {
+		return ErrInUse
 	}
 	err = s.docker.RemoveImage(ctx, img.ID)
 	switch {

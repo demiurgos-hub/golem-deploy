@@ -10,17 +10,27 @@ import (
 // Setting keys. Values are stored as text.
 const (
 	SettingRegistrationEnabled = "registration_enabled"
+	// SettingGameHost is the DNS name or IP address players use to reach
+	// game servers ("" falls back to the first --public-host).
+	SettingGameHost = "game_host"
+	// SettingGameCertificateMode is the game certificate mode
+	// (internal/certs; "" means the default, self-signed).
+	SettingGameCertificateMode = "game_certificate_mode"
 )
 
 // Settings is the typed view of the settings table. Missing keys take the
 // zero value, which must always be the safe default.
 type Settings struct {
 	RegistrationEnabled bool
+	// GameHost is the validated game host ("" when not set).
+	GameHost string
 }
 
-// SettingsUpdate changes settings. Nil fields are unchanged.
+// SettingsUpdate changes settings. Nil fields are unchanged. Callers
+// validate values first.
 type SettingsUpdate struct {
 	RegistrationEnabled *bool
+	GameHost            *string
 }
 
 // GetSetting returns a raw setting value and whether it exists.
@@ -54,6 +64,9 @@ func (s *Store) GetSettings(ctx context.Context) (Settings, error) {
 	if ok {
 		out.RegistrationEnabled, _ = strconv.ParseBool(v)
 	}
+	if out.GameHost, _, err = s.GetSetting(ctx, SettingGameHost); err != nil {
+		return Settings{}, err
+	}
 	return out, nil
 }
 
@@ -61,6 +74,11 @@ func (s *Store) GetSettings(ctx context.Context) (Settings, error) {
 func (s *Store) UpdateSettings(ctx context.Context, upd SettingsUpdate) (Settings, error) {
 	if upd.RegistrationEnabled != nil {
 		if err := s.SetSetting(ctx, SettingRegistrationEnabled, strconv.FormatBool(*upd.RegistrationEnabled)); err != nil {
+			return Settings{}, err
+		}
+	}
+	if upd.GameHost != nil {
+		if err := s.SetSetting(ctx, SettingGameHost, *upd.GameHost); err != nil {
 			return Settings{}, err
 		}
 	}

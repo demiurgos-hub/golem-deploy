@@ -2,7 +2,8 @@ package apitypes
 
 import "time"
 
-// Image is a Docker image managed (built and labelled) by Golem Deploy.
+// Image is a Docker image managed by this Golem Deploy installation (it
+// carries the managed and instance labels).
 type Image struct {
 	// ID is the image id ("sha256:..."); use it with DELETE /api/v1/images/{id}.
 	ID   string   `json:"id"`
@@ -13,10 +14,13 @@ type Image struct {
 	Commit    string    `json:"commit"`
 	SizeBytes int64     `json:"size_bytes"`
 	CreatedAt time.Time `json:"created_at"`
-	// ServerIDs lists the servers configured with this image.
+	// ServerIDs lists the servers whose build has this image.
 	ServerIDs []int64 `json:"server_ids"`
-	// InUse reports whether a server references the image or any container
-	// was created from it; such images cannot be deleted (409 conflict).
+	// BuildIDs lists the successful builds that produced this image.
+	BuildIDs []int64 `json:"build_ids"`
+	// InUse reports whether a build or server references the image or any
+	// container was created from it; such images cannot be deleted (409
+	// conflict).
 	InUse bool `json:"in_use"`
 }
 

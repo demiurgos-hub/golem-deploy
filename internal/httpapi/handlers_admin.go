@@ -1,11 +1,13 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
+	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -51,7 +53,24 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		return internal(err)
 	}
-	writeJSON(w, http.StatusOK, apitypes.Settings{RegistrationEnabled: st.RegistrationEnabled})
+	return s.writeSettings(w, r, st)
+}
+
+// effectiveGameHost is the game host servers use ("" when none).
+func (s *Server) effectiveGameHost(ctx context.Context) (string, error) {
+	if s.servers != nil {
+		return s.servers.GameHost(ctx)
+	}
+	st, err := s.store.GetSettings(ctx)
+	return st.GameHost, err
+}
+
+func (s *Server) writeSettings(w http.ResponseWriter, r *http.Request, st store.Settings) error {
+	host, err := s.effectiveGameHost(r.Context())
+	if err != nil {
+		return internal(err)
+	}
+	writeJSON(w, http.StatusOK, apitypes.Settings{RegistrationEnabled: st.RegistrationEnabled, GameHost: st.GameHost, EffectiveGameHost: host})
 	return nil
 }
 
@@ -60,13 +79,32 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) er
 	if err := decodeJSON(r, &req); err != nil {
 		return err
 	}
-	st, err := s.store.UpdateSettings(r.Context(), store.SettingsUpdate{RegistrationEnabled: req.RegistrationEnabled})
+	upd := store.SettingsUpdate{RegistrationEnabled: req.RegistrationEnabled}
+	if req.GameHost != nil {
+		host, err := certs.ValidateHost(*req.GameHost)
+		if err != nil {
+			return invalidField("game_host", "game_host "+err.Error()+" (no scheme, port or path)")
+		}
+		upd.GameHost = &host
+	}
+	st, err := s.store.UpdateSettings(r.Context(), upd)
 	if err != nil {
 		return internal(err)
 	}
-	s.logger.Info("settings updated", "request_id", requestIDFrom(r.Context()), "account_id", identityFrom(r).Account.ID)
-	writeJSON(w, http.StatusOK, apitypes.Settings{RegistrationEnabled: st.RegistrationEnabled})
-	return nil
+	s.logger.Info("settings updated", "request_id", requestIDFrom(r.Context()), "account_id", identityFrom(r).Account.ID,
+		"game_host_changed", req.GameHost != nil)
+	if req.GameHost != nil && s.certs != nil {
+		// A self-signed certificate follows the game host; a failure is
+		// retried hourly and before every server start.
+		host, err := s.effectiveGameHost(r.Context())
+		if err == nil {
+			_, err = s.certs.Ensure(r.Context(), host)
+		}
+		if err != nil && !errors.Is(err, certs.ErrExpired) && !errors.Is(err, certs.ErrNoCertificate) {
+			s.logger.Warn("could not update the game certificate for the new game host", "request_id", requestIDFrom(r.Context()), "err", err)
+		}
+	}
+	return s.writeSettings(w, r, st)
 }
 
 func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) error {

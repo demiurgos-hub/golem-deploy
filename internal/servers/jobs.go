@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
+	"github.com/demiurgos-hub/golem-deploy/internal/gameadmin"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
@@ -73,10 +75,11 @@ func shortID(id string) string {
 	return id
 }
 
-// Start (re)creates and starts the server's container: it removes the
-// server's previous container, ensures the network, checks the host port,
-// runs the container, records its id and waits for it to keep running for
-// the settle window.
+// Start (re)creates and starts the server's container: it checks the
+// build, the game host and the certificate, verifies the build's image,
+// removes the server's previous container, ensures the network, checks the
+// host port, runs the container, records its id and admin endpoint and
+// waits for the game to report ready (see waitReady).
 func (s *Service) Start(ctx context.Context, id int64, log io.Writer) error {
 	sv, err := s.load(ctx, id)
 	if err != nil {
@@ -123,26 +126,66 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 		return jobs.Fail(fmt.Sprintf("port %d is no longer allowed (outside the configured range %s, browser-unsafe or the panel's own port); "+
 			"assign a new port with PATCH /api/v1/servers/%d and start again", port, s.cfg.Ports, sv.ID), nil)
 	}
+	if sv.BuildID == nil {
+		return jobs.Fail(fmt.Sprintf("the server has no build; assign a successful build with PATCH /api/v1/servers/%d (build_id) and start again", sv.ID), nil)
+	}
+	b, err := s.store.GetBuild(ctx, *sv.BuildID)
+	if err != nil {
+		return jobs.Fail("could not read the server's build", err)
+	}
+	if b.Status != store.BuildStatusSuccess || b.ImageID == "" {
+		return jobs.Fail(fmt.Sprintf("build %d is not a successful build; assign another build and start again", b.ID), nil)
+	}
+	if s.cfg.Certs == nil {
+		return jobs.Fail("the game certificate is not configured on this daemon", nil)
+	}
+	p, err := s.params(ctx)
+	if err != nil {
+		return jobs.Fail("could not read the server settings", err)
+	}
+	if p.gameHost == "" {
+		return jobs.Fail("no game host is configured: set game_host (PATCH /api/v1/settings) or start the daemon with --public-host", nil)
+	}
+	cert, err := s.cfg.Certs.Ensure(ctx, p.gameHost)
+	switch {
+	case errors.Is(err, certs.ErrExpired):
+		return jobs.Fail("the custom game certificate has expired; upload a new one (PUT /api/v1/certificates/game)", err)
+	case errors.Is(err, certs.ErrNoCertificate):
+		return jobs.Fail("no valid custom game certificate is installed; upload one or switch to a self-signed certificate (PUT /api/v1/certificates/game)", err)
+	case err != nil:
+		s.logger.Error("could not prepare the game certificate", "job_id", jobIDFrom(ctx), "err", err)
+		return jobs.Fail("could not prepare the game certificate; see the daemon log", nil)
+	}
 	env, err := s.openEnv(sv)
 	if err != nil {
 		return jobs.Fail("could not decrypt the server environment", err)
 	}
-	fmt.Fprintf(log, "starting server %q (id %d) on port %d (udp+tcp -> %d)\n", sv.Name, sv.ID, port, docker.GamePort)
+	fmt.Fprintf(log, "starting server %q (id %d) from build %d (commit %s) on port %d (udp+tcp -> %d)\n",
+		sv.Name, sv.ID, b.ID, shortID(b.Commit), port, docker.GamePort)
+	fmt.Fprintf(log, "public URL %s\n", publicURL(p.gameHost, port))
 	if len(env) > 0 {
 		fmt.Fprintf(log, "environment variables: %s\n", strings.Join(docker.EnvKeys(env), ", "))
 	}
+	fmt.Fprintf(log, "game certificate: %s, valid until %s, sha-256 %s\n", cert.Mode, cert.NotAfter.Format(time.RFC3339), cert.Fingerprint)
+	if !cert.Covers(p.gameHost) {
+		fmt.Fprintf(log, "warning: the game certificate does not cover the game host %s; clients will refuse it\n", p.gameHost)
+	}
 
-	img, err := s.docker.ManagedImage(ctx, sv.Image)
+	img, err := s.docker.BuildImage(ctx, b.ImageID, b.ID)
 	switch {
-	case errors.Is(err, docker.ErrNotFound), errors.Is(err, docker.ErrNotManaged):
-		return jobs.Fail("the server's image is missing or not managed by golem-deploy", nil)
+	case errors.Is(err, docker.ErrNotFound):
+		return jobs.Fail(fmt.Sprintf("the image of build %d no longer exists; build the project again", b.ID), nil)
+	case errors.Is(err, docker.ErrNotManaged), errors.Is(err, docker.ErrNotOurs):
+		s.logger.Warn("refusing to run an image without this installation's build labels", "job_id", jobIDFrom(ctx), "server_id", sv.ID,
+			"build_id", b.ID, "image", b.ImageID, "err", err)
+		return jobs.Fail(fmt.Sprintf("the image recorded for build %d does not carry this installation's labels for that build; refusing to run it", b.ID), nil)
 	case err != nil:
 		return s.failDocker(ctx, sv, "inspect the server's image", err)
 	}
 	if len(img.Volumes) > docker.MaxImageVolumes {
 		return jobs.Fail(fmt.Sprintf("the server's image declares more than %d volumes", docker.MaxImageVolumes), nil)
 	}
-	fmt.Fprintf(log, "image %s verified (managed)\n", shortID(img.ID))
+	fmt.Fprintf(log, "image %s of build %d verified\n", shortID(img.ID), b.ID)
 	if len(img.Volumes) > 0 {
 		fmt.Fprintf(log, "image volumes %s get size-limited tmpfs mounts\n", strings.Join(img.Volumes, ", "))
 	}
@@ -168,55 +211,146 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 		return jobs.Fail(fmt.Sprintf("port %d is in use by another process on the host", port), nil)
 	}
 
-	cid, err := s.docker.RunServer(ctx, s.runSpec(sv, env, img))
+	token, sealedToken, err := s.newAdminToken(sv.ID)
+	if err != nil {
+		return jobs.Fail("could not create the admin token", err)
+	}
+	spec := s.runSpec(sv, b, env, img, p, token)
+	cid, err := s.docker.RunServer(ctx, spec)
 	if err != nil {
 		return s.failDocker(ctx, sv, "create the container", err)
 	}
-	if err := s.store.SetServerContainer(context.WithoutCancel(ctx), sv.ID, cid); err != nil {
+	cref := docker.ServerRef{ServerID: sv.ID, ContainerID: cid}
+	adminPort := 0
+	if ct, err := s.docker.ServerContainer(ctx, cref); err == nil {
+		adminPort = ct.LoopbackPort(AdminContainerPort)
+	}
+	if err := s.store.SetServerContainer(context.WithoutCancel(ctx), sv.ID, cid, adminPort, sealedToken); err != nil {
 		// Without a record the container could never be reached again.
-		_, _ = s.docker.RemoveServerContainer(context.WithoutCancel(ctx), docker.ServerRef{ServerID: sv.ID, ContainerID: cid}, s.cfg.StopTimeout)
+		_, _ = s.docker.RemoveServerContainer(context.WithoutCancel(ctx), cref, s.cfg.StopTimeout)
 		return jobs.Fail("could not record the new container", err)
 	}
-	sv.ContainerID = cid
-	fmt.Fprintf(log, "container %s created, waiting %s for it to settle\n", shortID(cid), s.cfg.SettleWindow)
-	return s.settle(ctx, sv, env, log)
+	sv.ContainerID, sv.AdminPort = cid, adminPort
+	fmt.Fprintf(log, "container %s created, waiting up to %s for the game to report ready\n", shortID(cid), s.cfg.StartTimeout)
+	// The excerpt of a failed start redacts operator and daemon values.
+	return s.waitReady(ctx, sv, b, spec.DaemonEnv, env, token, log)
 }
 
-// settle waits for the settle window and fails if the container stops
-// meanwhile. The container runs without a restart policy until then, so its
-// exit code is the real one; once settled, RestartPolicy is applied. The
-// last log lines of a failed start go to the job log (sanitised, prefixed
-// and with env values redacted), never into the detail.
-func (s *Service) settle(ctx context.Context, sv store.Server, env map[string]string, log io.Writer) error {
-	deadline := time.Now().Add(s.cfg.SettleWindow)
-	t := time.NewTicker(s.cfg.SettlePoll)
+// waitReady polls the container and the game's admin endpoint until the
+// game reports ready, the container stops or StartTimeout passes. The
+// container runs without a restart policy until then, so a crash is not
+// retried and keeps its real exit code; a failed start leaves the container
+// stopped so its logs stay readable, and copies its last lines to the job
+// log (sanitised, prefixed, with env values redacted), never into the
+// detail. On ready, the game's schema fingerprint is recorded on the build
+// and RestartPolicy is applied.
+func (s *Service) waitReady(ctx context.Context, sv store.Server, b store.Build, daemonEnv, env map[string]string, token string, log io.Writer) error {
+	redactEnv := map[string]string{}
+	for k, v := range env {
+		redactEnv[k] = v
+	}
+	redactEnv[EnvAdminToken] = daemonEnv[EnvAdminToken]
+	deadline := time.Now().Add(s.cfg.StartTimeout)
+	t := time.NewTicker(s.cfg.ReadyPoll)
 	defer t.Stop()
+	answered, oddAnswer := false, false
+	logsHint := fmt.Sprintf("see the server log (GET /api/v1/servers/%d/logs) and the job log", sv.ID)
+	var client *gameadmin.Client
 	for {
 		ct, err := s.docker.ServerContainer(ctx, ref(sv))
 		if err != nil {
+			s.stopQuietly(ctx, sv)
 			return s.failDocker(ctx, sv, "inspect the new container", err)
 		}
 		if !ct.Running {
 			fmt.Fprintf(log, "container is %s (exit code %d); last output:\n", ct.State, ct.ExitCode)
-			s.writeExcerpt(ctx, sv, env, log)
-			if _, err := s.docker.StopServer(ctx, ref(sv), s.cfg.StopTimeout); err != nil {
-				fmt.Fprintln(log, "could not stop the failing container")
+			s.writeExcerpt(ctx, sv, redactEnv, log)
+			s.stopQuietly(ctx, sv)
+			return jobs.Fail(fmt.Sprintf("the container exited before the game became ready (exit code %d); %s", ct.ExitCode, logsHint), nil)
+		}
+		if p := ct.LoopbackPort(AdminContainerPort); p != 0 && p != sv.AdminPort {
+			sv.AdminPort = p
+			_ = s.store.SetServerAdminPort(context.WithoutCancel(ctx), sv.ID, sv.ContainerID, p)
+			client = nil
+		}
+		if client == nil && sv.AdminPort != 0 {
+			if client, err = gameadmin.New(sv.AdminPort, token); err != nil {
+				s.stopQuietly(ctx, sv)
+				return jobs.Fail("could not reach the game's admin endpoint", err)
 			}
-			return jobs.Fail(fmt.Sprintf("the container exited right after starting (exit code %d); see the job log", ct.ExitCode), nil)
+		}
+		if client != nil {
+			r, err := client.Ready(ctx)
+			switch {
+			case err == nil:
+				answered = true
+				if r.Ready {
+					return s.ready(ctx, sv, b, client, log)
+				}
+			case errors.Is(err, gameadmin.ErrUnauthorized), errors.Is(err, gameadmin.ErrBadResponse):
+				answered = true
+				if !oddAnswer {
+					oddAnswer = true
+					fmt.Fprintln(log, "the game's admin endpoint answered outside the Golem Engine admin contract; still waiting")
+					s.logger.Warn("unexpected admin answer during start", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", err)
+				}
+			}
 		}
 		if !time.Now().Before(deadline) {
-			if err := s.docker.ApplyRestartPolicy(ctx, ref(sv)); err != nil {
-				_, _ = s.docker.StopServer(context.WithoutCancel(ctx), ref(sv), s.cfg.StopTimeout)
-				return s.failDocker(ctx, sv, "apply the restart policy", err)
+			fmt.Fprintln(log, "the game did not report ready in time; last output:")
+			s.writeExcerpt(ctx, sv, redactEnv, log)
+			s.stopQuietly(ctx, sv)
+			if !answered {
+				return jobs.Fail(fmt.Sprintf("the game did not become ready within %s and its admin endpoint never answered: the game must use "+
+					"the Golem Engine deploy contract (golem.ServerConfigFromEnv and the generated Runtime.Host); %s", s.cfg.StartTimeout, logsHint), nil)
 			}
-			fmt.Fprintf(log, "server %q is running (restart policy %s)\n", sv.Name, docker.RestartPolicy)
-			return nil
+			return jobs.Fail(fmt.Sprintf("the game did not report ready within %s; %s", s.cfg.StartTimeout, logsHint), nil)
 		}
 		select {
 		case <-ctx.Done():
+			s.stopQuietly(ctx, sv)
 			return ctx.Err()
 		case <-t.C:
 		}
+	}
+}
+
+// ready finishes a start whose game reported ready.
+func (s *Service) ready(ctx context.Context, sv store.Server, b store.Build, client *gameadmin.Client, log io.Writer) error {
+	if info, err := client.Info(ctx); err != nil {
+		fmt.Fprintln(log, "warning: could not read the game's /info")
+		s.logger.Warn("admin /info failed after ready", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", err)
+	} else {
+		fmt.Fprintf(log, "game ready: engine %s, transport %s, schema %s\n", orDash(info.EngineVersion), orDash(info.Transport), orDash(info.SchemaFingerprint))
+		if info.SchemaFingerprint != "" && info.SchemaFingerprint != b.SchemaFingerprint {
+			if err := s.store.SetBuildFingerprint(context.WithoutCancel(ctx), b.ID, info.SchemaFingerprint); err != nil {
+				s.logger.Warn("could not record the schema fingerprint", "build_id", b.ID, "err", err)
+			}
+		}
+		if b.EngineVersion != "" && info.EngineVersion != "" && b.EngineVersion != info.EngineVersion {
+			fmt.Fprintf(log, "note: the game reports engine %s, the build recorded %s\n", info.EngineVersion, b.EngineVersion)
+		}
+	}
+	if err := s.docker.ApplyRestartPolicy(ctx, ref(sv)); err != nil {
+		s.stopQuietly(ctx, sv)
+		return s.failDocker(ctx, sv, "apply the restart policy", err)
+	}
+	fmt.Fprintf(log, "server %q is running (restart policy %s)\n", sv.Name, docker.RestartPolicy)
+	return nil
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// stopQuietly stops a container whose start failed (it is kept for its
+// logs), also when ctx is cancelled.
+func (s *Service) stopQuietly(ctx context.Context, sv store.Server) {
+	if _, err := s.docker.StopServer(context.WithoutCancel(ctx), ref(sv), s.cfg.StopTimeout); err != nil {
+		s.logger.Warn("could not stop the container of a failed start", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", err)
 	}
 }
 

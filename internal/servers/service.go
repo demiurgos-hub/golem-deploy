@@ -1,15 +1,18 @@
 // Package servers is the game server service: server definitions in the
-// store (env sealed with secrets.ServerEnvPurpose), their containers through
-// the label-scoped docker client (each server's container is the one whose
-// id is recorded in its row), host port allocation, the start/stop/
-// restart/delete job bodies, export/import, startup reconciliation, the
-// managed image and volume views that cross-reference servers, and the
-// sanitising of container output shown to users.
+// store (env sealed with secrets.ServerEnvPurpose), each running the image
+// of a successful build, their containers through the label-scoped docker
+// client (each server's container is the one whose id is recorded in its
+// row), the Golem Engine deploy contract injected into every container,
+// host port allocation, the health-gated start/stop/restart/delete job
+// bodies, the runtime view read from the game's admin endpoint,
+// export/import, startup reconciliation, the managed image and volume views
+// that cross-reference servers and builds, and the sanitising of container
+// output shown to users.
 package servers
 
 import (
 	"context"
-	"crypto/sha256"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,6 +23,7 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/ports"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
@@ -39,6 +43,9 @@ var (
 	// ErrRunning: the change needs the server to be stopped first (its
 	// port cannot change while its container runs).
 	ErrRunning = errors.New("servers: server is running")
+	// ErrAdminUnavailable: the game's admin endpoint did not answer (or
+	// answered outside the contract).
+	ErrAdminUnavailable = errors.New("servers: the game's admin endpoint did not answer")
 )
 
 // FieldError is a rejected request field; Msg is safe to show to users.
@@ -52,6 +59,9 @@ func (e *FieldError) Error() string { return e.Field + ": " + e.Msg }
 func fieldErr(field, format string, a ...any) error {
 	return &FieldError{Field: field, Msg: fmt.Sprintf(format, a...)}
 }
+
+// DefaultStartTimeout is the default of Config.StartTimeout (--start-timeout).
+const DefaultStartTimeout = 60 * time.Second
 
 // Config holds daemon-wide server settings.
 type Config struct {
@@ -67,10 +77,17 @@ type Config struct {
 	CPUs     float64
 	// StopTimeout is the graceful stop timeout (default 30s).
 	StopTimeout time.Duration
-	// SettleWindow is how long a started container must keep running for
-	// the start job to succeed (default 3s); SettlePoll is the poll interval.
-	SettleWindow time.Duration
-	SettlePoll   time.Duration
+	// StartTimeout bounds how long a start waits for the game's admin
+	// endpoint to report ready (default DefaultStartTimeout); ReadyPoll is
+	// the poll interval (default 500ms).
+	StartTimeout time.Duration
+	ReadyPoll    time.Duration
+	// DefaultGameHost is used when the game_host setting is empty (the
+	// first --public-host; "" when there is none).
+	DefaultGameHost string
+	// Certs is the game certificate manager. Without it servers cannot
+	// start.
+	Certs *certs.Manager
 	// ProbePort checks that nothing else listens on a host port before a
 	// start (default ports.ProbeFree).
 	ProbePort func(bindAddr string, port int) error
@@ -99,11 +116,11 @@ func New(st *store.Store, box *secrets.Box, dc *docker.Client, cfg Config, logge
 	if cfg.StopTimeout <= 0 {
 		cfg.StopTimeout = docker.DefaultStopTimeout
 	}
-	if cfg.SettleWindow <= 0 {
-		cfg.SettleWindow = 3 * time.Second
+	if cfg.StartTimeout <= 0 {
+		cfg.StartTimeout = DefaultStartTimeout
 	}
-	if cfg.SettlePoll <= 0 {
-		cfg.SettlePoll = 250 * time.Millisecond
+	if cfg.ReadyPoll <= 0 {
+		cfg.ReadyPoll = 500 * time.Millisecond
 	}
 	if cfg.ProbePort == nil {
 		cfg.ProbePort = ports.ProbeFree
@@ -116,6 +133,35 @@ func New(st *store.Store, box *secrets.Box, dc *docker.Client, cfg Config, logge
 
 // PortRange returns the configured host port range.
 func (s *Service) PortRange() ports.Range { return s.cfg.Ports }
+
+// GameHost returns the effective game host: the game_host setting, or
+// Config.DefaultGameHost when it is empty ("" when neither is set).
+func (s *Service) GameHost(ctx context.Context) (string, error) {
+	st, err := s.store.GetSettings(ctx)
+	if err != nil {
+		return "", err
+	}
+	if st.GameHost != "" {
+		return st.GameHost, nil
+	}
+	return s.cfg.DefaultGameHost, nil
+}
+
+// params reads the installation-wide container inputs.
+func (s *Service) params(ctx context.Context) (runtimeParams, error) {
+	host, err := s.GameHost(ctx)
+	if err != nil {
+		return runtimeParams{}, err
+	}
+	p := runtimeParams{gameHost: host}
+	if s.cfg.Certs != nil {
+		if p.certMode, err = s.cfg.Certs.Mode(ctx); err != nil {
+			return runtimeParams{}, err
+		}
+		p.certDir, p.groupAdd = s.cfg.Certs.Dir(), s.cfg.Certs.GroupAdd()
+	}
+	return p, nil
+}
 
 func ref(sv store.Server) docker.ServerRef {
 	return docker.ServerRef{ServerID: sv.ID, ContainerID: sv.ContainerID}
@@ -166,35 +212,57 @@ func (s *Service) sealEnv(id int64, env map[string]string) ([]byte, error) {
 	return s.box.Seal(secrets.ServerEnvPurpose(id), pt)
 }
 
-// configHash fingerprints everything a container is created from. Env is
-// represented by a hash of its ciphertext, which is re-sealed (with a fresh
-// nonce) on every env change and reveals nothing about the values.
-func (s *Service) configHash(sv store.Server) string {
-	h := sha256.New()
-	port := 0
-	if sv.Port != nil {
-		port = *sv.Port
+// newAdminToken returns a fresh per-container admin token (64 hex
+// characters) and its ciphertext for the server row.
+func (s *Service) newAdminToken(id int64) (string, []byte, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", nil, err
 	}
-	envSum := sha256.Sum256(sv.Env)
-	fmt.Fprintf(h, "v1\x00%s\x00%d\x00%s\x00%d\x00%g\x00%x", sv.Image, port, s.cfg.BindAddress, s.cfg.MemoryMB, s.cfg.CPUs, envSum)
-	return hex.EncodeToString(h.Sum(nil))[:32]
+	tok := hex.EncodeToString(b)
+	sealed, err := s.box.Seal(secrets.ServerAdminTokenPurpose(id), []byte(tok))
+	if err != nil {
+		return "", nil, err
+	}
+	return tok, sealed, nil
 }
 
-func (s *Service) runSpec(sv store.Server, env map[string]string, img docker.Image) docker.RunSpec {
-	return docker.RunSpec{
-		ServerID:     sv.ID,
-		ServerName:   sv.Name,
-		ProjectID:    sv.ProjectID,
-		Image:        img.ID,
-		ImageVolumes: img.Volumes,
-		HostPort:     *sv.Port,
-		BindAddress:  s.cfg.BindAddress,
-		Env:          env,
-		MemoryMB:     s.cfg.MemoryMB,
-		CPUs:         s.cfg.CPUs,
-		StopTimeout:  s.cfg.StopTimeout,
-		ConfigHash:   s.configHash(sv),
+func (s *Service) openAdminToken(sv store.Server) (string, error) {
+	if len(sv.AdminToken) == 0 {
+		return "", errors.New("no admin token recorded")
 	}
+	pt, err := s.box.Open(secrets.ServerAdminTokenPurpose(sv.ID), sv.AdminToken)
+	if err != nil {
+		return "", fmt.Errorf("open admin token of server %d: %w", sv.ID, err)
+	}
+	return string(pt), nil
+}
+
+func (s *Service) runSpec(sv store.Server, b store.Build, env map[string]string, img docker.Image, p runtimeParams, token string) docker.RunSpec {
+	spec := docker.RunSpec{
+		ServerID:      sv.ID,
+		ServerName:    sv.Name,
+		ProjectID:     &b.ProjectID,
+		BuildID:       b.ID,
+		Commit:        b.Commit,
+		EngineVersion: b.EngineVersion,
+		Image:         img.ID,
+		ImageVolumes:  img.Volumes,
+		HostPort:      *sv.Port,
+		BindAddress:   s.cfg.BindAddress,
+		Env:           env,
+		DaemonEnv:     engineEnv(sv, p, token),
+		MemoryMB:      s.cfg.MemoryMB,
+		CPUs:          s.cfg.CPUs,
+		StopTimeout:   s.cfg.StopTimeout,
+		ConfigHash:    s.configHash(sv, &b, p),
+		GroupAdd:      p.groupAdd,
+		AdminPort:     AdminContainerPort,
+	}
+	if p.certDir != "" {
+		spec.ReadOnlyBinds = []docker.BindMount{{Source: p.certDir, Target: certs.ContainerDir}}
+	}
+	return spec
 }
 
 func mapState(st string) apitypes.ServerState {
@@ -214,9 +282,39 @@ func mapState(st string) apitypes.ServerState {
 	}
 }
 
-// view renders a server. ct is its recorded container (nil when it has
-// none); dockerOK false means runtime state is unknown.
-func (s *Service) view(sv store.Server, ct *docker.Container, dockerOK bool) (apitypes.Server, error) {
+// buildCache loads builds once per request.
+type buildCache struct {
+	s *Service
+	m map[int64]*store.Build
+}
+
+func (s *Service) builds() *buildCache { return &buildCache{s: s, m: map[int64]*store.Build{}} }
+
+// get returns the server's build, nil when it has none (or the row is
+// gone, which the store's foreign key prevents).
+func (c *buildCache) get(ctx context.Context, sv store.Server) (*store.Build, error) {
+	if sv.BuildID == nil {
+		return nil, nil
+	}
+	if b, ok := c.m[*sv.BuildID]; ok {
+		return b, nil
+	}
+	b, err := c.s.store.GetBuild(ctx, *sv.BuildID)
+	if errors.Is(err, store.ErrNotFound) {
+		c.m[*sv.BuildID] = nil
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.m[*sv.BuildID] = &b
+	return &b, nil
+}
+
+// view renders a server. b is its build (nil when it has none), ct its
+// recorded container (nil when it has none); dockerOK false means runtime
+// state is unknown.
+func (s *Service) view(sv store.Server, b *store.Build, p runtimeParams, ct *docker.Container, dockerOK bool) (apitypes.Server, error) {
 	env, err := s.openEnv(sv)
 	if err != nil {
 		return apitypes.Server{}, err
@@ -226,16 +324,22 @@ func (s *Service) view(sv store.Server, ct *docker.Container, dockerOK bool) (ap
 		port = *sv.Port
 	}
 	out := apitypes.Server{
-		ID:           sv.ID,
-		Name:         sv.Name,
-		ProjectID:    sv.ProjectID,
-		Image:        sv.Image,
-		Port:         port,
-		EnvKeys:      docker.EnvKeys(env),
-		DesiredState: apitypes.DesiredState(sv.DesiredState),
-		State:        apitypes.ServerStateMissing,
-		CreatedAt:    sv.CreatedAt.UTC(),
-		UpdatedAt:    sv.UpdatedAt.UTC(),
+		ID:             sv.ID,
+		Name:           sv.Name,
+		BuildID:        sv.BuildID,
+		Port:           port,
+		PublicURL:      publicURL(p.gameHost, port),
+		AllowedOrigins: append([]string{}, sv.AllowedOrigins...),
+		EnvKeys:        docker.EnvKeys(env),
+		DesiredState:   apitypes.DesiredState(sv.DesiredState),
+		State:          apitypes.ServerStateMissing,
+		CreatedAt:      sv.CreatedAt.UTC(),
+		UpdatedAt:      sv.UpdatedAt.UTC(),
+	}
+	if b != nil {
+		pid := b.ProjectID
+		out.ProjectID = &pid
+		out.Image, out.Commit, out.EngineVersion = b.ImageID, b.Commit, b.EngineVersion
 	}
 	switch {
 	case sv.ContainerID == "":
@@ -253,7 +357,7 @@ func (s *Service) view(sv store.Server, ct *docker.Container, dockerOK bool) (ap
 			code := ct.ExitCode
 			out.ExitCode = &code
 		}
-		out.RestartRequired = ct.Running && ct.Labels[docker.LabelConfigHash] != s.configHash(sv)
+		out.RestartRequired = ct.Running && ct.Labels[docker.LabelConfigHash] != s.configHash(sv, b, p)
 	}
 	return out, nil
 }
@@ -305,6 +409,10 @@ func (s *Service) List(ctx context.Context) ([]apitypes.Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	p, err := s.params(ctx)
+	if err != nil {
+		return nil, err
+	}
 	cts, derr := s.docker.ManagedContainers(ctx)
 	if derr != nil {
 		if err := s.dockerFailed(ctx, "list servers", derr); err != nil {
@@ -312,9 +420,14 @@ func (s *Service) List(ctx context.Context) ([]apitypes.Server, error) {
 		}
 	}
 	byServer := s.containers(rows, cts)
+	bc := s.builds()
 	out := make([]apitypes.Server, 0, len(rows))
 	for _, sv := range rows {
-		v, err := s.view(sv, byServer[sv.ID], derr == nil)
+		b, err := bc.get(ctx, sv)
+		if err != nil {
+			return nil, err
+		}
+		v, err := s.view(sv, b, p, byServer[sv.ID], derr == nil)
 		if err != nil {
 			return nil, err
 		}
@@ -347,6 +460,19 @@ func (s *Service) container(ctx context.Context, sv store.Server) (*docker.Conta
 	return &ct, nil
 }
 
+// viewOne renders one server with its container ct (dockerOK as in view).
+func (s *Service) viewOne(ctx context.Context, sv store.Server, ct *docker.Container, dockerOK bool) (apitypes.Server, error) {
+	p, err := s.params(ctx)
+	if err != nil {
+		return apitypes.Server{}, err
+	}
+	b, err := s.builds().get(ctx, sv)
+	if err != nil {
+		return apitypes.Server{}, err
+	}
+	return s.view(sv, b, p, ct, dockerOK)
+}
+
 // Get returns one server with runtime state.
 func (s *Service) Get(ctx context.Context, id int64) (apitypes.Server, error) {
 	sv, err := s.load(ctx, id)
@@ -359,25 +485,26 @@ func (s *Service) Get(ctx context.Context, id int64) (apitypes.Server, error) {
 			return apitypes.Server{}, err
 		}
 	}
-	return s.view(sv, ct, derr == nil)
+	return s.viewOne(ctx, sv, ct, derr == nil)
 }
 
-// resolveImage returns the immutable id of a managed image reference.
-func (s *Service) resolveImage(ctx context.Context, field, ref string) (string, error) {
-	if err := docker.ValidateImageRef(ref); err != nil {
-		return "", fieldErr(field, "image must be an image id or a name[:tag]")
+// resolveBuild returns build id if it is a successful build with an image.
+// Docker is not asked here: the image is verified when the server starts.
+func (s *Service) resolveBuild(ctx context.Context, field string, id int64) (store.Build, error) {
+	if id <= 0 {
+		return store.Build{}, fieldErr(field, "build_id is required (the id of a successful build)")
 	}
-	img, err := s.docker.ManagedImage(ctx, ref)
-	switch {
-	case errors.Is(err, docker.ErrNotFound), errors.Is(err, docker.ErrNotManaged):
-		return "", fieldErr(field, "image must be a managed image (built and labelled by golem-deploy)")
-	case err != nil:
-		return "", err
+	b, err := s.store.GetBuild(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Build{}, fieldErr(field, "build %d does not exist", id)
 	}
-	if len(img.Volumes) > docker.MaxImageVolumes {
-		return "", fieldErr(field, "the image declares more than %d volumes", docker.MaxImageVolumes)
+	if err != nil {
+		return store.Build{}, err
 	}
-	return img.ID, nil
+	if b.Status != store.BuildStatusSuccess || b.ImageID == "" {
+		return store.Build{}, fieldErr(field, "build %d has not succeeded; servers run successful builds only", id)
+	}
+	return b, nil
 }
 
 // validateEnv checks env and names the offending field: field for names
@@ -449,14 +576,11 @@ func (s *Service) Create(ctx context.Context, req apitypes.CreateServerRequest) 
 	if err := docker.ValidateServerName(req.Name); err != nil {
 		return apitypes.Server{}, fieldErr("name", "name must be 1-63 characters of a-z, 0-9 and '-', starting with a letter or digit")
 	}
-	if req.ProjectID != nil {
-		if _, err := s.store.GetProject(ctx, *req.ProjectID); errors.Is(err, store.ErrNotFound) {
-			return apitypes.Server{}, fieldErr("project_id", "project does not exist")
-		} else if err != nil {
-			return apitypes.Server{}, err
-		}
-	}
 	if err := validateEnv("env", req.Env); err != nil {
+		return apitypes.Server{}, err
+	}
+	origins, err := validateOrigins("allowed_origins", req.AllowedOrigins)
+	if err != nil {
 		return apitypes.Server{}, err
 	}
 	desired := apitypes.DesiredStateStopped
@@ -471,7 +595,7 @@ func (s *Service) Create(ctx context.Context, req apitypes.CreateServerRequest) 
 			return apitypes.Server{}, err
 		}
 	}
-	imageID, err := s.resolveImage(ctx, "image", req.Image)
+	b, err := s.resolveBuild(ctx, "build_id", req.BuildID)
 	if err != nil {
 		return apitypes.Server{}, err
 	}
@@ -479,7 +603,7 @@ func (s *Service) Create(ctx context.Context, req apitypes.CreateServerRequest) 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	seal := func(id int64) ([]byte, error) { return s.sealEnv(id, req.Env) }
-	row := store.Server{Name: req.Name, ProjectID: req.ProjectID, Image: imageID, DesiredState: string(desired)}
+	row := store.Server{Name: req.Name, BuildID: &b.ID, AllowedOrigins: origins, DesiredState: string(desired)}
 	for attempt := 0; ; attempt++ {
 		port := 0
 		if req.Port != nil {
@@ -499,8 +623,8 @@ func (s *Service) Create(ctx context.Context, req apitypes.CreateServerRequest) 
 		row.Port = &port
 		created, err := s.store.CreateServer(ctx, row, seal)
 		if err == nil {
-			s.logger.Info("server created", "server_id", created.ID, "name", created.Name, "port", port, "env_keys", len(req.Env))
-			return s.view(created, nil, true)
+			s.logger.Info("server created", "server_id", created.ID, "name", created.Name, "build_id", b.ID, "port", port, "env_keys", len(req.Env))
+			return s.viewOne(ctx, created, nil, true)
 		}
 		if !errors.Is(err, store.ErrConflict) {
 			return apitypes.Server{}, err
@@ -536,10 +660,15 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 			return apitypes.Server{}, err
 		}
 	}
-	imageID := ""
-	if req.Image != nil {
+	var origins []string
+	if req.AllowedOrigins != nil {
 		var err error
-		if imageID, err = s.resolveImage(ctx, "image", *req.Image); err != nil {
+		if origins, err = validateOrigins("allowed_origins", *req.AllowedOrigins); err != nil {
+			return apitypes.Server{}, err
+		}
+	}
+	if req.BuildID != nil {
+		if _, err := s.resolveBuild(ctx, "build_id", *req.BuildID); err != nil {
 			return apitypes.Server{}, err
 		}
 	}
@@ -552,10 +681,7 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 		if err != nil {
 			return apitypes.Server{}, err
 		}
-		u := store.ServerUpdate{}
-		if req.Image != nil {
-			u.Image = &imageID
-		}
+		u := store.ServerUpdate{BuildID: req.BuildID, SetOrigins: req.AllowedOrigins != nil, AllowedOrigins: origins}
 		if req.Port != nil && (sv.Port == nil || *sv.Port != *req.Port) {
 			if err := s.checkStopped(ctx, sv); err != nil {
 				return apitypes.Server{}, err
@@ -604,14 +730,14 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 		}
 		break
 	}
-	s.logger.Info("server updated", "server_id", id, "image_changed", req.Image != nil, "port_changed", req.Port != nil,
-		"env_set", len(req.EnvSet), "env_unset", len(req.EnvUnset))
+	s.logger.Info("server updated", "server_id", id, "build_changed", req.BuildID != nil, "port_changed", req.Port != nil,
+		"origins_changed", req.AllowedOrigins != nil, "env_set", len(req.EnvSet), "env_unset", len(req.EnvUnset))
 	ct, derr := s.container(ctx, updated)
 	if derr != nil {
 		// The update is stored; a cancelled caller only loses the view.
 		_ = s.dockerFailed(ctx, "update server", derr)
 	}
-	return s.view(updated, ct, derr == nil)
+	return s.viewOne(ctx, updated, ct, derr == nil)
 }
 
 // checkStopped returns ErrRunning when the server's container is running

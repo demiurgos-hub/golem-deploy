@@ -62,6 +62,11 @@ func (s *Server) routes() []route {
 		{method: "POST", path: "/servers/{id}/restart", access: AccessDeveloper, handler: s.handleRestartServer()},
 		{method: "GET", path: "/servers/{id}/logs", access: AccessDeveloper, handler: s.handleServerLogs},
 		{method: "GET", path: "/servers/{id}/stats", access: AccessDeveloper, handler: s.handleServerStats},
+		{method: "GET", path: "/servers/{id}/runtime", access: AccessDeveloper, handler: s.handleServerRuntime},
+
+		// Game certificate.
+		{method: "GET", path: "/certificates/game", access: AccessAdmin, handler: s.handleGetGameCertificate},
+		{method: "PUT", path: "/certificates/game", access: AccessAdmin, handler: s.handlePutGameCertificate, maxBody: maxCertificateBody},
 
 		// Images.
 		{method: "GET", path: "/images", access: AccessDeveloper, handler: s.handleListImages},

@@ -62,7 +62,7 @@ func TestD1_ServerEnvNeverReachesCLIProcess(t *testing.T) {
 		"PATH":        "/tmp/" + envMarker,
 		"MOTD":        `  "quoted" #hash $DOLLAR \back ünï ` + envMarker,
 	}
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img, Env: env})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID, Env: env})
 	d.start(s.ID)
 	want := docker.BaseEnv(func(k string) (string, bool) { v, ok := harnessCLIEnv[k]; return v, ok }, runtimeGOOS)
 	for _, c := range d.fake.Calls() {
@@ -89,12 +89,12 @@ func TestD1_ServerEnvNeverReachesCLIProcess(t *testing.T) {
 func TestD1_EnvValueRules(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1)
-	e := errBody(t, d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "a", Image: img,
+	e := errBody(t, d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "a", BuildID: img.ID,
 		Env: map[string]string{"MOTD": "line1\nINJECTED=" + envMarker}}), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
 	if e.Field != "env.MOTD" {
 		t.Fatalf("field %q", e.Field)
 	}
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "a", Image: img, Env: map[string]string{"PATH": "/opt/game/bin", "LD_LIBRARY_PATH": "/opt/game/lib"}})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "a", BuildID: img.ID, Env: map[string]string{"PATH": "/opt/game/bin", "LD_LIBRARY_PATH": "/opt/game/lib"}})
 	e = errBody(t, d.call("PATCH", fmt.Sprintf("/api/v1/servers/%d", s.ID), d.devTok, apitypes.UpdateServerRequest{EnvSet: map[string]string{"X": envMarker + "\r"}}),
 		http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
 	if e.Field != "env_set.X" {
@@ -105,8 +105,8 @@ func TestD1_EnvValueRules(t *testing.T) {
 	if e.Field != "env_set" || !strings.Contains(e.Message, "reserved") {
 		t.Fatalf("%+v", e)
 	}
-	rr := d.call("POST", "/api/v1/servers/import", d.adminSs, apitypes.ServerExport{FormatVersion: 1, Servers: []apitypes.ServerSpec{
-		{Name: "imp", Image: img, Env: map[string]string{"K": "a\x00" + envMarker}}}})
+	rr := d.call("POST", "/api/v1/servers/import", d.adminSs, apitypes.ServerExport{FormatVersion: 2, Servers: []apitypes.ServerSpec{
+		{Name: "imp", Project: "game", Env: map[string]string{"K": "a\x00" + envMarker}}}})
 	if e := errBody(t, rr, http.StatusBadRequest, apitypes.ErrorCodeValidationFailed); e.Field != "servers[0].env.K" {
 		t.Fatalf("field %q", e.Field)
 	}
@@ -116,9 +116,8 @@ func TestD1_EnvValueRules(t *testing.T) {
 // D2: image volumes become tmpfs mounts; images with too many are refused.
 func TestD2_ImageVolumesBecomeTmpfs(t *testing.T) {
 	d := newDockerHarness(t)
-	id := dockertest.ImageID(7)
-	d.fake.AddImage(dockertest.Image{ID: id, Labels: dockertest.ManagedLabels(), Volumes: []string{"/data", "/var/lib/game"}})
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "vol", Image: id})
+	id := d.buildImage(7, dockertest.Image{Volumes: []string{"/data", "/var/lib/game"}})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "vol", BuildID: id.ID})
 	j := d.start(s.ID)
 	ct, _ := d.fake.Container("golem-deploy-vol")
 	if !slices.Equal(ct.Tmpfs, []string{"/tmp:rw,noexec,nosuid,size=64m", "/data:rw,noexec,nosuid,size=64m", "/var/lib/game:rw,noexec,nosuid,size=64m"}) {
@@ -133,11 +132,10 @@ func TestD2_ImageVolumesBecomeTmpfs(t *testing.T) {
 			t.Fatalf("rm without --volumes: %q", rm.Args)
 		}
 	}
-	many := dockertest.ImageID(8)
-	d.fake.AddImage(dockertest.Image{ID: many, Labels: dockertest.ManagedLabels(), Volumes: []string{"/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h", "/i"}})
-	e := errBody(t, d.call("POST", "/api/v1/servers", d.devTok, apitypes.CreateServerRequest{Name: "many", Image: many}), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
-	if e.Field != "image" {
-		t.Fatalf("%+v", e)
+	many := d.buildImage(8, dockertest.Image{Volumes: []string{"/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h", "/i"}})
+	ms := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "many", BuildID: many.ID})
+	if j := d.action(d.devTok, ms.ID, "start"); j.Status != store.JobError || !strings.Contains(j.Detail, "more than 8 volumes") {
+		t.Fatalf("%s %q", j.Status, j.Detail)
 	}
 }
 
@@ -147,8 +145,8 @@ func TestD2_ImageVolumesBecomeTmpfs(t *testing.T) {
 func TestD3_ImpostorContainerIsIgnored(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1)
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
-	impostor := d.fake.AddContainer(dockertest.Container{Name: "impostor", Image: img,
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
+	impostor := d.fake.AddContainer(dockertest.Container{Name: "impostor", Image: img.Image,
 		Labels: dockertest.OurLabels(docker.LabelServerID, strconv.FormatInt(s.ID, 10), docker.LabelServer, "arena"),
 		Logs:   []string{"IMPOSTOR OUTPUT"}})
 	base := fmt.Sprintf("/api/v1/servers/%d", s.ID)
@@ -207,8 +205,8 @@ func TestD3_ImpostorContainerIsIgnored(t *testing.T) {
 func TestD3_UpgradeWithoutRecordedContainer(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1)
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
-	legacy := d.fake.AddContainer(dockertest.Container{Name: "golem-deploy-arena", Image: img,
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
+	legacy := d.fake.AddContainer(dockertest.Container{Name: "golem-deploy-arena", Image: img.Image,
 		Labels: dockertest.ManagedLabels(docker.LabelServerID, strconv.FormatInt(s.ID, 10), docker.LabelServer, "arena")})
 	if got := d.getServer(d.devTok, s.ID); got.State != apitypes.ServerStateMissing {
 		t.Fatalf("%+v", got)
@@ -246,7 +244,7 @@ func TestD3_InstanceIDIsNotExposed(t *testing.T) {
 func TestD4_MemoryLimitWithoutSwap(t *testing.T) {
 	d := newDockerHarness(t, func(c *servers.Config) { c.MemoryMB, c.CPUs = 2048, 2 })
 	img := d.managedImage(1)
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
 	d.start(s.ID)
 	run := strings.Join(d.fake.CallsTo("run")[0].Args, " ")
 	if !strings.Contains(run, "--memory 2048m --memory-swap 2048m") || !strings.Contains(run, "--cpus 2") {
@@ -261,7 +259,7 @@ func TestD5_StartWarnsWhenNetworkNotIsolated(t *testing.T) {
 	img := d.managedImage(1)
 	d.fake.AddNetwork(docker.NetworkName, dockertest.OurLabels(), nil)
 	d.fake.AddContainer(dockertest.Container{Name: "other", Network: docker.NetworkName, Labels: dockertest.OurLabels()})
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
 	j := d.start(s.ID)
 	if !strings.Contains(d.jobLog(j.ID), "warning: the golem-deploy network still allows traffic between servers") {
 		t.Fatal(d.jobLog(j.ID))
@@ -328,14 +326,13 @@ func TestD6_StaticQuotaAndConcurrency(t *testing.T) {
 func TestD8_D9_ContainerOutputInJobLogAndLogs(t *testing.T) {
 	d := newDockerHarness(t)
 	code := 1
-	id := dockertest.ImageID(5)
-	d.fake.AddImage(dockertest.Image{ID: id, Labels: dockertest.ManagedLabels(), ExitOnRun: &code, Logs: []string{
+	id := d.buildImage(5, dockertest.Image{ExitOnRun: &code, Logs: []string{
 		"token=" + envMarker + " and again " + envMarker,
 		"\x1b[2J\x1b]0;owned\x07red \x1b[31mtext",
 		"server \"x\" is running (restart policy on-failure:5)",
 		"broken \xff\xfe utf8",
 	}})
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "crashy", Image: id, Env: map[string]string{"TOKEN": envMarker}})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "crashy", BuildID: id.ID, Env: map[string]string{"TOKEN": envMarker}})
 	j := d.action(d.devTok, s.ID, "start")
 	if j.Status != store.JobError || !strings.Contains(j.Detail, "exit code 1") {
 		t.Fatalf("%s %q", j.Status, j.Detail)
@@ -368,7 +365,7 @@ func TestD8_D9_ContainerOutputInJobLogAndLogs(t *testing.T) {
 func TestD10_PatchDoesNotUndoDesiredState(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1)
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
 	box, _ := secrets.New(bytes.Repeat([]byte{3}, secrets.KeySize))
 	other := servers.New(d.st, box, d.dc, servers.Config{Ports: ports.Range{Lo: 7000, Hi: 7004}}, nil)
 	var wg sync.WaitGroup
@@ -428,7 +425,7 @@ func TestD10_PatchDoesNotUndoDesiredState(t *testing.T) {
 func TestD11_PortRules(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1)
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img, Port: ptr(7004)})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID, Port: ptr(7004)})
 	// The daemon restarts with a narrower range.
 	box, _ := secrets.New(bytes.Repeat([]byte{3}, secrets.KeySize))
 	narrow := servers.New(d.st, box, d.dc, servers.Config{Ports: ports.Range{Lo: 7000, Hi: 7003}, ProbePort: func(string, int) error { return nil }}, nil)
@@ -467,8 +464,8 @@ func TestD11_PortRules(t *testing.T) {
 func TestD12_DockerStderrStaysInDaemonLog(t *testing.T) {
 	d := newDockerHarness(t)
 	img := d.managedImage(1)
-	d.fake.AddContainer(dockertest.Container{Name: "golem-deploy-arena", Image: img})
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", Image: img})
+	d.fake.AddContainer(dockertest.Container{Name: "golem-deploy-arena", Image: img.Image})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "arena", BuildID: img.ID})
 	j := d.action(d.devTok, s.ID, "start")
 	log := d.jobLog(j.ID)
 	if j.Status != store.JobError || strings.Contains(log, "Error response from daemon") || strings.Contains(j.Detail, "Error response") {
@@ -527,9 +524,8 @@ func TestD13_UploadIsAtomic(t *testing.T) {
 func TestD14_SettleExitCodeAndRestartPolicy(t *testing.T) {
 	d := newDockerHarness(t)
 	code := 127
-	id := dockertest.ImageID(5)
-	d.fake.AddImage(dockertest.Image{ID: id, Labels: dockertest.ManagedLabels(), ExitOnRun: &code})
-	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "crashy", Image: id})
+	id := d.buildImage(5, dockertest.Image{ExitOnRun: &code})
+	s := d.createServer(d.devTok, apitypes.CreateServerRequest{Name: "crashy", BuildID: id.ID})
 	j := d.action(d.devTok, s.ID, "start")
 	if j.Status != store.JobError || !strings.Contains(j.Detail, "exit code 127") {
 		t.Fatalf("%s %q", j.Status, j.Detail)
@@ -540,6 +536,17 @@ func TestD14_SettleExitCodeAndRestartPolicy(t *testing.T) {
 	if len(d.fake.CallsTo("update")) != 0 {
 		t.Fatal("restart policy applied to a failed start")
 	}
+}
+
+// maxOrigins returns the most and longest allowed origins a server can
+// have.
+func maxOrigins() []string {
+	out := make([]string, servers.MaxAllowedOrigins)
+	for i := range out {
+		out[i] = fmt.Sprintf("https://%s.%s.%s.%s.example:%d", strings.Repeat("a", 60), strings.Repeat("b", 60), strings.Repeat("c", 60),
+			strings.Repeat("d", 30), 10000+i)
+	}
+	return out
 }
 
 // D14: an export of the largest allowed configuration fits the import
@@ -553,10 +560,10 @@ func TestD14_ImportRoundTripAtMaximum(t *testing.T) {
 		k := fmt.Sprintf("K%d", i)
 		big[k] = strings.Repeat("<", docker.MaxEnvVarBytes-len(k))
 	}
-	doc := apitypes.ServerExport{FormatVersion: 1}
+	doc := apitypes.ServerExport{FormatVersion: 2}
 	for i := 0; i < servers.MaxImportServers; i++ {
-		doc.Servers = append(doc.Servers, apitypes.ServerSpec{Name: fmt.Sprintf("s-%03d-%s", i, strings.Repeat("x", 50)), Image: img,
-			Port: ptr(7000 + i), Env: big, DesiredState: apitypes.DesiredStateRunning})
+		doc.Servers = append(doc.Servers, apitypes.ServerSpec{Name: fmt.Sprintf("s-%03d-%s", i, strings.Repeat("x", 50)), Project: "game",
+			Commit: testCommit(1), Port: ptr(7000 + i), Env: big, AllowedOrigins: maxOrigins(), DesiredState: apitypes.DesiredStateRunning})
 	}
 	rr := d.do("POST", "/api/v1/servers/import", d.adminSs, doc)
 	if rr.Code != http.StatusCreated {
@@ -577,6 +584,7 @@ func TestD14_ImportRoundTripAtMaximum(t *testing.T) {
 	if rr := d2.do("POST", "/api/v1/servers/import", d2.adminSs, back); rr.Code != http.StatusCreated {
 		t.Fatalf("re-import %d %s", rr.Code, rr.Body.String()[:min(200, rr.Body.Len())])
 	}
-	too := apitypes.ServerExport{FormatVersion: 1, Servers: make([]apitypes.ServerSpec, servers.MaxImportServers+1)}
+	too := apitypes.ServerExport{FormatVersion: 2, Servers: make([]apitypes.ServerSpec, servers.MaxImportServers+1)}
+	_ = img
 	errBody(t, d2.do("POST", "/api/v1/servers/import", d2.adminSs, too), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
 }

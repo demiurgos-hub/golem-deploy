@@ -55,6 +55,11 @@ func serversError(what string, err error) error {
 		return conflict(apitypes.ErrorCodeConflict, "the "+what+" is in use")
 	case errors.Is(err, servers.ErrConflict):
 		return conflict(apitypes.ErrorCodeConflict, "the change conflicts with a concurrent change; retry")
+	case errors.Is(err, servers.ErrAdminUnavailable):
+		e := newError(http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable,
+			"the game's admin endpoint did not answer; see the server log")
+		e.cause = err
+		return e
 	case errors.Is(err, docker.ErrUnavailable):
 		return dockerUnavailable(err)
 	}
@@ -350,6 +355,22 @@ func (s *Server) handleServerStats(w http.ResponseWriter, r *http.Request) error
 		return serversError("server", err)
 	}
 	writeJSON(w, http.StatusOK, st)
+	return nil
+}
+
+func (s *Server) handleServerRuntime(w http.ResponseWriter, r *http.Request) error {
+	if err := s.needServers(); err != nil {
+		return err
+	}
+	id, err := pathID(r, "id")
+	if err != nil {
+		return err
+	}
+	rt, err := s.servers.Runtime(r.Context(), id, s.now())
+	if err != nil {
+		return serversError("server", err)
+	}
+	writeJSON(w, http.StatusOK, rt)
 	return nil
 }
 

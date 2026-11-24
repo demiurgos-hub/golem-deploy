@@ -3,7 +3,6 @@ package servers
 import (
 	"bytes"
 	"context"
-	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -12,7 +11,6 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
 	"github.com/demiurgos-hub/golem-deploy/internal/ports"
-	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -89,27 +87,6 @@ func TestD8_Redact(t *testing.T) {
 	}
 }
 
-func newTestService(t *testing.T, cfg Config) (*Service, *dockertest.Fake, *store.Store) {
-	t.Helper()
-	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "db.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	box, err := secrets.New(bytes.Repeat([]byte{7}, secrets.KeySize))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f := dockertest.New()
-	dc := docker.New(docker.Options{Runner: f, InstanceID: dockertest.InstanceID, TempDir: t.TempDir()})
-	if cfg.Ports.Lo == 0 {
-		cfg.Ports = ports.Range{Lo: 7000, Hi: 7009}
-	}
-	cfg.ProbePort = func(string, int) error { return nil }
-	cfg.SettleWindow, cfg.SettlePoll = 1, 1
-	return New(st, box, dc, cfg, nil), f, st
-}
-
 func TestMapState(t *testing.T) {
 	for in, want := range map[string]apitypes.ServerState{
 		"created": apitypes.ServerStateCreated, "running": apitypes.ServerStateRunning, "restarting": apitypes.ServerStateRestarting,
@@ -125,25 +102,26 @@ func TestMapState(t *testing.T) {
 // The view is built from the recorded container only, and restart_required
 // follows the config hash.
 func TestViewAndContainersIndex(t *testing.T) {
-	svc, f, st := newTestService(t, Config{})
+	fx := newFixture(t, Config{})
+	svc, f, st := fx.svc, fx.f, fx.st
 	ctx := context.Background()
-	img := dockertest.ImageID(1)
-	f.AddImage(dockertest.Image{ID: img, Labels: dockertest.ManagedLabels()})
+	b := fx.build(t, 1, commitA)
 	p := 7001
-	sv, err := st.CreateServer(ctx, store.Server{Name: "a", Image: img, Port: &p}, nil)
+	sv, err := st.CreateServer(ctx, store.Server{Name: "a", BuildID: &b.ID, Port: &p}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	other := 7002
-	sv2, _ := st.CreateServer(ctx, store.Server{Name: "b", Image: img, Port: &other}, nil)
-	recorded := f.AddContainer(dockertest.Container{Name: "golem-deploy-a", Image: img,
-		Labels: dockertest.OurLabels(docker.LabelServerID, "1", docker.LabelConfigHash, svc.configHash(sv))})
-	impostor := f.AddContainer(dockertest.Container{Name: "x", Image: img, Labels: dockertest.OurLabels(docker.LabelServerID, "2")})
-	if err := st.SetServerContainer(ctx, sv.ID, recorded); err != nil {
+	sv2, _ := st.CreateServer(ctx, store.Server{Name: "b", BuildID: &b.ID, Port: &other}, nil)
+	params, _ := svc.params(ctx)
+	recorded := f.AddContainer(dockertest.Container{Name: "golem-deploy-a", Image: b.ImageID,
+		Labels: dockertest.OurLabels(docker.LabelServerID, "1", docker.LabelConfigHash, svc.configHash(sv, &b, params))})
+	impostor := f.AddContainer(dockertest.Container{Name: "x", Image: b.ImageID, Labels: dockertest.OurLabels(docker.LabelServerID, "2")})
+	if err := st.SetServerContainer(ctx, sv.ID, recorded, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	// sv2 records a container that belongs to server 1: not accepted.
-	if err := st.SetServerContainer(ctx, sv2.ID, recorded); err != nil {
+	if err := st.SetServerContainer(ctx, sv2.ID, recorded, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ := st.ListServers(ctx)
@@ -159,6 +137,10 @@ func TestViewAndContainersIndex(t *testing.T) {
 	if err != nil || list[0].State != apitypes.ServerStateRunning || list[0].RestartRequired || list[1].State != apitypes.ServerStateMissing {
 		t.Fatalf("%+v %v", list, err)
 	}
+	if v := list[0]; *v.BuildID != b.ID || *v.ProjectID != b.ProjectID || v.Image != b.ImageID || v.Commit != commitA ||
+		v.EngineVersion != "v0.4.0-rc.1" || v.PublicURL != "https://play.example.com:7001/" {
+		t.Fatalf("%+v", v)
+	}
 	// A definition change makes the running container stale.
 	if _, err := svc.Update(ctx, sv.ID, apitypes.UpdateServerRequest{EnvSet: map[string]string{"A": "1"}}); err != nil {
 		t.Fatal(err)
@@ -169,7 +151,8 @@ func TestViewAndContainersIndex(t *testing.T) {
 }
 
 func TestPortAllowedAndFieldNames(t *testing.T) {
-	svc, _, _ := newTestService(t, Config{Ports: ports.Range{Lo: 6000, Hi: 6010}, PanelPort: 6005})
+	fx := newFixture(t, Config{Ports: ports.Range{Lo: 6000, Hi: 6010}, PanelPort: 6005})
+	svc := fx.svc
 	for p, ok := range map[int]bool{6001: true, 6000: false /* browser-unsafe */, 6005: false /* panel */, 6011: false} {
 		if svc.portAllowed(p) != ok {
 			t.Errorf("port %d", p)
@@ -188,14 +171,14 @@ func TestPortAllowedAndFieldNames(t *testing.T) {
 	}
 }
 
-// Start records the container id, applies the restart policy after the
-// settle window, and Delete clears everything.
+// Start records the container id, applies the restart policy only once the
+// game reports ready, and Delete clears everything.
 func TestStartRecordsContainer(t *testing.T) {
-	svc, f, st := newTestService(t, Config{})
+	fx := newFixture(t, Config{})
+	svc, f, st := fx.svc, fx.f, fx.st
 	ctx := context.Background()
-	img := dockertest.ImageID(1)
-	f.AddImage(dockertest.Image{ID: img, Labels: dockertest.ManagedLabels()})
-	created, err := svc.Create(ctx, apitypes.CreateServerRequest{Name: "a", Image: img})
+	b := fx.build(t, 1, commitA)
+	created, err := svc.Create(ctx, apitypes.CreateServerRequest{Name: "a", BuildID: b.ID})
 	if err != nil {
 		t.Fatal(err)
 	}

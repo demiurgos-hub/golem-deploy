@@ -61,10 +61,15 @@ type Container struct {
 	StartedAt     time.Time
 	Ports         []string // --publish values
 	Mounts        []string // volume names
+	Binds         []string // --mount values of type=bind
 	Tmpfs         []string // --tmpfs values
-	Network       string
-	Env           map[string]string
-	Logs          []string
+	GroupAdd      []string // --group-add values
+	// Assigned are the host ports chosen for --publish values without a
+	// host port ("127.0.0.1::7778/tcp"), by container port ("7778/tcp").
+	Assigned map[string]int
+	Network  string
+	Env      map[string]string
+	Logs     []string
 }
 
 // Image is a fake image.
@@ -80,6 +85,10 @@ type Image struct {
 	ExitOnRun *int
 	// Logs are the lines a container from this image prints.
 	Logs []string
+	// AssignPort is the host port reported for a --publish without a host
+	// port (Docker's dynamic assignment), e.g. the port of a test admin
+	// server; zero assigns an unused port from 49152 up.
+	AssignPort int
 }
 
 // Volume is a fake volume.
@@ -132,6 +141,12 @@ func ManagedLabels(kv ...string) map[string]string {
 		m[kv[i]] = kv[i+1]
 	}
 	return m
+}
+
+// BuildLabels returns OurLabels plus the build-id label buildID and extra
+// key/value pairs: what an image built by the tested installation carries.
+func BuildLabels(buildID int64, kv ...string) map[string]string {
+	return OurLabels(append([]string{docker.LabelBuildID, strconv.FormatInt(buildID, 10)}, kv...)...)
 }
 
 // OurLabels returns the managed label, the instance label (InstanceID) and
@@ -233,6 +248,27 @@ func (f *Fake) Containers() []Container {
 	}
 	slices.SortFunc(out, func(a, b Container) int { return a.Created.Compare(b.Created) })
 	return out
+}
+
+// DeleteImage removes an image (as if someone deleted it behind the
+// daemon's back).
+func (f *Fake) DeleteImage(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.images, id)
+}
+
+// LatestEnv returns variable key of the most recently created container
+// ("" when there is none), e.g. the admin token a test admin server
+// expects.
+func (f *Fake) LatestEnv(key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	list := f.sortedContainers()
+	if len(list) == 0 {
+		return ""
+	}
+	return list[len(list)-1].Env[key]
 }
 
 // SetContainerState changes a container's state (e.g. to simulate a crash).
@@ -549,7 +585,8 @@ func (f *Fake) inspectContainers(refs []string, w io.Writer) *failure {
 				"Status": c.State, "Running": c.State == "running", "ExitCode": c.ExitCode,
 				"StartedAt": started, "FinishedAt": "0001-01-01T00:00:00Z",
 			},
-			"Config": map[string]any{"Labels": c.Labels},
+			"Config":          map[string]any{"Labels": c.Labels},
+			"NetworkSettings": map[string]any{"Ports": c.portMap()},
 		})
 	}
 	writeArray(w, out)
@@ -557,6 +594,33 @@ func (f *Fake) inspectContainers(refs []string, w io.Writer) *failure {
 		return fail(1, "Error: No such container: %s", missing[0])
 	}
 	return nil
+}
+
+// portMap renders the container's published ports like Docker's inspect
+// (only while it runs, like Docker).
+func (c *Container) portMap() map[string]any {
+	out := map[string]any{}
+	if c.State != "running" {
+		return out
+	}
+	for _, p := range c.Ports {
+		spec, proto, _ := strings.Cut(p, "/")
+		parts := strings.Split(spec, ":")
+		ip, host, cport := "0.0.0.0", "", parts[len(parts)-1]
+		if len(parts) >= 2 {
+			host = parts[len(parts)-2]
+		}
+		if len(parts) >= 3 {
+			ip = strings.Join(parts[:len(parts)-2], ":")
+		}
+		key := cport + "/" + proto
+		if host == "" {
+			host = strconv.Itoa(c.Assigned[key])
+		}
+		list, _ := out[key].([]map[string]string)
+		out[key] = append(list, map[string]string{"HostIp": ip, "HostPort": host})
+	}
+	return out
 }
 
 func writeArray(w io.Writer, v []map[string]any) {
@@ -608,7 +672,7 @@ func (f *Fake) run(a []string, envFile string, cliEnv []string, w io.Writer) *fa
 		}
 		for _, p := range c.Ports {
 			for _, q := range ports {
-				if hostPort(p) == hostPort(q) {
+				if hostPort(p) == hostPort(q) && !strings.HasPrefix(hostPort(q), "/") {
 					return fail(125, "docker: Error response from daemon: Bind for %s failed: port is already allocated.", q)
 				}
 			}
@@ -642,12 +706,28 @@ func (f *Fake) run(a []string, envFile string, cliEnv []string, w io.Writer) *fa
 			envVals[k] = v
 		}
 	}
-	var mounts []string
+	var mounts, binds []string
 	for _, m := range flagValues(a, "--mount") {
+		if strings.HasPrefix(m, "type=bind,") {
+			binds = append(binds, m)
+		}
 		for _, part := range strings.Split(m, ",") {
 			if strings.HasPrefix(part, "source=") && strings.Contains(m, "type=volume") {
 				mounts = append(mounts, strings.TrimPrefix(part, "source="))
 			}
+		}
+	}
+	assigned := map[string]int{}
+	for _, p := range ports {
+		spec, proto, _ := strings.Cut(p, "/")
+		parts := strings.Split(spec, ":")
+		if len(parts) >= 2 && parts[len(parts)-2] == "" {
+			port := img.AssignPort
+			if port == 0 {
+				f.seq++
+				port = 49152 + f.seq
+			}
+			assigned[parts[len(parts)-1]+"/"+proto] = port
 		}
 	}
 	network := ""
@@ -663,8 +743,8 @@ func (f *Fake) run(a []string, envFile string, cliEnv []string, w io.Writer) *fa
 	}
 	c := &Container{
 		ID: f.nextID(), Name: name, Image: img.ID, Labels: labels, State: "running", RestartPolicy: restart,
-		Created: f.tick(), Ports: ports, Mounts: mounts, Tmpfs: flagValues(a, "--tmpfs"), Network: network,
-		Env: envVals, Logs: slices.Clone(img.Logs),
+		Created: f.tick(), Ports: ports, Mounts: mounts, Binds: binds, Tmpfs: flagValues(a, "--tmpfs"), Network: network,
+		Env: envVals, Logs: slices.Clone(img.Logs), GroupAdd: flagValues(a, "--group-add"), Assigned: assigned,
 	}
 	c.StartedAt = c.Created
 	if img.ExitOnRun != nil {

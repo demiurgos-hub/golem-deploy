@@ -26,10 +26,19 @@ type Settings struct {
 	// While it is on, anyone can learn whether a username exists (register
 	// answers username_taken); login and its rate limits do not reveal it.
 	RegistrationEnabled bool `json:"registration_enabled"`
+	// GameHost is the DNS name or IP address players use to reach game
+	// servers ("" when not set). EffectiveGameHost is what servers use: the
+	// game host, or the first --public-host when it is empty, or "" when
+	// neither exists (servers cannot start then).
+	GameHost          string `json:"game_host"`
+	EffectiveGameHost string `json:"effective_game_host"`
 }
 
 // UpdateSettingsRequest is the body of PATCH /api/v1/settings. Absent fields
-// are left unchanged.
+// are left unchanged. GameHost must be a DNS name or an IP address (no
+// scheme, port or path); "" clears it. Changing it regenerates a
+// self-signed game certificate and marks running servers restart_required.
 type UpdateSettingsRequest struct {
-	RegistrationEnabled *bool `json:"registration_enabled,omitempty"`
+	RegistrationEnabled *bool   `json:"registration_enabled,omitempty"`
+	GameHost            *string `json:"game_host,omitempty"`
 }

@@ -63,6 +63,9 @@ var expectedRoutes = map[string]Access{
 	"POST /api/v1/servers/{id}/restart": AccessDeveloper,
 	"GET /api/v1/servers/{id}/logs":     AccessDeveloper,
 	"GET /api/v1/servers/{id}/stats":    AccessDeveloper,
+	"GET /api/v1/servers/{id}/runtime":  AccessDeveloper,
+	"GET /api/v1/certificates/game":     AccessAdmin,
+	"PUT /api/v1/certificates/game":     AccessAdmin,
 
 	"GET /api/v1/images":         AccessDeveloper,
 	"DELETE /api/v1/images/{id}": AccessAdmin,

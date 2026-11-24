@@ -30,6 +30,26 @@ type Container struct {
 	StartedAt    time.Time
 	FinishedAt   time.Time
 	Created      time.Time
+	// Ports are the published ports by container port ("7778/tcp"), as
+	// Docker reports them for the running container.
+	Ports map[string][]PortBinding
+}
+
+// PortBinding is one host address a container port is published on.
+type PortBinding struct {
+	HostIP   string
+	HostPort int
+}
+
+// LoopbackPort returns the host port container TCP port p is published on
+// at 127.0.0.1, or 0 when it is not (yet) published there.
+func (c Container) LoopbackPort(p int) int {
+	for _, b := range c.Ports[strconv.Itoa(p)+"/tcp"] {
+		if b.HostIP == "127.0.0.1" && b.HostPort > 0 && b.HostPort <= 65535 {
+			return b.HostPort
+		}
+	}
+	return 0
 }
 
 // ServerRef identifies a server's container: the server id and the
@@ -57,6 +77,12 @@ type containerJSON struct {
 	Config struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
+	NetworkSettings struct {
+		Ports map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		} `json:"Ports"`
+	} `json:"NetworkSettings"`
 }
 
 func (j containerJSON) container() Container {
@@ -64,7 +90,16 @@ func (j containerJSON) container() Container {
 	if labels == nil {
 		labels = map[string]string{}
 	}
+	ports := map[string][]PortBinding{}
+	for k, list := range j.NetworkSettings.Ports {
+		for _, b := range list {
+			if p, err := strconv.Atoi(b.HostPort); err == nil {
+				ports[k] = append(ports[k], PortBinding{HostIP: b.HostIP, HostPort: p})
+			}
+		}
+	}
 	return Container{
+		Ports:        ports,
 		ID:           j.ID,
 		Name:         strings.TrimPrefix(j.Name, "/"),
 		ImageID:      j.Image,

@@ -56,9 +56,13 @@ func TestMigrationsApplyAndAreIdempotent(t *testing.T) {
 	if _, err := s2.GetAccountByUsername(ctx, "alice"); err != nil {
 		t.Fatalf("data lost after reopen: %v", err)
 	}
+	migs, err := loadMigrations(migrationFS)
+	if err != nil || migs[len(migs)-1].version != v {
+		t.Fatalf("latest migration vs schema version %d: %v", v, err)
+	}
 	var n int
-	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil || n != v {
-		t.Fatalf("schema_migrations rows %d (err %v), want %d", n, err, v)
+	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil || n != len(migs) {
+		t.Fatalf("schema_migrations rows %d (err %v), want %d", n, err, len(migs))
 	}
 	// Pragmas are applied on every connection.
 	var fk int
@@ -466,35 +470,58 @@ func TestServersCRUD(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)
 	p, _ := s.CreateProject(ctx, Project{Name: "game", RepoURL: "x"}, nil)
+	b1, _ := s.CreateBuild(ctx, NewBuild{ProjectID: p.ID})
+	b2, _ := s.CreateBuild(ctx, NewBuild{ProjectID: p.ID})
 	port := 27015
-	sv, err := s.CreateServer(ctx, Server{Name: "eu-1", ProjectID: &p.ID, Image: "golem/game:1", Port: &port},
+	sv, err := s.CreateServer(ctx, Server{Name: "eu-1", BuildID: &b1.ID, Port: &port, AllowedOrigins: []string{"https://a.example"}},
 		func(id int64) ([]byte, error) { return []byte("ct"), nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sv.DesiredState != "stopped" || string(sv.Env) != "ct" || *sv.Port != port {
+	if sv.DesiredState != "stopped" || string(sv.Env) != "ct" || *sv.Port != port || *sv.BuildID != b1.ID ||
+		len(sv.AllowedOrigins) != 1 || sv.AdminPort != 0 || sv.AdminToken != nil {
 		t.Fatalf("unexpected server %+v", sv)
 	}
-	if _, err := s.CreateServer(ctx, Server{Name: "eu-2", Image: "i", Port: &port}, nil); !errors.Is(err, ErrConflict) {
+	if _, err := s.CreateServer(ctx, Server{Name: "eu-2", Port: &port}, nil); !errors.Is(err, ErrConflict) {
 		t.Fatalf("duplicate port: %v", err)
 	}
-	if _, err := s.CreateServer(ctx, Server{Name: "eu-1", Image: "i"}, nil); !errors.Is(err, ErrConflict) {
+	if _, err := s.CreateServer(ctx, Server{Name: "eu-1"}, nil); !errors.Is(err, ErrConflict) {
 		t.Fatalf("duplicate name: %v", err)
 	}
-	if _, err := s.CreateServer(ctx, Server{Name: "bad", Image: "i", DesiredState: "exploded"}, nil); err == nil {
+	if _, err := s.CreateServer(ctx, Server{Name: "bad", DesiredState: "exploded"}, nil); err == nil {
 		t.Fatal("invalid desired_state accepted")
 	}
-	img2, port2 := "golem/game:2", 27016
-	u, err := s.UpdateServer(ctx, sv.ID, ServerUpdate{Image: &img2, Port: &port2})
-	if err != nil || u.Image != "golem/game:2" || u.DesiredState != "stopped" || *u.Port != port2 || string(u.Env) != "ct" {
+	missing := int64(999)
+	if _, err := s.CreateServer(ctx, Server{Name: "nobuild", BuildID: &missing}, nil); err == nil {
+		t.Fatal("unknown build accepted")
+	}
+	port2 := 27016
+	u, err := s.UpdateServer(ctx, sv.ID, ServerUpdate{BuildID: &b2.ID, Port: &port2, SetOrigins: true})
+	if err != nil || *u.BuildID != b2.ID || u.DesiredState != "stopped" || *u.Port != port2 || string(u.Env) != "ct" || len(u.AllowedOrigins) != 0 {
 		t.Fatalf("update: %v %+v", err, u)
 	}
-	// Deleting the project detaches the server.
-	if err := s.DeleteProject(ctx, p.ID); err != nil {
+	// The container record carries the admin endpoint and is cleared with it.
+	if err := s.SetServerContainer(ctx, sv.ID, "c1", 41000, []byte("tok")); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := s.GetServer(ctx, sv.ID); got.ProjectID != nil {
-		t.Fatalf("project_id not nulled: %v", *got.ProjectID)
+	if err := s.SetServerAdminPort(ctx, sv.ID, "other", 42000); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetServer(ctx, sv.ID); got.ContainerID != "c1" || got.AdminPort != 41000 || string(got.AdminToken) != "tok" {
+		t.Fatalf("%+v", got)
+	}
+	if err := s.SetServerAdminPort(ctx, sv.ID, "c1", 42000); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearServerContainer(ctx, sv.ID, "c1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetServer(ctx, sv.ID); got.ContainerID != "" || got.AdminPort != 0 || got.AdminToken != nil {
+		t.Fatalf("%+v", got)
+	}
+	// A build a server references cannot be deleted.
+	if err := s.DeleteBuild(ctx, b2.ID); err == nil {
+		t.Fatal("referenced build deleted")
 	}
 	if n, _ := s.CountServers(ctx); n != 1 {
 		t.Fatalf("count %d", n)
@@ -507,5 +534,45 @@ func TestServersCRUD(t *testing.T) {
 	}
 	if _, err := s.GetServer(ctx, sv.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("get deleted: %v", err)
+	}
+}
+
+func TestLatestSuccessfulBuild(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	p, _ := s.CreateProject(ctx, Project{Name: "game", RepoURL: "x"}, nil)
+	other, _ := s.CreateProject(ctx, Project{Name: "other", RepoURL: "x"}, nil)
+	mk := func(pid int64, commit, status, image string) Build {
+		t.Helper()
+		b, err := s.CreateBuild(ctx, NewBuild{ProjectID: pid})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.MarkBuildRunning(ctx, b.ID, "main", commit); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.FinishBuild(ctx, b.ID, BuildResult{Status: status, ImageID: image}); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	a1 := mk(p.ID, "aaa", BuildStatusSuccess, "sha256:1")
+	a2 := mk(p.ID, "aaa", BuildStatusSuccess, "sha256:2")
+	mk(p.ID, "aaa", BuildStatusError, "")
+	bb := mk(p.ID, "bbb", BuildStatusSuccess, "sha256:3")
+	mk(p.ID, "ccc", BuildStatusError, "")
+	mk(other.ID, "aaa", BuildStatusSuccess, "sha256:4")
+	if got, err := s.LatestSuccessfulBuild(ctx, p.ID, "aaa"); err != nil || got.ID != a2.ID {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if got, err := s.LatestSuccessfulBuild(ctx, p.ID, ""); err != nil || got.ID != bb.ID {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if _, err := s.LatestSuccessfulBuild(ctx, p.ID, "ccc"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+	imgs, err := s.BuildsByImage(ctx)
+	if err != nil || len(imgs) != 4 || imgs["sha256:1"][0] != a1.ID {
+		t.Fatalf("%v %v", imgs, err)
 	}
 }
