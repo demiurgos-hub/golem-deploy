@@ -100,3 +100,31 @@ func TestD4_ServeDefaults(t *testing.T) {
 		t.Error("explicit 0 replaced by the default")
 	}
 }
+
+func TestBuildFlags(t *testing.T) {
+	t.Setenv("GOLEM_DEPLOY_INSECURE_HTTP", "")
+	t.Setenv("GOLEM_DEPLOY_BUILD_TIMEOUT", "")
+	t.Setenv("GOLEM_DEPLOY_BUILD_RETENTION", "")
+	_, _, stderr := runCLI(t, "", "serve", "-h")
+	for _, want := range []string{"-build-timeout duration", "(default 30m0s)", "-build-retention int", "(default 5)"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("serve -h lacks %q:\n%s", want, stderr)
+		}
+	}
+	t.Setenv("GOLEM_DEPLOY_BUILD_TIMEOUT", "45m")
+	t.Setenv("GOLEM_DEPLOY_BUILD_RETENTION", "9")
+	if _, _, stderr := runCLI(t, "", "serve", "-h"); !strings.Contains(stderr, "(default 45m0s)") || !strings.Contains(stderr, "(default 9)") {
+		t.Errorf("env fallbacks ignored:\n%s", stderr)
+	}
+	t.Setenv("GOLEM_DEPLOY_BUILD_TIMEOUT", "soon")
+	if code, _, _ := runCLI(t, "", "serve"); code != 2 {
+		t.Fatalf("bad env duration: %d", code)
+	}
+	t.Setenv("GOLEM_DEPLOY_BUILD_TIMEOUT", "")
+	if code, _, stderr := runCLI(t, "", "serve", "--listen", "127.0.0.1:0", "--build-timeout", "10s", "--data-dir", t.TempDir()); code != 1 || !strings.Contains(stderr, "--build-timeout") {
+		t.Fatalf("short timeout: %d %q", code, stderr)
+	}
+	if code, _, stderr := runCLI(t, "", "serve", "--listen", "127.0.0.1:0", "--build-retention", "-1", "--data-dir", t.TempDir()); code != 1 || !strings.Contains(stderr, "--build-retention") {
+		t.Fatalf("bad retention: %d %q", code, stderr)
+	}
+}

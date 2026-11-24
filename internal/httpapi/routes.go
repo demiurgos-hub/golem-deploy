@@ -48,6 +48,13 @@ func (s *Server) routes() []route {
 		{method: "POST", path: "/projects/{id}/pull", access: AccessDeveloper, handler: s.handlePullProject},
 		{method: "POST", path: "/projects/{id}/branch", access: AccessDeveloper, handler: s.handleSwitchBranch},
 		{method: "GET", path: "/projects/{id}/branches", access: AccessDeveloper, handler: s.handleListBranches},
+		{method: "POST", path: "/projects/{id}/builds", access: AccessDeveloper, handler: s.handleCreateBuild},
+		{method: "GET", path: "/projects/{id}/builds", access: AccessDeveloper, handler: s.handleListProjectBuilds},
+
+		// Builds.
+		{method: "GET", path: "/builds", access: AccessDeveloper, handler: s.handleListBuilds},
+		{method: "GET", path: "/builds/{id}", access: AccessDeveloper, handler: s.handleGetBuild},
+		{method: "DELETE", path: "/builds/{id}", access: AccessAdmin, handler: s.handleDeleteBuild},
 
 		// Servers.
 		{method: "GET", path: "/servers", access: AccessDeveloper, handler: s.handleListServers},

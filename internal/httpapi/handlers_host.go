@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
@@ -293,6 +294,13 @@ func (s *Server) handleDeleteStatic(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 	name := r.PathValue("name")
+	users, err := s.store.ProjectsUsingStatic(r.Context(), name)
+	if err != nil {
+		return internal(err)
+	}
+	if len(users) > 0 {
+		return conflict(apitypes.ErrorCodeConflict, "the file is a static add-on of project "+strings.Join(users, ", ")+"; remove it from the project first")
+	}
 	if err := s.static.Remove(name); err != nil {
 		return staticError(err)
 	}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/git"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
@@ -61,7 +62,12 @@ func newProjectState(d Deps) *projectState {
 var projectNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 func toAPIProject(p store.Project) apitypes.Project {
+	addons := make([]apitypes.StaticAddon, 0, len(p.StaticAddons))
+	for _, a := range p.StaticAddons {
+		addons = append(addons, apitypes.StaticAddon{Name: a.Name, Target: a.Target})
+	}
 	return apitypes.Project{
+		StaticAddons: addons,
 		ID:           p.ID,
 		Name:         p.Name,
 		RepoURL:      p.RepoURL,
@@ -315,7 +321,14 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) err
 	} else if err := git.CheckAuthKind(authMethodOf(p.AuthType), kind); err != nil {
 		return invalidField("repo_url", err.Error()+"; send new auth together with the URL")
 	}
-	if upd.RepoURL == nil && upd.Auth == nil {
+	if req.StaticAddons != nil {
+		addons, err := s.checkAddons(*req.StaticAddons)
+		if err != nil {
+			return err
+		}
+		upd.StaticAddons = &addons
+	}
+	if upd.RepoURL == nil && upd.Auth == nil && upd.StaticAddons == nil {
 		writeJSON(w, http.StatusOK, toAPIProject(p))
 		return nil
 	}
@@ -328,15 +341,61 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) err
 	}
 	s.proj.branches.forget(p.ID)
 	s.logger.Info("project updated", "request_id", requestIDFrom(r.Context()), "by", identityFrom(r).Account.ID,
-		"project_id", p.ID, "url_changed", upd.RepoURL != nil, "auth_changed", upd.Auth != nil, "auth_type", p.AuthType)
+		"project_id", p.ID, "url_changed", upd.RepoURL != nil, "auth_changed", upd.Auth != nil, "auth_type", p.AuthType,
+		"addons_changed", upd.StaticAddons != nil)
 	writeJSON(w, http.StatusOK, toAPIProject(p))
 	return nil
+}
+
+// checkAddons validates static add-ons for PATCH: names and targets
+// (build.ValidateAddons) and that every file exists in the static store as
+// a ZIP archive.
+func (s *Server) checkAddons(in []apitypes.StaticAddon) ([]store.StaticAddon, error) {
+	list := make([]build.Addon, 0, len(in))
+	for _, a := range in {
+		list = append(list, build.Addon{Name: a.Name, Target: a.Target})
+	}
+	norm, err := build.ValidateAddons(list)
+	var fe *build.FieldError
+	if errors.As(err, &fe) {
+		return nil, invalidField(fe.Field, fe.Msg)
+	}
+	if err != nil {
+		return nil, internal(err)
+	}
+	out := make([]store.StaticAddon, 0, len(norm))
+	if len(norm) > 0 {
+		if s.static == nil {
+			return nil, newError(http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable, "the static file store is not available")
+		}
+		files, err := s.static.List()
+		if err != nil {
+			return nil, internal(err)
+		}
+		zips := map[string]bool{}
+		for _, f := range files {
+			zips[f.Name] = f.IsZip
+		}
+		for i, a := range norm {
+			isZip, ok := zips[a.Name]
+			switch {
+			case !ok:
+				return nil, invalidField(fmt.Sprintf("static_addons[%d].name", i), "no static file has this name")
+			case !isZip:
+				return nil, invalidField(fmt.Sprintf("static_addons[%d].name", i), "the static file is not a ZIP archive")
+			}
+			out = append(out, store.StaticAddon{Name: a.Name, Target: a.Target})
+		}
+	}
+	return out, nil
 }
 
 // handleDeleteProject removes the checkout first and the row second: if
 // removing the checkout fails the project is still listed and the delete
 // can be retried; if deleting the row fails afterwards, the project has no
-// checkout and a pull re-clones it. Leftovers are swept at startup.
+// checkout and a pull re-clones it. Leftovers are swept at startup. It is
+// refused while servers are configured with one of the project's builds;
+// the images of its builds are removed afterwards (best effort).
 func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) error {
 	s.proj.mu.Lock()
 	defer s.proj.mu.Unlock()
@@ -347,6 +406,13 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) err
 	if _, busy := s.jobs.ActiveFor(jobs.Subject{Type: string(apitypes.SubjectTypeProject), ID: jobs.SubjectID(p.ID)}); busy {
 		return conflict(apitypes.ErrorCodeJobInProgress, "a job is running for this project; wait for it or cancel it")
 	}
+	if err := s.projectBuildsInUse(r.Context(), p.ID); err != nil {
+		return err
+	}
+	builds, err := s.store.ListBuilds(r.Context(), store.BuildFilter{ProjectID: &p.ID, Limit: 500})
+	if err != nil {
+		return internal(err)
+	}
 	if s.proj.repoDir != "" {
 		err := git.RemoveCheckout(s.proj.repoDir, p.ID, s.proj.tmpDir)
 		switch {
@@ -356,13 +422,20 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) err
 			return internal(fmt.Errorf("remove checkout of project %d: %w", p.ID, err))
 		}
 	}
-	if err := s.store.DeleteProject(r.Context(), p.ID); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+	if err := s.store.DeleteProjectUnused(r.Context(), p.ID); err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
 			return notFound("project")
+		case errors.Is(err, store.ErrInUse):
+			if e := s.projectBuildsInUse(r.Context(), p.ID); e != nil {
+				return e
+			}
+			return conflict(apitypes.ErrorCodeConflict, "servers are configured with builds of this project")
 		}
 		return internal(err)
 	}
 	s.proj.branches.forget(p.ID)
+	s.removeProjectImages(builds)
 	s.logger.Info("project deleted", "request_id", requestIDFrom(r.Context()), "by", identityFrom(r).Account.ID, "project_id", p.ID, "name", p.Name)
 	w.WriteHeader(http.StatusNoContent)
 	return nil

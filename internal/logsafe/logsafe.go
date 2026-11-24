@@ -24,7 +24,8 @@ const TruncatedMarker = " [line truncated]"
 // Writer is an io.Writer that splits a stream into lines, replaces the
 // configured literals in each complete line, escapes C0 controls (except
 // tab), DEL, C1 controls, the Unicode line/paragraph separators and
-// bidirectional controls (\x1b, \u0085, ‮, ...), replaces invalid UTF-8
+// bidirectional controls visibly (ESC as \x1b, NEL as \u0085, and so on),
+// replaces invalid UTF-8
 // with U+FFFD, caps each line at MaxLine bytes and prefixes it. Carriage
 // returns end a line too (progress output). Close flushes a final partial
 // line. Safe for concurrent use.

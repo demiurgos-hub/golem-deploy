@@ -245,7 +245,9 @@ func TestRunSuccess(t *testing.T) {
 func TestRunContainerdImageStore(t *testing.T) {
 	e := newEnv(t)
 	p := e.project("arena", nil)
-	e.fake.SetBuildHook(func(dockertest.BuildCall) dockertest.BuildOutcome { return dockertest.BuildOutcome{ContainerdStore: true} })
+	e.fake.SetBuildHook(func(dockertest.BuildCall) dockertest.BuildOutcome {
+		return dockertest.BuildOutcome{ContainerdStore: true}
+	})
 	b, log, err := e.run(context.Background(), p, nil)
 	if err != nil || b.Status != store.BuildStatusSuccess || !e.fake.HasImage(b.ImageID) {
 		t.Fatalf("%v %+v\n%s", err, b, log)

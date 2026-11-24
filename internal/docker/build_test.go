@@ -160,7 +160,9 @@ func TestBuiltImageLabelChecks(t *testing.T) {
 
 func TestBuildFailureClassification(t *testing.T) {
 	dc, fake, s := newBuildClient(t)
-	fake.SetBuildHook(func(dockertest.BuildCall) dockertest.BuildOutcome { return dockertest.BuildOutcome{Fail: true, Output: "secret-ish output\n"} })
+	fake.SetBuildHook(func(dockertest.BuildCall) dockertest.BuildOutcome {
+		return dockertest.BuildOutcome{Fail: true, Output: "secret-ish output\n"}
+	})
 	err := dc.Build(context.Background(), s, &strings.Builder{})
 	var ce *docker.CmdError
 	if !errors.As(err, &ce) || ce.Detail != "" || strings.Contains(err.Error(), "secret-ish") {
