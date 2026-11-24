@@ -393,6 +393,28 @@ func TestCustomChainMustBeInIssuerOrder(t *testing.T) {
 	}
 }
 
+func TestChainIssuersMustBeCurrentlyValid(t *testing.T) {
+	now := time.Now()
+	window := certOpts{notBefore: now.Add(-time.Hour), notAfter: now.Add(time.Hour)}
+	rootWindow := window
+	rootWindow.isCA = true
+	rootKey := newKey(t, ecP256)
+	root, _ := makeCert(t, rootKey, nil, nil, rootWindow)
+	leafKey := newKey(t, ecP256)
+	leafKeyPEM := keyPEM(t, leafKey, "PRIVATE KEY")
+	for name, issuerWindow := range map[string]certOpts{
+		"expired":       {notBefore: now.Add(-2 * time.Hour), notAfter: now.Add(-time.Minute), isCA: true},
+		"not yet valid": {notBefore: now.Add(time.Minute), notAfter: now.Add(time.Hour), isCA: true},
+	} {
+		issuerKey := newKey(t, ecP256)
+		issuer, issuerPEM := makeCert(t, issuerKey, root, rootKey, issuerWindow)
+		_, leafPEM := makeCert(t, leafKey, issuer, issuerKey, window)
+		if _, _, err := ValidateCustom(slices.Concat(leafPEM, issuerPEM), leafKeyPEM, now); err == nil {
+			t.Errorf("accepted a current leaf under an issuer that is %s", name)
+		}
+	}
+}
+
 func TestModeChangeCommitAndRecovery(t *testing.T) {
 	ctx := context.Background()
 	m, clk, settings := newManager(t)

@@ -117,7 +117,10 @@ const (
 func (m *acmeClient) client(account ACMEAccount) (*acme.Client, *acmeTransport, func()) {
 	transport, stop := m.newTransport()
 	bounded := &acmeTransport{base: transport}
-	return &acme.Client{Directory: account.Directory, UserAgent: "golem-deploy",
+	// Poll once a second when the CA gives no Retry-After: the library's
+	// default of four polls a second would use up the order's request
+	// budget long before its deadline.
+	return &acme.Client{Directory: account.Directory, UserAgent: "golem-deploy", PollInterval: time.Second,
 		HTTPClient: &http.Client{Timeout: 30 * time.Second, Transport: bounded},
 	}, bounded, stop
 }

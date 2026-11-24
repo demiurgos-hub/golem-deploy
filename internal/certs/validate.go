@@ -119,6 +119,12 @@ func ValidateCustom(chainPEM, keyPEM []byte, now time.Time) (chainOut, keyOut []
 		if !bytes.Equal(child.RawIssuer, parent.RawSubject) || child.CheckSignatureFrom(parent) != nil {
 			return nil, nil, invalid(FieldCertificate, "certificate %d in the chain must be signed by certificate %d", i, i+1)
 		}
+		// Clients reject a chain through an issuer outside its validity,
+		// even when the leaf itself is current.
+		if !now.Before(parent.NotAfter) || now.Before(parent.NotBefore) {
+			return nil, nil, invalid(FieldCertificate, "certificate %d in the chain is not valid now (%s to %s)", i+1,
+				parent.NotBefore.UTC().Format(time.RFC3339), parent.NotAfter.UTC().Format(time.RFC3339))
+		}
 	}
 	var out bytes.Buffer
 	for _, c := range chain {

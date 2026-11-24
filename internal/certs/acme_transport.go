@@ -118,7 +118,10 @@ func (t *acmeTransport) inspectResponse(req *http.Request, resp *http.Response, 
 	}
 	endpoint := req.URL.String()
 	if req.Method == http.MethodPost && endpoint == t.newOrderURL {
-		t.rejectedReplacement = mediaType == "application/problem+json" && orderHasReplacement(req)
+		// A rate limit or a server failure is not a verdict on the hint:
+		// asking again at once would ignore the CA's Retry-After.
+		t.rejectedReplacement = mediaType == "application/problem+json" && orderHasReplacement(req) &&
+			resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < http.StatusInternalServerError
 		if resp.StatusCode == http.StatusCreated {
 			var order acme.Order
 			if json.Unmarshal(body, &order) == nil {

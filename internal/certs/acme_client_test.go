@@ -123,6 +123,37 @@ func TestACMEReplacesOnlyIssuingAccountAndRetriesRejectedOrder(t *testing.T) {
 	}
 }
 
+func TestACMERateLimitedOrderIsNotRetriedWithoutReplaces(t *testing.T) {
+	var orders atomic.Int32
+	url := mockACMEDirectory(t, true, func(w http.ResponseWriter, r *http.Request, _ string) {
+		if r.URL.Path != "/order" {
+			http.NotFound(w, r)
+			return
+		}
+		orders.Add(1)
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"type":"urn:ietf:params:acme:error:rateLimited","detail":"too many orders"}`)
+	})
+	client := testACMEClient(t)
+	account := ACMEAccount{Directory: url, Email: "original@example.com"}
+	host := "game.example.com"
+	pair := testACMEPair(t, host, time.Now())
+	issuingURL := strings.TrimSuffix(url, "/dir") + "/account/1"
+	if err := client.storage(account).savePair(host, storedACMEPair{AccountURL: issuingURL, Chain: pair.chain, Key: pair.key}); err != nil {
+		t.Fatal(err)
+	}
+	err := client.Issue(t.Context(), account, host, true, io.Discard)
+	failure := summarizeACME(err)
+	if err == nil || orders.Load() != 1 {
+		t.Fatalf("a rate-limited order was sent %d times (err %v), want once", orders.Load(), err)
+	}
+	if left := time.Until(failure.retry); left < 50*time.Minute || left > time.Hour+time.Minute {
+		t.Fatalf("the CA's Retry-After was not kept: retry in %v", left)
+	}
+}
+
 func TestACMEStorageSeparatesAccountsAndDirectories(t *testing.T) {
 	url := mockACMEDirectory(t, false, httpNotFoundACME)
 	client := testACMEClient(t)
