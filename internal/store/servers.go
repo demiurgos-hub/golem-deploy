@@ -276,6 +276,11 @@ func (s *Store) UpdateServer(ctx context.Context, id int64, u ServerUpdate) (Ser
 				if currentProjectID != projectID {
 					return ErrServerProject
 				}
+			} else if len(current.Env) != 0 && (!u.SetEnv || len(u.Env) != 0) {
+				// Migration 0006 cleared the pre-build project link. An
+				// operator can assign the first build after clearing the
+				// old environment, whose project can no longer be proved.
+				return ErrLegacyServerEnv
 			}
 		}
 		var err error
@@ -285,10 +290,11 @@ func (s *Store) UpdateServer(ctx context.Context, id int64, u ServerUpdate) (Ser
 	return out, err
 }
 
-// ErrServerProject and ErrServerJob protect a server's project and active jobs.
+// These errors protect a server's project, legacy environment and active jobs.
 var (
-	ErrServerProject = errors.New("store: server project cannot change")
-	ErrServerJob     = errors.New("store: server job in progress")
+	ErrServerProject   = errors.New("store: server project cannot change")
+	ErrLegacyServerEnv = errors.New("store: legacy server environment has no associated project")
+	ErrServerJob       = errors.New("store: server job in progress")
 )
 
 // CheckServerJob reports an active job early, before inspecting Docker for

@@ -16,6 +16,7 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
 	"github.com/demiurgos-hub/golem-deploy/internal/gameadmin/gameadmintest"
+	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
 type testDockerRunner func(context.Context, string, docker.Cmd) error
@@ -213,5 +214,29 @@ func TestReadinessDeadlineBoundsInspectAndProbe(t *testing.T) {
 				t.Fatalf("%s overran readiness deadline: %v after %s", slow, err, time.Since(start))
 			}
 		})
+	}
+}
+
+func TestLegacyEnvCannotFollowAnUnassignedServer(t *testing.T) {
+	ctx := t.Context()
+	fx := newFixture(t, Config{})
+	b := fx.build(t, 1, commitA)
+	legacy, err := fx.st.CreateServer(ctx, store.Server{Name: "legacy", Port: ptr(7000)}, func(id int64) ([]byte, error) {
+		return fx.svc.sealEnv(id, map[string]string{"SECRET": marker})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fx.svc.Update(ctx, legacy.ID, apitypes.UpdateServerRequest{BuildID: &b.ID}); err == nil {
+		t.Fatal("legacy environment attached to a build of an unverified project")
+	} else {
+		var field *FieldError
+		if !errors.As(err, &field) || field.Field != "build_id" {
+			t.Fatalf("expected build_id validation: %v", err)
+		}
+	}
+	updated, err := fx.svc.Update(ctx, legacy.ID, apitypes.UpdateServerRequest{BuildID: &b.ID, EnvUnset: []string{"SECRET"}})
+	if err != nil || updated.BuildID == nil || *updated.BuildID != b.ID || len(updated.EnvKeys) != 0 {
+		t.Fatalf("first build and explicit env clear: %+v %v", updated, err)
 	}
 }

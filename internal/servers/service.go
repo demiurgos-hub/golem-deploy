@@ -749,6 +749,8 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 			return apitypes.Server{}, ErrConflict
 		case errors.Is(err, store.ErrServerProject):
 			return apitypes.Server{}, fieldErr("build_id", "the build must belong to the server's project")
+		case errors.Is(err, store.ErrLegacyServerEnv):
+			return apitypes.Server{}, fieldErr("build_id", "clear the legacy server's saved environment before assigning its first build")
 		case errors.Is(err, store.ErrMissingReference):
 			return apitypes.Server{}, errBuildGone
 		case errors.Is(err, store.ErrConflict):
