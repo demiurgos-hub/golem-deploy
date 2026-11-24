@@ -199,6 +199,8 @@ func TestACMEReconcileNewerStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := NewAutomation(AutomationOptions{Game: reopened, GameHost: fixedHost(host), PanelMode: apitypes.PanelCertificateModeNone, Client: fake})
+	lastAttempt := c.now()
+	a.record(ctx, (accountSettings{}).account(""), host, attemptState{At: &lastAttempt, Detail: "Previous renewal failed", Failures: 1})
 	if err := a.Initialize(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -210,6 +212,10 @@ func TestACMEReconcileNewerStorage(t *testing.T) {
 	}
 	if fake.calls != 2 {
 		t.Fatal("local reconciliation contacted the CA")
+	}
+	status, err := a.ACME(ctx)
+	if err != nil || len(status.Certificates) != 1 || status.Certificates[0].Status != "issued" || status.Certificates[0].LastError != "" {
+		t.Fatalf("status did not reflect the recovered pair: %+v, %v", status, err)
 	}
 }
 

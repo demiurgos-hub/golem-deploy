@@ -120,7 +120,7 @@ func (a *Automation) recordFailure(ctx context.Context, account ACMEAccount, hos
 	last, _ := a.attempt(context.WithoutCancel(ctx), account, host)
 	count := min(last.Failures+1, 7)
 	wait := time.Minute << (count - 1)
-	next := at.Add(wait)
+	next := a.now().Add(wait)
 	var failure *acmeFailure
 	if errors.As(err, &failure) && failure.retry.After(next) {
 		next = failure.retry
@@ -148,7 +148,7 @@ func (a *Automation) run(ctx context.Context, action Action, requested []string,
 		at := a.now().UTC()
 		pair, err := a.obtain(ctx, account, host, action == RenewAll, log)
 		if err == nil && action == RenewAll {
-			err = a.installManaged(ctx, host, pair, false)
+			_, err = a.installManaged(ctx, host, pair, false)
 			if err != nil && ctx.Err() == nil {
 				a.recordFailure(ctx, account, host, at, err)
 			}
@@ -216,38 +216,43 @@ func (a *Automation) run(ctx context.Context, action Action, requested []string,
 	return nil
 }
 
-func (a *Automation) installManaged(ctx context.Context, host string, pair *certificatePair, newerOnly bool) error {
+func (a *Automation) installManaged(ctx context.Context, host string, pair *certificatePair, newerOnly bool) (bool, error) {
 	a.hostMu.Lock()
 	defer a.hostMu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	state, err := a.state(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	uses := state.managed[host]
 	if len(uses) == 0 {
-		return errHostsChanged
+		return false, errHostsChanged
 	}
+	changed := false
 	if slices.Contains(uses, apitypes.ACMECertificateUseGame) {
 		old, err := a.Game.Current(ctx, 0)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if pair.info.Fingerprint != old.Fingerprint && (!newerOnly || newer(pair.info, old, host)) {
 			if _, err := a.Game.useShared(ctx, ModeACME, pair.chain, pair.key); err != nil {
-				return err
+				return false, err
 			}
+			changed = true
 		}
 	}
 	if slices.Contains(uses, apitypes.ACMECertificateUsePanel) {
 		old := state.panel.issued[host]
-		if old == nil || !newerOnly || newer(pair.info, old.info, host) {
-			return a.setPanelPair(host, pair)
+		if old == nil || (pair.info.Fingerprint != old.info.Fingerprint && (!newerOnly || newer(pair.info, old.info, host))) {
+			if err := a.setPanelPair(host, pair); err != nil {
+				return changed, err
+			}
+			changed = true
 		}
 	}
-	return nil
+	return changed, nil
 }
 
 func newer(pair, installed Info, host string) bool {
@@ -350,17 +355,26 @@ func (a *Automation) check(ctx context.Context, network bool) error {
 
 func (a *Automation) checkIdentifier(ctx context.Context, account ACMEAccount, host string, network bool) error {
 	pair, err := a.loadACME(ctx, account, host)
+	var reconciled bool
 	if err == nil {
-		if err := a.installManaged(ctx, host, pair, true); err != nil {
+		reconciled, err = a.installManaged(ctx, host, pair, true)
+		if err != nil {
 			return err
 		}
 	}
-	if !network {
+	if !network && !reconciled {
 		return nil
 	}
 	last, err := a.attempt(ctx, account, host)
-	if err != nil || last.Retry.After(a.now()) {
+	if err != nil {
 		return err
+	}
+	if reconciled && last.Detail != "" {
+		last = attemptState{At: last.At}
+		a.record(ctx, account, host, last)
+	}
+	if !network || last.Retry.After(a.now()) {
+		return nil
 	}
 	if pair != nil && !a.renewalDue(ctx, account, host, pair) {
 		return nil
@@ -370,7 +384,7 @@ func (a *Automation) checkIdentifier(ctx context.Context, account ACMEAccount, h
 	if err != nil {
 		return nil // already recorded and logged safely
 	}
-	if err := a.installManaged(ctx, host, pair, false); err != nil {
+	if _, err := a.installManaged(ctx, host, pair, false); err != nil {
 		a.recordFailure(ctx, account, host, at, err)
 		return err
 	}
