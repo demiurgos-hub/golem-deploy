@@ -14,7 +14,7 @@ import { Field, Input } from "@/components/ui/input";
 import { DetailList, Section } from "@/components/ui/page";
 import { EmptyState, ErrorState, ErrorText, LoadingState, Notice } from "@/components/ui/states";
 import { useToast } from "@/components/ui/toast";
-import { formatBytes, formatDateTime, formatDuration, formatRelative, shortFingerprint } from "@/lib/format";
+import { formatBytes, formatDateTime, formatDurationWords, formatRelative, shortFingerprint } from "@/lib/format";
 import {
   BACKUP_KEEP_DEFAULT,
   BACKUP_NOTE_MAX,
@@ -22,6 +22,7 @@ import {
   validateBackupInterval,
   validateBackupKeep,
   validateBackupNote,
+  trimBackupNote,
   validateSnapshotInterval,
 } from "@/lib/validators";
 
@@ -69,7 +70,7 @@ export function scheduleOf(d: DataSettingsDraft): BackupSchedule {
 function autosaveHint(raw: string): string {
   const n = Number(raw.trim());
   if (!/^\d+$/.test(raw.trim())) return "";
-  return n === 0 ? "Autosave off: the game saves only when it stops and for backups." : `Saves every ${formatDuration(n)}.`;
+  return n === 0 ? "Autosave off: the game saves only when it stops and for backups." : `Saves every ${formatDurationWords(n)}.`;
 }
 
 /** The autosave period and backup schedule fields, shared by the server page and the new-server dialog. */
@@ -205,7 +206,7 @@ function BackUpNow({ server, busy, onJob }: { server: Server; busy: boolean; onJ
 
   function submit(e: FormEvent) {
     e.preventDefault();
-    const n = note.trim();
+    const n = trimBackupNote(note);
     const err = validateBackupNote(n);
     setNoteError(err);
     if (!err) backup.mutate(n);

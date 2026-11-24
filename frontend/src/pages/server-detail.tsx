@@ -7,7 +7,16 @@ import { describeError, isApiError, sentence } from "@/api/errors";
 import { isJobActive, useAccount, useProjects, useServer, useServerRuntime, useServerStats, useSubjectJobs, useSuccessfulBuilds } from "@/api/queries";
 import { qk } from "@/api/query-keys";
 import type { Backup, Job, Server, UpdateServerRequest } from "@/api/types.gen";
-import { BackupPickerDialog, ResetDataDialog, RestoreDialog, schemaMatch, serverBuildFingerprint, useBuildFingerprints } from "@/components/backups";
+import {
+  BackupPickerDialog,
+  DeleteServerDialog,
+  ResetDataDialog,
+  RestoreDialog,
+  isLastBackupRefusal,
+  schemaMatch,
+  serverBuildFingerprint,
+  useBuildFingerprints,
+} from "@/components/backups";
 import { buildName } from "@/components/builds";
 import { CertificateDetails } from "@/components/certificate";
 import { EnvEditor } from "@/components/env-editor";
@@ -19,7 +28,7 @@ import { ServerStateBadge, isContainerActive, portLocked, serverActionsBlocked }
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
-import { ConfirmDialog, Dialog } from "@/components/ui/dialog";
+import { Dialog } from "@/components/ui/dialog";
 import { Checkbox, Field, Input, Select } from "@/components/ui/input";
 import { LogViewer } from "@/components/ui/log-viewer";
 import { DetailList, PageHeader, Section } from "@/components/ui/page";
@@ -90,12 +99,16 @@ function ServerDetail({ id }: { id: number }) {
     void navigate({ to: "/servers" });
   }, [deletedLate, serverName, toast, queryClient, navigate]);
 
-  async function remove(target: Server) {
+  async function remove(target: Server, skipLastBackup: boolean) {
     try {
-      await api.servers.remove(target.id);
+      await api.servers.remove(target.id, { skipLastBackup });
     } catch (err) {
-      setDialog(null);
-      toast.error(err, `Could not delete ${target.name}`);
+      // A refused last backup keeps the dialog open with the daemon's message and the way out.
+      const refused = isLastBackupRefusal(err);
+      if (!refused) {
+        setDialog(null);
+        toast.error(err, `Could not delete ${target.name}`);
+      }
       // DELETE runs a server.delete job; show it here so its outcome and log are visible.
       if (!(isApiError(err) && err.code === "job_in_progress")) {
         try {
@@ -112,9 +125,15 @@ function ServerDetail({ id }: { id: number }) {
       }
       void queryClient.invalidateQueries({ queryKey: qk.servers.detail(target.id) });
       void queryClient.invalidateQueries({ queryKey: qk.jobs.forSubject("server", target.id) });
+      // The last backup may have been stored before the deletion stopped.
+      void queryClient.invalidateQueries({ queryKey: qk.backups.all });
+      if (refused) throw err;
       return;
     }
-    toast.success(`Server ${target.name} deleted: container and saved data removed, port ${target.port} freed. Its backups are kept.`);
+    const lastBackup = target.data.volume !== "" && !skipLastBackup;
+    toast.success(
+      `Server ${target.name} deleted: container and saved data removed, port ${target.port} freed. ${lastBackup ? "A last backup of its saved world was stored; its" : "Its"} backups are kept.`,
+    );
     queryClient.removeQueries({ queryKey: qk.servers.detail(target.id) });
     void queryClient.invalidateQueries({ queryKey: qk.servers.list });
     void queryClient.invalidateQueries({ queryKey: qk.builds.all });
@@ -342,23 +361,9 @@ function ServerDetail({ id }: { id: number }) {
       )}
       {restoring && <RestoreDialog backup={restoring} target={s} onClose={() => setRestoring(null)} onJob={(job) => shown.show(job)} />}
       {dialog === "reset" && <ResetDataDialog server={s} onClose={() => setDialog(null)} onJob={shown.show} />}
-      <ConfirmDialog
-        open={dialog === "delete"}
-        onOpenChange={(o) => !o && setDialog(null)}
-        title="Delete server"
-        description={
-          <>
-            Delete <span className="font-medium text-foreground">{s.name}</span>? The container is stopped gracefully (this can
-            take up to 30 seconds) and removed, its stored environment is deleted and port {s.port} is freed.{" "}
-            {s.data.volume
-              ? "Its saved world is deleted with it. Its backups are kept: they stay on the Backups page and can be restored into another server."
-              : "Its backups, if any, are kept on the Backups page."}
-          </>
-        }
-        confirmLabel="Delete server"
-        destructive
-        onConfirm={() => remove(s)}
-      />
+      {dialog === "delete" && (
+        <DeleteServerDialog server={s} isAdmin={isAdmin} onClose={() => setDialog(null)} onDelete={(skip) => remove(s, skip)} />
+      )}
     </>
   );
 }

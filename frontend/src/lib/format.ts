@@ -60,6 +60,32 @@ export function formatDuration(seconds: number): string {
   return `${s}s`;
 }
 
+const DURATION_UNITS: [number, string][] = [
+  [86400, "day"],
+  [3600, "hour"],
+  [60, "minute"],
+  [1, "second"],
+];
+
+/**
+ * A duration in seconds in words, without zero parts: "5 minutes",
+ * "1 hour 30 minutes", "1 day". Under two minutes a duration that is not a
+ * whole minute stays in seconds ("90 seconds").
+ */
+export function formatDurationWords(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "-";
+  let s = Math.floor(seconds);
+  if (s === 0) return "0 seconds";
+  if (s < 120 && s % 60 !== 0) return `${s} second${s === 1 ? "" : "s"}`;
+  const parts: string[] = [];
+  for (const [size, unit] of DURATION_UNITS) {
+    const n = Math.floor(s / size);
+    s -= n * size;
+    if (n > 0) parts.push(`${n} ${unit}${n === 1 ? "" : "s"}`);
+  }
+  return parts.join(" ");
+}
+
 /** A schema fingerprint shortened for tables; the full value goes in a title or copy button. */
 export function shortFingerprint(fp: string): string {
   return fp ? fp.slice(0, 12) : "-";

@@ -80,6 +80,10 @@ interface ConfirmDialogProps {
   destructive?: boolean;
   /** May return a promise; the dialog stays open and shows the error if it rejects. */
   onConfirm: () => unknown;
+  /** Extra content under the description, such as a secondary option. */
+  children?: ReactNode;
+  /** Explains what to do about an error onConfirm rejected with, shown under it. */
+  errorHint?: (error: unknown) => ReactNode;
 }
 
 /** Confirmation for consequential actions. Name the thing being changed in the description. */
@@ -91,6 +95,8 @@ export function ConfirmDialog({
   confirmLabel,
   destructive = false,
   onConfirm,
+  children,
+  errorHint,
 }: ConfirmDialogProps) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -124,9 +130,11 @@ export function ConfirmDialog({
             <AlertDialog.Description asChild>
               <div className="mt-2 text-sm text-muted-foreground">{description}</div>
             </AlertDialog.Description>
+            {children && <div className="mt-3">{children}</div>}
             {error !== null && (
-              <div className="mt-3">
+              <div className="mt-3 flex flex-col gap-1">
                 <ErrorText error={error}>{describeError(error)}</ErrorText>
+                {errorHint?.(error)}
               </div>
             )}
           </div>

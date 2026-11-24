@@ -154,7 +154,12 @@ export function createEndpoints(c: ApiClient) {
       create: (body: CreateServerRequest) => c.request<Server>("POST", "/servers", { body }),
       update: (id: number, body: UpdateServerRequest) =>
         c.request<Server>("PATCH", `/servers/${seg(id)}`, { body }),
-      remove: (id: number) => c.request<void>("DELETE", `/servers/${seg(id)}`),
+      /**
+       * Runs a server.delete job and waits for it. A last backup of the saved data comes first; 409 conflict when it
+       * cannot be taken or would be incomplete. `skipLastBackup` (admin) sends skip_safety_backup=1.
+       */
+      remove: (id: number, opts: { skipLastBackup?: boolean } = {}) =>
+        c.request<void>("DELETE", `/servers/${seg(id)}`, opts.skipLastBackup ? { query: { skip_safety_backup: "1" } } : {}),
       start: (id: number) => c.request<Job>("POST", `/servers/${seg(id)}/start`),
       stop: (id: number) => c.request<Job>("POST", `/servers/${seg(id)}/stop`),
       restart: (id: number) => c.request<Job>("POST", `/servers/${seg(id)}/restart`),

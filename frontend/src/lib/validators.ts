@@ -318,8 +318,34 @@ export const validateBackupKeep: Validator = (value) => {
   return null;
 };
 
+/** A regular expression character class of code points and inclusive ranges. */
+function charClass(points: readonly (number | readonly [number, number])[]): string {
+  const hex = (n: number) => `\\u{${n.toString(16)}}`;
+  return `[${points.map((p) => (typeof p === "number" ? hex(p) : `${hex(p[0])}-${hex(p[1])}`)).join("")}]`;
+}
+
+/** The space Go's strings.TrimSpace removes around a note (unicode.IsSpace). */
+const NOTE_SPACE = charClass([[0x09, 0x0d], 0x20, 0x85, 0xa0, 0x1680, [0x2000, 0x200a], 0x2028, 0x2029, 0x202f, 0x205f, 0x3000]);
+const NOTE_TRIM = new RegExp(`^${NOTE_SPACE}+|${NOTE_SPACE}+$`, "gu");
+
+/**
+ * Characters the daemon refuses in a backup note (servers.ValidateNote):
+ * C0 controls, DEL, C1 controls, the line and paragraph separators and the
+ * bidirectional formatting characters.
+ */
+export const BACKUP_NOTE_FORBIDDEN = new RegExp(charClass([[0x00, 0x1f], [0x7f, 0x9f], 0x2028, 0x2029, [0x202a, 0x202e], [0x2066, 0x2069]]), "u");
+const LINE_BREAK = new RegExp(charClass([0x0a, 0x0d, 0x2028, 0x2029]), "u");
+
+/** Removes the surrounding space the daemon removes from a note before checking it. */
+export function trimBackupNote(value: string): string {
+  return value.replace(NOTE_TRIM, "");
+}
+
+/** Checks a backup note as the daemon does, after removing the surrounding space. */
 export const validateBackupNote: Validator = (value) => {
-  if (/[\r\n]/.test(value)) return "Use a single line.";
-  if ([...value].length > BACKUP_NOTE_MAX) return `Use at most ${BACKUP_NOTE_MAX} characters.`;
+  const note = trimBackupNote(value);
+  if (LINE_BREAK.test(note)) return "Use a single line.";
+  if (BACKUP_NOTE_FORBIDDEN.test(note)) return "Remove the control characters and text direction marks.";
+  if ([...note].length > BACKUP_NOTE_MAX) return `Use at most ${BACKUP_NOTE_MAX} characters.`;
   return null;
 };
