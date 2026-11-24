@@ -1,17 +1,15 @@
 ---
-description: Game certificate manager (self-signed and custom), its files, permissions and API
-globs: "{internal/certs/**/*.go,internal/httpapi/handlers_certificates.go,docs/CERTIFICATES.md}"
+description: Game and panel TLS, ACME jobs, renewal and certificate storage
+globs: "{internal/certs/**/*.go,internal/httpapi/handlers_certificates.go,internal/apitypes/certificates.go,docs/CERTIFICATES.md}"
 alwaysApply: false
 ---
 
-# Game certificates
+# Certificates
 
-- `internal/certs.Manager` owns a stable read-only mount under `<data>/certs/servers/<id>/` for each server, and the canonical custom pair under `<data>/certs/game/`. Never expose the certs parent or a sibling's mount to a game.
-- Self-signed pairs use distinct ECDSA P-256 keys, a 13-day validity and SANs for the game host, localhost and loopback. `Ensure` generates on first start and `Check` rotates existing pairs on a host change or within five days of expiry. Removing a server removes its pair. Startup sweeps orphaned directories.
-- Custom mode copies the administrator's shared pair into the same stable mounts. `ValidateCustom` checks sizes, key and leaf matching, current validity, server-auth usage and ordered issuer signatures. Keep key material out of errors and logs.
-- Mode changes stage outside every mount. One settings write commits the mode and generation. Publish the committed stage independently of request cancellation. Startup and manager operations recover that generation and drop an uncommitted stage.
-- Pair replacement fsyncs and atomically renames complete files, key first. The engine rejects a transient mismatch and retries. Mount directories, not files, so replacements reach running games.
-- `GameCertificate.certificate` describes only a custom pair and `Server.certificate` describes the applicable pair. Both use null when the applicable pair is missing.
-- Permissions: dir 0750, key 0640, cert 0644. Unix `groupPolicy`: files get the daemon's egid and containers `GroupAdd` it; with egid 0 the files get `ContainerGID` (65532) and no group is added (never hand group 0 to a container). Windows: no group handling. `Info` strings are cleaned (`clean`) before they reach the API.
-- `ValidateHost` (DNS name or IP, normalised) is shared by the `game_host` setting and `servers.ValidateOrigin`.
-- Verify with `go test ./internal/certs/... ./internal/httpapi/...` (Unix permission/group checks run only on Unix: `TestFilePermissions`); `GOLEM_DEPLOY_DOCKER_TESTS=1` adds the real mount and replacement check in `TestIntegrationServersAPI`.
+- `Manager` owns the canonical game pair and stable read-only per-server mounts. Only mount a server's own directory. Shared modes `custom` and `acme` use the same staged generation mechanism. `Ensure` checks validity before a start. Self-signed game pairs remain independent, short-lived and pinned.
+- Game mode changes stage complete pairs outside all mounts. One durable settings write commits the mode and generation. Publication is independent of request cancellation after commit. Startup resumes committed stages. Publish the key first and the certificate last; the engine rejects a transient mismatch and retries.
+- `Automation` owns account settings, managed panel TLS and ACME reconciliation. It acquires its operation gate before the game manager lock. Never hold the game lock across CA traffic. Host changes and publishing an issued pair serialize through `ChangeHost` and a host recheck. Panel handshakes use an immutable snapshot. Panel mode commits only after every requested pair is saved.
+- One ACME pair per identifier is shared by every active use. Read storage at startup and during maintenance, including after crashes. CA traffic must be limited to active modes or explicit jobs with agreed terms. Do not enable on-demand TLS, DNS-01 or a fallback issuer. IP requests use the shortlived profile.
+- Only answer challenges started by the daemon, with the exact HTTP challenge host and path or the matching TLS-ALPN SNI. Never delegate unknown HTTP tokens to CertMagic's blind challenge handler. Treat CA text as untrusted. Log and persist only bounded problem summaries and controlled lifecycle messages. Never log private key material.
+- ACME and panel files are private and never mounted. Shared canonical and staged game keys use 0600. Game mount keys use 0640 with the existing group policy and certificates use 0644. Windows uses inherited ACLs.
+- Verify with `go test ./internal/certs/... ./internal/httpapi/...`, the Pebble gate in AGENTS.md, and the Docker-gated server tests for mount replacement.

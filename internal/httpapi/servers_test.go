@@ -107,9 +107,15 @@ func newDockerHarnessWith(t *testing.T, staticOpts staticfiles.Options, mutate .
 		defer cancel()
 		_ = runner.Shutdown(ctx)
 	})
+	automation := certs.NewAutomation(certs.AutomationOptions{
+		Game: cm, GameHost: svc.GameHost, PanelMode: apitypes.PanelCertificateModeNone, Jobs: runner,
+	})
+	if err := automation.Initialize(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	srv, err := New(Config{Listen: "127.0.0.1:0", Version: "test", PublicHosts: []string{"example.com"}}, Deps{
 		Store: h.st, Sessions: h.sessions, Hasher: h.hasher, Secrets: box, Jobs: runner, Logger: logger,
-		Docker: dc, Servers: svc, Static: static, Certs: cm, Now: h.clock.Now,
+		Docker: dc, Servers: svc, Static: static, Certs: cm, Automation: automation, Now: h.clock.Now,
 	})
 	if err != nil {
 		t.Fatal(err)

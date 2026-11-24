@@ -250,22 +250,26 @@ A server is a container run from the image of a successful build, its host `port
 | Method | Path | Access | Request | Response | Status |
 |--------|------|--------|---------|----------|--------|
 | GET | `/certificates/game` | admin | — | 200 `GameCertificate` | implemented |
-| PUT | `/certificates/game` | admin | `UpdateGameCertificateRequest` `{mode, certificate_pem?, private_key_pem?}` (at most 160 KiB) | 200 or 202 `UpdateGameCertificateResponse` `{certificate, job}` | implemented; mode `acme` and the response shape are planned |
-| GET | `/certificates/panel` | admin | — | 200 `PanelCertificate` | planned |
-| PUT | `/certificates/panel` | admin | `UpdatePanelCertificateRequest` `{mode}` | 200 or 202 `UpdatePanelCertificateResponse` `{certificate, job}` | planned |
-| GET | `/certificates/acme` | admin | — | 200 `ACME` | planned |
-| PUT | `/certificates/acme` | admin | `UpdateACMERequest` `{email?, staging?, terms_agreed?}` | 200 `ACME` | planned |
-| POST | `/certificates/acme/renew` | admin | — | 202 `Job` (`certificate.renew`) | planned |
+| PUT | `/certificates/game` | admin | `UpdateGameCertificateRequest` `{mode, certificate_pem?, private_key_pem?}` (at most 160 KiB) | 200 or 202 `UpdateGameCertificateResponse` `{certificate, job}` | implemented |
+| GET | `/certificates/panel` | admin | — | 200 `PanelCertificate` | implemented |
+| PUT | `/certificates/panel` | admin | `UpdatePanelCertificateRequest` `{mode}` | 200 or 202 `UpdatePanelCertificateResponse` `{certificate, job}` | implemented |
+| GET | `/certificates/acme` | admin | — | 200 `ACME` | implemented |
+| PUT | `/certificates/acme` | admin | `UpdateACMERequest` `{email?, staging?, terms_agreed?}` | 200 `ACME` | implemented |
+| POST | `/certificates/acme/renew` | admin | — | 202 `Job` (`certificate.renew`) | implemented |
 
 Game servers use TLS for WebTransport and HTTPS. See [CERTIFICATES.md](CERTIFICATES.md) for storage and rotation.
 
-- `GameCertificate` is `{mode, game_host, certificate}`. In `self_signed` mode `certificate` is always `null`. In `custom` mode it describes the uploaded pair, or is `null` when a pair is missing. Expired custom metadata is still returned.
+- `GameCertificate` is `{mode, game_host, certificate}`. In `self_signed` mode `certificate` is always `null`. In `custom` or `acme` mode it describes the shared pair, or is `null` when a pair is missing. Metadata for expired pairs is still returned.
 - `CertificateInfo` is `{subject, issuer, dns_names, ip_addresses, not_before, not_after, fingerprint_sha256, self_signed, chain_length, covers_game_host}`. The fingerprint is lowercase hex SHA-256 of the leaf. `covers_game_host` reports whether the leaf covers the effective game host. The key is never returned.
-- `Server.certificate` describes the server's individual self-signed certificate after it is generated, or the shared custom certificate in custom mode. It is `null` if the applicable certificate is missing.
+- `Server.certificate` describes the server's individual self-signed certificate after it is generated, or the shared certificate in custom and ACME modes. It is `null` if the applicable certificate is missing.
 - PUT `{"mode":"self_signed"}` generates new pairs for the existing servers. PEM fields in this mode produce `validation_failed` on `certificate_pem`. In `custom` mode upload a PEM chain (leaf first, at most 8 certificates and 64 KiB) and an unencrypted PEM key (PKCS#8, PKCS#1 or SEC 1, at most 16 KiB, RSA of at least 2048 bits or ECDSA P-256/P-384/P-521). The key must match the leaf. The leaf must be valid now for TLS servers and each certificate must be signed by the next one in the chain. Invalid input produces `validation_failed` with `field` set to `mode`, `certificate_pem` or `private_key_pem`.
-- Running servers pick up certificate replacements through the engine's file poll. Switching modes reports `restart_required` because the running game's pinning setting changes only on restart.
-- Planned (milestone 4), see the types in `internal/apitypes/certificates.go`: game mode `acme` obtains and renews one publicly trusted certificate for the game host, shared by all servers like a custom one. `PanelCertificate` is `{mode, configurable, hosts, certificate, covers_hosts}` with modes `none`, `files`, `self_signed`, `acme`. `ACME` is `{email, staging, terms_agreed, directory_url, http01_available, tls_alpn01_available, certificates}` and `ACMECertificate` `{identifier, used_by, status, certificate, last_error, last_attempt_at}`. A change to `acme` runs a restricted `certificate.issue` job (subject `certificate`/`acme`) and takes effect only when it succeeds; `POST /certificates/acme/renew` runs `certificate.renew`.
-- Expected errors: `validation_failed`, `service_unavailable`.
+- Running servers pick up certificate replacements through the engine's file poll. Switching the pinning setting reports `restart_required` because the running game's pinning setting changes only on restart.
+- A successful synchronous game or panel change returns 200 with `job: null`. ACME changes return 202 with the previously active certificate state and a restricted `certificate.issue` job (subject `certificate` / `acme`). The mode commits after all requested certificates are available and staged. Game ACME uses one pair for the effective game host. A host change in ACME mode starts issuance for the new host in the background while the prior pair stays installed.
+- `PanelCertificate` is `{mode, configurable, hosts, certificate, covers_hosts}`. The modes `none` and `files` come from the serve flags and have `configurable: false`. PUT accepts `self_signed` or `acme` in configurable modes. `hosts` is the public host list, or the effective game host when the list is empty. `certificate` describes the pair served for the first host, or is null in plaintext mode. `covers_hosts` checks coverage across all hosts.
+- `ACME` is `{email, staging, terms_agreed, directory_url, http01_available, tls_alpn01_available, certificates}`. Omitted PUT fields keep their values. The email is empty or one plain address without a display name or control characters (at most 254 bytes). Only serve flags can override the directory.
+- `ACMECertificate` is `{identifier, used_by, status, certificate, last_error, last_attempt_at}`. The array is sorted by identifier. `used_by` contains `game`, `panel`, or both when they share a pair. Status is `pending`, `issued` or `error`. Failed renewals keep the old pair. POST to renew starts a restricted `certificate.renew` job on the same subject and attempts immediate renewal of every managed identifier.
+- Invalid mode, input PEM, or contact email returns 400 `validation_failed` on `mode`, `certificate_pem`, `private_key_pem` or `email`. Supplying PEM in game `acme` or `self_signed` mode is a validation error on `certificate_pem`. Starting an ACME job without agreement, a host, an enabled challenge, or an eligible public identifier returns 400 `validation_failed` on `terms_agreed`, `game_host`, or `mode` (challenge or eligibility). A configured directory override bypasses the public-identifier check.
+- Panel PUT in `none` or `files`, changing staging with either service in ACME mode, and renewal with no managed identifiers return 409 `conflict`. Conflicting certificate operations return 409 `job_in_progress`. Shutdown or a missing certificate service returns 503 `service_unavailable`. Standard admin authentication and JSON-decoding errors also apply.
 
 ### Images, static files, volumes
 

@@ -74,6 +74,11 @@ func (s *Server) routes() []route {
 		// Game certificate.
 		{method: "GET", path: "/certificates/game", access: AccessAdmin, handler: s.handleGetGameCertificate},
 		{method: "PUT", path: "/certificates/game", access: AccessAdmin, handler: s.handlePutGameCertificate, maxBody: maxCertificateBody},
+		{method: "GET", path: "/certificates/panel", access: AccessAdmin, handler: s.handleGetPanelCertificate},
+		{method: "PUT", path: "/certificates/panel", access: AccessAdmin, handler: s.handlePutPanelCertificate},
+		{method: "GET", path: "/certificates/acme", access: AccessAdmin, handler: s.handleGetACME},
+		{method: "PUT", path: "/certificates/acme", access: AccessAdmin, handler: s.handlePutACME},
+		{method: "POST", path: "/certificates/acme/renew", access: AccessAdmin, handler: s.handleRenewACME},
 
 		// Images.
 		{method: "GET", path: "/images", access: AccessDeveloper, handler: s.handleListImages},

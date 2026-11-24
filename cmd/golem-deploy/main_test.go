@@ -71,10 +71,10 @@ func TestServeRejectsBadNetworkFlags(t *testing.T) {
 	}
 }
 
-func TestServeRefusesPlaintextPublicBind(t *testing.T) {
+func TestServeRejectsIncompatibleTLSFlags(t *testing.T) {
 	t.Setenv("GOLEM_DEPLOY_INSECURE_HTTP", "")
-	code, _, stderr := runCLI(t, "", "serve", "--listen", "0.0.0.0:0", "--data-dir", t.TempDir())
-	if code != 1 || !strings.Contains(stderr, "refusing to serve plaintext HTTP") {
+	code, _, stderr := runCLI(t, "", "serve", "--listen", "127.0.0.1:0", "--http-listen", ":80", "--data-dir", t.TempDir())
+	if code != 1 || !strings.Contains(stderr, "--http-listen requires the panel to serve HTTPS") {
 		t.Fatalf("serve: %d %q", code, stderr)
 	}
 	t.Setenv("GOLEM_DEPLOY_INSECURE_HTTP", "maybe")

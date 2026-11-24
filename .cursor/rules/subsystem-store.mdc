@@ -18,4 +18,5 @@ alwaysApply: false
 - Migration versions may have gaps (0005 was reserved and is unused; 0007 adds the builds' transport paths, 0008 launch recovery state, 0009 build hardening). Tests compare against the embedded migration list, not the highest version.
 - Typed settings (`GetSettings`/`UpdateSettings`) include `game_host` (validated by callers with `certs.ValidateHost`); the certificate mode key `game_certificate_mode` is owned by `internal/certs` and commits the staged certificate generation as well as the mode. Certificate commits and launch identities use a fully synced write before publishing files or starting Docker operations.
 - `InstanceID` creates the installation's random instance id once (settings key `instance_id`, never returned by the API); Docker objects are labelled with it.
+- ACME account settings and the panel certificate mode are durable settings writes. Account settings change as one value. They contain no keys or certificate PEM.
 - Verify with `go test ./internal/store/...`.

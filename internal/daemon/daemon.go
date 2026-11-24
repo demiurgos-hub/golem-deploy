@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -37,11 +38,14 @@ import (
 
 // Options configures Run.
 type Options struct {
-	DataDir      string
-	Listen       string
-	TLSCert      string
-	TLSKey       string
-	InsecureHTTP bool
+	DataDir       string
+	Listen        string
+	TLSCert       string
+	TLSKey        string
+	HTTPListen    string
+	ACMEDirectory string
+	ACMERootCA    string
+	InsecureHTTP  bool
 	// PublicHosts are host names accepted in the Host header besides IP
 	// literals and localhost (--public-host).
 	PublicHosts []string
@@ -102,6 +106,11 @@ func serverConfig(o Options) (servers.Config, error) {
 	if err := rng.Validate(panel); err != nil {
 		return servers.Config{}, err
 	}
+	if _, p, err := net.SplitHostPort(o.HTTPListen); err == nil {
+		if port, err := strconv.Atoi(p); err == nil && rng.Contains(port) {
+			return servers.Config{}, fmt.Errorf("port range %s contains the HTTP redirect listener port %d", rng, port)
+		}
+	}
 	if o.PortBindAddress != "" {
 		if ip, err := netip.ParseAddr(o.PortBindAddress); err != nil || ip.Zone() != "" {
 			return servers.Config{}, fmt.Errorf("--port-bind-address %q is not an IP address", o.PortBindAddress)
@@ -149,7 +158,40 @@ func Run(ctx context.Context, o Options) (err error) {
 	if (o.TLSCert == "") != (o.TLSKey == "") {
 		return errors.New("--tls-cert and --tls-key must be set together")
 	}
-	if err := httpapi.CheckListen(o.Listen, o.TLSCert != "", o.InsecureHTTP); err != nil {
+	panelMode := apitypes.PanelCertificateModeNone
+	var fileCert *tls.Certificate
+	switch {
+	case o.TLSCert != "":
+		panelMode = apitypes.PanelCertificateModeFiles
+		pair, err := tls.LoadX509KeyPair(o.TLSCert, o.TLSKey)
+		if err != nil {
+			return fmt.Errorf("load panel TLS files: %w", err)
+		}
+		fileCert = &pair
+	default:
+		if err := httpapi.CheckListen(o.Listen, false, o.InsecureHTTP); errors.Is(err, httpapi.ErrPlaintextNonLoopback) {
+			panelMode = apitypes.PanelCertificateModeSelfSigned
+		} else if err != nil {
+			return err
+		}
+	}
+	panelTLS := panelMode != apitypes.PanelCertificateModeNone
+	if err := httpapi.CheckListen(o.Listen, panelTLS, o.InsecureHTTP); err != nil {
+		return err
+	}
+	if o.HTTPListen != "" {
+		if !panelTLS {
+			return errors.New("--http-listen requires the panel to serve HTTPS")
+		}
+		if err := httpapi.CheckListen(o.HTTPListen, false, true); err != nil {
+			return fmt.Errorf("--http-listen: %w", err)
+		}
+	}
+	if err := certs.ValidateDirectory(o.ACMEDirectory); err != nil {
+		return err
+	}
+	roots, err := certs.LoadACMERoots(o.ACMERootCA)
+	if err != nil {
 		return err
 	}
 	publicHosts, err := httpapi.NormalizePublicHosts(o.PublicHosts)
@@ -310,6 +352,34 @@ func Run(ctx context.Context, o Options) (err error) {
 	})
 	svc := servers.New(st, box, dockerClient, srvCfg, logger)
 	certMgr.Check(ctx, svc.GameHost)
+	ln, err := httpapi.OpenListener(o.Listen, "--listen")
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	var httpLn net.Listener
+	var listeners certs.ACMEListeners
+	if o.HTTPListen != "" {
+		httpLn, err = httpapi.OpenListener(o.HTTPListen, "--http-listen")
+		if err != nil {
+			return err
+		}
+		defer httpLn.Close()
+		listeners.HTTP = httpLn.Addr().String()
+	}
+	if panelTLS && ln.Addr().(*net.TCPAddr).Port == 443 {
+		listeners.ALPN = ln.Addr().String()
+	}
+	automation := certs.NewAutomation(certs.AutomationOptions{
+		Game: certMgr, GameHost: svc.GameHost, PublicHosts: publicHosts,
+		PanelMode: panelMode, PanelDir: layout.PanelCerts(), FileCertificate: fileCert,
+		Client:    certs.NewACMEClient(layout.ACME(), roots, logger, listeners),
+		Directory: o.ACMEDirectory, HTTP01: listeners.HTTP != "", TLSALPN01: listeners.ALPN != "",
+		Jobs: runner,
+	})
+	if err := automation.Initialize(ctx); err != nil {
+		return fmt.Errorf("initialize certificates: %w", err)
+	}
 	var probe httpapi.DockerProbe = dockerClient
 	if o.docker != nil {
 		probe = o.docker
@@ -318,37 +388,34 @@ func Run(ctx context.Context, o Options) (err error) {
 		Listen:         o.Listen,
 		TLSCert:        o.TLSCert,
 		TLSKey:         o.TLSKey,
+		ManagedTLS:     panelTLS && o.TLSCert == "",
 		InsecureHTTP:   o.InsecureHTTP,
 		Version:        o.Version,
 		PublicHosts:    publicHosts,
 		TrustedProxies: trusted,
 	}, httpapi.Deps{
-		Store:    st,
-		Sessions: sessions,
-		Hasher:   hasher,
-		Secrets:  box,
-		Jobs:     runner,
-		Logger:   logger,
-		Docker:   probe,
-		Git:      gitClient,
-		RepoDir:  layout.Repositories(),
-		TempDir:  layout.Tmp(),
-		Servers:  svc,
-		Static:   static,
-		Certs:    certMgr,
-		Builds:   builds,
-		SPA:      o.SPA,
+		Store:      st,
+		Sessions:   sessions,
+		Hasher:     hasher,
+		Secrets:    box,
+		Jobs:       runner,
+		Logger:     logger,
+		Docker:     probe,
+		Git:        gitClient,
+		RepoDir:    layout.Repositories(),
+		TempDir:    layout.Tmp(),
+		Servers:    svc,
+		Static:     static,
+		Certs:      certMgr,
+		Automation: automation,
+		Builds:     builds,
+		SPA:        o.SPA,
 	})
 	if err != nil {
 		return err
 	}
-	ln, err := srv.Listen()
-	if err != nil {
-		_ = runner.Shutdown(context.Background())
-		return err
-	}
 	scheme := "http"
-	if o.TLSCert != "" {
+	if panelTLS {
 		scheme = "https"
 	}
 	logger.Info("golem-deploy listening", "addr", ln.Addr().String(), "scheme", scheme, "data_dir", layout.Root, "version", o.Version,
@@ -398,27 +465,33 @@ func Run(ctx context.Context, o Options) (err error) {
 	certDone := make(chan struct{})
 	go func() {
 		defer close(certDone)
-		certMgr.Maintain(recCtx, svc.GameHost)
+		automation.Maintain(recCtx)
 	}()
 	defer func() {
 		cancelRec()
 		<-certDone
 	}()
+	runCtx, stopRun := context.WithCancel(ctx)
+	defer stopRun()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		<-ctx.Done()
+		<-runCtx.Done()
 		jctx, cancel := context.WithTimeout(context.Background(), jobShutdownGrace)
 		defer cancel()
 		jobErr = runner.Shutdown(jctx)
 	}()
-	serveErr := srv.Serve(ctx, ln)
-	if serveErr != nil && ctx.Err() == nil {
-		// Serving failed on its own; stop the job goroutine too.
-		_ = runner.Shutdown(context.Background())
-		return serveErr
-	}
+	serveErr := srv.Serve(runCtx, ln, httpLn)
+	stopRun()
+	cancelRec()
 	wg.Wait()
+	if jobErr != nil {
+		// A timed-out shutdown must still wait for any certificate job
+		// before the store closes, including its final job status write.
+		if id, ok := runner.ActiveFor(jobs.Subject{Type: string(apitypes.SubjectTypeCertificate), ID: "acme"}); ok {
+			<-runner.Done(id)
+		}
+	}
 	logger.Info("golem-deploy stopped")
 	if serveErr != nil {
 		return serveErr

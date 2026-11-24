@@ -45,8 +45,14 @@ func (l Layout) Static() string { return filepath.Join(l.Root, "static") }
 // JobLogs holds one log file per job.
 func (l Layout) JobLogs() string { return filepath.Join(l.Root, "logs", "jobs") }
 
-// GameCerts holds the canonical custom certificate. Server mounts are siblings under certs/servers.
+// GameCerts holds the canonical shared certificate. Server mounts are siblings under certs/servers.
 func (l Layout) GameCerts() string { return filepath.Join(l.Root, "certs", "game") }
+
+// PanelCerts holds the panel's private certificate files.
+func (l Layout) PanelCerts() string { return filepath.Join(l.Root, "certs", "panel") }
+
+// ACME holds the private account and certificate storage.
+func (l Layout) ACME() string { return filepath.Join(l.Root, "acme") }
 
 // Tmp is scratch space on the same filesystem as the other directories.
 func (l Layout) Tmp() string { return filepath.Join(l.Root, "tmp") }
@@ -122,7 +128,7 @@ func Prepare(root string) (Layout, error) {
 	default:
 		return Layout{}, fmt.Errorf("stat data directory: %w", err)
 	}
-	for _, d := range []string{l.KeysDir(), l.Repositories(), l.Static(), filepath.Join(l.Root, "logs"), l.JobLogs(), l.Tmp()} {
+	for _, d := range []string{l.KeysDir(), l.Repositories(), l.Static(), filepath.Join(l.Root, "logs"), l.JobLogs(), l.Tmp(), l.ACME()} {
 		if err := os.Mkdir(d, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 			return Layout{}, fmt.Errorf("create %s: %w", d, err)
 		}

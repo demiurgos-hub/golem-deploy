@@ -111,7 +111,11 @@ func TestGameCertificateRoutes(t *testing.T) {
 
 	certPEM, keyPEM := testCertPEM(t, "play.example.com", time.Now().Add(60*24*time.Hour))
 	rr := d.call("PUT", "/api/v1/certificates/game", d.adminSs, apitypes.UpdateGameCertificateRequest{Mode: "custom", CertificatePEM: certPEM, PrivateKeyPEM: keyPEM})
-	custom := decode[apitypes.GameCertificate](t, rr)
+	updated := decode[apitypes.UpdateGameCertificateResponse](t, rr)
+	if updated.Job != nil {
+		t.Fatalf("custom mode returned a job: %+v", updated.Job)
+	}
+	custom := updated.Certificate
 	if custom.Mode != apitypes.CertificateModeCustom || !custom.Certificate.CoversGameHost || custom.Certificate.FingerprintSHA256 == "" {
 		t.Fatalf("%+v", custom)
 	}
@@ -129,7 +133,7 @@ func TestGameCertificateRoutes(t *testing.T) {
 		{apitypes.UpdateGameCertificateRequest{Mode: "custom", CertificatePEM: "junk", PrivateKeyPEM: keyPEM}, "certificate_pem"},
 		{apitypes.UpdateGameCertificateRequest{Mode: "custom", CertificatePEM: otherCert}, "private_key_pem"},
 		{apitypes.UpdateGameCertificateRequest{Mode: "self_signed", CertificatePEM: certPEM}, "certificate_pem"},
-		{apitypes.UpdateGameCertificateRequest{Mode: "acme"}, "mode"},
+		{apitypes.UpdateGameCertificateRequest{Mode: "invalid"}, "mode"},
 	} {
 		e := errBody(t, d.call("PUT", "/api/v1/certificates/game", d.adminSs, tc.req), http.StatusBadRequest, apitypes.ErrorCodeValidationFailed)
 		if e.Field != tc.field || strings.Contains(e.Message, "PRIVATE KEY") {
@@ -155,7 +159,7 @@ func TestGameCertificateRoutes(t *testing.T) {
 	if now.Certificate.FingerprintSHA256 != custom.Certificate.FingerprintSHA256 || now.Certificate.CoversGameHost {
 		t.Fatalf("%+v", now)
 	}
-	back := decode[apitypes.GameCertificate](t, d.call("PUT", "/api/v1/certificates/game", d.adminSs, apitypes.UpdateGameCertificateRequest{Mode: "self_signed"}))
+	back := decode[apitypes.UpdateGameCertificateResponse](t, d.call("PUT", "/api/v1/certificates/game", d.adminSs, apitypes.UpdateGameCertificateRequest{Mode: "self_signed"})).Certificate
 	if back.Mode != apitypes.CertificateModeSelfSigned || back.Certificate != nil {
 		t.Fatalf("%+v", back)
 	}
@@ -238,9 +242,9 @@ func TestServersMountOnlyTheirOwnCertificateDirectory(t *testing.T) {
 	}
 	chain, key := testCertPEM(t, "play.example.com", time.Now().Add(time.Hour))
 	path := "/api/v1/certificates/game"
-	custom := decode[apitypes.GameCertificate](t, d.call("PUT", path, d.adminSs, apitypes.UpdateGameCertificateRequest{
+	custom := decode[apitypes.UpdateGameCertificateResponse](t, d.call("PUT", path, d.adminSs, apitypes.UpdateGameCertificateRequest{
 		Mode: apitypes.CertificateModeCustom, CertificatePEM: chain, PrivateKeyPEM: key,
-	}))
+	})).Certificate
 	for _, sv := range []apitypes.Server{a, b} {
 		got := d.getServer(d.devTok, sv.ID)
 		cert, keyOnDisk := readPair(sv.ID)
@@ -249,7 +253,7 @@ func TestServersMountOnlyTheirOwnCertificateDirectory(t *testing.T) {
 			t.Fatalf("custom pair was not published to server %s", sv.Name)
 		}
 	}
-	mode := decode[apitypes.GameCertificate](t, d.call("PUT", path, d.adminSs, apitypes.UpdateGameCertificateRequest{Mode: apitypes.CertificateModeSelfSigned}))
+	mode := decode[apitypes.UpdateGameCertificateResponse](t, d.call("PUT", path, d.adminSs, apitypes.UpdateGameCertificateRequest{Mode: apitypes.CertificateModeSelfSigned})).Certificate
 	_, newAKey := readPair(a.ID)
 	_, newBKey := readPair(b.ID)
 	if mode.Certificate != nil || bytes.Equal(aKey, newAKey) || bytes.Equal(bKey, newBKey) || bytes.Equal(newAKey, newBKey) {
