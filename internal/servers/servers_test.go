@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
 	"github.com/demiurgos-hub/golem-deploy/internal/logsafe"
@@ -120,6 +121,7 @@ func TestViewAndContainersIndex(t *testing.T) {
 	other := 7002
 	sv2, _ := st.CreateServer(ctx, store.Server{Name: "b", BuildID: &b.ID, Port: &other}, nil)
 	params, _ := svc.params(ctx)
+	params.certMode, params.certDir = certs.ModeSelfSigned, fx.certs.ServerDir(sv.ID)
 	recorded := f.AddContainer(dockertest.Container{Name: "golem-deploy-a", Image: b.ImageID,
 		Labels: dockertest.OurLabels(docker.LabelServerID, "1", docker.LabelConfigHash, svc.configHash(sv, &b, params))})
 	impostor := f.AddContainer(dockertest.Container{Name: "x", Image: b.ImageID, Labels: dockertest.OurLabels(docker.LabelServerID, "2")})

@@ -8,11 +8,13 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -23,15 +25,15 @@ const (
 	pendingKey  = KeyFile + ".new"
 )
 
-// generate creates and installs a self-signed certificate for host.
-func (m *Manager) generate(host, reason string) (Info, error) {
+// generate creates a new self-signed pair for host.
+func (m *Manager) generate(host string) ([]byte, []byte, Info, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return Info{}, err
+		return nil, nil, Info{}, err
 	}
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
 	if err != nil {
-		return Info{}, err
+		return nil, nil, Info{}, err
 	}
 	dns, ips := selfSignedNames(host)
 	cn := host
@@ -54,25 +56,21 @@ func (m *Manager) generate(host, reason string) (Info, error) {
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
-		return Info{}, err
+		return nil, nil, Info{}, err
 	}
 	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
-		return Info{}, err
+		return nil, nil, Info{}, err
 	}
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	if err := m.install(certPEM, keyPEM); err != nil {
-		return Info{}, err
-	}
-	info, err := m.load()
+	leaf, err := x509.ParseCertificate(der)
 	if err != nil {
-		return Info{}, err
+		return nil, nil, Info{}, err
 	}
+	info := describe(leaf, 1)
 	info.Mode = ModeSelfSigned
-	m.logger.Info("self-signed game certificate generated", "reason", reason, "host", host, "fingerprint", info.Fingerprint,
-		"not_after", info.NotAfter)
-	return info, nil
+	return certPEM, keyPEM, info, nil
 }
 
 // install replaces the pair. Both files are first written completely
@@ -84,31 +82,42 @@ func (m *Manager) generate(host, reason string) (Info, error) {
 // load) rejects, keeping the previous certificate and retrying on the next
 // poll until the certificate rename completes. A crash between the renames
 // is completed by recoverPending on the next start.
-func (m *Manager) install(certPEM, keyPEM []byte) error {
+func (m *Manager) install(dir string, certPEM, keyPEM []byte) error {
 	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
 		return fmt.Errorf("certs: refusing to install an invalid pair: %w", err)
 	}
-	if err := m.writeFile(pendingKey, keyPEM, 0o640); err != nil {
+	if err := m.prepareDir(dir); err != nil {
 		return err
 	}
-	if err := m.writeFile(pendingCert, certPEM, 0o644); err != nil {
-		_ = os.Remove(filepath.Join(m.dir, pendingKey))
+	if err := m.recoverPending(dir); err != nil {
 		return err
 	}
-	if err := os.Rename(filepath.Join(m.dir, pendingKey), filepath.Join(m.dir, KeyFile)); err != nil {
+	if err := m.writeFile(dir, pendingKey, keyPEM, 0o640); err != nil {
+		return err
+	}
+	if err := m.writeFile(dir, pendingCert, certPEM, 0o644); err != nil {
+		_ = os.Remove(filepath.Join(dir, pendingKey))
+		return err
+	}
+	if err := syncDir(dir); err != nil {
+		return err
+	}
+	if err := os.Rename(filepath.Join(dir, pendingKey), filepath.Join(dir, KeyFile)); err != nil {
 		return fmt.Errorf("install certificate key: %w", err)
 	}
-	if err := os.Rename(filepath.Join(m.dir, pendingCert), filepath.Join(m.dir, CertFile)); err != nil {
+	if err := syncDir(dir); err != nil {
+		return err
+	}
+	if err := os.Rename(filepath.Join(dir, pendingCert), filepath.Join(dir, CertFile)); err != nil {
 		return fmt.Errorf("install certificate: %w", err)
 	}
-	syncDir(m.dir)
-	return nil
+	return syncDir(dir)
 }
 
 // writeFile writes name in the directory through a uniquely named
 // temporary file and renames it to name.
-func (m *Manager) writeFile(name string, data []byte, mode os.FileMode) error {
-	f, err := os.CreateTemp(m.dir, ".tmp-*")
+func (m *Manager) writeFile(dir, name string, data []byte, mode os.FileMode) error {
+	f, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return fmt.Errorf("write %s: %w", name, err)
 	}
@@ -132,58 +141,96 @@ func (m *Manager) writeFile(name string, data []byte, mode os.FileMode) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("write %s: %w", name, err)
 	}
-	if err := os.Rename(tmp, filepath.Join(m.dir, name)); err != nil {
+	if err := os.Rename(tmp, filepath.Join(dir, name)); err != nil {
 		return fmt.Errorf("write %s: %w", name, err)
 	}
 	ok = true
 	return nil
 }
 
-// recoverPending finishes a replacement interrupted between its renames,
-// or discards one interrupted while writing, and removes stray temporary
-// files.
-func (m *Manager) recoverPending() {
-	entries, _ := os.ReadDir(m.dir)
-	for _, e := range entries {
-		if len(e.Name()) > 5 && e.Name()[:5] == ".tmp-" {
-			_ = os.Remove(filepath.Join(m.dir, e.Name()))
+func (m *Manager) prepareDir(dir string) error {
+	if err := os.Mkdir(dir, 0o750); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("certificate path %s is not a directory", dir)
+	}
+	if err := m.setPerm(dir, 0o750); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(dir))
+}
+
+// recoverPending completes an interrupted replacement or discards an
+// unfinished stage. The caller holds the manager lock.
+func (m *Manager) recoverPending(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".tmp-") {
+			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+				return err
+			}
 		}
 	}
-	read := func(n string) []byte {
-		b, err := os.ReadFile(filepath.Join(m.dir, n))
-		if err != nil {
-			return nil
-		}
-		return b
+	cert, err := os.ReadFile(filepath.Join(dir, pendingCert))
+	if errors.Is(err, os.ErrNotExist) {
+		return removeIfPresent(filepath.Join(dir, pendingKey))
 	}
-	cert := read(pendingCert)
-	if cert == nil {
-		// Interrupted before the certificate was written: the installed
-		// pair was never touched.
-		_ = os.Remove(filepath.Join(m.dir, pendingKey))
-		return
+	if err != nil {
+		return err
 	}
-	key := read(pendingKey)
-	keyName := pendingKey
-	if key == nil {
-		key, keyName = read(KeyFile), KeyFile // the key was already renamed
+	key, err := os.ReadFile(filepath.Join(dir, pendingKey))
+	hasPendingKey := err == nil
+	if errors.Is(err, os.ErrNotExist) {
+		key, err = os.ReadFile(filepath.Join(dir, KeyFile))
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	if _, err := tls.X509KeyPair(cert, key); err != nil {
-		_ = os.Remove(filepath.Join(m.dir, pendingCert))
-		_ = os.Remove(filepath.Join(m.dir, pendingKey))
-		return
+		return errors.Join(removeIfPresent(filepath.Join(dir, pendingCert)), removeIfPresent(filepath.Join(dir, pendingKey)))
 	}
-	if keyName == pendingKey {
-		if err := os.Rename(filepath.Join(m.dir, pendingKey), filepath.Join(m.dir, KeyFile)); err != nil {
-			m.logger.Warn("could not complete an interrupted certificate replacement", "err", err)
-			return
+	if hasPendingKey {
+		if err := os.Rename(filepath.Join(dir, pendingKey), filepath.Join(dir, KeyFile)); err != nil {
+			return err
+		}
+		if err := syncDir(dir); err != nil {
+			return err
 		}
 	}
-	if err := os.Rename(filepath.Join(m.dir, pendingCert), filepath.Join(m.dir, CertFile)); err != nil {
-		m.logger.Warn("could not complete an interrupted certificate replacement", "err", err)
-		return
+	if err := os.Rename(filepath.Join(dir, pendingCert), filepath.Join(dir, CertFile)); err != nil {
+		return err
 	}
-	m.logger.Info("completed a certificate replacement interrupted by a restart")
+	return syncDir(dir)
+}
+
+func removeIfPresent(path string) error {
+	if err := os.Remove(path); !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) copyPair(src, dst string) error {
+	chain, err := os.ReadFile(filepath.Join(src, CertFile))
+	if err != nil {
+		return err
+	}
+	key, err := os.ReadFile(filepath.Join(src, KeyFile))
+	if err != nil {
+		return err
+	}
+	return m.install(dst, chain, key)
 }
 
 // setPerm sets the mode and group of an existing path.

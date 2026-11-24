@@ -13,8 +13,8 @@ const (
 	// SettingGameHost is the DNS name or IP address players use to reach
 	// game servers ("" falls back to the first --public-host).
 	SettingGameHost = "game_host"
-	// SettingGameCertificateMode is the game certificate mode
-	// (internal/certs; "" means the default, self-signed).
+	// SettingGameCertificateMode is the game certificate mode and its
+	// committed file generation (internal/certs; "" means self-signed).
 	SettingGameCertificateMode = "game_certificate_mode"
 )
 
@@ -48,9 +48,12 @@ func (s *Store) GetSetting(ctx context.Context, key string) (string, bool, error
 
 // SetSetting upserts a raw setting value.
 func (s *Store) SetSetting(ctx context.Context, key, value string) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO settings (key, value) VALUES (?, ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	const upsert = `INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+	if key == SettingGameCertificateMode {
+		return mapErr("set certificate state", s.durableWrite(ctx, upsert, key, value))
+	}
+	_, err := s.db.ExecContext(ctx, upsert, key, value)
 	return mapErr("set setting", err)
 }
 

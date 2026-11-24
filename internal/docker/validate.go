@@ -19,6 +19,7 @@ const (
 	LabelServer     = "dev.golemengine.deploy.server"
 	LabelProjectID  = "dev.golemengine.deploy.project-id"
 	LabelCommit     = "dev.golemengine.deploy.commit"
+	LabelLaunchID   = "dev.golemengine.deploy.launch-id"
 	LabelConfigHash = "dev.golemengine.deploy.config-hash"
 	// LabelBuildID and LabelEngineVersion are set on images by the build
 	// pipeline: the id of the builds row and the Golem Engine version.

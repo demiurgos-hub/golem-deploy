@@ -25,8 +25,10 @@ import (
 )
 
 type memSettings struct {
-	mu sync.Mutex
-	m  map[string]string
+	mu      sync.Mutex
+	m       map[string]string
+	ids     []int64
+	saveErr error
 }
 
 func (s *memSettings) GetSetting(_ context.Context, k string) (string, bool, error) {
@@ -36,9 +38,14 @@ func (s *memSettings) GetSetting(_ context.Context, k string) (string, bool, err
 	return v, ok, nil
 }
 
+func (s *memSettings) ListServerIDs(context.Context) ([]int64, error) { return s.ids, nil }
+
 func (s *memSettings) SetSetting(_ context.Context, k, v string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	s.m[k] = v
 	return nil
 }
@@ -55,10 +62,14 @@ func (c *clock) add(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
+func fixedHost(host string) func(context.Context) (string, error) {
+	return func(context.Context) (string, error) { return host, nil }
+}
+
 func newManager(t *testing.T) (*Manager, *clock, *memSettings) {
 	t.Helper()
 	c := &clock{t: time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)}
-	st := &memSettings{m: map[string]string{}}
+	st := &memSettings{m: map[string]string{}, ids: []int64{1, 2}}
 	m, err := Open(Options{Dir: filepath.Join(t.TempDir(), "certs", "game"), Settings: st, Now: c.now})
 	if err != nil {
 		t.Fatal(err)
@@ -69,10 +80,10 @@ func newManager(t *testing.T) (*Manager, *clock, *memSettings) {
 func TestSelfSignedGenerationAndRotation(t *testing.T) {
 	ctx := context.Background()
 	m, c, _ := newManager(t)
-	if _, err := m.Current(ctx); !errors.Is(err, ErrNoCertificate) {
+	if info, err := m.Current(ctx, 1); err != nil || info.Fingerprint != "" {
 		t.Fatalf("got %v", err)
 	}
-	info, err := m.Ensure(ctx, "play.example.com")
+	info, err := m.Ensure(ctx, 1, fixedHost("play.example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +99,7 @@ func TestSelfSignedGenerationAndRotation(t *testing.T) {
 		t.Fatal("covers")
 	}
 	// The key is ECDSA P-256 (required for serverCertificateHashes).
-	pair, err := tls.LoadX509KeyPair(filepath.Join(m.Dir(), CertFile), filepath.Join(m.Dir(), KeyFile))
+	pair, err := tls.LoadX509KeyPair(filepath.Join(m.ServerDir(1), CertFile), filepath.Join(m.ServerDir(1), KeyFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,35 +107,35 @@ func TestSelfSignedGenerationAndRotation(t *testing.T) {
 		t.Fatalf("key %T", pair.PrivateKey)
 	}
 	// Unchanged host and enough validity: kept.
-	again, err := m.Ensure(ctx, "play.example.com")
+	again, err := m.Ensure(ctx, 1, fixedHost("play.example.com"))
 	if err != nil || again.Fingerprint != info.Fingerprint {
 		t.Fatalf("regenerated without reason: %v", err)
 	}
 	// Host change: regenerated for the new host (an IP).
-	byIP, err := m.Ensure(ctx, "203.0.113.7")
+	byIP, err := m.Ensure(ctx, 1, fixedHost("203.0.113.7"))
 	if err != nil || byIP.Fingerprint == info.Fingerprint || !byIP.Covers("203.0.113.7") || byIP.Covers("play.example.com") {
 		t.Fatalf("%+v %v", byIP, err)
 	}
 	// Rotation once less than RenewBefore is left.
 	c.add(SelfSignedValidity - RenewBefore - 2*time.Hour)
-	if kept, _ := m.Ensure(ctx, "203.0.113.7"); kept.Fingerprint != byIP.Fingerprint {
+	if kept, _ := m.Ensure(ctx, 1, fixedHost("203.0.113.7")); kept.Fingerprint != byIP.Fingerprint {
 		t.Fatal("rotated too early")
 	}
 	c.add(2 * time.Hour)
-	rotated, err := m.Ensure(ctx, "203.0.113.7")
+	rotated, err := m.Ensure(ctx, 1, fixedHost("203.0.113.7"))
 	if err != nil || rotated.Fingerprint == byIP.Fingerprint || !rotated.NotBefore.Before(c.now()) {
 		t.Fatalf("not rotated: %+v %v", rotated, err)
 	}
 	// No host: localhost only.
-	local, err := m.Ensure(ctx, "")
+	local, err := m.Ensure(ctx, 1, fixedHost(""))
 	if err != nil || !slices.Equal(sortedCopy(local.DNSNames), []string{"localhost"}) {
 		t.Fatalf("%+v %v", local, err)
 	}
 	// A damaged pair is replaced.
-	if err := os.WriteFile(filepath.Join(m.Dir(), KeyFile), []byte("junk"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(m.ServerDir(1), KeyFile), []byte("junk"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if fixed, err := m.Ensure(ctx, ""); err != nil || fixed.Fingerprint == local.Fingerprint {
+	if fixed, err := m.Ensure(ctx, 1, fixedHost("")); err != nil || fixed.Fingerprint == local.Fingerprint {
 		t.Fatalf("damaged pair kept: %v", err)
 	}
 }
@@ -134,11 +145,11 @@ func TestFilePermissions(t *testing.T) {
 		t.Skip("Unix permissions and groups are not used on Windows hosts")
 	}
 	m, _, _ := newManager(t)
-	if _, err := m.Ensure(context.Background(), "play.example.com"); err != nil {
+	if _, err := m.Ensure(context.Background(), 1, fixedHost("play.example.com")); err != nil {
 		t.Fatal(err)
 	}
 	for name, want := range map[string]os.FileMode{"": 0o750 | os.ModeDir, KeyFile: 0o640, CertFile: 0o644} {
-		fi, err := os.Stat(filepath.Join(m.Dir(), name))
+		fi, err := os.Stat(filepath.Join(m.ServerDir(1), name))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -153,7 +164,7 @@ func TestFilePermissions(t *testing.T) {
 	} else if !slices.Equal(m.GroupAdd(), []int{os.Getegid()}) {
 		t.Fatalf("group add %v", m.GroupAdd())
 	}
-	entries, _ := os.ReadDir(m.Dir())
+	entries, _ := os.ReadDir(m.ServerDir(1))
 	if len(entries) != 2 {
 		t.Fatalf("leftover files: %v", entries)
 	}
@@ -252,25 +263,25 @@ func TestCustomCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode != ModeCustom || info.SelfSigned || info.ChainLength != 2 || !info.Covers("play.example.com") || st.m[SettingMode] != "custom" {
+	if info.Mode != ModeCustom || info.SelfSigned || info.ChainLength != 2 || !info.Covers("play.example.com") || !strings.HasPrefix(st.m[SettingMode], "custom:") {
 		t.Fatalf("%+v", info)
 	}
 	// The key is stored normalised as PKCS#8 and never with other modes.
-	stored, _ := os.ReadFile(filepath.Join(m.Dir(), KeyFile))
+	stored, _ := os.ReadFile(filepath.Join(m.ServerDir(1), KeyFile))
 	if !strings.HasPrefix(string(stored), "-----BEGIN PRIVATE KEY-----") {
 		t.Fatalf("stored key %.40q", stored)
 	}
 	// Ensure never replaces a custom certificate, whatever the host.
-	if again, err := m.Ensure(ctx, "other.example.com"); err != nil || again.Fingerprint != info.Fingerprint {
+	if again, err := m.Ensure(ctx, 1, fixedHost("other.example.com")); err != nil || again.Fingerprint != info.Fingerprint {
 		t.Fatalf("custom certificate changed: %v", err)
 	}
 	c.add(91 * 24 * time.Hour)
-	if _, err := m.Ensure(ctx, "play.example.com"); !errors.Is(err, ErrExpired) {
+	if _, err := m.Ensure(ctx, 1, fixedHost("play.example.com")); !errors.Is(err, ErrExpired) {
 		t.Fatalf("expired custom certificate: %v", err)
 	}
 	// Back to self-signed.
-	ss, err := m.UseSelfSigned(ctx, "play.example.com")
-	if err != nil || ss.Mode != ModeSelfSigned || !ss.SelfSigned || st.m[SettingMode] != "self_signed" {
+	ss, err := m.UseSelfSigned(ctx, fixedHost("play.example.com"))
+	if err != nil || ss.Mode != ModeSelfSigned || ss.Fingerprint != "" || !strings.HasPrefix(st.m[SettingMode], "self_signed:") {
 		t.Fatalf("%+v %v", ss, err)
 	}
 	// A custom certificate that disappeared is reported, not regenerated.
@@ -279,8 +290,8 @@ func TestCustomCertificate(t *testing.T) {
 	if _, err := m.UseCustom(ctx, ecPEM, keyPEM(t, ecKey, "EC PRIVATE KEY")); err != nil {
 		t.Fatal(err)
 	}
-	_ = os.Remove(filepath.Join(m.Dir(), CertFile))
-	if _, err := m.Ensure(ctx, "play.example.com"); !errors.Is(err, ErrNoCertificate) {
+	_ = os.Remove(filepath.Join(m.dir, CertFile))
+	if _, err := m.Ensure(ctx, 1, fixedHost("play.example.com")); !errors.Is(err, ErrNoCertificate) {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -297,7 +308,7 @@ func TestValidateCustomRejects(t *testing.T) {
 	ed := newKey(t, edKey)
 	_, edCert := makeCert(t, ed, nil, nil, valid)
 	_, expired := makeCert(t, ec, nil, nil, certOpts{notBefore: now.Add(-48 * time.Hour), notAfter: now.Add(-time.Hour)})
-	_, future := makeCert(t, ec, nil, nil, certOpts{notBefore: now.Add(time.Hour), notAfter: now.Add(48 * time.Hour)})
+	_, future := makeCert(t, ec, nil, nil, certOpts{notBefore: now.Add(time.Minute), notAfter: now.Add(48 * time.Hour)})
 	_, clientOnly := makeCert(t, ec, nil, nil, certOpts{notBefore: valid.notBefore, notAfter: valid.notAfter, eku: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
 	encrypted := pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: []byte{1, 2, 3}})
 	legacyEncrypted := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Headers: map[string]string{"Proc-Type": "4,ENCRYPTED"}, Bytes: []byte{1}})
@@ -345,27 +356,103 @@ func TestValidateCustomRejects(t *testing.T) {
 	}
 }
 
+func TestCustomChainMustBeInIssuerOrder(t *testing.T) {
+	now := time.Now()
+	window := certOpts{notBefore: now.Add(-time.Hour), notAfter: now.Add(time.Hour)}
+	caWindow := window
+	caWindow.isCA = true
+	rootKey := newKey(t, ecP256)
+	root, rootPEM := makeCert(t, rootKey, nil, nil, caWindow)
+	issuerKey := newKey(t, ecP256)
+	issuer, issuerPEM := makeCert(t, issuerKey, root, rootKey, caWindow)
+	leafKey := newKey(t, ecP256)
+	_, leafPEM := makeCert(t, leafKey, issuer, issuerKey, window)
+	leafKeyPEM := keyPEM(t, leafKey, "PRIVATE KEY")
+	if _, _, err := ValidateCustom(slices.Concat(leafPEM, issuerPEM, rootPEM), leafKeyPEM, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ValidateCustom(slices.Concat(leafPEM, rootPEM, issuerPEM), leafKeyPEM, now); err == nil {
+		t.Fatal("accepted the chain in reverse issuer order")
+	}
+}
+
+func TestModeChangeCommitAndRecovery(t *testing.T) {
+	ctx := context.Background()
+	m, clk, settings := newManager(t)
+	host := "play.example.com"
+	first, err := m.Ensure(ctx, 1, fixedHost(host))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, key, custom, err := m.generate(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveErr := errors.New("injected settings write failure")
+	settings.saveErr = saveErr
+	if _, err := m.UseCustom(ctx, cert, key); !errors.Is(err, saveErr) {
+		t.Fatalf("save error: %v", err)
+	}
+	if mounted, err := load(m.ServerDir(1)); err != nil || mounted.Fingerprint != first.Fingerprint {
+		t.Fatalf("failed write changed a live pair: %v %v", mounted.Fingerprint, err)
+	}
+	mode, err := m.Mode(ctx)
+	if err != nil || mode != ModeSelfSigned {
+		t.Fatalf("failed switch: %s %v", mode, err)
+	}
+	settings.saveErr = nil
+	// Interrupt publication after the settings commit and first mount
+	// update. A fresh manager must complete the committed transaction.
+	if err := os.WriteFile(m.ServerDir(2), []byte("block publication"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.UseCustom(ctx, cert, key); err == nil {
+		t.Fatal("expected an interrupted publication")
+	}
+	if err := os.Remove(m.ServerDir(2)); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(Options{Dir: m.dir, Settings: settings, Now: clk.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range settings.ids {
+		got, err := load(m.ServerDir(id))
+		if err != nil || got.Fingerprint != custom.Fingerprint {
+			t.Fatalf("mount %d after recovery: %v %v", id, got.Fingerprint, err)
+		}
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := m.UseSelfSigned(canceled, fixedHost(host)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled switch: %v", err)
+	}
+	if got, err := m.Current(ctx, 0); err != nil || got.Mode != ModeCustom || got.Fingerprint != custom.Fingerprint {
+		t.Fatalf("cancelled switch changed mode or pair: %v %v %v", got.Mode, got.Fingerprint, err)
+	}
+}
+
 // A replacement interrupted between its renames is completed on the next
 // Open; one interrupted while writing is discarded.
 func TestRecoverPending(t *testing.T) {
 	ctx := context.Background()
 	m, c, st := newManager(t)
-	old, err := m.Ensure(ctx, "a.example.com")
+	old, err := m.Ensure(ctx, 1, fixedHost("a.example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Prepare a complete new pair under the pending names.
 	other, _, _ := newManager(t)
-	newInfo, _ := other.Ensure(ctx, "b.example.com")
-	newCert, _ := os.ReadFile(filepath.Join(other.Dir(), CertFile))
-	newKey, _ := os.ReadFile(filepath.Join(other.Dir(), KeyFile))
+	newInfo, _ := other.Ensure(ctx, 1, fixedHost("b.example.com"))
+	newCert, _ := os.ReadFile(filepath.Join(other.ServerDir(1), CertFile))
+	newKey, _ := os.ReadFile(filepath.Join(other.ServerDir(1), KeyFile))
 	reopen := func() Info {
 		t.Helper()
-		m2, err := Open(Options{Dir: m.Dir(), Settings: st, Now: c.now})
+		m2, err := Open(Options{Dir: m.dir, Settings: st, Now: c.now})
 		if err != nil {
 			t.Fatal(err)
 		}
-		info, err := m2.Current(ctx)
+		info, err := m2.Current(ctx, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -374,25 +461,25 @@ func TestRecoverPending(t *testing.T) {
 
 	// Crash after the key rename: the new key is installed, the new
 	// certificate still pending.
-	_ = os.WriteFile(filepath.Join(m.Dir(), KeyFile), newKey, 0o640)
-	_ = os.WriteFile(filepath.Join(m.Dir(), pendingCert), newCert, 0o644)
+	_ = os.WriteFile(filepath.Join(m.ServerDir(1), KeyFile), newKey, 0o640)
+	_ = os.WriteFile(filepath.Join(m.ServerDir(1), pendingCert), newCert, 0o644)
 	if got := reopen(); got.Fingerprint != newInfo.Fingerprint {
 		t.Fatal("interrupted replacement not completed")
 	}
 	// Crash while writing the certificate: the pending key is discarded.
-	_ = os.WriteFile(filepath.Join(m.Dir(), pendingKey), []byte("partial"), 0o640)
+	_ = os.WriteFile(filepath.Join(m.ServerDir(1), pendingKey), []byte("partial"), 0o640)
 	if got := reopen(); got.Fingerprint != newInfo.Fingerprint {
 		t.Fatal("installed pair changed")
 	}
 	// A pending pair that does not match is discarded.
-	_ = os.WriteFile(filepath.Join(m.Dir(), pendingKey), newKey, 0o640)
+	_ = os.WriteFile(filepath.Join(m.ServerDir(1), pendingKey), newKey, 0o640)
 	oldCert, _ := makeCertPEM(t)
-	_ = os.WriteFile(filepath.Join(m.Dir(), pendingCert), oldCert, 0o644)
-	_ = os.WriteFile(filepath.Join(m.Dir(), ".tmp-123"), []byte("x"), 0o600)
+	_ = os.WriteFile(filepath.Join(m.ServerDir(1), pendingCert), oldCert, 0o644)
+	_ = os.WriteFile(filepath.Join(m.ServerDir(1), ".tmp-123"), []byte("x"), 0o600)
 	if got := reopen(); got.Fingerprint != newInfo.Fingerprint || got.Fingerprint == old.Fingerprint {
 		t.Fatal("mismatched pending pair installed")
 	}
-	if entries, _ := os.ReadDir(m.Dir()); len(entries) != 2 {
+	if entries, _ := os.ReadDir(m.ServerDir(1)); len(entries) != 2 {
 		t.Fatalf("leftovers %v", entries)
 	}
 }

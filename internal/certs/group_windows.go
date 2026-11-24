@@ -9,4 +9,4 @@ func groupPolicy() (fileGID int, groupAdd []int) { return -1, nil }
 
 func chownGroup(string, int) error { return nil }
 
-func syncDir(string) {}
+func syncDir(string) error { return nil }

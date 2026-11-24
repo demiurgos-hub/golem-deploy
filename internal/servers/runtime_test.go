@@ -285,7 +285,7 @@ func TestHealthGatedStart(t *testing.T) {
 		t.Fatalf("restart policy %q", ct.RestartPolicy)
 	}
 	token := ct.Env[EnvAdminToken]
-	if len(token) != 64 || row.AdminPort != fx.admin.Port || len(row.AdminToken) == 0 || bytes.Contains(row.AdminToken, []byte(token)) {
+	if len(token) != 64 || row.AdminPort != 0 || !row.StartComplete || len(row.AdminToken) == 0 || bytes.Contains(row.AdminToken, []byte(token)) {
 		t.Fatalf("admin record: port %d token %d bytes", row.AdminPort, len(row.AdminToken))
 	}
 	if ct.Env["SECRET"] != marker || ct.Env[EnvPublicURL] != "https://play.example.com:7000/wt" ||
@@ -293,7 +293,7 @@ func TestHealthGatedStart(t *testing.T) {
 		t.Fatalf("container env %v", ct.Env)
 	}
 	if len(ct.Binds) != 1 || !strings.Contains(ct.Binds[0], "target=/run/golem-deploy/tls,readonly") ||
-		!strings.Contains(ct.Binds[0], "source="+fx.certs.Dir()) {
+		!strings.Contains(ct.Binds[0], "source="+fx.certs.ServerDir(sv.ID)) {
 		t.Fatalf("binds %v", ct.Binds)
 	}
 	if ct.Labels[docker.LabelBuildID] != itoa(b.ID) || ct.Labels[docker.LabelCommit] != commitA || ct.Labels[docker.LabelEngineVersion] != "v0.4.0-rc.1" {
@@ -432,7 +432,7 @@ func TestImageTrust(t *testing.T) {
 			if d := failDetail(err); !strings.Contains(d, "refusing to run it") {
 				t.Fatalf("detail %q", d)
 			}
-			if len(fx.f.CallsTo("run")) != 0 {
+			if len(fx.f.CallsTo("create")) != 0 {
 				t.Fatal("docker run issued")
 			}
 		})
@@ -480,7 +480,7 @@ func TestStartPreconditions(t *testing.T) {
 	if _, err := startJob(t, nohost, sv.ID); !strings.Contains(failDetail(err), "no game host is configured") {
 		t.Fatalf("%v", err)
 	}
-	if len(nohost.f.CallsTo("run")) != 0 {
+	if len(nohost.f.CallsTo("create")) != 0 {
 		t.Fatal("docker run issued")
 	}
 	_ = b

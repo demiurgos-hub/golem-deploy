@@ -212,7 +212,7 @@ func TestIntegrationServersAPI(t *testing.T) {
 	// The certificate mount is readable by uid 65532 (the game could not
 	// have become ready otherwise) and is read-only.
 	startLog, _ := os.ReadFile(runner.LogPath(startJob.ID))
-	if !strings.Contains(string(startLog), "game ready: engine v0.4.0-rc.1, transport webtransport, schema itest-fp-1") {
+	if !strings.Contains(string(startLog), "game ready: engine v0.4.0-rc.1, transport webtransport, reported schema itest-fp-1") {
 		t.Fatalf("start log:\n%s", startLog)
 	}
 	mounts := itestDocker(t, "", "container", "inspect", "--format", "{{range .Mounts}}{{.Destination}} {{.RW}};{{end}}", got.ContainerID)
@@ -229,9 +229,9 @@ func TestIntegrationServersAPI(t *testing.T) {
 		t.Fatalf("runtime %+v", rt)
 	}
 
-	// The game serves the installation's certificate on the published TCP
+	// The game serves the server's certificate on the published TCP
 	// port, and picks up a replacement without a restart.
-	before, err := cm.Current(ctx)
+	before, err := cm.Current(ctx, got.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,20 +239,45 @@ func TestIntegrationServersAPI(t *testing.T) {
 		t.Fatalf("served %q, installed %q", fp, before.Fingerprint)
 	}
 	rr = h.do("PUT", "/api/v1/certificates/game", tok, apitypes.UpdateGameCertificateRequest{Mode: apitypes.CertificateModeSelfSigned})
-	after := decode[apitypes.GameCertificate](t, rr)
-	if after.Certificate.FingerprintSHA256 == before.Fingerprint || !after.Certificate.CoversGameHost {
+	mode := decode[apitypes.GameCertificate](t, rr)
+	if mode.Certificate != nil {
+		t.Fatalf("%+v", mode)
+	}
+	after := decode[apitypes.Server](t, h.do("GET", base, tok, nil))
+	if after.Certificate == nil || after.Certificate.FingerprintSHA256 == before.Fingerprint || !after.Certificate.CoversGameHost {
 		t.Fatalf("%+v", after)
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	for served(lo) != after.Certificate.FingerprintSHA256 {
-		if time.Now().After(deadline) {
-			t.Fatal("replaced certificate not picked up by the running game")
+	waitForCertificate := func(fingerprint string) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for served(lo) != fingerprint {
+			if time.Now().After(deadline) {
+				t.Fatal("replaced certificate not picked up by the running game")
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
+	waitForCertificate(after.Certificate.FingerprintSHA256)
 	if again := decode[apitypes.Server](t, h.do("GET", base, tok, nil)); again.RestartRequired || again.ContainerID != got.ContainerID {
 		t.Fatalf("certificate replacement restarted or staled the server: %+v", again)
 	}
+	customChain, customKey := testCertPEM(t, "localhost", time.Now().Add(time.Hour))
+	custom := decode[apitypes.GameCertificate](t, h.do("PUT", "/api/v1/certificates/game", tok, apitypes.UpdateGameCertificateRequest{
+		Mode: apitypes.CertificateModeCustom, CertificatePEM: customChain, PrivateKeyPEM: customKey,
+	}))
+	if custom.Certificate == nil {
+		t.Fatal("missing uploaded certificate")
+	}
+	waitForCertificate(custom.Certificate.FingerprintSHA256)
+	if again := decode[apitypes.Server](t, h.do("GET", base, tok, nil)); !again.RestartRequired || again.ContainerID != got.ContainerID {
+		t.Fatalf("mode change did not flag the pinning configuration: %+v", again)
+	}
+	_ = decode[apitypes.GameCertificate](t, h.do("PUT", "/api/v1/certificates/game", tok, apitypes.UpdateGameCertificateRequest{Mode: apitypes.CertificateModeSelfSigned}))
+	back := decode[apitypes.Server](t, h.do("GET", base, tok, nil))
+	if back.Certificate == nil || back.Certificate.FingerprintSHA256 == after.Certificate.FingerprintSHA256 || back.ContainerID != got.ContainerID {
+		t.Fatalf("switching back did not regenerate the running server's certificate: %+v", back)
+	}
+	waitForCertificate(back.Certificate.FingerprintSHA256)
 
 	// D3: an impostor with every one of our labels is not the server's
 	// container.

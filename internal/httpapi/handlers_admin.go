@@ -94,15 +94,7 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) er
 	s.logger.Info("settings updated", "request_id", requestIDFrom(r.Context()), "account_id", identityFrom(r).Account.ID,
 		"game_host_changed", req.GameHost != nil)
 	if req.GameHost != nil && s.certs != nil {
-		// A self-signed certificate follows the game host; a failure is
-		// retried hourly and before every server start.
-		host, err := s.effectiveGameHost(r.Context())
-		if err == nil {
-			_, err = s.certs.Ensure(r.Context(), host)
-		}
-		if err != nil && !errors.Is(err, certs.ErrExpired) && !errors.Is(err, certs.ErrNoCertificate) {
-			s.logger.Warn("could not update the game certificate for the new game host", "request_id", requestIDFrom(r.Context()), "err", err)
-		}
+		s.certs.Check(r.Context(), s.effectiveGameHost)
 	}
 	return s.writeSettings(w, r, st)
 }

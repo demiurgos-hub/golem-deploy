@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"modernc.org/sqlite"
@@ -90,6 +91,33 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 func (s *Store) nowUTC() time.Time { return s.now().UTC() }
+
+// durableWrite syncs the database before the caller changes files or
+// Docker state that recovery identifies using this write.
+func (s *Store) durableWrite(ctx context.Context, query string, args ...any) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	var previous int
+	if err := conn.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&previous); err != nil {
+		return err
+	}
+	if previous < 2 { // FULL
+		if _, err := conn.ExecContext(ctx, "PRAGMA synchronous = FULL"); err != nil {
+			return err
+		}
+		defer func() {
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "PRAGMA synchronous = "+strconv.Itoa(previous))
+		}()
+	}
+	res, err := conn.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	return checkAffected("durable write", res)
+}
 
 // withTx runs fn in a transaction, committing when it returns nil.
 func (s *Store) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {

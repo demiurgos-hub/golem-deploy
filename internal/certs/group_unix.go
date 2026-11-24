@@ -30,9 +30,11 @@ func chownGroup(path string, gid int) error {
 }
 
 // syncDir flushes a directory's entries (the renames) to disk.
-func syncDir(dir string) {
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
 	}
+	defer d.Close()
+	return d.Sync()
 }

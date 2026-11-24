@@ -59,7 +59,7 @@ const (
 	TLSReloadInterval = "30s"
 	// envContractVersion changes whenever the variables below change
 	// meaning, so running containers report restart_required.
-	envContractVersion = "engine-env-1"
+	envContractVersion = "engine-env-2"
 )
 
 // MaxAllowedOrigins bounds a server's extra allowed origins.

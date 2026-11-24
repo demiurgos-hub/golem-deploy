@@ -271,7 +271,7 @@ func TestServerLifecycle(t *testing.T) {
 	if j.Status != store.JobSuccess {
 		t.Fatalf("start job %s %q\n%s", j.Status, j.Detail, d.jobLog(j.ID))
 	}
-	runs := d.fake.CallsTo("run")
+	runs := d.fake.CallsTo("create")
 	if len(runs) != 1 {
 		t.Fatalf("run calls %v", runs)
 	}
@@ -320,7 +320,7 @@ func TestServerLifecycle(t *testing.T) {
 	// PATCH env: no implicit restart, restart_required reported.
 	rr = d.call("PATCH", fmt.Sprintf("/api/v1/servers/%d", created.ID), d.devTok, apitypes.UpdateServerRequest{EnvSet: map[string]string{"MODE": "tdm"}})
 	patched := decode[apitypes.Server](t, rr)
-	if !patched.RestartRequired || patched.State != apitypes.ServerStateRunning || len(d.fake.CallsTo("run")) != 0 {
+	if !patched.RestartRequired || patched.State != apitypes.ServerStateRunning || len(d.fake.CallsTo("create")) != 0 {
 		t.Fatalf("patched %+v", patched)
 	}
 	rr = d.call("PATCH", fmt.Sprintf("/api/v1/servers/%d", created.ID), d.devTok, apitypes.UpdateServerRequest{EnvSet: map[string]string{"A": "1"}, EnvUnset: []string{"A"}})
@@ -565,7 +565,7 @@ func TestStartFailsWhenPortBusy(t *testing.T) {
 	if j.Status != store.JobError || j.Detail != "port 7000 is in use by another process on the host" {
 		t.Fatalf("job %s %q", j.Status, j.Detail)
 	}
-	if len(d.fake.CallsTo("run")) != 0 {
+	if len(d.fake.CallsTo("create")) != 0 {
 		t.Fatal("ran despite a busy port")
 	}
 }
@@ -615,7 +615,7 @@ func TestExportImport(t *testing.T) {
 		res.Created[0].DesiredState != apitypes.DesiredStateStopped || res.Created[0].EnvKeys[0] != "S" {
 		t.Fatalf("import result %+v", res)
 	}
-	if len(d.fake.CallsTo("run")) != 0 {
+	if len(d.fake.CallsTo("create")) != 0 {
 		t.Fatal("import started a server")
 	}
 	d.assertNoMarker()

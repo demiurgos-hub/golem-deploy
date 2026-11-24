@@ -4,14 +4,15 @@
 //
 // The game is untrusted code, so is everything it answers. The client only
 // ever connects to 127.0.0.1 on the port Docker published the container's
-// admin port on (it never resolves names, uses no proxy and keeps no
-// connections), bounds every request with a short timeout, never follows
+// admin port on (it never resolves names, uses no proxy and never
+// redials during a multi-request operation), bounds every request with a short timeout, never follows
 // redirects, refuses compressed bodies, caps the response size, and
 // returns only bounded, sanitised values. The token is sent in the
 // Authorization header only and never appears in errors or logs.
 package gameadmin
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -41,8 +42,7 @@ const (
 	MinTokenLength = 16
 )
 
-// Errors. Callers show fixed messages for them; the wrapped detail is for
-// the daemon log.
+// Errors contain no data received from the endpoint.
 var (
 	// ErrUnreachable: no connection or no complete answer in time.
 	ErrUnreachable = errors.New("gameadmin: the admin endpoint did not answer")
@@ -55,60 +55,113 @@ var (
 
 // Client talks to one container's admin endpoint.
 type Client struct {
-	addr  string
-	token string
-	http  *http.Client
+	addr      string
+	token     string
+	session   bool
+	attempted bool
+	conn      net.Conn
+	wire      io.LimitedReader
+	reader    *bufio.Reader
 }
 
-// New returns a client for the admin endpoint published on
-// 127.0.0.1:port.
+// New returns a client that opens a fresh loopback connection per request.
 func New(port int, token string) (*Client, error) {
+	return newClient(port, token, false)
+}
+
+// NewSession allows exactly one connection for a sequence of requests.
+// Use it serially and Close it when done. A peer that closes the connection
+// aborts the sequence rather than receiving the token again on a fresh socket.
+func NewSession(port int, token string) (*Client, error) {
+	return newClient(port, token, true)
+}
+
+func newClient(port int, token string, session bool) (*Client, error) {
 	if port <= 0 || port > 65535 {
 		return nil, errors.New("gameadmin: invalid port")
 	}
 	if len(token) < MinTokenLength || strings.ContainsAny(token, " \t\r\n") {
 		return nil, errors.New("gameadmin: invalid token")
 	}
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	dialer := &net.Dialer{Timeout: RequestTimeout}
-	tr := &http.Transport{
-		Proxy: nil, // never a proxy from the environment
-		DialContext: func(ctx context.Context, _, a string) (net.Conn, error) {
-			if a != addr {
-				return nil, fmt.Errorf("gameadmin: refusing to dial %q", a)
-			}
-			return dialer.DialContext(ctx, "tcp4", addr)
-		},
-		DisableKeepAlives:      true,
-		DisableCompression:     true,
-		MaxResponseHeaderBytes: 8 << 10,
-		ResponseHeaderTimeout:  RequestTimeout,
-		ForceAttemptHTTP2:      false,
+	return &Client{addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), token: token, session: session}, nil
+}
+
+// Close releases a session's connection.
+func (c *Client) Close() {
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
 	}
-	return &Client{addr: addr, token: token, http: &http.Client{
-		Transport:     tr,
-		Timeout:       RequestTimeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}}, nil
+}
+
+// connection dials only the inspected address and only once per session.
+func (c *Client) connection(ctx context.Context) error {
+	if c.conn != nil {
+		return nil
+	}
+	if c.session && c.attempted {
+		return ErrUnreachable
+	}
+	c.attempted = true
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp4", c.addr)
+	if err != nil {
+		return ErrUnreachable
+	}
+	c.conn = conn
+	c.wire.R = conn
+	c.reader = bufio.NewReader(&c.wire)
+	return nil
 }
 
 // get performs GET path and decodes a JSON answer with an accepted status
 // into dst; it returns the status.
 func (c *Client) get(ctx context.Context, path string, dst any, accept ...int) (int, error) {
+	if !c.session {
+		// Non-session callers can use the same configuration concurrently.
+		c = &Client{addr: c.addr, token: c.token}
+	}
 	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+c.addr+path, nil)
-	if err != nil {
+	if err := c.connection(ctx); err != nil {
 		return 0, err
 	}
+	keep := false
+	defer func() {
+		if !keep {
+			c.Close()
+		}
+	}()
+	conn := c.conn
+	deadline, _ := ctx.Deadline()
+	if err := conn.SetDeadline(deadline); err != nil {
+		return 0, ErrUnreachable
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+c.addr+path, nil)
+	if err != nil {
+		return 0, ErrUnreachable
+	}
+	req.Close = !c.session
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Accept", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		// *url.Error names only the URL (no token).
-		return 0, fmt.Errorf("%w: %v", ErrUnreachable, err)
+	if err := req.Write(conn); err != nil {
+		return 0, ErrUnreachable
 	}
-	defer resp.Body.Close()
+	// Parse the response directly so there is no retry, proxy, redirect,
+	// compression or transport logging of arbitrary bytes from the peer.
+	c.wire.N = 8 << 10
+	resp, err := http.ReadResponse(c.reader, req)
+	if err != nil {
+		var netErr net.Error
+		if ctx.Err() != nil || errors.Is(err, io.EOF) || (errors.As(err, &netErr) && netErr.Timeout()) {
+			return 0, ErrUnreachable
+		}
+		return 0, ErrBadResponse
+	}
+	// Bound decoded bytes and wire overhead (e.g. chunk metadata).
+	c.wire.N = 2 * MaxResponseBytes
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		return resp.StatusCode, fmt.Errorf("%w: status %d", ErrUnauthorized, resp.StatusCode)
@@ -123,7 +176,7 @@ func (c *Client) get(ctx context.Context, path string, dst any, accept ...int) (
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes+1))
 	if err != nil {
-		return resp.StatusCode, fmt.Errorf("%w: %v", ErrUnreachable, err)
+		return resp.StatusCode, ErrUnreachable
 	}
 	if len(body) > MaxResponseBytes {
 		return resp.StatusCode, fmt.Errorf("%w: body larger than %d bytes", ErrBadResponse, MaxResponseBytes)
@@ -131,6 +184,9 @@ func (c *Client) get(ctx context.Context, path string, dst any, accept ...int) (
 	if err := json.Unmarshal(body, dst); err != nil {
 		return resp.StatusCode, fmt.Errorf("%w: malformed JSON", ErrBadResponse)
 	}
+	// ReadAll reached the end of the body, so no data remains to drain.
+	_ = resp.Body.Close()
+	keep = c.session && !resp.Close && ctx.Err() == nil
 	return resp.StatusCode, nil
 }
 
@@ -162,7 +218,7 @@ func (c *Client) Ready(ctx context.Context) (Readiness, error) {
 	if err != nil {
 		return Readiness{}, err
 	}
-	return Readiness{Ready: status == http.StatusOK && v.Ready, Reason: Clean(v.Reason, 32)}, nil
+	return Readiness{Ready: status == http.StatusOK && v.Ready, Reason: c.clean(v.Reason, 32)}, nil
 }
 
 // Info is the sanitised answer of GET /info.
@@ -204,15 +260,15 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 		return Info{}, err
 	}
 	return Info{
-		Name:                          Clean(v.Name, MaxString),
-		SchemaFingerprint:             Fingerprint(v.SchemaFingerprint),
-		EngineVersion:                 Clean(v.EngineVersion, 64),
-		GoVersion:                     Clean(v.GoVersion, 32),
-		Transport:                     Transport(v.Transport),
+		Name:                          c.clean(v.Name, MaxString),
+		SchemaFingerprint:             Fingerprint(c.withoutToken(v.SchemaFingerprint)),
+		EngineVersion:                 c.clean(v.EngineVersion, 64),
+		GoVersion:                     c.clean(v.GoVersion, 32),
+		Transport:                     Transport(c.withoutToken(v.Transport)),
 		TickRate:                      clampInt(v.TickRate),
 		CertificateHashesPublished:    v.CertificateHashesPublished,
-		WebTransportCertificateHashes: hashes(v.WebTransportCertificateHashes),
-		HTTPCertificateHashes:         hashes(v.HTTPCertificateHashes),
+		WebTransportCertificateHashes: c.hashes(v.WebTransportCertificateHashes),
+		HTTPCertificateHashes:         c.hashes(v.HTTPCertificateHashes),
 	}, nil
 }
 
@@ -302,13 +358,24 @@ func Transport(s string) string {
 
 var hexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-func hashes(list []hashJSON) []string {
+func (c *Client) withoutToken(s string) string {
+	if strings.Contains(s, c.token) {
+		return ""
+	}
+	return s
+}
+
+func (c *Client) clean(s string, max int) string {
+	return c.withoutToken(Clean(c.withoutToken(s), max))
+}
+
+func (c *Client) hashes(list []hashJSON) []string {
 	out := []string{}
 	for _, h := range list {
 		if len(out) == 8 {
 			break
 		}
-		if strings.EqualFold(h.Algorithm, "sha-256") && hexRE.MatchString(h.Value) {
+		if strings.EqualFold(c.withoutToken(h.Algorithm), "sha-256") && hexRE.MatchString(c.withoutToken(h.Value)) {
 			out = append(out, h.Value)
 		}
 	}

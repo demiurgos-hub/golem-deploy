@@ -231,7 +231,7 @@ func TestIntegrationDocker(t *testing.T) {
 		ServerID: sid, ServerName: name, Image: img.ID, HostPort: port, BindAddress: "127.0.0.1",
 		Env: map[string]string{"GAME_SECRET": secretMarker}, ConfigHash: "itest", MemoryMB: 256, CPUs: 1,
 	}
-	id, err := c.RunServer(ctx, s)
+	id, err := createAndStart(ctx, c, s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +371,7 @@ func TestD1_IntegrationEnvFile(t *testing.T) {
 		"TAB":                        "\tx\t",
 	}
 	sid := serverID()
-	id, err := c.RunServer(ctx, docker.RunSpec{ServerID: sid, ServerName: name, Image: img.ID, HostPort: freePort(t), BindAddress: "127.0.0.1", Env: env})
+	id, err := createAndStart(ctx, c, docker.RunSpec{ServerID: sid, ServerName: name, Image: img.ID, HostPort: freePort(t), BindAddress: "127.0.0.1", Env: env})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +404,7 @@ func TestD1_IntegrationEnvFile(t *testing.T) {
 	// The env file mechanism of this platform was used.
 	wantPath := "/dev/fd/3"
 	for _, a := range rr.args {
-		if len(a) > 0 && a[0] == "run" {
+		if len(a) > 0 && a[0] == "create" {
 			i := slices.Index(a, "--env-file")
 			if i < 0 {
 				t.Fatalf("run without --env-file: %q", a)
@@ -461,7 +461,7 @@ func TestD1_IntegrationMaximumEnv(t *testing.T) {
 	if len(content) <= 64<<10 {
 		t.Fatalf("env file of %d bytes does not exceed a pipe buffer", len(content))
 	}
-	id, err := c.RunServer(ctx, docker.RunSpec{ServerID: serverID(), ServerName: name, Image: img.ID, HostPort: freePort(t), BindAddress: "127.0.0.1", Env: env})
+	id, err := createAndStart(ctx, c, docker.RunSpec{ServerID: serverID(), ServerName: name, Image: img.ID, HostPort: freePort(t), BindAddress: "127.0.0.1", Env: env})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +510,7 @@ func TestD2_IntegrationImageVolumes(t *testing.T) {
 	sid := serverID()
 	s := docker.RunSpec{ServerID: sid, ServerName: name, Image: img.ID, ImageVolumes: img.Volumes, HostPort: freePort(t), BindAddress: "127.0.0.1"}
 	for round := 0; round < 2; round++ { // start, then "restart" (remove + run)
-		id, err := c.RunServer(ctx, s)
+		id, err := createAndStart(ctx, c, s)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -570,7 +570,7 @@ func TestD3_IntegrationImpostor(t *testing.T) {
 		t.Fatal(err)
 	}
 	sid := serverID()
-	id, err := c.RunServer(ctx, docker.RunSpec{ServerID: sid, ServerName: name, Image: img.ID, HostPort: freePort(t), BindAddress: "127.0.0.1"})
+	id, err := createAndStart(ctx, c, docker.RunSpec{ServerID: sid, ServerName: name, Image: img.ID, HostPort: freePort(t), BindAddress: "127.0.0.1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,11 +624,11 @@ func TestD5_IntegrationIsolation(t *testing.T) {
 	}
 	sid := serverID()
 	portB := freePort(t)
-	idA, err := c.RunServer(ctx, docker.RunSpec{ServerID: sid, ServerName: a, Image: img.ID, HostPort: freePort(t), BindAddress: "127.0.0.1"})
+	idA, err := createAndStart(ctx, c, docker.RunSpec{ServerID: sid, ServerName: a, Image: img.ID, HostPort: freePort(t), BindAddress: "127.0.0.1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	idB, err := c.RunServer(ctx, docker.RunSpec{ServerID: sid + 1, ServerName: b, Image: img.ID, HostPort: portB, BindAddress: "127.0.0.1"})
+	idB, err := createAndStart(ctx, c, docker.RunSpec{ServerID: sid + 1, ServerName: b, Image: img.ID, HostPort: portB, BindAddress: "127.0.0.1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -685,7 +685,7 @@ func TestD14_IntegrationExitCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	sid := serverID()
-	id, err := c.RunServer(ctx, docker.RunSpec{ServerID: sid, ServerName: name, Image: img.ID, HostPort: freePort(t), BindAddress: "127.0.0.1"})
+	id, err := createAndStart(ctx, c, docker.RunSpec{ServerID: sid, ServerName: name, Image: img.ID, HostPort: freePort(t), BindAddress: "127.0.0.1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -754,3 +754,16 @@ func containsVolume(list []docker.Volume, name string) bool {
 
 func itoa(n int) string     { return strconv.Itoa(n) }
 func itoa64(n int64) string { return strconv.FormatInt(n, 10) }
+
+func createAndStart(ctx context.Context, c *docker.Client, spec docker.RunSpec) (string, error) {
+	id, err := c.CreateServer(ctx, spec)
+	if err != nil {
+		return "", err
+	}
+	ref := docker.ServerRef{ServerID: spec.ServerID, ContainerID: id}
+	if err := c.StartServer(ctx, ref); err != nil {
+		_, _ = c.RemoveServerContainer(context.WithoutCancel(ctx), ref, docker.DefaultStopTimeout)
+		return "", err
+	}
+	return id, nil
+}

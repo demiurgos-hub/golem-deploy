@@ -62,11 +62,15 @@ func run(t *testing.T, c *docker.Client, s docker.RunSpec) docker.ServerRef {
 	if _, err := c.EnsureNetwork(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	id, err := c.RunServer(context.Background(), s)
+	id, err := c.CreateServer(context.Background(), s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return docker.ServerRef{ServerID: s.ServerID, ContainerID: id}
+	ref := docker.ServerRef{ServerID: s.ServerID, ContainerID: id}
+	if err := c.StartServer(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+	return ref
 }
 
 func TestRunSpecArgvExact(t *testing.T) {
@@ -76,7 +80,7 @@ func TestRunSpecArgvExact(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"run", "--detach", "--pull", "never", "--name", "golem-deploy-arena",
+		"create", "--pull", "never", "--name", "golem-deploy-arena",
 		"--label", "dev.golemengine.deploy.managed=true",
 		"--label", "dev.golemengine.deploy.instance=" + instance,
 		"--label", "dev.golemengine.deploy.server-id=12",
@@ -86,6 +90,7 @@ func TestRunSpecArgvExact(t *testing.T) {
 		"--label", "dev.golemengine.deploy.build-id=",
 		"--label", "dev.golemengine.deploy.engine-version=",
 		"--label", "dev.golemengine.deploy.config-hash=abc",
+		"--label", "dev.golemengine.deploy.launch-id=",
 		"--restart", "no", "--init", "--no-healthcheck", "--stop-signal", "SIGTERM", "--stop-timeout", "30",
 		"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512",
 		"--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
@@ -197,7 +202,7 @@ func TestD1_EnvValuesNeverReachCLIEnvOrArgv(t *testing.T) {
 		"MODE":        secretMarker,
 	}
 	r := run(t, c, s)
-	calls := f.CallsTo("run")
+	calls := f.CallsTo("create")
 	if len(calls) != 1 {
 		t.Fatalf("calls %v", f.Calls())
 	}
@@ -831,14 +836,14 @@ func TestRunErrorsAreClassifiedAndRedacted(t *testing.T) {
 	c, f, _ := newClient(t)
 	img := managedImage(f, 1)
 	f.AddContainer(dockertest.Container{Name: "golem-deploy-arena"})
-	_, err := c.RunServer(context.Background(), spec(img))
+	_, err := c.CreateServer(context.Background(), spec(img))
 	if !errors.Is(err, docker.ErrConflict) || strings.Contains(err.Error(), secretMarker) {
 		t.Fatalf("got %v", err)
 	}
 	s := spec(img)
 	s.Image = dockertest.ImageID(77)
 	s.ServerName = "other"
-	if _, err := c.RunServer(context.Background(), s); !errors.Is(err, docker.ErrImageMissing) {
+	if _, err := c.CreateServer(context.Background(), s); !errors.Is(err, docker.ErrImageMissing) {
 		t.Fatalf("missing image: %v", err)
 	}
 }

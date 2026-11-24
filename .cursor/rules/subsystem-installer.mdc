@@ -6,6 +6,7 @@ alwaysApply: false
 
 # Installer and systemd unit
 
+- Windows is for development only. The daemon warns at startup that data-directory ACLs are unchecked on Windows.
 - `scripts/install.sh` (bash, run as root with the path to a built binary) installs Golem Deploy on Ubuntu/Debian: checks (root, OS, systemd, docker CLI + daemon + `docker` group, ELF binary that runs `version`, options) all run before any change; then apt packages, the `golem-deploy` system user (in the `docker` group), `/var/lib/golem-deploy` (0700), `/usr/local/bin/golem-deploy`, `/etc/golem-deploy/golem-deploy.env` (0640 `root:golem-deploy`), optional TLS copies in `/etc/golem-deploy/tls/`, and `deploy/golem-deploy.service` (read relative to the script). It never installs Docker or touches firewall rules. The full installer (releases, Docker, setup link, certificates) is a later milestone.
 - Idempotent: a re-run replaces binary, unit and TLS copies and restarts the service; it never rewrites an existing env file or touches an existing data directory (it refuses one with the wrong owner or mode). Keep it that way.
 - The env file holds only `GOLEM_DEPLOY_*` variables of `serve` (`cmd/golem-deploy/main.go`). When a serve flag, its default, the data directory rules (`internal/datadir`), the plaintext/loopback rule or the port-range rules change, update the script's validation, its printed next steps and `docs/INSTALL.md`.

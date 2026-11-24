@@ -45,8 +45,7 @@ func (l Layout) Static() string { return filepath.Join(l.Root, "static") }
 // JobLogs holds one log file per job.
 func (l Layout) JobLogs() string { return filepath.Join(l.Root, "logs", "jobs") }
 
-// GameCerts holds the game certificate (internal/certs); it is bind-mounted
-// read-only into every server container.
+// GameCerts holds the canonical custom certificate. Server mounts are siblings under certs/servers.
 func (l Layout) GameCerts() string { return filepath.Join(l.Root, "certs", "game") }
 
 // Tmp is scratch space on the same filesystem as the other directories.

@@ -232,10 +232,9 @@ func (c *Client) ServerContainer(ctx context.Context, ref ServerRef) (Container,
 	return list[0], nil
 }
 
-// RunServer creates and starts a server container (without a restart
-// policy; see ApplyRestartPolicy) and returns its id. The spec is
+// CreateServer creates a stopped server container and returns its id. The spec is
 // validated; env values reach the CLI only through an env file.
-func (c *Client) RunServer(ctx context.Context, spec RunSpec) (string, error) {
+func (c *Client) CreateServer(ctx context.Context, spec RunSpec) (string, error) {
 	if err := c.needInstance(); err != nil {
 		return "", err
 	}
@@ -246,7 +245,7 @@ func (c *Client) RunServer(ctx context.Context, spec RunSpec) (string, error) {
 	if _, err := spec.Args(c.instance, "/dev/null"); err != nil { // validate before any side effect
 		return "", err
 	}
-	c.logger.Info("docker run", "server_id", spec.ServerID, "container", ContainerName(spec.ServerName), "image", spec.Image,
+	c.logger.Info("docker create", "server_id", spec.ServerID, "container", ContainerName(spec.ServerName), "image", spec.Image,
 		"port", spec.HostPort, "env_keys", strings.Join(EnvKeys(spec.mergedEnv()), ","))
 	out := &capBuffer{max: 4 << 10}
 	errBuf := &capBuffer{max: maxStderr}
@@ -273,15 +272,58 @@ func (c *Client) RunServer(ctx context.Context, spec RunSpec) (string, error) {
 	id := strings.TrimSpace(out.buf.String())
 	if err != nil {
 		if errors.Is(err, errEnvFileNotRead) && ValidContainerID(id) {
-			// Created without its environment: never leave it running.
-			_ = c.exec(context.WithoutCancel(ctx), quickTimeout, []string{"rm", "--force", "--volumes", "--", id}, nil, nil, nil)
+			// Created without its environment: discard the verified container.
+			_, _ = c.RemoveServerContainer(context.WithoutCancel(ctx), ServerRef{ServerID: spec.ServerID, ContainerID: id}, DefaultStopTimeout)
 		}
 		return "", err
 	}
 	if !ValidContainerID(id) {
-		return "", &CmdError{Op: "run", Detail: "unexpected container id output"}
+		return "", &CmdError{Op: "create", Detail: "unexpected container id output"}
 	}
 	return id, nil
+}
+
+// PendingServerContainer finds the result of one specific create whose
+// reply was lost. The daemon generated and recorded launchID before issuing
+// the create. A name or labels inherited from the image alone prove nothing.
+func (c *Client) PendingServerContainer(ctx context.Context, serverID int64, name, launchID string) (Container, error) {
+	if err := c.needInstance(); err != nil {
+		return Container{}, err
+	}
+	if serverID <= 0 || ValidateServerName(name) != nil || !ValidInstanceID(launchID) {
+		return Container{}, ErrNotOurs
+	}
+	ids, err := c.psIDs(ctx, managedFilter(), c.instanceFilter(), "label="+LabelLaunchID+"="+launchID)
+	if err != nil {
+		return Container{}, err
+	}
+	all, err := c.inspectContainers(ctx, ids)
+	if err != nil {
+		return Container{}, err
+	}
+	for _, ct := range all {
+		if c.IsPendingServerContainer(ct, serverID, name, launchID) {
+			return ct, nil
+		}
+	}
+	return Container{}, ErrNotFound
+}
+
+// IsPendingServerContainer verifies the unique create intent saved before
+// Docker was called. A container name or ordinary labels are insufficient.
+func (c *Client) IsPendingServerContainer(ct Container, serverID int64, name, launchID string) bool {
+	return ValidInstanceID(launchID) && ValidContainerID(ct.ID) &&
+		c.IsServerContainer(ct, ServerRef{ServerID: serverID, ContainerID: ct.ID}) &&
+		ct.Name == ContainerName(name) && ct.Labels[LabelLaunchID] == launchID
+}
+
+// StartServer starts the server's verified, recorded container.
+func (c *Client) StartServer(ctx context.Context, ref ServerRef) error {
+	ct, err := c.ServerContainer(ctx, ref)
+	if err != nil {
+		return err
+	}
+	return c.exec(ctx, runTimeout, []string{"start", "--", ct.ID}, nil, nil, nil)
 }
 
 // reclassify sets ce.Kind from its (redacted) Detail when exec could not

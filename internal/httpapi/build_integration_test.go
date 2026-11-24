@@ -39,7 +39,7 @@ import (
 // the game's admin /ready, the runtime view and the build's schema
 // fingerprint come from the game, and the game serves its page and its
 // realtime config (public URL, fallback URL, certificate hashes) over HTTPS
-// with the installation's certificate. No GitHub access is needed: the
+// with the server's certificate. No GitHub access is needed: the
 // checkout is a copy of the fixture.
 func TestIntegrationBuildToServer(t *testing.T) {
 	if os.Getenv("GOLEM_DEPLOY_DOCKER_TESTS") != "1" {
@@ -180,8 +180,8 @@ func TestIntegrationBuildToServer(t *testing.T) {
 	}
 
 	// The game's page and realtime config over HTTPS on the server's port,
-	// with the installation's certificate.
-	cert, err := cm.Current(ctx)
+	// with the server's certificate.
+	cert, err := cm.Current(ctx, sv.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

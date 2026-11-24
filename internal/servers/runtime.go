@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/gameadmin"
 )
 
@@ -26,25 +27,22 @@ func (s *Service) Runtime(ctx context.Context, id int64, now time.Time) (apitype
 	if ct == nil {
 		return apitypes.ServerRuntime{}, ErrNoContainer
 	}
-	if !ct.Running {
+	if !adminRunning(*ct) {
 		return apitypes.ServerRuntime{}, ErrNotRunning
 	}
 	port := ct.LoopbackPort(AdminContainerPort)
 	if port == 0 {
 		return apitypes.ServerRuntime{}, fmt.Errorf("%w: the container publishes no admin port", ErrAdminUnavailable)
 	}
-	if port != sv.AdminPort {
-		// Docker can assign another port when it restarts the container.
-		_ = s.store.SetServerAdminPort(context.WithoutCancel(ctx), sv.ID, sv.ContainerID, port)
-	}
 	token, err := s.openAdminToken(sv)
 	if err != nil {
 		return apitypes.ServerRuntime{}, fmt.Errorf("%w: %w", ErrAdminUnavailable, err)
 	}
-	c, err := gameadmin.New(port, token)
+	c, err := gameadmin.NewSession(port, token)
 	if err != nil {
 		return apitypes.ServerRuntime{}, fmt.Errorf("%w: %w", ErrAdminUnavailable, err)
 	}
+	defer c.Close()
 	r, err := c.Ready(ctx)
 	if err != nil {
 		return apitypes.ServerRuntime{}, fmt.Errorf("%w: %w", ErrAdminUnavailable, err)
@@ -74,3 +72,6 @@ func (s *Service) Runtime(ctx context.Context, id int64, now time.Time) (apitype
 		SampledAt:                  now.UTC(),
 	}, nil
 }
+
+// Docker may set Running for paused or restarting containers as well.
+func adminRunning(c docker.Container) bool { return c.Running && c.State == "running" }
