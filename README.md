@@ -57,7 +57,7 @@ go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 go test -race ./...
 ```
 
-Tests against a real Docker daemon are opt-in: `GOLEM_DEPLOY_DOCKER_TESTS=1 go test -p 1 ./internal/build/... ./internal/docker/... ./internal/httpapi/... ./internal/servers/...` (they build small labelled `gdm2h-*` images from a pinned busybox and a `FROM scratch` image of a fake game compiled with the local Go toolchain, share the `golem-deploy` network, hence `-p 1`, and clean up after themselves; `internal/build` builds the fixture game in `internal/build/testdata/game` as `golem-deploy/gdm3b-*`, which needs network access for base images, Go modules and npm, and runs it briefly).
+Tests against a real Docker daemon are opt-in: `GOLEM_DEPLOY_DOCKER_TESTS=1 go test -p 1 ./internal/build/... ./internal/docker/... ./internal/httpapi/... ./internal/servers/...` (they build small labelled `gdm2h-*` images from a pinned busybox and a `FROM scratch` image of a fake game compiled with the local Go toolchain, share the `golem-deploy` network, hence `-p 1`, and clean up after themselves; `internal/build` builds the fixture game in `internal/build/testdata/game` as `golem-deploy/gdm3b-*`, which needs network access for base images, Go modules and npm, and runs it briefly; `TestIntegrationBuildToServer` in `internal/httpapi` builds the same fixture through the API and runs it as a server until it reports ready, then checks the runtime view and the realtime config over HTTPS).
 
 ## Develop the web client
 

@@ -37,7 +37,7 @@ func TestBuildArgs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"build", "--file", s.Dockerfile, "--tag", "golem-deploy/arena:a1a1a1a1a1a1",
+	want := []string{"build", "--file", s.Dockerfile, "--tag", "golem-deploy/arena:a1a1a1a1a1a1-b9",
 		"--label", "dev.golemengine.deploy.managed=true", "--label", "dev.golemengine.deploy.instance=" + dockertest.InstanceID,
 		"--label", "dev.golemengine.deploy.project-id=3", "--label", "dev.golemengine.deploy.commit=" + s.Commit,
 		"--label", "dev.golemengine.deploy.build-id=9", "--label", "dev.golemengine.deploy.engine-version=v0.4.0-rc.1",

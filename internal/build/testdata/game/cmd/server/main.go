@@ -1,26 +1,34 @@
 // Command server is the golem-deploy build fixture: the smallest Golem
-// Engine game that runs through the generated Runtime.Host, serving the
-// built web client from web/dist and a health endpoint.
+// Engine game that runs through the generated Runtime.Host under the deploy
+// contract (WebTransport primary, configured by GOLEM_* variables), serving
+// the built web client from web/dist and a health endpoint.
 package main
 
 import (
 	"context"
 	"log"
+	"net"
 	"net/http"
 
 	"github.com/demiurgos-hub/golem-engine/golem"
-	"github.com/demiurgos-hub/golem-engine/golem/host"
 
 	"example.com/golem-deploy-fixture/internal/generated"
 )
 
 func main() {
-	srv, rt := generated.NewServer(golem.ServerConfigFromEnv(golem.ServerConfig{
-		TickRate:        10,
-		Transport:       golem.TransportWebSocket,
-		StateUpdateLane: golem.StateUpdateLaneStream,
-		Path:            host.DefaultWebSocketPath,
-	}))
+	cfg := golem.ServerConfigFromEnv(golem.ServerConfig{
+		TickRate:  10,
+		Addr:      "127.0.0.1:8080",
+		Transport: golem.TransportWebTransport,
+	})
+	// Without TLS files (a local run) WebTransport uses the engine's
+	// development certificate on a loopback address; golem-deploy always
+	// provides the files.
+	if host, _, err := net.SplitHostPort(cfg.Addr); err == nil && cfg.TLSCertFile == "" && cfg.TLSKeyFile == "" {
+		ip := net.ParseIP(host)
+		cfg.DevSelfSignedCert = host == "localhost" || (ip != nil && ip.IsLoopback())
+	}
+	srv, rt := generated.NewServer(cfg)
 	api := http.NewServeMux()
 	api.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ready\n"))
