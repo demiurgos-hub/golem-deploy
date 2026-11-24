@@ -257,9 +257,10 @@ func Run(ctx context.Context, o Options) (err error) {
 	if err != nil {
 		return err
 	}
-	// Waiting builds hold a worker (build.MaxActiveBuilds at most), so
-	// there are enough workers left for server and project jobs.
-	runner := jobs.New(st, layout.JobLogs(), jobs.Options{Logger: logger, Workers: 4 + build.MaxActiveBuilds})
+	// Builds run on their own pool: a waiting build holds a worker of that
+	// pool (build.MaxActiveBuilds at most), so builds never delay server
+	// starts and stops or other project jobs on the default pool.
+	runner := jobs.New(st, layout.JobLogs(), jobs.Options{Logger: logger, Workers: 4, Pools: map[string]int{build.JobPool: build.MaxActiveBuilds}})
 	instanceID, err := st.InstanceID(ctx)
 	if err != nil {
 		return err

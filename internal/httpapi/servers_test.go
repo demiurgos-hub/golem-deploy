@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
@@ -100,7 +101,7 @@ func newDockerHarnessWith(t *testing.T, staticOpts staticfiles.Options, mutate .
 		t.Fatal(err)
 	}
 	logDir := t.TempDir()
-	runner := jobs.New(h.st, logDir, jobs.Options{Workers: 4, Logger: logger})
+	runner := jobs.New(h.st, logDir, jobs.Options{Workers: 4, Pools: map[string]int{build.JobPool: build.MaxActiveBuilds}, Logger: logger})
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

@@ -233,8 +233,8 @@ func TestJobCancelledWhileBeingAdmittedNeverStarts(t *testing.T) {
 		// conditions are ready when its goroutine looks.
 		r.mu.Lock()
 		r.active[j2.ID].cancel(errCancelledByUser)
-		r.workers = 2
-		r.admitLocked()
+		r.pools[""].workers = 2
+		r.admitLocked(r.pools[""])
 		r.mu.Unlock()
 		waitDone(t, r, j2.ID)
 		close(block)
@@ -244,7 +244,7 @@ func TestJobCancelledWhileBeingAdmittedNeverStarts(t *testing.T) {
 			t.Fatalf("job cancelled during admission: ran=%v %+v", ran.Load(), got)
 		}
 		r.mu.Lock()
-		running, queued := r.running, len(r.queue)
+		running, queued := r.pools[""].running, len(r.pools[""].queue)
 		r.mu.Unlock()
 		if running != 0 || queued != 0 {
 			t.Fatalf("worker accounting after cancellation: running=%d queued=%d", running, queued)
@@ -296,6 +296,78 @@ func TestErrorDetailIsSafe(t *testing.T) {
 	if got := getJob(t, st, j2.ID); got.Detail != "authentication with the remote failed" {
 		t.Fatalf("safe detail %q", got.Detail)
 	}
+}
+
+// Jobs of a named pool wait only for that pool's workers: a queue of
+// blocked jobs in one pool never delays jobs of another (builds waiting
+// for the build slot must not delay server starts).
+func TestPoolsAreIndependent(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	r := New(st, filepath.Join(dir, "logs"), Options{Workers: 1, Pools: map[string]int{"build": 2}})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = r.Shutdown(ctx)
+	})
+	if err := os.MkdirAll(filepath.Join(dir, "logs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	defer close(block)
+	blocked := func(ctx context.Context, _ io.Writer) error {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return ctx.Err()
+	}
+	var builds []store.Job
+	for i := range 4 { // 2 hold the build pool's workers, 2 wait
+		j, err := r.Start(context.Background(), "project.build", Subject{Type: "project", ID: SubjectID(int64(i + 1))}, nil, blocked, InPool("build"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		builds = append(builds, j)
+	}
+	ran := make(chan struct{})
+	j, err := r.Start(context.Background(), "server.start", Subject{Type: "server", ID: "1"}, nil, func(context.Context, io.Writer) error {
+		close(ran)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a default-pool job waited for the build pool")
+	}
+	waitDone(t, r, j.ID)
+	if got := getJob(t, st, builds[3].ID); got.Status != store.JobQueued {
+		t.Fatalf("fourth build %s, want queued", got.Status)
+	}
+	// And the other way round: a busy default pool does not hold builds.
+	hold, _ := r.Start(context.Background(), "server.start", Subject{Type: "server", ID: "2"}, nil, blocked)
+	waitRunning := func(id int64) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for getJob(t, st, id).Status != store.JobRunning {
+			if time.Now().After(deadline) {
+				t.Fatalf("job %d did not start", id)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	waitRunning(hold.ID)
+	if err := r.Cancel(builds[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	waitRunning(builds[2].ID)
 }
 
 func TestBoundedWorkers(t *testing.T) {

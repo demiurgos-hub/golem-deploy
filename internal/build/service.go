@@ -39,9 +39,13 @@ const (
 	DefaultTimeout   = 30 * time.Minute
 	DefaultRetention = 5
 	// MaxActiveBuilds bounds build jobs that are queued or running across
-	// the daemon (one builds, the others wait), so waiting builds cannot
-	// occupy every job worker.
+	// the daemon (one builds, the others wait for the build slot).
 	MaxActiveBuilds = 4
+	// JobPool is the job runner pool build jobs run on, with
+	// MaxActiveBuilds workers (jobs.Options.Pools): a waiting build holds a
+	// worker of this pool only, never one of the default pool that server
+	// and other project jobs use.
+	JobPool = "build"
 	// KeepFailed is how many failed or cancelled builds are kept per
 	// project.
 	KeepFailed = 20

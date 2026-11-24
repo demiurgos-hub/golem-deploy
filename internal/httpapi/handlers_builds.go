@@ -110,7 +110,7 @@ func (s *Server) handleCreateBuild(w http.ResponseWriter, r *http.Request) error
 	buildID := b.ID
 	job, err := s.startJob(r, apitypes.JobKindProjectBuild, apitypes.SubjectTypeProject, p.ID, func(ctx context.Context, log io.Writer) error {
 		return s.builds.Run(ctx, buildID, log, prepare)
-	})
+	}, jobs.InPool(build.JobPool))
 	if err != nil {
 		release()
 		if derr := s.store.DeleteBuild(context.WithoutCancel(r.Context()), b.ID); derr != nil {

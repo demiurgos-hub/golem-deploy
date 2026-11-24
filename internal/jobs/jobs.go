@@ -74,10 +74,14 @@ func Fail(msg string, cause error) error { return &SafeError{Msg: msg, Err: caus
 
 // Options configures a Runner.
 type Options struct {
-	// Workers bounds how many jobs run at once (default 4). Further jobs
-	// stay queued.
+	// Workers bounds how many jobs of the default pool run at once
+	// (default 4). Further jobs stay queued.
 	Workers int
-	Logger  *slog.Logger
+	// Pools are further named worker pools with their own bound (at least
+	// 1 each). A job started with InPool(name) waits only for a worker of
+	// that pool, so jobs of one pool never delay jobs of another.
+	Pools  map[string]int
+	Logger *slog.Logger
 	// MaxLogBytes caps each job's log file (default DefaultMaxLogBytes).
 	// Output beyond it is replaced by one truncation marker line and
 	// discarded; the job keeps running.
@@ -90,11 +94,10 @@ const DefaultMaxLogBytes = 16 << 20
 // Runner executes jobs. Create it with New after store.Reconcile and stop it
 // with Shutdown.
 type Runner struct {
-	store   *store.Store
-	logDir  string
-	logger  *slog.Logger
-	workers int
-	maxLog  int64
+	store  *store.Store
+	logDir string
+	logger *slog.Logger
+	maxLog int64
 
 	baseCtx    context.Context
 	cancelBase context.CancelFunc
@@ -104,15 +107,22 @@ type Runner struct {
 	closed   bool
 	subjects map[Subject]int64
 	active   map[int64]*activeJob
-	// queue holds the jobs waiting for a worker, in the order they were
-	// started; running counts the jobs holding one. Admission happens
-	// under mu (admitLocked), so jobs run in start order whatever order
-	// their goroutines are scheduled in.
+	// pools by name ("" is the default pool).
+	pools map[string]*pool
+}
+
+// pool is a set of workers. queue holds its jobs waiting for a worker, in
+// the order they were started; running counts the jobs holding one.
+// Admission happens under Runner.mu (admitLocked), so a pool's jobs run in
+// start order whatever order their goroutines are scheduled in.
+type pool struct {
+	workers int
 	queue   []*activeJob
 	running int
 }
 
 type activeJob struct {
+	pool    *pool
 	subject Subject
 	cancel  context.CancelCauseFunc
 	done    chan struct{}
@@ -137,17 +147,23 @@ func New(st *store.Store, logDir string, opts Options) *Runner {
 	if opts.MaxLogBytes <= 0 {
 		opts.MaxLogBytes = DefaultMaxLogBytes
 	}
+	pools := map[string]*pool{"": {workers: opts.Workers}}
+	for name, n := range opts.Pools {
+		if name != "" {
+			pools[name] = &pool{workers: max(n, 1)}
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
 		store:      st,
 		logDir:     logDir,
 		logger:     opts.Logger,
-		workers:    opts.Workers,
 		maxLog:     opts.MaxLogBytes,
 		baseCtx:    ctx,
 		cancelBase: cancel,
 		subjects:   map[Subject]int64{},
 		active:     map[int64]*activeJob{},
+		pools:      pools,
 	}
 }
 
@@ -156,13 +172,24 @@ func (r *Runner) LogPath(id int64) string {
 	return filepath.Join(r.logDir, strconv.FormatInt(id, 10)+".log")
 }
 
-// StartOption adjusts the job recorded by Start.
-type StartOption func(*store.NewJob)
+// StartOption adjusts the job started by Start.
+type StartOption func(*startConfig)
+
+type startConfig struct {
+	job  store.NewJob
+	pool string
+}
 
 // Restricted marks the job as restricted: only admins may read its log or
 // cancel it (enforced by the HTTP layer).
 func Restricted(restricted bool) StartOption {
-	return func(j *store.NewJob) { j.Restricted = restricted }
+	return func(c *startConfig) { c.job.Restricted = restricted }
+}
+
+// InPool runs the job on the named pool of Options.Pools instead of the
+// default pool (an unknown name is the default pool).
+func InPool(name string) StartOption {
+	return func(c *startConfig) { c.pool = name }
 }
 
 // Start persists a queued job and runs fn in the background. It fails with
@@ -186,11 +213,11 @@ func (r *Runner) Start(ctx context.Context, kind string, subject Subject, create
 		r.mu.Unlock()
 	}
 
-	nj := store.NewJob{Kind: kind, SubjectType: subject.Type, SubjectID: subject.ID, CreatedBy: createdBy}
+	cfg := startConfig{job: store.NewJob{Kind: kind, SubjectType: subject.Type, SubjectID: subject.ID, CreatedBy: createdBy}}
 	for _, o := range opts {
-		o(&nj)
+		o(&cfg)
 	}
-	job, err := r.store.CreateJob(ctx, nj)
+	job, err := r.store.CreateJob(ctx, cfg.job)
 	if err != nil {
 		release()
 		return store.Job{}, err
@@ -203,7 +230,11 @@ func (r *Runner) Start(ctx context.Context, kind string, subject Subject, create
 	}
 
 	jctx, cancel := context.WithCancelCause(r.baseCtx)
-	aj := &activeJob{subject: subject, cancel: cancel, done: make(chan struct{}), admit: make(chan struct{})}
+	p := r.pools[cfg.pool]
+	if p == nil {
+		p = r.pools[""]
+	}
+	aj := &activeJob{pool: p, subject: subject, cancel: cancel, done: make(chan struct{}), admit: make(chan struct{})}
 
 	r.mu.Lock()
 	if r.closed {
@@ -216,8 +247,8 @@ func (r *Runner) Start(ctx context.Context, kind string, subject Subject, create
 	}
 	r.subjects[subject] = job.ID
 	r.active[job.ID] = aj
-	r.queue = append(r.queue, aj)
-	r.admitLocked()
+	p.queue = append(p.queue, aj)
+	r.admitLocked(p)
 	r.wg.Add(1)
 	r.mu.Unlock()
 
@@ -253,7 +284,7 @@ func (r *Runner) run(ctx context.Context, job store.Job, aj *activeJob, logFile 
 		return
 	}
 	r.mu.Unlock()
-	defer r.releaseWorker()
+	defer r.releaseWorker(aj.pool)
 	if ctx.Err() != nil {
 		// Admitted at the moment it was cancelled (select picks either
 		// ready case): a cancelled job never starts.
@@ -316,34 +347,35 @@ func cancelDetail(ctx context.Context) string {
 	return DetailShutdown
 }
 
-// admitLocked gives free workers to the oldest waiting jobs. r.mu must be
-// held.
-func (r *Runner) admitLocked() {
-	for r.running < r.workers && len(r.queue) > 0 {
-		aj := r.queue[0]
-		r.queue[0] = nil
-		r.queue = r.queue[1:]
+// admitLocked gives free workers of p to its oldest waiting jobs. r.mu
+// must be held.
+func (r *Runner) admitLocked(p *pool) {
+	for p.running < p.workers && len(p.queue) > 0 {
+		aj := p.queue[0]
+		p.queue[0] = nil
+		p.queue = p.queue[1:]
 		aj.admitted = true
-		r.running++
+		p.running++
 		close(aj.admit)
 	}
 }
 
 // dequeueLocked removes a job that gave up waiting. r.mu must be held.
 func (r *Runner) dequeueLocked(aj *activeJob) {
-	for i, q := range r.queue {
+	p := aj.pool
+	for i, q := range p.queue {
 		if q == aj {
-			r.queue = append(r.queue[:i], r.queue[i+1:]...)
+			p.queue = append(p.queue[:i], p.queue[i+1:]...)
 			return
 		}
 	}
 }
 
-// releaseWorker returns a worker and admits the next waiting job.
-func (r *Runner) releaseWorker() {
+// releaseWorker returns a worker of p and admits its next waiting job.
+func (r *Runner) releaseWorker(p *pool) {
 	r.mu.Lock()
-	r.running--
-	r.admitLocked()
+	p.running--
+	r.admitLocked(p)
 	r.mu.Unlock()
 }
 

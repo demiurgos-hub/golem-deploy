@@ -18,14 +18,14 @@ import (
 // returned Job. A job started from an admin route (or from a request that
 // did not come through the route table) is restricted: only admins can read
 // its log or cancel it.
-func (s *Server) startJob(r *http.Request, kind apitypes.JobKind, subjectType apitypes.SubjectType, subjectID int64, fn jobs.Func) (apitypes.Job, error) {
+func (s *Server) startJob(r *http.Request, kind apitypes.JobKind, subjectType apitypes.SubjectType, subjectID int64, fn jobs.Func, opts ...jobs.StartOption) (apitypes.Job, error) {
 	var createdBy *int64
 	if id := identityFrom(r); id != nil {
 		createdBy = &id.Account.ID
 	}
 	access, known := routeAccessFrom(r)
 	restricted := !known || access == AccessAdmin
-	job, err := s.jobs.Start(r.Context(), string(kind), jobs.Subject{Type: string(subjectType), ID: jobs.SubjectID(subjectID)}, createdBy, fn, jobs.Restricted(restricted))
+	job, err := s.jobs.Start(r.Context(), string(kind), jobs.Subject{Type: string(subjectType), ID: jobs.SubjectID(subjectID)}, createdBy, fn, append([]jobs.StartOption{jobs.Restricted(restricted)}, opts...)...)
 	switch {
 	case errors.Is(err, jobs.ErrSubjectBusy):
 		return apitypes.Job{}, conflict(apitypes.ErrorCodeJobInProgress, "another job is already running for this "+string(subjectType))
