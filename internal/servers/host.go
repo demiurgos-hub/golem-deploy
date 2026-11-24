@@ -65,6 +65,18 @@ func (s *Service) Images(ctx context.Context) ([]apitypes.Image, error) {
 	return out, nil
 }
 
+// ImageOfBuildError: the image is recorded on successful builds, so it is
+// removed by deleting them (DELETE /builds/{id}), never through /images. It
+// matches ErrInUse.
+type ImageOfBuildError struct {
+	BuildIDs []int64
+}
+
+func (e *ImageOfBuildError) Error() string { return ErrInUse.Error() }
+
+// Is makes errors.Is(err, ErrInUse) true.
+func (e *ImageOfBuildError) Is(target error) bool { return target == ErrInUse }
+
 // RemoveImage deletes a managed image that no successful build records
 // (delete the build instead) and no container uses. Unknown and unmanaged
 // images are both ErrNotFound so the API does not reveal unmanaged images.
@@ -83,8 +95,8 @@ func (s *Service) RemoveImage(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if len(byImage[img.ID]) > 0 {
-		return ErrInUse
+	if ids := byImage[img.ID]; len(ids) > 0 {
+		return &ImageOfBuildError{BuildIDs: append([]int64{}, ids...)}
 	}
 	err = s.docker.RemoveImage(ctx, img.ID)
 	switch {

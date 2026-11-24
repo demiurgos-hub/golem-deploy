@@ -112,7 +112,10 @@ func TestBuildImageInUseByStoppedContainer(t *testing.T) {
 		t.Fatal(e.Message)
 	}
 	// DELETE /images never removes an image a build records.
-	errBody(t, b.call("DELETE", "/api/v1/images/"+a1.ImageID, b.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	e = errBody(t, b.call("DELETE", "/api/v1/images/"+a1.ImageID, b.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	if !strings.Contains(e.Message, fmt.Sprintf("belongs to build %d", a1.ID)) {
+		t.Fatal(e.Message)
+	}
 	if _, err := b.st.GetProject(b.t.Context(), pa.ID); err != nil || !b.fake.HasImage(a1.ImageID) {
 		t.Fatalf("project or image removed: %v", err)
 	}

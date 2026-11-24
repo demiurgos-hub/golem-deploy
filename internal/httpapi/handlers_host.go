@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/servers"
 	"github.com/demiurgos-hub/golem-deploy/internal/staticfiles"
 )
 
@@ -34,6 +35,10 @@ func (s *Server) handleDeleteImage(w http.ResponseWriter, r *http.Request) error
 	}
 	id := r.PathValue("id")
 	if err := s.servers.RemoveImage(r.Context(), id); err != nil {
+		var ob *servers.ImageOfBuildError
+		if errors.As(err, &ob) {
+			return conflict(apitypes.ErrorCodeConflict, "the image belongs to build "+joinIDs(ob.BuildIDs)+"; delete the build instead (DELETE /api/v1/builds/{id})")
+		}
 		return serversError("image", err)
 	}
 	s.logger.Info("image deleted", "request_id", requestIDFrom(r.Context()), "account_id", identityFrom(r).Account.ID, "image", id)
