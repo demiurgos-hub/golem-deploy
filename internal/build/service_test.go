@@ -254,6 +254,31 @@ func TestRunContainerdImageStore(t *testing.T) {
 	}
 }
 
+// A successful build records the game's transport endpoint paths: the
+// engine defaults, or what golem-deploy.yaml declares.
+func TestRunRecordsTransportPaths(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	p := e.project("arena", nil)
+	b, log, err := e.run(ctx, p, nil)
+	if err != nil || b.WebTransportPath != DefaultWebTransportPath || b.WebSocketPath != DefaultWebSocketPath {
+		t.Fatalf("%v %+v\n%s", err, b, log)
+	}
+	cfg := "transport:\n  webtransport_path: /lantern/wt\n  websocket_path: /lantern/ws\n"
+	if err := os.WriteFile(filepath.Join(e.repoDir, fmt.Sprint(p.ID), ConfigFile), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b, log, err = e.run(ctx, p, nil)
+	if err != nil || b.WebTransportPath != "/lantern/wt" || b.WebSocketPath != "/lantern/ws" || !strings.Contains(log, "Transport paths: WebTransport /lantern/wt") {
+		t.Fatalf("%v %+v\n%s", err, b, log)
+	}
+	// A failed build records none.
+	e.fake.SetBuildHook(func(dockertest.BuildCall) dockertest.BuildOutcome { return dockertest.BuildOutcome{Fail: true} })
+	if b, _, _ = e.run(ctx, p, nil); b.Status != store.BuildStatusError || b.WebTransportPath != "" {
+		t.Fatalf("%+v", b)
+	}
+}
+
 func TestRunFailures(t *testing.T) {
 	cases := []struct {
 		name   string

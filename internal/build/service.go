@@ -442,7 +442,11 @@ func (r *run) build(ctx context.Context, p store.Project, checkout string) error
 		return jobs.Fail("the built image could not be found or verified", err)
 	}
 	fmt.Fprintf(log, "Built image %s (%s, %s)\n", img.ID, spec.Tag(), byteSize(img.SizeBytes))
-	r.finish(store.BuildResult{Status: store.BuildStatusSuccess, ImageID: img.ID, ImageTag: spec.Tag(), EngineVersion: plan.EngineVersion})
+	if plan.WebTransportPath != DefaultWebTransportPath || plan.WebSocketPath != DefaultWebSocketPath {
+		fmt.Fprintf(log, "Transport paths: WebTransport %s, WebSocket %s\n", plan.WebTransportPath, plan.WebSocketPath)
+	}
+	r.finish(store.BuildResult{Status: store.BuildStatusSuccess, ImageID: img.ID, ImageTag: spec.Tag(), EngineVersion: plan.EngineVersion,
+		WebTransportPath: plan.WebTransportPath, WebSocketPath: plan.WebSocketPath})
 	return nil
 }
 

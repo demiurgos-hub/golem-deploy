@@ -1,6 +1,7 @@
 package build
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"go/version"
@@ -73,6 +74,12 @@ type Plan struct {
 	WebBuild []string
 	WebDist  string
 
+	// WebTransportPath and WebSocketPath are the game's transport endpoint
+	// paths (transport in golem-deploy.yaml, defaults filled in); they are
+	// recorded on the build for the servers' public URLs.
+	WebTransportPath string
+	WebSocketPath    string
+
 	// Dockerignore is the repository's own .dockerignore (may be nil); the
 	// daemon's mandatory exclusions are appended to it.
 	Dockerignore []byte
@@ -119,7 +126,9 @@ func inspect(repo *repoFS) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Plan{Root: cfg.Root, ServerArgs: cfg.Server.Args}
+	p := &Plan{Root: cfg.Root, ServerArgs: cfg.Server.Args,
+		WebTransportPath: cmp.Or(cfg.Transport.WebTransportPath, DefaultWebTransportPath),
+		WebSocketPath:    cmp.Or(cfg.Transport.WebSocketPath, DefaultWebSocketPath)}
 	if raw != nil {
 		p.Notes = append(p.Notes, "Using "+ConfigFile)
 	}

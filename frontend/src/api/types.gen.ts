@@ -243,6 +243,16 @@ export interface Build {
    */
   schema_fingerprint: string;
   /**
+   * WebTransportPath and WebSocketPath are the endpoint paths the game
+   * serves its transports on (transport in golem-deploy.yaml, defaults
+   * "/wt" and "/api/ws"); servers running the build publish
+   * https://<game host>:<port><webtransport_path> and
+   * wss://<game host>:<port><websocket_path>. Empty unless the build
+   * succeeded.
+   */
+  webtransport_path: string;
+  websocket_path: string;
+  /**
    * ServerIDs lists the servers configured with this build; a build that
    * is in use cannot be deleted (409 conflict).
    */

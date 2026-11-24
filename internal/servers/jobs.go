@@ -168,7 +168,8 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 	}
 	fmt.Fprintf(log, "starting server %q (id %d) from build %d (commit %s) on port %d (udp+tcp -> %d)\n",
 		sv.Name, sv.ID, b.ID, shortID(b.Commit), port, docker.GamePort)
-	fmt.Fprintf(log, "public URL %s\n", publicURL(p.gameHost, port))
+	wtPath, wsPath := transportPaths(&b)
+	fmt.Fprintf(log, "public URL %s (WebTransport path %s, WebSocket fallback path %s)\n", publicURL(p.gameHost, port), wtPath, wsPath)
 	if len(env) > 0 {
 		fmt.Fprintf(log, "environment variables: %s\n", strings.Join(docker.EnvKeys(env), ", "))
 	}

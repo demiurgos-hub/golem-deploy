@@ -112,7 +112,7 @@ func (fx *fixture) build(t *testing.T, n int, commit string) store.Build {
 func TestEngineEnvContract(t *testing.T) {
 	port := 7001
 	sv := store.Server{ID: 3, Port: &port, AllowedOrigins: []string{"https://play.example.com:7001", "https://web.example.com"}}
-	got := engineEnv(sv, runtimeParams{gameHost: "play.example.com", certMode: certs.ModeSelfSigned}, "tok")
+	got := engineEnv(sv, nil, runtimeParams{gameHost: "play.example.com", certMode: certs.ModeSelfSigned}, "tok")
 	want := map[string]string{
 		"GOLEM_ADDR":                ":7777",
 		"GOLEM_HTTP_ADDR":           ":7777",
@@ -137,13 +137,23 @@ func TestEngineEnvContract(t *testing.T) {
 			t.Errorf("%s outside the reserved prefix", k)
 		}
 	}
-	v6 := engineEnv(sv, runtimeParams{gameHost: "2001:db8::7", certMode: certs.ModeCustom}, "")
+	v6 := engineEnv(sv, nil, runtimeParams{gameHost: "2001:db8::7", certMode: certs.ModeCustom}, "")
 	if v6["GOLEM_PUBLIC_URL"] != "https://[2001:db8::7]:7001/wt" || v6["GOLEM_TLS_PINNED"] != "0" ||
 		!strings.HasPrefix(v6["GOLEM_WT_ALLOWED_ORIGINS"], "https://[2001:db8::7]:7001,") {
 		t.Fatalf("%v", v6)
 	}
 	if _, ok := v6[EnvAdminToken]; ok {
 		t.Fatal("empty token injected")
+	}
+	// A build that recorded other transport paths (golem-deploy.yaml) gets
+	// URLs with them; a build recorded before paths existed the defaults.
+	custom := engineEnv(sv, &store.Build{WebTransportPath: "/game/wt", WebSocketPath: "/game/ws"}, runtimeParams{gameHost: "play.example.com"}, "")
+	if custom["GOLEM_PUBLIC_URL"] != "https://play.example.com:7001/game/wt" || custom["GOLEM_WS_FALLBACK_URL"] != "wss://play.example.com:7001/game/ws" {
+		t.Fatalf("%v", custom)
+	}
+	legacy := engineEnv(sv, &store.Build{}, runtimeParams{gameHost: "play.example.com"}, "")
+	if legacy["GOLEM_PUBLIC_URL"] != got["GOLEM_PUBLIC_URL"] || legacy["GOLEM_WS_FALLBACK_URL"] != got["GOLEM_WS_FALLBACK_URL"] {
+		t.Fatalf("%v", legacy)
 	}
 	if publicURL("2001:db8::7", 7001) != "https://[2001:db8::7]:7001/" || publicURL("", 7001) != "" {
 		t.Fatal("public url")

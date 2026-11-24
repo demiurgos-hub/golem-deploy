@@ -37,7 +37,26 @@ type Config struct {
 	// Dockerfile, when set, is a custom Dockerfile used instead of the
 	// generated one.
 	Dockerfile string
+	Transport  TransportConfig
 }
+
+// TransportConfig names the endpoint paths the game server serves its
+// transports on, when the game changed the engine's defaults; empty means
+// the default. The daemon publishes the server's URLs with them.
+type TransportConfig struct {
+	// WebTransportPath is golem.ServerConfig.Path of a WebTransport game
+	// (default DefaultWebTransportPath).
+	WebTransportPath string
+	// WebSocketPath is host.GameOptions.WebSocketPath, the WebSocket
+	// fallback (default DefaultWebSocketPath).
+	WebSocketPath string
+}
+
+// The engine's default endpoint paths (golem/net and golem/host).
+const (
+	DefaultWebTransportPath = "/wt"
+	DefaultWebSocketPath    = "/api/ws"
+)
 
 // ServerConfig configures the game server binary.
 type ServerConfig struct {
@@ -78,6 +97,10 @@ type rawConfig struct {
 		Dist  *string  `yaml:"dist"`
 	} `yaml:"web"`
 	Dockerfile *string `yaml:"dockerfile"`
+	Transport  *struct {
+		WebTransportPath *string `yaml:"webtransport_path"`
+		WebSocketPath    *string `yaml:"websocket_path"`
+	} `yaml:"transport"`
 }
 
 // command accepts a list of words (exec form) or a string split on white
@@ -174,7 +197,56 @@ func ParseConfig(data []byte) (Config, error) {
 			return Config{}, err
 		}
 	}
+	if t := raw.Transport; t != nil {
+		if t.WebTransportPath != nil {
+			if cfg.Transport.WebTransportPath, err = cleanURLPath("transport.webtransport_path", *t.WebTransportPath); err != nil {
+				return Config{}, err
+			}
+		}
+		if t.WebSocketPath != nil {
+			if cfg.Transport.WebSocketPath, err = cleanURLPath("transport.websocket_path", *t.WebSocketPath); err != nil {
+				return Config{}, err
+			}
+		}
+	}
 	return cfg, nil
+}
+
+// Limits of a transport endpoint path.
+const (
+	maxURLPathBytes    = 128
+	maxURLPathSegments = 8
+)
+
+var urlSegmentRE = regexp.MustCompile(`^[A-Za-z0-9._~-]+$`)
+
+// cleanURLPath validates a transport endpoint path from the build
+// configuration: "/" followed by at most maxURLPathSegments segments of
+// unreserved URL characters (letters, digits, '.', '_', '~', '-'; not "."
+// or ".."), no empty segment, no trailing '/', at most maxURLPathBytes
+// bytes. Nothing in it needs escaping in a URL or an environment value.
+func cleanURLPath(field, p string) (string, error) {
+	if len(p) > maxURLPathBytes {
+		return "", fieldErr(field, "must be at most %d bytes", maxURLPathBytes)
+	}
+	if !strings.HasPrefix(p, "/") || p == "/" {
+		return "", fieldErr(field, "must be an absolute URL path such as /wt (not / itself)")
+	}
+	segs := strings.Split(p[1:], "/")
+	if len(segs) > maxURLPathSegments {
+		return "", fieldErr(field, "must have at most %d path segments", maxURLPathSegments)
+	}
+	for _, s := range segs {
+		switch {
+		case s == "":
+			return "", fieldErr(field, "must not contain empty segments or end with '/'")
+		case s == "." || s == "..":
+			return "", fieldErr(field, "must not contain '.' or '..' segments")
+		case !urlSegmentRE.MatchString(s):
+			return "", fieldErr(field, "may only contain letters, digits, '.', '_', '~', '-' and '/'")
+		}
+	}
+	return p, nil
 }
 
 // yamlMessage returns a short, single-line parser message without Go type

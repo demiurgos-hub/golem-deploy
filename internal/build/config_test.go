@@ -164,3 +164,46 @@ func TestCleanPath(t *testing.T) {
 		}
 	}
 }
+
+// transport names the game's endpoint paths when it changed the engine's
+// defaults; only plain absolute URL paths are accepted.
+func TestParseConfigTransport(t *testing.T) {
+	cfg, err := ParseConfig([]byte("transport:\n  webtransport_path: /game/wt\n  websocket_path: /game/ws-1.v2_~\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Transport != (TransportConfig{WebTransportPath: "/game/wt", WebSocketPath: "/game/ws-1.v2_~"}) {
+		t.Fatalf("%+v", cfg.Transport)
+	}
+	if cfg, err := ParseConfig([]byte("transport: {}\n")); err != nil || cfg.Transport != (TransportConfig{}) {
+		t.Fatalf("%+v %v", cfg, err)
+	}
+	for name, in := range map[string]string{
+		"relative":       "wt",
+		"root":           "/",
+		"trailing slash": "/wt/",
+		"empty segment":  "/a//b",
+		"dot segment":    "/a/./b",
+		"dotdot":         "/a/../b",
+		"query":          "/wt?x=1",
+		"fragment":       "/wt#x",
+		"percent":        "/w%74",
+		"space":          "/w t",
+		"backslash":      "/w\\t",
+		"unicode":        "/wé",
+		"scheme":         "https://x/wt",
+		"too many":       "/a/b/c/d/e/f/g/h/i",
+		"too long":       "/" + strings.Repeat("a", 128),
+		"empty":          "",
+	} {
+		_, err := ParseConfig([]byte("transport:\n  webtransport_path: \"" + in + "\"\n"))
+		wantUserErr(t, err, "transport.webtransport_path")
+		_, err = ParseConfig([]byte("transport:\n  websocket_path: \"" + in + "\"\n"))
+		wantUserErr(t, err, "transport.websocket_path")
+		_ = name
+	}
+	_, err = ParseConfig([]byte("transport:\n  wt_path: /wt\n"))
+	wantUserErr(t, err, "not valid")
+	_, err = ParseConfig([]byte("transport:\n  webtransport_path: [a]\n"))
+	wantUserErr(t, err, "not valid")
+}

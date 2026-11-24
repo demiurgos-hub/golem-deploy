@@ -1,6 +1,7 @@
 package servers
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
@@ -55,11 +57,6 @@ const (
 	// TLSReloadInterval is how often the engine checks the certificate
 	// files for a replacement.
 	TLSReloadInterval = "30s"
-	// WebTransportPath is the engine's default WebTransport endpoint path
-	// and WebSocketPath the deploy contract's WebSocket endpoint
-	// (host.DefaultWebSocketPath).
-	WebTransportPath = "/wt"
-	WebSocketPath    = "/api/ws"
 	// envContractVersion changes whenever the variables below change
 	// meaning, so running containers report restart_required.
 	envContractVersion = "engine-env-1"
@@ -91,10 +88,21 @@ func publicURL(host string, port int) string {
 	return "https://" + authority(host, port) + "/"
 }
 
-// engineEnv returns the daemon-injected environment of a container. token
-// is the per-container admin token ("" when computing the config hash, so
-// the hash does not change with every new container).
-func engineEnv(sv store.Server, p runtimeParams, token string) map[string]string {
+// transportPaths returns the WebTransport and WebSocket endpoint paths the
+// build's game serves (recorded by the build from golem-deploy.yaml; the
+// engine defaults for builds recorded before, or without a build).
+func transportPaths(b *store.Build) (wt, ws string) {
+	wt, ws = build.DefaultWebTransportPath, build.DefaultWebSocketPath
+	if b != nil {
+		wt, ws = cmp.Or(b.WebTransportPath, wt), cmp.Or(b.WebSocketPath, ws)
+	}
+	return wt, ws
+}
+
+// engineEnv returns the daemon-injected environment of a container running
+// build b. token is the per-container admin token ("" when computing the
+// config hash, so the hash does not change with every new container).
+func engineEnv(sv store.Server, b *store.Build, p runtimeParams, token string) map[string]string {
 	port := 0
 	if sv.Port != nil {
 		port = *sv.Port
@@ -111,14 +119,15 @@ func engineEnv(sv store.Server, p runtimeParams, token string) map[string]string
 		pinned = "1"
 	}
 	game := ":" + strconv.Itoa(docker.GamePort)
+	wtPath, wsPath := transportPaths(b)
 	env := map[string]string{
 		EnvAddr:              game,
 		EnvHTTPAddr:          game,
 		EnvTLSCertFile:       certs.ContainerDir + "/" + certs.CertFile,
 		EnvTLSKeyFile:        certs.ContainerDir + "/" + certs.KeyFile,
 		EnvTLSReloadInterval: TLSReloadInterval,
-		EnvPublicURL:         "https://" + auth + WebTransportPath,
-		EnvWSFallbackURL:     "wss://" + auth + WebSocketPath,
+		EnvPublicURL:         "https://" + auth + wtPath,
+		EnvWSFallbackURL:     "wss://" + auth + wsPath,
 		EnvAllowedOrigins:    strings.Join(origins, ","),
 		EnvTLSPinned:         pinned,
 		EnvAdminAddr:         ":" + strconv.Itoa(AdminContainerPort),
@@ -151,7 +160,7 @@ func (s *Service) configHash(sv store.Server, b *store.Build, p runtimeParams) s
 	envSum := sha256.Sum256(sv.Env)
 	fmt.Fprintf(h, "v2\x00%s\x00%d\x00%s\x00%d\x00%s\x00%d\x00%g\x00%x\x00", envContractVersion, buildID, image, port,
 		s.cfg.BindAddress, s.cfg.MemoryMB, s.cfg.CPUs, envSum)
-	env := engineEnv(sv, p, "")
+	env := engineEnv(sv, b, p, "")
 	for _, k := range docker.EnvKeys(env) {
 		fmt.Fprintf(h, "%s=%s\x00", k, env[k])
 	}

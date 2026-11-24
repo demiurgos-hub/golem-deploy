@@ -34,6 +34,8 @@ func toAPIBuild(b store.Build, used map[int64][]int64) apitypes.Build {
 		ImageTag:          b.ImageTag,
 		EngineVersion:     b.EngineVersion,
 		SchemaFingerprint: b.SchemaFingerprint,
+		WebTransportPath:  b.WebTransportPath,
+		WebSocketPath:     b.WebSocketPath,
 		ServerIDs:         ids,
 		CreatedBy:         b.CreatedBy,
 		CreatedAt:         b.CreatedAt.UTC(),

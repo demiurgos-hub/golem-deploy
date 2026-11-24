@@ -57,8 +57,8 @@ The daemon configures every container for the Golem Engine deploy contract (gole
 | `GOLEM_HTTP_ADDR` | `:7777` (HTTPS sidecar: realtime config, WebSocket fallback, the game's pages; TCP) |
 | `GOLEM_TLS_CERT_FILE`, `GOLEM_TLS_KEY_FILE` | `/run/golem-deploy/tls/tls.crt`, `/run/golem-deploy/tls/tls.key` |
 | `GOLEM_TLS_RELOAD_INTERVAL` | `30s` (replaced certificates are picked up without a restart) |
-| `GOLEM_PUBLIC_URL` | `https://<game host>:<port>/wt` (the engine's default WebTransport path) |
-| `GOLEM_WS_FALLBACK_URL` | `wss://<game host>:<port>/api/ws` |
+| `GOLEM_PUBLIC_URL` | `https://<game host>:<port><webtransport path>`: the engine's default `/wt` unless the build recorded another `transport.webtransport_path` from `golem-deploy.yaml` (see [BUILDS.md](BUILDS.md#golem-deployyaml)) |
+| `GOLEM_WS_FALLBACK_URL` | `wss://<game host>:<port><websocket path>`: `/api/ws` unless the build recorded another `transport.websocket_path` |
 | `GOLEM_WT_ALLOWED_ORIGINS` | `https://<game host>:<port>` plus the server's `allowed_origins` (WebTransport and WebSocket) |
 | `GOLEM_TLS_PINNED` | `1` with a self-signed certificate (publish its hashes for pinning), `0` with a custom one |
 | `GOLEM_ADMIN_ADDR` | `:7778` |

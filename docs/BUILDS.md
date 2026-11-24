@@ -42,7 +42,16 @@ web:
 # A custom Dockerfile, relative to the game root, used instead of the generated one
 # (see "Custom Dockerfile").
 # dockerfile: deploy/Dockerfile
+
+transport:
+  # Only when the game changed the engine's endpoint paths: the WebTransport path
+  # (golem.ServerConfig.Path, default "/wt") and the WebSocket fallback path
+  # (host.GameOptions.WebSocketPath, default "/api/ws").
+  webtransport_path: /wt
+  websocket_path: /api/ws
 ```
+
+`transport` paths are recorded on the build (`webtransport_path`, `websocket_path`) and become the URLs servers running the build publish (`GOLEM_PUBLIC_URL`, `GOLEM_WS_FALLBACK_URL`, see [SERVERS.md](SERVERS.md#engine-deploy-contract)). Each is `/` followed by at most 8 segments of letters, digits, `.`, `_`, `~` and `-` (no `.`/`..`, no empty segment, no trailing `/`, no query), at most 128 bytes. The daemon cannot read the paths from the game's code: if the game serves other paths than the build declares, clients fail to connect while the start still succeeds (the admin endpoint reports ready either way).
 
 Commands and arguments are passed in Dockerfile exec form (a JSON array): there is no shell, no variable expansion and no way to add a line to the Dockerfile. Each word is single-line UTF-8 without control or bidirectional characters, at most 1024 bytes, at most 32 words. To use shell features, write them out: `build: ["sh", "-c", "npm run lint && npm run build"]`.
 

@@ -30,7 +30,11 @@ type Build struct {
 	ImageTag          string
 	EngineVersion     string
 	SchemaFingerprint string
-	CreatedBy         *int64
+	// WebTransportPath and WebSocketPath are the endpoint paths the game
+	// serves (set on success; empty on rows recorded before they existed).
+	WebTransportPath string
+	WebSocketPath    string
+	CreatedBy        *int64
 	CreatedAt         time.Time
 	StartedAt         *time.Time
 	FinishedAt        *time.Time
@@ -47,11 +51,13 @@ type NewBuild struct {
 // be success, error or cancelled; the image fields are stored only on
 // success.
 type BuildResult struct {
-	Status        string
-	Detail        string
-	ImageID       string
-	ImageTag      string
-	EngineVersion string
+	Status           string
+	Detail           string
+	ImageID          string
+	ImageTag         string
+	EngineVersion    string
+	WebTransportPath string
+	WebSocketPath    string
 }
 
 // BuildFilter narrows ListBuilds.
@@ -64,7 +70,7 @@ type BuildFilter struct {
 	Limit int
 }
 
-const buildCols = `id, project_id, branch, commit_hash, status, detail, job_id, image_id, image_tag, engine_version, schema_fingerprint, created_by, created_at, started_at, finished_at`
+const buildCols = `id, project_id, branch, commit_hash, status, detail, job_id, image_id, image_tag, engine_version, schema_fingerprint, webtransport_path, websocket_path, created_by, created_at, started_at, finished_at`
 
 func scanBuild(r scanner) (Build, error) {
 	var b Build
@@ -72,7 +78,7 @@ func scanBuild(r scanner) (Build, error) {
 	var created string
 	var started, finished sql.NullString
 	if err := r.Scan(&b.ID, &b.ProjectID, &b.Branch, &b.Commit, &b.Status, &b.Detail, &jobID, &b.ImageID, &b.ImageTag,
-		&b.EngineVersion, &b.SchemaFingerprint, &createdBy, &created, &started, &finished); err != nil {
+		&b.EngineVersion, &b.SchemaFingerprint, &b.WebTransportPath, &b.WebSocketPath, &createdBy, &created, &started, &finished); err != nil {
 		return Build{}, err
 	}
 	b.JobID = int64Ptr(jobID)
@@ -125,14 +131,14 @@ func (s *Store) MarkBuildRunning(ctx context.Context, id int64, branch, commit s
 // FinishBuild records the terminal outcome of an active build. ErrNotFound
 // means the build is not queued or running.
 func (s *Store) FinishBuild(ctx context.Context, id int64, r BuildResult) error {
-	imageID, imageTag := "", ""
+	imageID, imageTag, wtPath, wsPath := "", "", "", ""
 	if r.Status == BuildStatusSuccess {
-		imageID, imageTag = r.ImageID, r.ImageTag
+		imageID, imageTag, wtPath, wsPath = r.ImageID, r.ImageTag, r.WebTransportPath, r.WebSocketPath
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE builds SET status = ?, detail = ?, image_id = ?, image_tag = ?, engine_version = ?, finished_at = ?
+		`UPDATE builds SET status = ?, detail = ?, image_id = ?, image_tag = ?, engine_version = ?, webtransport_path = ?, websocket_path = ?, finished_at = ?
 		 WHERE id = ? AND status IN ('queued', 'running')`,
-		r.Status, r.Detail, imageID, imageTag, r.EngineVersion, formatTime(s.nowUTC()), id)
+		r.Status, r.Detail, imageID, imageTag, r.EngineVersion, wtPath, wsPath, formatTime(s.nowUTC()), id)
 	if err != nil {
 		return mapErr("finish build", err)
 	}
