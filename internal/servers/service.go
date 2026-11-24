@@ -4,7 +4,9 @@
 // client (each server's container is the one whose id is recorded in its
 // row), the Golem Engine deploy contract injected into every container,
 // host port allocation, the health-gated start/stop/restart/delete job
-// bodies, the runtime view read from the game's admin endpoint,
+// bodies, each server's data volume with the backup, restore and reset job
+// bodies and the backup schedule, the runtime view read from the game's
+// admin endpoint,
 // export/import, startup reconciliation, the managed image and volume views
 // that cross-reference servers and builds, and the sanitising of container
 // output shown to users.
@@ -23,6 +25,8 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
+	"github.com/demiurgos-hub/golem-deploy/internal/backups"
+	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/logsafe"
@@ -97,7 +101,21 @@ type Config struct {
 	// ProbePort checks that nothing else listens on a host port before a
 	// start (default ports.ProbeFree).
 	ProbePort func(bindAddr string, port int) error
+	// Backups stores backup archives; without it backups, restores and
+	// safety backups fail. BackupMaxBytes is the largest data directory a
+	// backup accepts (default DefaultBackupMaxBytes).
+	Backups        *backups.Store
+	BackupMaxBytes int64
+	// SnapshotRetry is the pause between snapshot requests while the game
+	// reports one in progress (default 2s).
+	SnapshotRetry time.Duration
+	// Now is the clock of the backup schedule (default time.Now).
+	Now func() time.Time
 }
+
+// DefaultBackupMaxBytes is the default of Config.BackupMaxBytes
+// (--backup-max-mb 1024).
+const DefaultBackupMaxBytes = 1024 << 20
 
 // Service implements server operations. It is safe for concurrent use.
 type Service struct {
@@ -115,6 +133,18 @@ type Service struct {
 	// our labels but are not the container recorded for any server), so
 	// each is logged once.
 	foreign sync.Map
+	// knownHelpers holds the launch ids of helper containers this process
+	// created or found recorded (they are neither servers nor foreign);
+	// activeHelpers those a running job still uses (cleanup skips them).
+	knownHelpers  sync.Map
+	activeHelpers sync.Map
+	// pendingVolumes holds data volumes a running job created and has not
+	// recorded (or switched to) yet; they cannot be deleted meanwhile.
+	pendingVolumes sync.Map
+	// schedMu guards schedFailed: when the last scheduled backup of a
+	// server failed.
+	schedMu     sync.Mutex
+	schedFailed map[int64]time.Time
 }
 
 // New returns a Service.
@@ -131,11 +161,23 @@ func New(st *store.Store, box *secrets.Box, dc *docker.Client, cfg Config, logge
 	if cfg.ProbePort == nil {
 		cfg.ProbePort = ports.ProbeFree
 	}
+	if cfg.BackupMaxBytes <= 0 {
+		cfg.BackupMaxBytes = DefaultBackupMaxBytes
+	}
+	if cfg.SnapshotRetry <= 0 {
+		cfg.SnapshotRetry = 2 * time.Second
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Service{store: st, box: box, docker: dc, cfg: cfg, logger: logger}
+	return &Service{store: st, box: box, docker: dc, cfg: cfg, logger: logger, schedFailed: map[int64]time.Time{}}
 }
+
+// BackupMaxBytes returns the largest data directory a backup accepts.
+func (s *Service) BackupMaxBytes() int64 { return s.cfg.BackupMaxBytes }
 
 // PortRange returns the configured host port range.
 func (s *Service) PortRange() ports.Range { return s.cfg.Ports }
@@ -266,6 +308,9 @@ func (s *Service) runSpec(sv store.Server, b store.Build, env map[string]string,
 		GroupAdd:      p.groupAdd,
 		AdminPort:     AdminContainerPort,
 	}
+	if sv.DataVolume != "" {
+		spec.DataVolume = &docker.VolumeMount{Name: sv.DataVolume, Target: build.DataDir}
+	}
 	if p.certDir != "" {
 		spec.ReadOnlyBinds = []docker.BindMount{{Source: p.certDir, Target: certs.ContainerDir}}
 	}
@@ -320,8 +365,9 @@ func (c *buildCache) get(ctx context.Context, sv store.Server) (*store.Build, er
 
 // view renders a server. b is its build (nil when it has none), ct its
 // recorded container (nil when it has none); dockerOK false means runtime
-// state is unknown.
-func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p runtimeParams, ct *docker.Container, dockerOK bool) (apitypes.Server, error) {
+// state is unknown. lastBackup is when its newest backup was taken (nil
+// without one).
+func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p runtimeParams, ct *docker.Container, dockerOK bool, lastBackup *time.Time) (apitypes.Server, error) {
 	env, err := s.openEnv(sv)
 	if err != nil {
 		return apitypes.Server{}, err
@@ -340,8 +386,15 @@ func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p r
 		EnvKeys:        docker.EnvKeys(env),
 		DesiredState:   apitypes.DesiredState(sv.DesiredState),
 		State:          apitypes.ServerStateMissing,
-		CreatedAt:      sv.CreatedAt.UTC(),
-		UpdatedAt:      sv.UpdatedAt.UTC(),
+		Data: apitypes.ServerData{
+			Volume:            sv.DataVolume,
+			SchemaFingerprint: sv.DataFingerprint,
+			LastBackupAt:      lastBackup,
+		},
+		SnapshotIntervalSeconds: sv.SnapshotIntervalSeconds,
+		BackupSchedule:          apitypes.BackupSchedule{IntervalHours: sv.BackupIntervalHours, Keep: sv.BackupKeep},
+		CreatedAt:               sv.CreatedAt.UTC(),
+		UpdatedAt:               sv.UpdatedAt.UTC(),
 	}
 	out.Certificate, err = s.serverCertificate(ctx, sv.ID, &p)
 	if err != nil {
@@ -351,6 +404,7 @@ func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p r
 		pid := b.ProjectID
 		out.ProjectID = &pid
 		out.Image, out.Commit, out.EngineVersion = b.ImageID, b.Commit, b.EngineVersion
+		out.Data.SchemaMismatch = schemaMismatch(sv.DataFingerprint, b.SchemaFingerprint)
 	}
 	switch {
 	case sv.ContainerID == "":
@@ -416,9 +470,13 @@ func (s *Service) containers(rows []store.Server, cts []docker.Container) map[in
 	for i := range cts {
 		ct := cts[i]
 		sv := pending[ct.ServerID]
-		if !claimed[ct.ID] && !s.docker.IsPendingServerContainer(ct, sv.ID, sv.Name, sv.PendingLaunch) {
-			s.logForeign(ct)
+		if claimed[ct.ID] || s.docker.IsPendingServerContainer(ct, sv.ID, sv.Name, sv.PendingLaunch) {
+			continue
 		}
+		if _, helper := s.knownHelpers.Load(ct.Labels[docker.LabelHelper]); helper && docker.IsHelper(ct) {
+			continue // a recorded helper container
+		}
+		s.logForeign(ct)
 	}
 	return out
 }
@@ -441,6 +499,10 @@ func (s *Service) List(ctx context.Context) ([]apitypes.Server, error) {
 		}
 	}
 	byServer := s.containers(rows, cts)
+	last, err := s.store.LastBackups(ctx)
+	if err != nil {
+		return nil, err
+	}
 	bc := s.builds()
 	out := make([]apitypes.Server, 0, len(rows))
 	for _, sv := range rows {
@@ -448,7 +510,7 @@ func (s *Service) List(ctx context.Context) ([]apitypes.Server, error) {
 		if err != nil {
 			return nil, err
 		}
-		v, err := s.view(ctx, sv, b, p, byServer[sv.ID], derr == nil)
+		v, err := s.view(ctx, sv, b, p, byServer[sv.ID], derr == nil, timePtr(last, sv.ID))
 		if err != nil {
 			return nil, err
 		}
@@ -491,7 +553,20 @@ func (s *Service) viewOne(ctx context.Context, sv store.Server, ct *docker.Conta
 	if err != nil {
 		return apitypes.Server{}, err
 	}
-	return s.view(ctx, sv, b, p, ct, dockerOK)
+	last, err := s.store.LastBackups(ctx)
+	if err != nil {
+		return apitypes.Server{}, err
+	}
+	return s.view(ctx, sv, b, p, ct, dockerOK, timePtr(last, sv.ID))
+}
+
+func timePtr(m map[int64]time.Time, id int64) *time.Time {
+	t, ok := m[id]
+	if !ok {
+		return nil
+	}
+	t = t.UTC()
+	return &t
 }
 
 // Get returns one server with runtime state.
@@ -628,6 +703,10 @@ func (s *Service) Create(ctx context.Context, req apitypes.CreateServerRequest) 
 			return apitypes.Server{}, err
 		}
 	}
+	snapshot, interval, keep, err := dataSettings("", req.SnapshotIntervalSeconds, req.BackupSchedule, store.DefaultSnapshotIntervalSeconds, 0, store.DefaultBackupKeep)
+	if err != nil {
+		return apitypes.Server{}, err
+	}
 	b, err := s.resolveBuild(ctx, "build_id", req.BuildID)
 	if err != nil {
 		return apitypes.Server{}, err
@@ -636,7 +715,8 @@ func (s *Service) Create(ctx context.Context, req apitypes.CreateServerRequest) 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	seal := func(id int64) ([]byte, error) { return s.sealEnv(id, req.Env) }
-	row := store.Server{Name: req.Name, BuildID: &b.ID, AllowedOrigins: origins, DesiredState: string(desired)}
+	row := store.Server{Name: req.Name, BuildID: &b.ID, AllowedOrigins: origins, DesiredState: string(desired),
+		SnapshotIntervalSeconds: snapshot, BackupIntervalHours: interval, BackupKeep: keep}
 	for attempt := 0; ; attempt++ {
 		port := 0
 		if req.Port != nil {
@@ -707,6 +787,19 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 			return apitypes.Server{}, err
 		}
 		u := store.ServerUpdate{SetOrigins: req.AllowedOrigins != nil, AllowedOrigins: origins}
+		if req.SnapshotIntervalSeconds != nil || req.BackupSchedule != nil {
+			snapshot, interval, keep, err := dataSettings("", req.SnapshotIntervalSeconds, req.BackupSchedule,
+				sv.SnapshotIntervalSeconds, sv.BackupIntervalHours, sv.BackupKeep)
+			if err != nil {
+				return apitypes.Server{}, err
+			}
+			if req.SnapshotIntervalSeconds != nil {
+				u.SnapshotIntervalSeconds = &snapshot
+			}
+			if req.BackupSchedule != nil {
+				u.BackupIntervalHours, u.BackupKeep = &interval, &keep
+			}
+		}
 		portChange := req.Port != nil && (sv.Port == nil || *sv.Port != *req.Port)
 		buildChange := req.BuildID != nil && (sv.BuildID == nil || *sv.BuildID != *req.BuildID)
 		if portChange || buildChange {
@@ -779,7 +872,8 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 		break
 	}
 	s.logger.Info("server updated", "server_id", id, "build_changed", req.BuildID != nil, "port_changed", req.Port != nil,
-		"origins_changed", req.AllowedOrigins != nil, "env_set", len(req.EnvSet), "env_unset", len(req.EnvUnset))
+		"origins_changed", req.AllowedOrigins != nil, "env_set", len(req.EnvSet), "env_unset", len(req.EnvUnset),
+		"snapshot_interval_changed", req.SnapshotIntervalSeconds != nil, "backup_schedule_changed", req.BackupSchedule != nil)
 	ct, derr := s.container(ctx, updated)
 	if derr != nil {
 		// The update is stored; a cancelled caller only loses the view.

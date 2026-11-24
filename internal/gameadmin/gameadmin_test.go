@@ -163,3 +163,85 @@ func TestNewRejects(t *testing.T) {
 		t.Fatalf("%q", got)
 	}
 }
+
+// POST /snapshot: success, the engine's error statuses, and answers
+// outside the contract.
+func TestSnapshot(t *testing.T) {
+	ctx := context.Background()
+	s := gameadmintest.New(t)
+	wrote := 0
+	s.Set(func(s *gameadmintest.Server) {
+		s.ExpectToken = func() string { return token }
+		s.OnSnapshot = func() { wrote++ }
+	})
+	c := client(t, s.Port)
+	if d, err := c.Snapshot(ctx); err != nil || d != 12*time.Millisecond || wrote != 1 {
+		t.Fatalf("%v %v %d", d, err, wrote)
+	}
+	for status, want := range map[int]error{
+		http.StatusConflict:            gameadmin.ErrSnapshotInProgress,
+		http.StatusNotImplemented:      gameadmin.ErrSnapshotUnsupported,
+		http.StatusGatewayTimeout:      gameadmin.ErrSnapshotTimeout,
+		http.StatusInternalServerError: gameadmin.ErrSnapshotFailed,
+	} {
+		s.Set(func(s *gameadmintest.Server) { s.SnapshotStatus = status })
+		if _, err := c.Snapshot(ctx); !errors.Is(err, want) {
+			t.Errorf("%d: %v", status, err)
+		}
+	}
+	s.Set(func(s *gameadmintest.Server) { s.SnapshotStatus = 0; s.SnapshotBusyFor = 1 })
+	if _, err := c.Snapshot(ctx); !errors.Is(err, gameadmin.ErrSnapshotInProgress) {
+		t.Fatal(err)
+	}
+	if _, err := c.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, paths := s.Requests()
+	if paths[len(paths)-1] != "/snapshot" {
+		t.Fatalf("%v", paths)
+	}
+	// Outside the contract: other statuses, other content, a wrong token.
+	for name, h := range map[string]http.HandlerFunc{
+		"teapot": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTeapot)
+			_, _ = w.Write([]byte(`{}`))
+		},
+		"html": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		},
+		"not ok": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":false}`))
+		},
+		"get": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.ContentLength > 0 {
+				w.WriteHeader(http.StatusTeapot)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true,"duration_ms":1e300}`))
+		},
+	} {
+		srv := httptest.NewServer(h)
+		_, port, _ := net.SplitHostPort(srv.Listener.Addr().String())
+		p, _ := strconv.Atoi(port)
+		d, err := client(t, p).Snapshot(ctx)
+		srv.Close()
+		switch name {
+		case "get":
+			if err != nil || d != time.Hour {
+				t.Errorf("%s: %v %v", name, d, err)
+			}
+		default:
+			if !errors.Is(err, gameadmin.ErrBadResponse) {
+				t.Errorf("%s: %v", name, err)
+			}
+		}
+	}
+	bad, _ := gameadmin.New(s.Port, "ffffffffffffffffffffffffffffffff")
+	if _, err := bad.Snapshot(ctx); !errors.Is(err, gameadmin.ErrUnauthorized) {
+		t.Fatal(err)
+	}
+}

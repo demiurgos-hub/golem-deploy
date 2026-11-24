@@ -81,6 +81,11 @@ type Plan struct {
 	WebTransportPath string
 	WebSocketPath    string
 
+	// SchemaFingerprint is the game's schema fingerprint read from the
+	// committed generated Go code (generated Dockerfile with
+	// golem-bake --check only); "" when it is not known.
+	SchemaFingerprint string
+
 	// Dockerignore is the repository's own .dockerignore (may be nil); the
 	// daemon's mandatory exclusions are appended to it.
 	Dockerignore []byte
@@ -186,6 +191,7 @@ func inspect(repo *repoFS, allowCustomDockerfile bool) (*Plan, error) {
 	if committed {
 		p.Bake = BakeCheck
 		p.Notes = append(p.Notes, "Generated Golem Engine code is committed: it is verified with golem-bake --check")
+		p.SchemaFingerprint = committedFingerprint(repo, cfg.Root, golemYAML)
 	} else {
 		p.Bake = BakeGenerate
 		p.Notes = append(p.Notes, "Generated Golem Engine code is not committed: golem-bake generates it during the build")

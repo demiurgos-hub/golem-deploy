@@ -71,6 +71,15 @@ func (s *Server) routes() []route {
 		{method: "GET", path: "/servers/{id}/stats", access: AccessDeveloper, handler: s.handleServerStats},
 		{method: "GET", path: "/servers/{id}/runtime", access: AccessDeveloper, handler: s.handleServerRuntime},
 		{method: "GET", path: "/servers/{id}/connectivity", access: AccessDeveloper, handler: s.handleServerConnectivity},
+		{method: "POST", path: "/servers/{id}/backups", access: AccessDeveloper, handler: s.handleCreateBackup},
+		{method: "POST", path: "/servers/{id}/restore", access: AccessAdmin, handler: s.handleRestoreServer},
+		{method: "POST", path: "/servers/{id}/data/reset", access: AccessAdmin, handler: s.handleResetServerData},
+
+		// Backups.
+		{method: "GET", path: "/backups", access: AccessDeveloper, handler: s.handleListBackups},
+		{method: "GET", path: "/backups/{id}", access: AccessDeveloper, handler: s.handleGetBackup},
+		{method: "GET", path: "/backups/{id}/download", access: AccessDeveloper, handler: s.handleDownloadBackup},
+		{method: "DELETE", path: "/backups/{id}", access: AccessAdmin, handler: s.handleDeleteBackup},
 
 		// Game certificate.
 		{method: "GET", path: "/certificates/game", access: AccessAdmin, handler: s.handleGetGameCertificate},

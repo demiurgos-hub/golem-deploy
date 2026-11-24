@@ -1,6 +1,6 @@
 // Package gameadmintest is a fake Golem Engine admin endpoint for tests:
-// an httptest server on 127.0.0.1 that answers /ready, /info and /stats
-// like golem/host, and can misbehave like a hostile game.
+// an httptest server on 127.0.0.1 that answers /ready, /info, /stats and
+// POST /snapshot like golem/host, and can misbehave like a hostile game.
 package gameadmintest
 
 import (
@@ -49,6 +49,14 @@ type Server struct {
 	Fingerprint string
 	Sessions    int
 	Entities    int
+	// SnapshotStatus is the status of POST /snapshot (0: 200);
+	// SnapshotBusyFor answers that many snapshots 409 first. OnSnapshot,
+	// when set, runs (without the lock) before a 200 answer, e.g. to write
+	// the snapshot into a fake volume. Snapshots counts the requests.
+	SnapshotStatus  int
+	SnapshotBusyFor int
+	OnSnapshot      func()
+	Snapshots       int
 	// Auth records the Authorization header of every request.
 	Auth  []string
 	Paths []string
@@ -86,6 +94,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/snapshot" {
+		s.snapshot(w, r)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Auth = append(s.Auth, r.Header.Get("Authorization"))
@@ -152,4 +164,38 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 	}
+}
+
+func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.Auth = append(s.Auth, r.Header.Get("Authorization"))
+	s.Paths = append(s.Paths, r.URL.Path)
+	s.Snapshots++
+	scheme, tok, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+	if scheme != "Bearer" || tok == "" || (s.ExpectToken != nil && tok != s.ExpectToken()) {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if r.Method != http.MethodPost {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"code": "method_not_allowed", "message": "use POST"})
+		return
+	}
+	status, hook := s.SnapshotStatus, s.OnSnapshot
+	if s.SnapshotBusyFor > 0 {
+		s.SnapshotBusyFor--
+		status = http.StatusConflict
+	}
+	s.mu.Unlock()
+	codes := map[int]string{http.StatusConflict: "snapshot_in_progress", http.StatusNotImplemented: "not_implemented",
+		http.StatusGatewayTimeout: "snapshot_timeout", http.StatusInternalServerError: "snapshot_failed"}
+	if status != 0 && status != http.StatusOK {
+		writeJSON(w, status, map[string]string{"code": codes[status], "message": "fake " + codes[status]})
+		return
+	}
+	if hook != nil {
+		hook()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "duration_ms": 12})
 }

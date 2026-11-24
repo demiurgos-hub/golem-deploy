@@ -99,6 +99,7 @@ func TestIntegrationBuildToServer(t *testing.T) {
 	t.Cleanup(func() {
 		_ = runner.Shutdown(context.Background())
 		itestQuiet("rm", "--force", docker.ContainerName(serverName))
+		itestRemoveVolumes(serverName)
 		if imageID != "" {
 			itestQuiet("image", "rm", "--force", imageID)
 		}

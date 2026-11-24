@@ -41,7 +41,9 @@ func (s *Service) Export(ctx context.Context) (apitypes.ServerExport, error) {
 		if err != nil {
 			return apitypes.ServerExport{}, err
 		}
-		spec := apitypes.ServerSpec{Name: sv.Name, Port: sv.Port, DesiredState: apitypes.DesiredState(sv.DesiredState)}
+		snapshot := sv.SnapshotIntervalSeconds
+		spec := apitypes.ServerSpec{Name: sv.Name, Port: sv.Port, DesiredState: apitypes.DesiredState(sv.DesiredState),
+			SnapshotIntervalSeconds: &snapshot, BackupSchedule: &apitypes.BackupSchedule{IntervalHours: sv.BackupIntervalHours, Keep: sv.BackupKeep}}
 		if len(env) > 0 {
 			spec.Env = env
 		}
@@ -136,7 +138,13 @@ func (s *Service) Import(ctx context.Context, doc apitypes.ServerExport) ([]apit
 		if err != nil {
 			return nil, err
 		}
-		row := store.Server{Name: sp.Name, DesiredState: "stopped", AllowedOrigins: origins}
+		snapshot, interval, keep, err := dataSettings(fmt.Sprintf("servers[%d].", i), sp.SnapshotIntervalSeconds, sp.BackupSchedule,
+			store.DefaultSnapshotIntervalSeconds, 0, store.DefaultBackupKeep)
+		if err != nil {
+			return nil, err
+		}
+		row := store.Server{Name: sp.Name, DesiredState: "stopped", AllowedOrigins: origins,
+			SnapshotIntervalSeconds: snapshot, BackupIntervalHours: interval, BackupKeep: keep}
 		if sp.Project == "" {
 			return nil, fieldErr(f("project"), "project is required (the server runs a build of that project)")
 		}

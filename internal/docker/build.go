@@ -209,7 +209,7 @@ func (c *Client) Build(ctx context.Context, spec BuildSpec, out io.Writer) error
 		return err
 	}
 	c.logger.Info("docker build", "project_id", spec.ProjectID, "build_id", spec.BuildID, "tag", spec.Tag())
-	err = c.execEnv(ctx, 0, args, env, nil, out, io.MultiWriter(out, head), true)
+	err = c.execEnv(ctx, 0, args, env, nil, nil, out, io.MultiWriter(out, head), true)
 	if err == nil {
 		return nil
 	}

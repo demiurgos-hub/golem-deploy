@@ -45,6 +45,8 @@ type Cmd struct {
 	// pipe). The runner owns them: it closes them once the child has
 	// started, or when starting it fails.
 	ExtraFiles []*os.File
+	// Stdin, when not nil, is the child's standard input (docker cp -).
+	Stdin io.Reader
 	// Stdout and Stderr receive the output. They may be the same writer.
 	Stdout io.Writer
 	Stderr io.Writer
@@ -70,6 +72,7 @@ func (ExecRunner) Run(ctx context.Context, path string, c Cmd) error {
 		cmd.Env = []string{}
 	}
 	cmd.ExtraFiles = c.ExtraFiles
+	cmd.Stdin = c.Stdin
 	cmd.Stdout = c.Stdout
 	cmd.Stderr = c.Stderr
 	cmd.WaitDelay = 5 * time.Second
@@ -260,12 +263,12 @@ func (b *capBuffer) Write(p []byte) (int, error) {
 // inherited by the child (the runner closes them). stdout may be nil to
 // discard. When stderr is nil, it is captured for error classification.
 func (c *Client) exec(ctx context.Context, timeout time.Duration, args []string, extra []*os.File, stdout, stderr io.Writer) error {
-	return c.execEnv(ctx, timeout, args, c.baseEnv, extra, stdout, stderr, false)
+	return c.execEnv(ctx, timeout, args, c.baseEnv, extra, nil, stdout, stderr, false)
 }
 
 // execEnv is exec with a caller-selected client environment. Its callers
 // use the base allowlist or the dedicated build environment.
-func (c *Client) execEnv(ctx context.Context, timeout time.Duration, args, env []string, extra []*os.File, stdout, stderr io.Writer, tree bool) error {
+func (c *Client) execEnv(ctx context.Context, timeout time.Duration, args, env []string, extra []*os.File, stdin io.Reader, stdout, stderr io.Writer, tree bool) error {
 	if c.binErr != nil {
 		closeFiles(extra)
 		return &CmdError{Op: opName(args), Kind: ErrUnavailable, Detail: "docker CLI not found"}
@@ -284,7 +287,7 @@ func (c *Client) execEnv(ctx context.Context, timeout time.Duration, args, env [
 		stdout = io.Discard
 	}
 	c.logger.Debug("docker", "op", opName(args))
-	err := c.runner.Run(ctx, c.bin, Cmd{Args: args, Env: slices.Clone(env), ExtraFiles: extra, Stdout: stdout, Stderr: stderr, ProcessTree: tree})
+	err := c.runner.Run(ctx, c.bin, Cmd{Args: args, Env: slices.Clone(env), ExtraFiles: extra, Stdin: stdin, Stdout: stdout, Stderr: stderr, ProcessTree: tree})
 	if err == nil {
 		return nil
 	}

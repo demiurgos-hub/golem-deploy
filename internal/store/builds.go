@@ -58,6 +58,9 @@ type BuildResult struct {
 	EngineVersion    string
 	WebTransportPath string
 	WebSocketPath    string
+	// SchemaFingerprint is the fingerprint read from the repository's
+	// committed generated code ("" when unknown); stored only on success.
+	SchemaFingerprint string
 }
 
 // BuildFilter narrows ListBuilds.
@@ -133,14 +136,15 @@ func (s *Store) MarkBuildRunning(ctx context.Context, id int64, branch, commit s
 // FinishBuild records the terminal outcome of an active build. ErrNotFound
 // means the build is not queued or running.
 func (s *Store) FinishBuild(ctx context.Context, id int64, r BuildResult) error {
-	imageID, imageTag, wtPath, wsPath := "", "", "", ""
+	imageID, imageTag, wtPath, wsPath, fingerprint := "", "", "", "", ""
 	if r.Status == BuildStatusSuccess {
-		imageID, imageTag, wtPath, wsPath = r.ImageID, r.ImageTag, r.WebTransportPath, r.WebSocketPath
+		imageID, imageTag, wtPath, wsPath, fingerprint = r.ImageID, r.ImageTag, r.WebTransportPath, r.WebSocketPath, r.SchemaFingerprint
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE builds SET status = ?, detail = ?, image_id = ?, image_tag = ?, engine_version = ?, webtransport_path = ?, websocket_path = ?, finished_at = ?
+		`UPDATE builds SET status = ?, detail = ?, image_id = ?, image_tag = ?, engine_version = ?, webtransport_path = ?, websocket_path = ?,
+		 schema_fingerprint = ?, finished_at = ?
 		 WHERE id = ? AND status IN ('queued', 'running')`,
-		r.Status, r.Detail, imageID, imageTag, r.EngineVersion, wtPath, wsPath, formatTime(s.nowUTC()), id)
+		r.Status, r.Detail, imageID, imageTag, r.EngineVersion, wtPath, wsPath, fingerprint, formatTime(s.nowUTC()), id)
 	if err != nil {
 		return mapErr("finish build", err)
 	}

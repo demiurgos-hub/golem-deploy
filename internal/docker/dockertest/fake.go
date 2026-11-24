@@ -61,9 +61,14 @@ type Container struct {
 	StartedAt     time.Time
 	Ports         []string // --publish values
 	Mounts        []string // volume names
-	Binds         []string // --mount values of type=bind
-	Tmpfs         []string // --tmpfs values
-	GroupAdd      []string // --group-add values
+	// MountTargets maps each volume mount's target to its volume name;
+	// ReadOnlyTargets lists the targets mounted read-only.
+	MountTargets    map[string]string
+	ReadOnlyTargets []string
+	Entrypoint      string
+	Binds           []string // --mount values of type=bind
+	Tmpfs           []string // --tmpfs values
+	GroupAdd        []string // --group-add values
 	// Assigned are the host ports chosen for --publish values without a
 	// host port ("127.0.0.1::7778/tcp"), by container port ("7778/tcp").
 	Assigned map[string]int
@@ -91,10 +96,11 @@ type Image struct {
 	AssignPort int
 }
 
-// Volume is a fake volume.
+// Volume is a fake volume. Files is its content (see File).
 type Volume struct {
 	Name   string
 	Labels map[string]string
+	Files  []File
 }
 
 // Network is a fake network.
@@ -120,6 +126,11 @@ type Fake struct {
 	ignoreFilters bool
 	// buildHook decides the outcome of "docker build" (see SetBuildHook).
 	buildHook func(BuildCall) BuildOutcome
+	// copyHook can fail or delay "docker cp" (see SetCopyHook).
+	copyHook func(CopyCall) error
+	// copiedIn records the tar headers of every "docker cp -" into a
+	// container.
+	copiedIn [][]File
 }
 
 // BuildCall is a "docker build" the fake received.
@@ -174,8 +185,9 @@ func New() *Fake {
 		containers: map[string]*Container{},
 		images:     map[string]*Image{},
 		volumes:    map[string]*Volume{},
-		networks:   map[string]*Network{"bridge": {Labels: map[string]string{}, Options: map[string]string{}}},
-		clock:      time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		networks: map[string]*Network{"bridge": {Labels: map[string]string{}, Options: map[string]string{}},
+			"none": {Labels: map[string]string{}, Options: map[string]string{}}},
+		clock: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
 }
 
@@ -312,16 +324,18 @@ func (f *Fake) DeleteImage(id string) {
 }
 
 // LatestEnv returns variable key of the most recently created container
-// ("" when there is none), e.g. the admin token a test admin server
-// expects.
+// that is not a helper ("" when there is none), e.g. the admin token a test
+// admin server expects.
 func (f *Fake) LatestEnv(key string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	list := f.sortedContainers()
-	if len(list) == 0 {
-		return ""
+	for i := len(list) - 1; i >= 0; i-- {
+		if list[i].Labels[docker.LabelHelper] == "" {
+			return list[i].Env[key]
+		}
 	}
-	return list[len(list)-1].Env[key]
+	return ""
 }
 
 // SetContainerState changes a container's state (e.g. to simulate a crash).
@@ -512,6 +526,10 @@ func (f *Fake) Run(ctx context.Context, _ string, cmd docker.Cmd) error {
 		ferr = f.imageInspect(positional(a), stdout)
 	case has(a, "image", "rm"):
 		ferr = f.imageRm(a)
+	case has(a, "cp"):
+		return f.cp(ctx, a, cmd.Stdin, stdout, stderr)
+	case has(a, "volume", "create"):
+		ferr = f.volumeCreate(a, stdout)
 	case has(a, "volume", "ls"):
 		ferr = f.volumeLs(a, stdout)
 	case has(a, "volume", "inspect"):
@@ -763,15 +781,34 @@ func (f *Fake) create(a []string, envFile string, cliEnv []string, w io.Writer) 
 			envVals[k] = v
 		}
 	}
-	var mounts, binds []string
+	var mounts, binds, readOnly []string
+	targets := map[string]string{}
 	for _, m := range flagValues(a, "--mount") {
 		if strings.HasPrefix(m, "type=bind,") {
 			binds = append(binds, m)
 		}
+		if !strings.Contains(m, "type=volume") {
+			continue
+		}
+		source, target, ro := "", "", false
 		for _, part := range strings.Split(m, ",") {
-			if strings.HasPrefix(part, "source=") && strings.Contains(m, "type=volume") {
-				mounts = append(mounts, strings.TrimPrefix(part, "source="))
+			switch {
+			case strings.HasPrefix(part, "source="):
+				source = strings.TrimPrefix(part, "source=")
+			case strings.HasPrefix(part, "target="):
+				target = strings.TrimPrefix(part, "target=")
+			case part == "readonly":
+				ro = true
 			}
+		}
+		mounts = append(mounts, source)
+		targets[target] = source
+		if ro {
+			readOnly = append(readOnly, target)
+		}
+		if f.volumes[source] == nil {
+			// Like Docker, a missing named volume is created (unlabelled).
+			f.volumes[source] = &Volume{Name: source, Labels: map[string]string{}}
 		}
 	}
 	assigned := map[string]int{}
@@ -802,6 +839,7 @@ func (f *Fake) create(a []string, envFile string, cliEnv []string, w io.Writer) 
 		ID: f.nextID(), Name: name, Image: img.ID, Labels: labels, State: "created", RestartPolicy: restart,
 		Created: f.tick(), Ports: ports, Mounts: mounts, Binds: binds, Tmpfs: flagValues(a, "--tmpfs"), Network: network,
 		Env: envVals, Logs: slices.Clone(img.Logs), GroupAdd: flagValues(a, "--group-add"), Assigned: assigned,
+		MountTargets: targets, ReadOnlyTargets: readOnly, Entrypoint: firstOr(flagValues(a, "--entrypoint")),
 	}
 	f.containers[c.ID] = c
 	fmt.Fprintln(w, c.ID)

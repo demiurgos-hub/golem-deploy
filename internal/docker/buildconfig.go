@@ -130,7 +130,7 @@ func (c *Client) buildClientEnv(ctx context.Context, spec BuildSpec) ([]string, 
 	}
 	readContext := func(env []string) (inspect, error) {
 		out := &capBuffer{max: maxMetadataBytes}
-		err := c.execEnv(ctx, quickTimeout, []string{"context", "inspect", "--format", "{{json .}}"}, env, nil, out, io.Discard, false)
+		err := c.execEnv(ctx, quickTimeout, []string{"context", "inspect", "--format", "{{json .}}"}, env, nil, nil, out, io.Discard, false)
 		var current inspect
 		if err != nil {
 			return inspect{}, err
