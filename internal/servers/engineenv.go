@@ -59,7 +59,7 @@ const (
 	TLSReloadInterval = "30s"
 	// envContractVersion changes whenever the variables below change
 	// meaning, so running containers report restart_required.
-	envContractVersion = "engine-env-2"
+	envContractVersion = "engine-env-3"
 )
 
 // MaxAllowedOrigins bounds a server's extra allowed origins.
@@ -69,10 +69,11 @@ const MaxAllowedOrigins = 16
 // the server row and its build.
 type runtimeParams struct {
 	// gameHost is the effective game host ("" when none is configured).
-	gameHost string
-	certMode certs.Mode
-	certDir  string
-	groupAdd []int
+	gameHost    string
+	testOrigins []string
+	certMode    certs.Mode
+	certDir     string
+	groupAdd    []int
 }
 
 // authority returns host:port for URLs (IPv6 in brackets).
@@ -99,6 +100,54 @@ func transportPaths(b *store.Build) (wt, ws string) {
 	return wt, ws
 }
 
+// transportURLs uses the same paths for the engine environment and the probe.
+func transportURLs(b *store.Build, host string, port int) (wt, ws string) {
+	if host == "" || port == 0 {
+		return "", ""
+	}
+	auth := authority(host, port)
+	wtPath, wsPath := transportPaths(b)
+	return "https://" + auth + wtPath, "wss://" + auth + wsPath
+}
+
+func (c Config) testOrigins(gameHost string) []string {
+	origins := []string{}
+	add := func(scheme, host string, port int) {
+		if host == "" {
+			return
+		}
+		// The daemon normalizes public hosts and the effective game host.
+		auth := authority(host, port)
+		if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
+			auth = strings.TrimSuffix(auth, ":"+strconv.Itoa(port))
+		}
+		origin := scheme + "://" + auth
+		if !slices.Contains(origins, origin) {
+			origins = append(origins, origin)
+		}
+	}
+	scheme := "http"
+	if c.PanelTLS {
+		scheme = "https"
+	}
+	if c.PanelPort != 0 {
+		for _, host := range c.PanelPublicHosts {
+			add(scheme, host, c.PanelPort)
+		}
+		add(scheme, gameHost, c.PanelPort)
+		if c.PanelLoopback && !c.PanelTLS {
+			add("http", "localhost", c.PanelPort)
+			add("http", "127.0.0.1", c.PanelPort)
+		}
+	}
+	if c.PanelBehindProxy {
+		for _, host := range c.PanelPublicHosts {
+			add("https", host, 443)
+		}
+	}
+	return origins
+}
+
 // engineEnv returns the daemon-injected environment of a container running
 // build b. token is the per-container admin token ("" when computing the
 // config hash, so the hash does not change with every new container).
@@ -107,9 +156,8 @@ func engineEnv(sv store.Server, b *store.Build, p runtimeParams, token string) m
 	if sv.Port != nil {
 		port = *sv.Port
 	}
-	auth := authority(p.gameHost, port)
 	origins := []string{certs.Origin(p.gameHost, port)}
-	for _, o := range sv.AllowedOrigins {
+	for _, o := range slices.Concat(sv.AllowedOrigins, p.testOrigins) {
 		if !slices.Contains(origins, o) {
 			origins = append(origins, o)
 		}
@@ -119,15 +167,15 @@ func engineEnv(sv store.Server, b *store.Build, p runtimeParams, token string) m
 		pinned = "1"
 	}
 	game := ":" + strconv.Itoa(docker.GamePort)
-	wtPath, wsPath := transportPaths(b)
+	wt, ws := transportURLs(b, p.gameHost, port)
 	env := map[string]string{
 		EnvAddr:              game,
 		EnvHTTPAddr:          game,
 		EnvTLSCertFile:       certs.ContainerDir + "/" + certs.CertFile,
 		EnvTLSKeyFile:        certs.ContainerDir + "/" + certs.KeyFile,
 		EnvTLSReloadInterval: TLSReloadInterval,
-		EnvPublicURL:         "https://" + auth + wtPath,
-		EnvWSFallbackURL:     "wss://" + auth + wsPath,
+		EnvPublicURL:         wt,
+		EnvWSFallbackURL:     ws,
 		EnvAllowedOrigins:    strings.Join(origins, ","),
 		EnvTLSPinned:         pinned,
 		EnvAdminAddr:         ":" + strconv.Itoa(AdminContainerPort),

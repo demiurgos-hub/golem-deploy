@@ -270,6 +270,7 @@ func (s *Server) register(rt route) {
 // JSON envelopes, and everything else to the web client.
 func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 	if !isAPIPath(r.URL.Path) {
+		s.allowGameConnections(w.Header(), r.Context())
 		s.spa.ServeHTTP(w, r)
 		return
 	}

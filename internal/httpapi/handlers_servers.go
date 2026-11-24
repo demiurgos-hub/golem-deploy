@@ -376,6 +376,22 @@ func (s *Server) handleServerRuntime(w http.ResponseWriter, r *http.Request) err
 	return nil
 }
 
+func (s *Server) handleServerConnectivity(w http.ResponseWriter, r *http.Request) error {
+	if err := s.needServers(); err != nil {
+		return err
+	}
+	id, err := pathID(r, "id")
+	if err != nil {
+		return err
+	}
+	out, err := s.servers.Connectivity(r.Context(), id)
+	if err != nil {
+		return serversError("server", err)
+	}
+	writeJSON(w, http.StatusOK, out)
+	return nil
+}
+
 func (s *Server) handleExportServers(w http.ResponseWriter, r *http.Request) error {
 	if err := s.needServers(); err != nil {
 		return err

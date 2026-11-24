@@ -72,6 +72,11 @@ type Config struct {
 	// PanelPort is the panel's own listen port (0 when unknown); a server
 	// can never be started on it.
 	PanelPort int
+	// Panel connection settings supply the browser test origins.
+	PanelPublicHosts []string
+	PanelTLS         bool
+	PanelLoopback    bool
+	PanelBehindProxy bool
 	// BindAddress is the host IP game ports are published on ("" = all).
 	BindAddress string
 	// MemoryMB and CPUs are per-container limits (0 = unlimited).
@@ -136,6 +141,10 @@ func New(st *store.Store, box *secrets.Box, dc *docker.Client, cfg Config, logge
 // PortRange returns the configured host port range.
 func (s *Service) PortRange() ports.Range { return s.cfg.Ports }
 
+// SetPanelPort records the bound port when the daemon did not have a numeric
+// port at configuration time. Call it before serving requests or reconciling.
+func (s *Service) SetPanelPort(port int) { s.cfg.PanelPort = port }
+
 // GameHost returns the effective game host: the game_host setting, or
 // Config.DefaultGameHost when it is empty ("" when neither is set).
 func (s *Service) GameHost(ctx context.Context) (string, error) {
@@ -155,7 +164,7 @@ func (s *Service) params(ctx context.Context) (runtimeParams, error) {
 	if err != nil {
 		return runtimeParams{}, err
 	}
-	p := runtimeParams{gameHost: host}
+	p := runtimeParams{gameHost: host, testOrigins: s.cfg.testOrigins(host)}
 	if s.cfg.Certs != nil {
 		p.groupAdd = s.cfg.Certs.GroupAdd()
 	}
@@ -335,13 +344,9 @@ func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p r
 		CreatedAt:      sv.CreatedAt.UTC(),
 		UpdatedAt:      sv.UpdatedAt.UTC(),
 	}
-	if s.cfg.Certs != nil {
-		info, err := s.cfg.Certs.Current(ctx, sv.ID)
-		if err != nil {
-			return apitypes.Server{}, err
-		}
-		out.Certificate = info.APIInfo(p.gameHost)
-		p.certMode, p.certDir = info.Mode, s.cfg.Certs.ServerDir(sv.ID)
+	out.Certificate, err = s.serverCertificate(ctx, sv.ID, &p)
+	if err != nil {
+		return apitypes.Server{}, err
 	}
 	if b != nil {
 		pid := b.ProjectID
@@ -364,9 +369,13 @@ func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p r
 			code := ct.ExitCode
 			out.ExitCode = &code
 		}
-		out.RestartRequired = ct.Running && ct.Labels[docker.LabelConfigHash] != s.configHash(sv, b, p)
+		out.RestartRequired = s.restartRequired(sv, b, p, ct)
 	}
 	return out, nil
+}
+
+func (s *Service) restartRequired(sv store.Server, b *store.Build, p runtimeParams, ct *docker.Container) bool {
+	return ct.Running && ct.Labels[docker.LabelConfigHash] != s.configHash(sv, b, p)
 }
 
 // dockerFailed logs a failed runtime query whose result is reported as
@@ -488,17 +497,25 @@ func (s *Service) viewOne(ctx context.Context, sv store.Server, ct *docker.Conta
 
 // Get returns one server with runtime state.
 func (s *Service) Get(ctx context.Context, id int64) (apitypes.Server, error) {
-	sv, err := s.load(ctx, id)
+	sv, ct, dockerOK, err := s.inspect(ctx, id)
 	if err != nil {
 		return apitypes.Server{}, err
+	}
+	return s.viewOne(ctx, sv, ct, dockerOK)
+}
+
+func (s *Service) inspect(ctx context.Context, id int64) (store.Server, *docker.Container, bool, error) {
+	sv, err := s.load(ctx, id)
+	if err != nil {
+		return sv, nil, false, err
 	}
 	ct, derr := s.container(ctx, sv)
 	if derr != nil {
 		if err := s.dockerFailed(ctx, "get server", derr); err != nil {
-			return apitypes.Server{}, err
+			return sv, nil, false, err
 		}
 	}
-	return s.viewOne(ctx, sv, ct, derr == nil)
+	return sv, ct, derr == nil, nil
 }
 
 // resolveBuild returns build id if it is a successful build with an image.

@@ -12,4 +12,5 @@ alwaysApply: false
 - `internal/daemon/admin.go` backs the `admin` CLI and works while the daemon runs (SQLite WAL). `reset-password` ends sessions and deletes the account's API tokens; its output must say exactly that.
 - `frontend/embed.go` embeds `frontend/dist` (`all:dist`); without `index.html` it serves a plain-text 503 notice. Only paths outside `/api/` reach it.
 - Changes to flags, environment variables or the data directory layout must update `README.md`.
+- Pass the panel listen scheme, port and normalized public hosts to the server service for its browser test origins. Record an OS-assigned port before serving requests or starting recovery.
 - Verify with `go test ./cmd/... ./internal/daemon/... ./internal/datadir/... ./frontend/...`.

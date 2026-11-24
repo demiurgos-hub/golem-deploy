@@ -165,6 +165,10 @@ func Run(ctx context.Context, o Options) (err error) {
 		return err
 	}
 	srvCfg.DefaultGameHost = defaultGameHost(publicHosts)
+	srvCfg.PanelPublicHosts = publicHosts
+	srvCfg.PanelLoopback = httpapi.CheckListen(o.Listen, false, false) == nil
+	srvCfg.PanelTLS = panelUsesTLS(o, srvCfg.PanelLoopback)
+	srvCfg.PanelBehindProxy = o.InsecureHTTP
 	if o.MaxRepoSizeMB < 0 {
 		return errors.New("--max-repo-size-mb must be 0 (unlimited) or positive")
 	}
@@ -347,6 +351,9 @@ func Run(ctx context.Context, o Options) (err error) {
 		_ = runner.Shutdown(context.Background())
 		return err
 	}
+	if srvCfg.PanelPort == 0 {
+		svc.SetPanelPort(ln.Addr().(*net.TCPAddr).Port)
+	}
 	scheme := "http"
 	if o.TLSCert != "" {
 		scheme = "https"
@@ -424,6 +431,11 @@ func Run(ctx context.Context, o Options) (err error) {
 		return serveErr
 	}
 	return jobErr
+}
+
+// panelUsesTLS mirrors the panel TLS policy for the origins handed to games.
+func panelUsesTLS(o Options, loopback bool) bool {
+	return o.TLSCert != "" || (!o.InsecureHTTP && !loopback)
 }
 
 // prepareGit sweeps git scratch files and orphaned checkouts left by a

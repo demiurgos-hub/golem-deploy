@@ -10,6 +10,8 @@ import (
 	"runtime/debug"
 	"strings"
 	"time"
+
+	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 )
 
 type ctxKey int
@@ -173,6 +175,25 @@ func (s *Server) setSecurityHeaders(h http.Header, api bool) {
 }
 
 func isAPIPath(p string) bool { return p == "/api" || strings.HasPrefix(p, "/api/") }
+
+// Game ports can be assigned while a page is open. Allow connections to the
+// effective game host only, with no change to the other CSP directives.
+func (s *Server) allowGameConnections(h http.Header, ctx context.Context) {
+	if s.servers == nil {
+		return
+	}
+	raw, err := s.servers.GameHost(ctx)
+	if err != nil {
+		return
+	}
+	host, err := certs.ValidateHost(raw)
+	if err != nil || host == "" || strings.Contains(host, ":") {
+		// CSP host source expressions cannot express IPv6 literals.
+		return
+	}
+	connect := "connect-src 'self' https://" + host + ":* wss://" + host + ":*"
+	h.Set("Content-Security-Policy", strings.Replace(cspSPA, "connect-src 'self'", connect, 1))
+}
 
 // clientIP returns the client address key used for rate limiting and the
 // access log: an IPv4 address or an IPv6 /64. It is the TCP peer, or, when
