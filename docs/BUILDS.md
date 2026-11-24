@@ -1,6 +1,6 @@
 # Builds
 
-A build turns a project's checkout into a Docker image that game servers run. It is started with `POST /api/v1/projects/{id}/builds` (see [API.md](API.md#builds)), runs as a `project.build` job and records a `Build` with the image id. This document describes what a game repository must contain, the optional `golem-deploy.yaml`, how the build runs and its security model.
+A build turns a project's checkout into a Docker image that game servers run. It is started with `POST /api/v1/projects/{id}/builds` (see [API.md](API.md#builds)), runs as a `project.build` job and records a `Build` with the image id. This document describes what a game repository must contain, the optional `golem-deploy.yaml`, how the build runs and its security model. The project before it is described in [REPOSITORIES.md](REPOSITORIES.md); running a successful build as a game server (`POST /api/v1/servers` with `build_id`) in [SERVERS.md](SERVERS.md), the certificate servers get in [CERTIFICATES.md](CERTIFICATES.md).
 
 ## What a game repository must contain
 
@@ -58,11 +58,11 @@ Commands and arguments are passed in Dockerfile exec form (a JSON array): there 
 ## How a build runs
 
 1. With `pull: true`, the checkout is updated first (exactly like `POST /projects/{id}/pull`), in the same job.
-2. The build waits for the daemon's build slot (one build at a time; at most 4 may be queued or running).
+2. The build waits for the daemon's build slot (one build at a time; at most 4 may be queued or running). Build jobs have their own job workers, so waiting builds never delay server starts and stops or other project jobs.
 3. The daemon reads the few files above from the checkout and validates them (the *preflight*). Problems are reported as the build's `detail`, for example `golem.yaml was not found in the game root "."`.
 4. In a private directory below the data directory's `tmp/` it writes the generated `Dockerfile`, its `Dockerfile.dockerignore` and the extracted static add-ons. Nothing is written into the checkout.
 5. `docker build` runs with the repository root as context. The image is tagged `golem-deploy/<project>:<commit[:12]>` and labelled from the command line (managed, instance, project id, commit, build id, engine version). The build's output is the job log (sanitised, host paths replaced by placeholders such as `<repository>`).
-6. The image is looked up by its exact id and must carry exactly those labels; then the build is recorded as successful and the retention policy runs (keep the newest `--build-retention` successful builds per project, default 5, plus every build a server uses; keep the newest 20 failed or cancelled builds).
+6. The image is looked up by its exact id and must carry exactly those labels; then the build is recorded as successful (with the engine version and the transport paths) and the retention policy runs (keep the newest `--build-retention` successful builds per project, default 5, plus every build a server is configured with or whose image a container, also a stopped server's, still uses; keep the newest 20 failed or cancelled builds).
 
 The generated Dockerfile (printed at the top of every build log) is a two-stage build:
 
@@ -93,7 +93,7 @@ The game repository is **untrusted**, and so is everyone who can push to it.
 - **The host never runs repository code.** The daemon only reads `golem-deploy.yaml`, `.dockerignore`, `golem.yaml`, `go.mod`, `package.json` (and a custom Dockerfile) from the checkout, through a reader that is contained to the checkout (`os.Root`), refuses symbolic links anywhere in a path and anything that is not a regular file, and caps sizes (64 KiB to 1 MiB). It never writes to the checkout. A repository cannot make the daemon read or write host files outside it.
 - **No injection.** Every value placed in the Dockerfile or the `docker build` command line is a constant, a number, a version matching a strict pattern, or a path from the allowlist above; commands are JSON exec-form arrays. The command line takes `--` before the context, and no repository value can become an option.
 - **No secrets in builds.** The build gets no build arguments, secrets, SSH agent or entitlements; `.git` (where the daemon keeps no credentials anyway) never enters the context; the docker CLI runs with the daemon's fixed minimal environment plus fixed BuildKit settings (`BUILDX_GIT_INFO=false`, so the CLI does not run git in the checkout; no attestations).
-- **Outputs are verified.** The image is identified by its exact id and must carry exactly the labels the daemon set; servers will only run images recorded by successful builds.
+- **Outputs are verified.** The image is identified by its exact id and must carry exactly the labels the daemon set; servers only run the image id recorded on a successful build, and check the same labels again before every start.
 
 What this does **not** protect against:
 

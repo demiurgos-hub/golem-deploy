@@ -47,7 +47,7 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck scripts/install.sh
+          shellcheck scripts/install.sh scripts/build.sh scripts/gen-types.sh
 
   go:
     name: Go

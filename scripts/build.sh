@@ -3,7 +3,7 @@
 # Extra arguments are passed to `go build` (for example: -ldflags "-s -w").
 set -eu
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root/frontend"
 npm ci
 npm run build

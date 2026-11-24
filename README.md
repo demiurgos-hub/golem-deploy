@@ -49,6 +49,7 @@ Run the checks used in CI:
 
 ```sh
 (cd frontend && npm run lint && npm test && npm run build)
+shellcheck scripts/*.sh
 go vet ./...
 go run ./scripts/checkchars          # no bidi controls, U+2028/U+2029, NUL or other control characters in tracked files
 go run honnef.co/go/tools/cmd/staticcheck@latest ./...
