@@ -168,8 +168,14 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 	case errors.As(err, &settingsFailure):
 		return err
 	case errors.Is(err, certs.ErrExpired):
+		if cert.Mode == certs.ModeACME {
+			return jobs.Fail("the automatic game certificate has expired; renew it (POST /api/v1/certificates/acme/renew)", err)
+		}
 		return jobs.Fail("the custom game certificate has expired; upload a new one (PUT /api/v1/certificates/game)", err)
 	case errors.Is(err, certs.ErrNoCertificate):
+		if cert.Mode == certs.ModeACME {
+			return jobs.Fail("no valid automatic game certificate is installed; renew it (POST /api/v1/certificates/acme/renew)", err)
+		}
 		return jobs.Fail("no valid custom game certificate is installed; upload one or switch to a self-signed certificate (PUT /api/v1/certificates/game)", err)
 	case err != nil:
 		s.logger.Error("could not prepare the game certificate", "job_id", jobIDFrom(ctx), "err", err)

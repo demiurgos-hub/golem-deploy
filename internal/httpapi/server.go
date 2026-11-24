@@ -12,8 +12,11 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
@@ -30,9 +33,10 @@ import (
 // Config holds listener settings.
 type Config struct {
 	// Listen is the TCP address, e.g. "127.0.0.1:8000".
-	Listen  string
-	TLSCert string
-	TLSKey  string
+	Listen     string
+	TLSCert    string
+	TLSKey     string
+	ManagedTLS bool
 	// InsecureHTTP allows plaintext HTTP on a non-loopback address.
 	InsecureHTTP bool
 	// Version is reported by GET /api/v1/status.
@@ -47,7 +51,7 @@ type Config struct {
 	TrustedProxies []netip.Prefix
 }
 
-func (c Config) tls() bool { return c.TLSCert != "" && c.TLSKey != "" }
+func (c Config) tls() bool { return c.ManagedTLS || (c.TLSCert != "" && c.TLSKey != "") }
 
 // DockerProbe reports whether Docker is reachable.
 type DockerProbe interface {
@@ -76,7 +80,8 @@ type Deps struct {
 	Static  *staticfiles.Store
 	// Certs manages the game certificate; nil makes the certificate routes
 	// answer 503.
-	Certs *certs.Manager
+	Certs      *certs.Manager
+	Automation *certs.Automation
 	// Builds runs project builds; when nil the build routes that need it
 	// answer 503 (listing and reading build records still works).
 	Builds *build.Service
@@ -93,21 +98,22 @@ type Deps struct {
 
 // Server holds the HTTP layer's state. Create it with New.
 type Server struct {
-	cfg      Config
-	store    *store.Store
-	sessions *auth.Sessions
-	hasher   *auth.Hasher
-	secrets  *secrets.Box
-	jobs     *jobs.Runner
-	logger   *slog.Logger
-	docker   DockerProbe
-	servers  *servers.Service
-	static   *staticfiles.Store
-	certs    *certs.Manager
-	builds   *build.Service
-	spa      http.Handler
-	now      func() time.Time
-	proj     *projectState
+	cfg        Config
+	store      *store.Store
+	sessions   *auth.Sessions
+	hasher     *auth.Hasher
+	secrets    *secrets.Box
+	jobs       *jobs.Runner
+	logger     *slog.Logger
+	docker     DockerProbe
+	servers    *servers.Service
+	static     *staticfiles.Store
+	certs      *certs.Manager
+	automation *certs.Automation
+	builds     *build.Service
+	spa        http.Handler
+	now        func() time.Time
+	proj       *projectState
 
 	// Password attempt limits (login, password change, token creation):
 	// failures per client IP and per submitted username, a known-good-IP
@@ -201,6 +207,7 @@ func New(cfg Config, d Deps) (*Server, error) {
 		servers:    d.Servers,
 		static:     d.Static,
 		certs:      d.Certs,
+		automation: d.Automation,
 		builds:     d.Builds,
 		spa:        d.SPA,
 		now:        d.Now,
@@ -383,15 +390,92 @@ func (s *Server) Listen() (net.Listener, error) {
 	if err := CheckListen(s.cfg.Listen, s.cfg.tls(), s.cfg.InsecureHTTP); err != nil {
 		return nil, err
 	}
-	return net.Listen("tcp", s.cfg.Listen)
+	return OpenListener(s.cfg.Listen, "--listen")
+}
+
+// OpenListener adds actionable diagnostics to bind errors on either listener.
+func OpenListener(addr, flag string) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err == nil {
+		return ln, nil
+	}
+	_, port, _ := net.SplitHostPort(addr)
+	switch {
+	case errors.Is(err, syscall.EADDRINUSE), strings.Contains(err.Error(), "Only one usage of each socket address"):
+		return nil, fmt.Errorf("cannot bind TCP port %s: another program, often a web server, is using it; stop or reconfigure that program or choose another port with %s", port, flag)
+	case errors.Is(err, os.ErrPermission), strings.Contains(err.Error(), "forbidden by its access permissions"):
+		return nil, fmt.Errorf("permission denied binding TCP port %s: grant the daemon CAP_NET_BIND_SERVICE for low ports, check OS port reservations, or choose a different port with %s", port, flag)
+	default:
+		return nil, fmt.Errorf("bind %s: %w", flag, err)
+	}
 }
 
 // Serve serves on ln until ctx is cancelled, then shuts down gracefully:
 // it stops accepting connections, ends streaming responses and waits up to
 // a grace period for in-flight requests.
-func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	srv := &http.Server{
-		Handler:           s.handler,
+func (s *Server) Serve(ctx context.Context, ln net.Listener, redirect ...net.Listener) error {
+	srv := s.httpServer(s.handler)
+	if s.cfg.tls() {
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		if s.automation != nil {
+			srv.TLSConfig.GetCertificate = s.automation.GetCertificate
+			if s.automation.TLSALPN01 {
+				srv.TLSConfig.NextProtos = []string{"acme-tls/1"}
+			}
+		} else {
+			cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)
+			if err != nil {
+				_ = ln.Close()
+				return fmt.Errorf("load TLS certificate: %w", err)
+			}
+			srv.TLSConfig.Certificates = []tls.Certificate{cert}
+		}
+	}
+	errCh := make(chan error, 2)
+	var secondary *http.Server
+	if len(redirect) > 0 && redirect[0] != nil {
+		_, port, _ := net.SplitHostPort(ln.Addr().String())
+		secondary = s.httpServer(s.redirectHandler(port))
+		go func() { errCh <- secondary.Serve(redirect[0]) }()
+	}
+	go func() {
+		if srv.TLSConfig != nil {
+			errCh <- srv.ServeTLS(ln, "", "")
+		} else {
+			errCh <- srv.Serve(ln)
+		}
+	}()
+
+	var serveErr error
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, http.ErrServerClosed) {
+			serveErr = err
+		}
+	case <-ctx.Done():
+	}
+	s.beginShutdown()
+	sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	var wg sync.WaitGroup
+	if secondary != nil {
+		wg.Go(func() {
+			if err := secondary.Shutdown(sctx); err != nil {
+				_ = secondary.Close()
+			}
+		})
+	}
+	if err := srv.Shutdown(sctx); err != nil {
+		_ = srv.Close()
+		serveErr = errors.Join(serveErr, fmt.Errorf("graceful shutdown: %w", err))
+	}
+	wg.Wait()
+	return serveErr
+}
+
+func (s *Server) httpServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -399,41 +483,30 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		MaxHeaderBytes:    maxHeaderBytes,
 		ErrorLog:          slog.NewLogLogger(s.logger.Handler(), slog.LevelWarn),
 	}
-	if s.cfg.tls() {
-		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)
-		if err != nil {
-			_ = ln.Close()
-			return fmt.Errorf("load TLS certificate: %w", err)
-		}
-		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
-	}
+}
 
-	errCh := make(chan error, 1)
-	go func() {
-		if srv.TLSConfig != nil {
-			errCh <- srv.ServeTLS(ln, "", "") // certificates are in TLSConfig
+func (s *Server) redirectHandler(port string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.automation != nil && s.automation.Client.HTTPChallenge(w, r) {
 			return
 		}
-		errCh <- srv.Serve(ln)
-	}()
-
-	select {
-	case err := <-errCh:
-		s.beginShutdown()
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+		if !s.hostAllowed(r.Host) {
+			s.writeError(w, r, errBadHost)
+			return
 		}
-		return err
-	case <-ctx.Done():
-	}
-	s.beginShutdown()
-	sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-	defer cancel()
-	if err := srv.Shutdown(sctx); err != nil {
-		_ = srv.Close()
-		return fmt.Errorf("graceful shutdown: %w", err)
-	}
-	return nil
+		host := requestHostname(r.Host)
+		authority := certs.URLHost(host)
+		if port != "443" {
+			authority = net.JoinHostPort(host, port)
+		}
+		if !s.hostAllowed(authority) {
+			s.writeError(w, r, errBadHost)
+			return
+		}
+		target := url.URL{Scheme: "https", Host: authority, Path: r.URL.Path,
+			RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
+		http.Redirect(w, r, target.String(), http.StatusPermanentRedirect)
+	})
 }
 
 func (s *Server) beginShutdown() {

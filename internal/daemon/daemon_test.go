@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"log/slog"
@@ -9,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +20,6 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
-	"github.com/demiurgos-hub/golem-deploy/internal/httpapi"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -25,18 +27,64 @@ type noDocker struct{}
 
 func (noDocker) Reachable(context.Context) bool { return false }
 
-func TestRunRefusesPlaintextNonLoopback(t *testing.T) {
-	dir := t.TempDir()
-	err := Run(context.Background(), Options{DataDir: dir, Listen: "0.0.0.0:0", Logger: slog.New(slog.DiscardHandler)})
-	if !errors.Is(err, httpapi.ErrPlaintextNonLoopback) {
-		t.Fatalf("got %v", err)
+func TestRunSelectsManagedTLSForNonLoopback(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	ctx, cancel := context.WithCancel(t.Context())
+	ready, done := make(chan net.Addr, 1), make(chan error, 1)
+	stopped := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
+	})
+	go func() {
+		defer close(stopped)
+		done <- Run(ctx, Options{
+			DataDir: dir, Listen: "0.0.0.0:0", docker: noDocker{}, Logger: slog.New(slog.DiscardHandler),
+			Ready: func(addr net.Addr) { ready <- addr },
+		})
+	}()
+	var port int
+	select {
+	case addr := <-ready:
+		port = addr.(*net.TCPAddr).Port
+	case err := <-done:
+		t.Fatalf("daemon stopped during startup: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("managed TLS listener did not start")
 	}
-	// Refused before touching the data directory.
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-		t.Fatalf("data dir written: %v", entries)
+	cert, err := os.ReadFile(filepath.Join((datadir.Layout{Root: dir}).PanelCerts(), "fallback.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(cert) {
+		t.Fatal("fallback certificate could not be loaded")
+	}
+	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	resp, err := client.Get("https://127.0.0.1:" + strconv.Itoa(port) + "/api/v1/auth/options")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("public HTTPS endpoint returned %s", resp.Status)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("daemon did not shut down")
 	}
 	if err := Run(context.Background(), Options{DataDir: dir, Listen: "127.0.0.1:0", TLSCert: "c.pem"}); err == nil {
 		t.Fatal("cert without key accepted")
+	}
+	if err := Run(t.Context(), Options{DataDir: dir, Listen: "127.0.0.1:0", HTTPListen: "127.0.0.1:0"}); err == nil {
+		t.Fatal("HTTP redirect listener without HTTPS accepted")
 	}
 }
 

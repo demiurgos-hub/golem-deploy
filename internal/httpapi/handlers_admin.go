@@ -87,7 +87,18 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) er
 		}
 		upd.GameHost = &host
 	}
-	st, err := s.store.UpdateSettings(r.Context(), upd)
+	var st store.Settings
+	save := func() error {
+		var err error
+		st, err = s.store.UpdateSettings(r.Context(), upd)
+		return err
+	}
+	var err error
+	if req.GameHost != nil && s.automation != nil {
+		err = s.automation.ChangeHost(save)
+	} else {
+		err = save()
+	}
 	if err != nil {
 		return internal(err)
 	}

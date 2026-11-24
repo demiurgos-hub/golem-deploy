@@ -5,7 +5,7 @@ Golem Deploy is an open-source tool for self-hosting games built on Golem Engine
 ## Source of truth
 
 - Prefer current code, manifests, and build scripts. `docs/API.md` is the human/agent HTTP contract; the route table in `internal/httpapi/routes.go` is authoritative for routes and their access levels, and `internal/apitypes` for wire types.
-- Runtime configuration is the `serve` flags (with `GOLEM_DEPLOY_*` environment fallbacks) in `cmd/golem-deploy/main.go`. There is no config file. Runtime settings that admins change live in the database (`settings` table, `GET|PATCH /api/v1/settings`).
+- Runtime configuration is the `serve` flags (with `GOLEM_DEPLOY_*` environment fallbacks) in `cmd/golem-deploy/main.go`. There is no config file. Runtime settings live in the database (`settings` table), including ACME account settings and certificate modes. The directory URL and trust roots are serve flags, outside the HTTP configuration.
 - Read the relevant `.cursor/rules/subsystem-*.mdc` files before changing a subsystem or its contracts.
 
 ## Change discipline
@@ -19,6 +19,7 @@ Golem Deploy is an open-source tool for self-hosting games built on Golem Engine
 - Treat `frontend/dist` (except its committed `.gitkeep`), `frontend/node_modules`, `bin`, `data` (the default data directory, including its keys), and other secrets as generated or runtime state.
 - Build the web client before the binary because `frontend/embed.go` embeds `frontend/dist`. Without a build, the binary serves a plain-text "web client not built" notice instead of the SPA.
 - Before finishing, run what CI runs: `npm run lint`, `npm test` and `npm run build` in `frontend/`; `shellcheck scripts/*.sh`; then `scripts/gen-types.sh` (the generated file must not change), `go run ./scripts/checkchars`, `go vet ./...`, `staticcheck ./...`, `govulncheck ./...`, and `go test -race ./...` from the root (see `.github/workflows/ci.yml`).
+- Certificate changes also need `GOLEM_DEPLOY_ACME_TESTS=1 go test -count=1 -v ./internal/certs -run '^TestPebbleCertificates changes to Docker or server code also need `GOLEM_DEPLOY_DOCKER_TESTS=1 go test -p 1 ./internal/build/... ./internal/docker/... ./internal/httpapi/... ./internal/servers/...` (CI does not run it; `-p 1` because the packages share the `golem-deploy` network).`. It runs a pinned local Pebble process and exercises real challenges without the public CA.
 - With Docker available, changes to Docker or server code also need `GOLEM_DEPLOY_DOCKER_TESTS=1 go test -p 1 ./internal/build/... ./internal/docker/... ./internal/httpapi/... ./internal/servers/...` (CI does not run it; `-p 1` because the packages share the `golem-deploy` network).
 
 ## Required rule maintenance

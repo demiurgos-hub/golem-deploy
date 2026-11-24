@@ -26,7 +26,7 @@ const (
 )
 
 // generate creates a new self-signed pair for host.
-func (m *Manager) generate(host string) ([]byte, []byte, Info, error) {
+func (m *Manager) generate(host string, otherHosts ...string) ([]byte, []byte, Info, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, Info{}, err
@@ -35,7 +35,7 @@ func (m *Manager) generate(host string) ([]byte, []byte, Info, error) {
 	if err != nil {
 		return nil, nil, Info{}, err
 	}
-	dns, ips := selfSignedNames(host)
+	dns, ips := selfSignedNames(append([]string{host}, otherHosts...)...)
 	cn := host
 	if cn == "" {
 		cn = "localhost"
@@ -92,7 +92,11 @@ func (m *Manager) install(dir string, certPEM, keyPEM []byte) error {
 	if err := m.recoverPending(dir); err != nil {
 		return err
 	}
-	if err := m.writeFile(dir, pendingKey, keyPEM, 0o640); err != nil {
+	keyMode := os.FileMode(0o600)
+	if filepath.Dir(dir) == m.serversDir() {
+		keyMode = 0o640
+	}
+	if err := m.writeFile(dir, pendingKey, keyPEM, keyMode); err != nil {
 		return err
 	}
 	if err := m.writeFile(dir, pendingCert, certPEM, 0o644); err != nil {

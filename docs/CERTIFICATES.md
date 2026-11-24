@@ -1,59 +1,46 @@
-# Game certificates: operator notes
+# Game and panel certificates
 
-Every game server serves TLS: WebTransport (QUIC over UDP) and the game's HTTPS sidecar (realtime config, WebSocket fallback, the game's own pages) on the server's port. Each server mounts its own certificate directory. By default each server has a unique self-signed key and certificate. An admin can choose custom mode, where **all servers share the uploaded certificate and private key**. The panel's own TLS (`--tls-cert`, `--tls-key`) is separate and unaffected. The HTTP contract is in [API.md](API.md#game-certificate).
+Game servers use TLS for WebTransport over UDP and for HTTPS on their TCP port. The panel also supports managed TLS. Admins configure certificates through the [certificate API](API.md#game-certificate).
 
-## Where it lives
+## Choose a mode
 
-- `<data>/certs/servers/<id>/tls.crt` holds the chain (leaf first) and `tls.key` the PKCS#8 key. The directory is removed when its server is deleted. The canonical custom pair is stored under `<data>/certs/game/` and should be backed up with the data directory if you use custom mode.
-- Each server sees only its own directory, bind-mounted **read-only** at `/run/golem-deploy/tls`, and the engine is told where to find the files (`GOLEM_TLS_CERT_FILE`, `GOLEM_TLS_KEY_FILE`). It is never baked into images.
-- Permissions on Unix hosts: directory `0750`, key `0640`, certificate `0644`, owned by the daemon user and the daemon's group. Server containers run as uid 65532, so they read the files through the group: each container gets the daemon's group as a supplementary group (`--group-add`). The key is never world-readable. When the daemon runs with group 0 (for example as root), the files get group 65532 (the container user's own group) instead, so no container is ever given group 0. A daemon running with group 0 that is not root cannot do that and refuses to start.
-- On Windows development hosts (Docker Desktop) no group handling is done; Docker Desktop's bind mounts do not carry Unix ownership.
-- The data directory path must not contain `,`, `"`, `'` or `=` (they cannot be expressed in a bind mount); the daemon refuses to start otherwise.
+| Service | Mode | Use |
+|---------|------|-----|
+| Game | `self_signed` | Default for development, LAN play and clients that pin a certificate. Each server receives a separate ECDSA P-256 key and a 13-day certificate. The daemon rotates it when the game host changes or when fewer than five days remain. |
+| Game | `custom` | Upload a matching PEM certificate chain and private key. All servers share the pair. Renew it yourself. The daemon warns when expiry is within 14 days. |
+| Game | `acme` | Obtain and renew a publicly trusted pair for the game host. All game servers share it. |
+| Panel | `none` | Plain HTTP on loopback without TLS files, or with explicit `--insecure-http` for a trusted proxy setup. |
+| Panel | `files` | Serve the certificate and key configured through `--tls-cert` and `--tls-key`. The operator renews these and restarts the daemon. |
+| Panel | `self_signed` | Initial TLS mode on a non-loopback listener without TLS files. Compare the SHA-256 fingerprint in the startup log with the browser's certificate before accepting it. |
+| Panel | `acme` | Obtain a certificate for each panel host. TLS picks the certificate for the client SNI, the local address for a client without SNI, or the first panel host when no local-address certificate is available. The daemon falls back to a generated certificate for names without a usable ACME pair. |
 
-What this does not cover: hosts with Docker user namespace remapping (`userns-remap`) or SELinux enforcing on the bind mount may still deny the container access; servers then fail to become ready and the server log shows the certificate error.
+The effective game host is the admin's `game_host` setting, or the first `--public-host` when the setting is empty. Each server's page is at `https://<game host>:<port>/`. The panel uses the `--public-host` list, with the effective game host as its fallback when the list is empty. The panel's generated fallback covers its hosts, the game host, `localhost`, `127.0.0.1` and `::1`.
 
-## Game host
+Browser players need a trusted HTTPS page. A self-signed game certificate enables WebTransport hash pinning from a page already served over trusted HTTPS, and works with native clients that support pinning. Browsers still warn when opening the game server's own page with a self-signed certificate. Browser WebSockets use normal chain validation.
 
-The certificate is issued for the **game host**: the DNS name or IP address players use to reach game servers. Set it with `PATCH /api/v1/settings` (`game_host`); when it is empty the first `--public-host` is used; when neither exists, servers cannot start. Each server's page is `https://<game host>:<port>/`.
+## Configure automatic certificates
 
-## Modes
+1. Point each public DNS name at the daemon, or use a publicly reachable IP address. The default CA rejects identifiers such as loopback, private and other non-public addresses, and local or single-label names.
+2. Make TCP port 80 or 443 reachable **for each identifier**. Set `--http-listen` for HTTP-01 and route public port 80 there. TLS-ALPN-01 requires a TLS panel listener on port 443 and a direct TLS connection from the CA, including through any TCP passthrough proxy. HTTP-01 handles active challenges and redirects other allowed requests to the HTTPS panel. There is no DNS-01 solver.
+3. Read and accept the CA's subscriber agreement in the ACME account settings. You may provide a contact email. ACME is off until an admin asks for it.
+4. Switch the game or panel to `acme`. The restricted issuance job reports progress. The previous mode and pair stay active until the new pair is staged and the mode commits.
 
-### `self_signed` (default)
+The default CA is Let's Encrypt. DNS names use its default profile, with a lifetime set by the CA (typically up to 90 days). IP certificates use the `shortlived` profile, about 160 hours. Staging exercises validation with higher rate limits and certificates browsers do not trust. To change staging, first switch the game and panel away from ACME. `--acme-directory` overrides both directories, including for a private CA. `--acme-root-ca` sets the roots used to connect to that CA. Private directory overrides permit local identifiers, subject to the CA's own policy.
 
-At first start, the daemon generates an ECDSA P-256 key and certificate for that server. PUT in self-signed mode generates fresh keys and certificates for all existing servers. Each certificate meets these requirements.
+One identifier uses one ACME pair across the installation. When the game host is also a panel host, the panel and all game containers use that **same private key**. A game process can read the key in its own mount. Give the panel a separate hostname if you want to keep its key out of game containers. Let's Encrypt limits certificates for an identical identifier set to five per week. Prefer staging for experiments and use manual renewal only when needed.
 
-- Valid for **13 days** (one hour of it before the moment of creation, to absorb clock skew). WebTransport certificate hash pinning (`serverCertificateHashes`) only accepts certificates valid for at most 14 days;
-- Covers the game host, `localhost`, `127.0.0.1` and `::1` as subject alternative names.
-- The daemon regenerates it when the game host changes or when less than five days of validity remain. It checks at startup, every hour and before each server start.
+## Renewal and failures
 
-Servers are started with `GOLEM_TLS_PINNED=1`, so the game's realtime config publishes the certificate's SHA-256 hashes and browser clients pin them instead of validating a chain.
+The daemon uses ACME Renewal Information when available and otherwise schedules renewal around half the lifetime. It retries failures with backoff. The ACME status includes the most recent attempt and its error, and a failed renewal keeps the installed pair. A missing or expired shared game certificate prevents a new server start. An expired ACME panel certificate gives way to the self-signed fallback.
 
-### `custom`
+When the effective game host changes in ACME mode, the daemon obtains a certificate for the new host in the background. The installed game certificate stays in use meanwhile. Check `covers_game_host` to see whether it covers the new host. The game URL and allowed origins also change, so running servers may show `restart_required`. To force renewal for all active identifiers, call `POST /api/v1/certificates/acme/renew`. When neither service uses ACME and no certificate job was requested, the daemon makes no CA requests.
 
-An admin uploads a PEM chain (leaf first, at most 8 certificates and 64 KiB) and an unencrypted private key (PKCS#8, PKCS#1 or SEC 1, at most 16 KiB) with `PUT /api/v1/certificates/game`. The upload is refused unless the key is RSA of at least 2048 bits or ECDSA (P-256, P-384, P-521), matches the leaf, the leaf is currently valid for TLS servers and each certificate is signed by the next one in the chain. The private key is never returned. The daemon never changes a custom certificate: renew it yourself before it expires (the daemon logs a warning from 14 days before expiry; an expired custom certificate makes server starts fail with a message). `GET /api/v1/certificates/game` reports whether it covers the current game host.
+## Storage and replacement
 
-Servers are started with `GOLEM_TLS_PINNED=0`: clients validate the chain normally.
+- `<data>/acme/` holds private certificate and ACME account assets. `<data>/certs/panel/` holds the generated fallback and copies of installed panel pairs. Both are private to the daemon and never mounted into a game.
+- `<data>/certs/game/` holds the canonical custom or ACME pair. Game mounts are `<data>/certs/servers/<id>/`, mounted read-only at `/run/golem-deploy/tls`. They contain only that server's `tls.crt` (leaf first) and `tls.key`. The mount is removed when the server is deleted.
+- On Unix, private keys outside game mounts are mode `0600`. A game mount uses directory `0750`, key `0640` and certificate `0644`. Containers read through the daemon's group, or group 65532 when the daemon runs as root with group 0. A non-root daemon with group 0 cannot assign that group. Windows development hosts inherit the data ACL. Docker user namespace remapping and SELinux policy may require host configuration for bind-mount access.
 
-### Later: a certificate manager
+Game changes stage complete pairs outside the mounts and commit the mode and generation together. Startup discards uncommitted stages and finishes committed ones. Each publication atomically renames the key and then the chain. The engine checks both files every 30 seconds and keeps its previous certificate when a poll sees a transient mismatch. It loads the new pair on a later poll without restarting. Startup and periodic reconciliation also adopt a newer ACME pair saved just before an interrupted install.
 
-Automatic certificates from a public CA (ACME) are planned as a third mode.
-
-## Replacement without restarts
-
-Running servers pick up a replaced certificate **without a restart**: the engine checks the files every 30 seconds (`GOLEM_TLS_RELOAD_INTERVAL`) and reloads them when either file's size or modification time changes; existing connections keep their certificate, new handshakes get the new one. This applies to rotation, a host change in self-signed mode, a new custom upload and a mode switch.
-
-The daemon writes both files completely under temporary names and then renames them over the old ones, **key first, certificate last**. Each rename is atomic, so the engine never reads a half-written file. Between the two renames the directory briefly holds the new key with the old certificate; the engine's reload validates that the pair matches, rejects the mismatched pair, keeps serving the previous certificate and retries on the next check, by which time the certificate rename has completed. Startup completes a replacement interrupted between renames.
-
-A mode switch or custom upload stages the new pairs outside the mounts. One settings write commits the mode and identifies the complete staged replacement. A failed save or cancellation before that commit leaves the old mode and pairs in use. After commit, the daemon publishes the pairs to the stable mounts. Startup discards uncommitted staging files and finishes committed changes. Each game reloads independently, so the change can reach different servers on different poll ticks.
-
-Switching between modes changes `GOLEM_TLS_PINNED`. Running servers reload the files, and report `restart_required` until restarted because the pinning setting still belongs to the previous mode. On upgrade, recovery jobs recreate running servers from versions that mounted the shared directory. A new game host also marks them `restart_required` (their public URL and allowed origins change).
-
-## The honest limit of self-signed certificates
-
-A self-signed, pinned certificate works for:
-
-- **LAN play and development**, where players open a page served by something they trust (or `localhost`);
-- **native clients** (desktop, Unity, the Go client), which use the published certificate hashes;
-- browser clients whose page is served over **trusted HTTPS** from somewhere else and that connect to the game with `serverCertificateHashes`.
-
-It does **not** give players on the internet a browser page they can simply open: `https://<game host>:<port>/` served with a self-signed certificate shows a certificate warning, and browsers only allow `serverCertificateHashes` pinning from a secure (trusted HTTPS) page. For internet players the page must come from a host with a publicly trusted certificate: upload one in `custom` mode today, or wait for the certificate manager. The WebSocket fallback has the same requirement: browsers do not pin certificates for WebSocket.
+Self-signed games start with `GOLEM_TLS_PINNED=1`. Custom and ACME use `GOLEM_TLS_PINNED=0` and clients validate the certificate chain normally. Switching between those pinning settings reports `restart_required` until the server restarts.

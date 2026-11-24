@@ -1,6 +1,6 @@
 # Installing Golem Deploy on a Linux host
 
-`scripts/install.sh` installs an already built `golem-deploy` binary as a systemd service on **Ubuntu or Debian**. It is a minimal installer: it does not download releases, install Docker, configure certificates or touch the firewall. A full installer (checksum-verified releases, Docker installation, setup link, certificate management) will replace it.
+`scripts/install.sh` installs an already built `golem-deploy` binary as a systemd service on **Ubuntu or Debian**. It checks the host and configures listeners for a new installation. It leaves obtaining trusted certificates to the daemon or operator. A later installer will add checksum-verified releases, Docker installation and a setup link.
 
 Windows with Docker Desktop is supported for development only. On Windows, Golem Deploy leaves the data directory ACL unchecked and unchanged. Certificate keys and temporary environment files inherit its permissions. Run production installations on Linux.
 
@@ -32,15 +32,18 @@ Options (they only apply when the settings file is created; see [Configuration](
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `--public-host NAMES` | none | Comma-separated host names the panel is reached by (`GOLEM_DEPLOY_PUBLIC_HOST`); IP addresses and `localhost` always work |
-| `--listen ADDR` | `127.0.0.1:8000`, or `:8443` with TLS | Panel listen address (`GOLEM_DEPLOY_LISTEN`); the port must be 1024 or higher |
+| `--listen ADDR` | `:443` (with HTTP on `:80`) when both ports are free, a free loopback port from 8000 to 8099 on conflict, or `:8443` with TLS files | Panel listen address (`GOLEM_DEPLOY_LISTEN`) |
 | `--port-range LO-HI` | `7000-7099` | Host ports for game servers, within 1024-32767 (`GOLEM_DEPLOY_PORT_RANGE`) |
 | `--tls-cert FILE`, `--tls-key FILE` | none | Existing PEM certificate (chain) and private key, copied to `/etc/golem-deploy/tls/` |
 
 Examples:
 
 ```sh
-# Panel on loopback only, reached through an SSH tunnel.
-sudo scripts/install.sh ./golem-deploy
+# Managed HTTPS on 443 with redirects and HTTP-01 on 80, when both are free.
+sudo scripts/install.sh --public-host deploy.example.com ./golem-deploy
+
+# Panel on loopback, reached through an SSH tunnel or reverse proxy.
+sudo scripts/install.sh --listen 127.0.0.1:8000 ./golem-deploy
 
 # Panel on the network with your own certificate.
 sudo scripts/install.sh --public-host deploy.example.com \
@@ -59,13 +62,13 @@ At the end the script prints the next steps:
 
    It prompts for the password twice; `--password-stdin` reads it from the first line of standard input instead. It works while the service is running.
 
-2. **Reach the panel.** Without TLS it listens on `127.0.0.1:8000` with plain HTTP and is reachable from the host only. From your computer:
+2. **Reach the panel.** On a new installation with ports 443 and 80 free, browse to `https://<public host>/` and verify the self-signed fingerprint from `journalctl -u golem-deploy`. Open the required ports in your firewall for automatic certificates. If the installer reports a port conflict, it falls back to loopback HTTP. Reach that listener through an SSH tunnel:
 
    ```sh
    ssh -N -L 8000:127.0.0.1:8000 <user>@<host>
    ```
 
-   then browse to `http://localhost:8000/`. With TLS, browse to `https://<public host>:8443/` and allow that TCP port in your firewall.
+   Then browse to `http://localhost:8000/`. With supplied TLS files and the installer's default port, browse to `https://<public host>:8443/`.
 
 3. **Open the game ports.** Players connect to game servers on the port range over **UDP and TCP**. The script does not change firewall rules: allow the range for both protocols in your provider's firewall (security groups). Docker publishes the ports itself and bypasses ufw and firewalld; see [SERVERS.md](SERVERS.md#firewall).
 
@@ -95,7 +98,7 @@ The unit is sandboxed with systemd's hardening options: no capabilities and no p
 
 ### Configuration
 
-`/etc/golem-deploy/golem-deploy.env` holds one `KEY=value` per line (no quotes) for the `GOLEM_DEPLOY_*` variables of `golem-deploy serve`, listed in the [README](../README.md#run): data directory, listen address, public hosts, port range and, with TLS, the certificate paths. Change settings by editing it, then:
+`/etc/golem-deploy/golem-deploy.env` holds one `KEY=value` per line (no quotes) for the `GOLEM_DEPLOY_*` variables of `golem-deploy serve`, listed in the [README](../README.md#run): data directory, HTTPS and optional HTTP listener addresses, public hosts, port range and optional certificate paths. Change settings by editing it, then:
 
 ```sh
 sudo systemctl restart golem-deploy
@@ -115,7 +118,9 @@ Only if the proxy runs on another machine does the panel need a non-loopback add
 
 ### TLS certificates
 
-Certificates are copied, not referenced, so the service user never needs access to the directory they come from (Let's Encrypt keeps keys readable by root only). They are **not renewed automatically**: after each renewal, re-run the installer with `--tls-cert` and `--tls-key` (it replaces the copies and restarts the service). If the settings file was created without TLS, add the two lines the installer prints, adjust `GOLEM_DEPLOY_LISTEN` (for example `:8443`) and restart. Certificate management is planned for a later version.
+To enable ACME, make TCP port 80 or 443 reachable for each requested identifier and accept the CA terms. Point `GOLEM_DEPLOY_HTTP_LISTEN` at the HTTP-01 listener if you use port 80. The unit grants only `CAP_NET_BIND_SERVICE` for low ports. See [CERTIFICATES.md](CERTIFICATES.md).
+
+With `--tls-cert` and `--tls-key`, the installer copies the files into `/etc/golem-deploy/tls/`. After renewing them, re-run the installer to replace the copies and restart the service. On an existing installation, add the printed environment lines if needed and adjust `GOLEM_DEPLOY_LISTEN` before restarting.
 
 ## Upgrade
 
@@ -161,16 +166,16 @@ The apt packages and Docker itself are left installed.
 ## Security notes
 
 - **The `docker` group is root-equivalent.** The service user must be in it to drive Docker, and any member of the group can start a privileged container that mounts the host's file system. Treat the `golem-deploy` account, and the panel's admin accounts, as root on this host. Do not add people to the `docker` group, and keep the host dedicated.
-- **Plain HTTP on loopback until certificates are configured.** Without `--tls-cert`/`--tls-key` the panel serves unencrypted HTTP and the daemon refuses to listen on anything but a loopback address. Reach it through an SSH tunnel (or a reverse proxy that terminates TLS on the same host). With TLS, the panel is reachable on the network; consider restricting the panel port to your own addresses.
+- **Managed TLS on network listeners.** A non-loopback listener without TLS files serves HTTPS with a generated certificate until ACME is configured. Keep the panel on loopback if you reach it through an SSH tunnel or a reverse proxy on the same host.
 - The settings file and the TLS key are readable by root and the service group only; the data directory (database and keys) by the service user only.
 - Game servers can reach the host and its networks; see [SERVERS.md](SERVERS.md#network-isolation) for the isolation model and optional egress rules.
-- **Builds and the service sandbox.** `docker build` runs as the service user under the unit's restrictions: the buildx client uses the dedicated `DOCKER_CONFIG` at `/var/lib/golem-deploy/docker-build`, its scratch files in the private `/tmp`, and the daemon writes the generated Dockerfile, `--iidfile` and `--metadata-file` below the data directory's `tmp/`, all writable under `ProtectSystem=strict`. The build itself (and every `RUN` step) executes inside dockerd's BuildKit, outside the sandbox. Keep the default `docker` builder in the dedicated configuration. Builds use public base images by default. To grant registry access deliberately, run `sudo -u golem-deploy env DOCKER_CONFIG=/var/lib/golem-deploy/docker-build docker login <registry>`. Keep proxy settings out of this configuration. Docker discovers buildx in its system plugin paths and the original client's `cli-plugins/`. For other plugin locations, install buildx under the dedicated `cli-plugins/` or set `cliPluginsExtraDirs` there. If the primary Docker client uses a named TLS context, import that context into the dedicated directory as well. The game certificate (`/var/lib/golem-deploy/certs/game`) is bind-mounted by dockerd from its real path, which the unit leaves unchanged.
+- **Builds and the service sandbox.** `docker build` runs as the service user under the unit's restrictions: the buildx client uses the dedicated `DOCKER_CONFIG` at `/var/lib/golem-deploy/docker-build`, its scratch files in the private `/tmp`, and the daemon writes the generated Dockerfile, `--iidfile` and `--metadata-file` below the data directory's `tmp/`, all writable under `ProtectSystem=strict`. The build itself (and every `RUN` step) executes inside dockerd's BuildKit, outside the sandbox. Keep the default `docker` builder in the dedicated configuration. Builds use public base images by default. To grant registry access deliberately, run `sudo -u golem-deploy env DOCKER_CONFIG=/var/lib/golem-deploy/docker-build docker login <registry>`. Keep proxy settings out of this configuration. Docker discovers buildx in its system plugin paths and the original client's `cli-plugins/`. For other plugin locations, install buildx under the dedicated `cli-plugins/` or set `cliPluginsExtraDirs` there. If the primary Docker client uses a named TLS context, import that context into the dedicated directory as well. Each game's certificate directory (`/var/lib/golem-deploy/certs/servers/<id>`) is bind-mounted by dockerd from its real path, which the unit leaves unchanged.
 
 ## Troubleshooting
 
 - **Logs:** `journalctl -u golem-deploy -f` (the daemon's own log, including Docker errors of failed jobs); `systemctl status golem-deploy` for the state.
 - **The service does not start, `bind: address already in use`:** another process holds the listen port. Find it with `ss -ltnp 'sport = :8000'`, then stop it or change `GOLEM_DEPLOY_LISTEN` and restart. A game port range that contains the listen port is refused at startup.
-- **`refusing to serve plaintext HTTP on a non-loopback address`:** configure TLS (see above) or set the listen address back to `127.0.0.1:8000`.
+- **A listener port is busy or forbidden.** Free it in the other service or update the corresponding listener in the environment file. For a manually configured daemon on Linux, binding low ports may require `CAP_NET_BIND_SERVICE`.
 - **Docker unreachable in the panel, or `permission denied ... /var/run/docker.sock` in the log:** check that the user is in the group (`id golem-deploy` lists `docker`), that the socket belongs to that group (`ls -l /var/run/docker.sock` shows `root docker`), and that Docker runs (`systemctl status docker`). Group changes apply when the service restarts: `systemctl restart golem-deploy`. The installer checks this with `runuser -u golem-deploy -- docker version`.
 - **Data directory refused** (`has mode ...`, `not empty and was not initialised by Golem Deploy`): the data directory must be owned by `golem-deploy`, mode 0700, and contain only what Golem Deploy put there. The installer refuses an existing `/var/lib/golem-deploy` with another owner or mode and prints the `chown`/`chmod` to run if it is the right directory.
 - **`start request repeated too quickly`:** the service failed 5 times in 5 minutes. Fix the cause shown in the log, then `systemctl reset-failed golem-deploy && systemctl start golem-deploy`.

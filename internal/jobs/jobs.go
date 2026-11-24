@@ -192,6 +192,14 @@ func InPool(name string) StartOption {
 	return func(c *startConfig) { c.pool = name }
 }
 
+// Busy reports whether a subject is reserved by a queued or running job.
+func (r *Runner) Busy(subject Subject) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, busy := r.subjects[subject]
+	return busy
+}
+
 // Start persists a queued job and runs fn in the background. It fails with
 // ErrSubjectBusy when the subject already has an active job.
 func (r *Runner) Start(ctx context.Context, kind string, subject Subject, createdBy *int64, fn Func, opts ...StartOption) (store.Job, error) {

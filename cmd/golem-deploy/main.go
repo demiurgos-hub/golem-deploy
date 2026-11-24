@@ -143,8 +143,11 @@ func cmdServe(args []string, stderr io.Writer) int {
 	listen := fs.String("listen", envDefault("GOLEM_DEPLOY_LISTEN", "127.0.0.1:8000"), "listen address (env GOLEM_DEPLOY_LISTEN)")
 	tlsCert := fs.String("tls-cert", envDefault("GOLEM_DEPLOY_TLS_CERT", ""), "TLS certificate file (env GOLEM_DEPLOY_TLS_CERT)")
 	tlsKey := fs.String("tls-key", envDefault("GOLEM_DEPLOY_TLS_KEY", ""), "TLS private key file (env GOLEM_DEPLOY_TLS_KEY)")
+	httpListen := fs.String("http-listen", envDefault("GOLEM_DEPLOY_HTTP_LISTEN", ""), "HTTP redirect and ACME HTTP-01 listen address (env GOLEM_DEPLOY_HTTP_LISTEN)")
+	acmeDirectory := fs.String("acme-directory", envDefault("GOLEM_DEPLOY_ACME_DIRECTORY", ""), "override the ACME directory URL (env GOLEM_DEPLOY_ACME_DIRECTORY)")
+	acmeRootCA := fs.String("acme-root-ca", envDefault("GOLEM_DEPLOY_ACME_ROOT_CA", ""), "PEM roots for the ACME connection (env GOLEM_DEPLOY_ACME_ROOT_CA)")
 	insecure := fs.Bool("insecure-http", insecureDefault, "allow plaintext HTTP on a non-loopback address, e.g. behind a TLS-terminating proxy (env GOLEM_DEPLOY_INSECURE_HTTP)")
-	publicHost := fs.String("public-host", envDefault("GOLEM_DEPLOY_PUBLIC_HOST", ""), "comma-separated host names the panel is reached by, besides IP addresses and localhost; other Host headers get 421 (env GOLEM_DEPLOY_PUBLIC_HOST)")
+	publicHost := fs.String("public-host", envDefault("GOLEM_DEPLOY_PUBLIC_HOST", ""), "comma-separated panel DNS names or IP addresses, also used for managed TLS (env GOLEM_DEPLOY_PUBLIC_HOST)")
 	trustedProxy := fs.String("trusted-proxy", envDefault("GOLEM_DEPLOY_TRUSTED_PROXY", ""), "comma-separated CIDRs of reverse proxies whose X-Forwarded-For is trusted for the client address (env GOLEM_DEPLOY_TRUSTED_PROXY)")
 	portRange := fs.String("port-range", envDefault("GOLEM_DEPLOY_PORT_RANGE", "7000-7099"), "host port range for game servers, published as UDP and TCP (env GOLEM_DEPLOY_PORT_RANGE)")
 	portBind := fs.String("port-bind-address", envDefault("GOLEM_DEPLOY_PORT_BIND_ADDRESS", ""), "host IP game server ports are published on; empty means all interfaces (env GOLEM_DEPLOY_PORT_BIND_ADDRESS)")
@@ -223,6 +226,9 @@ func cmdServe(args []string, stderr io.Writer) int {
 		Listen:          *listen,
 		TLSCert:         *tlsCert,
 		TLSKey:          *tlsKey,
+		HTTPListen:      *httpListen,
+		ACMEDirectory:   *acmeDirectory,
+		ACMERootCA:      *acmeRootCA,
 		InsecureHTTP:    *insecure,
 		PublicHosts:     splitList(*publicHost),
 		TrustedProxies:  splitList(*trustedProxy),

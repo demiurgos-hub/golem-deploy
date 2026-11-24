@@ -20,6 +20,7 @@ import (
 
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
+	"github.com/demiurgos-hub/golem-deploy/internal/ports"
 )
 
 // Integration tests run against a real Docker daemon with
@@ -71,12 +72,22 @@ func dockerQuiet(args ...string) { _, _ = dockerTry(args...) }
 
 func freePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	// Docker publishes the same number on both transports. Start with the
+	// UDP allocator so Windows UDP exclusions never become test candidates.
+	const loopback = "127.0.0.1"
+	for range 32 {
+		conn, err := net.ListenPacket("udp4", loopback+":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := conn.LocalAddr().(*net.UDPAddr).Port
+		_ = conn.Close()
+		if ports.ProbeFree(loopback, port) == nil {
+			return port
+		}
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	t.Fatal("could not find a host port available on both TCP and UDP")
+	return 0
 }
 
 // buildImage builds an image from dockerfile with extra build args and

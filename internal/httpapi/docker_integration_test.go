@@ -239,7 +239,7 @@ func TestIntegrationServersAPI(t *testing.T) {
 		t.Fatalf("served %q, installed %q", fp, before.Fingerprint)
 	}
 	rr = h.do("PUT", "/api/v1/certificates/game", tok, apitypes.UpdateGameCertificateRequest{Mode: apitypes.CertificateModeSelfSigned})
-	mode := decode[apitypes.GameCertificate](t, rr)
+	mode := decode[apitypes.UpdateGameCertificateResponse](t, rr).Certificate
 	if mode.Certificate != nil {
 		t.Fatalf("%+v", mode)
 	}
@@ -262,9 +262,9 @@ func TestIntegrationServersAPI(t *testing.T) {
 		t.Fatalf("certificate replacement restarted or staled the server: %+v", again)
 	}
 	customChain, customKey := testCertPEM(t, "localhost", time.Now().Add(time.Hour))
-	custom := decode[apitypes.GameCertificate](t, h.do("PUT", "/api/v1/certificates/game", tok, apitypes.UpdateGameCertificateRequest{
+	custom := decode[apitypes.UpdateGameCertificateResponse](t, h.do("PUT", "/api/v1/certificates/game", tok, apitypes.UpdateGameCertificateRequest{
 		Mode: apitypes.CertificateModeCustom, CertificatePEM: customChain, PrivateKeyPEM: customKey,
-	}))
+	})).Certificate
 	if custom.Certificate == nil {
 		t.Fatal("missing uploaded certificate")
 	}
@@ -272,7 +272,7 @@ func TestIntegrationServersAPI(t *testing.T) {
 	if again := decode[apitypes.Server](t, h.do("GET", base, tok, nil)); !again.RestartRequired || again.ContainerID != got.ContainerID {
 		t.Fatalf("mode change did not flag the pinning configuration: %+v", again)
 	}
-	_ = decode[apitypes.GameCertificate](t, h.do("PUT", "/api/v1/certificates/game", tok, apitypes.UpdateGameCertificateRequest{Mode: apitypes.CertificateModeSelfSigned}))
+	_ = decode[apitypes.UpdateGameCertificateResponse](t, h.do("PUT", "/api/v1/certificates/game", tok, apitypes.UpdateGameCertificateRequest{Mode: apitypes.CertificateModeSelfSigned}))
 	back := decode[apitypes.Server](t, h.do("GET", base, tok, nil))
 	if back.Certificate == nil || back.Certificate.FingerprintSHA256 == after.Certificate.FingerprintSHA256 || back.ContainerID != got.ContainerID {
 		t.Fatalf("switching back did not regenerate the running server's certificate: %+v", back)

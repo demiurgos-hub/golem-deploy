@@ -1,6 +1,5 @@
-// Package certs manages the game TLS files on their per-server read-only
-// mounts. Self-signed servers have independent keys. In custom mode each
-// mount receives a copy of the administrator's pair.
+// Package certs manages game and panel TLS certificates, including ACME
+// issuance and renewal. Game servers read their pairs from per-server mounts.
 package certs
 
 import (
@@ -36,10 +35,11 @@ type Mode string
 const (
 	ModeSelfSigned Mode = "self_signed"
 	ModeCustom     Mode = "custom"
+	ModeACME       Mode = "acme"
 )
 
 // Valid reports whether m is a known mode.
-func (m Mode) Valid() bool { return m == ModeSelfSigned || m == ModeCustom }
+func (m Mode) Valid() bool { return m == ModeSelfSigned || m == ModeCustom || m == ModeACME }
 
 // File names inside the certificate directory, and the paths the engine
 // finds them at inside every server container.
@@ -79,7 +79,7 @@ var (
 	// ErrNoCertificate: no valid certificate is installed (a custom
 	// certificate that was never uploaded or is damaged).
 	ErrNoCertificate = errors.New("certs: no valid game certificate is installed")
-	// ErrExpired: the custom certificate has expired.
+	// ErrExpired: the shared certificate has expired.
 	ErrExpired = errors.New("certs: the game certificate has expired")
 )
 
@@ -148,7 +148,7 @@ func (i Info) APIInfo(host string) *apitypes.CertificateInfo {
 // Manager owns the certificate directory. It is safe for concurrent use;
 // changes are serialised.
 type Manager struct {
-	dir      string // canonical custom pair (also read on upgrades)
+	dir      string // canonical custom or ACME pair
 	settings Settings
 	logger   *slog.Logger
 	now      func() time.Time
@@ -213,7 +213,7 @@ func (m *Manager) Mode(ctx context.Context) (Mode, error) {
 }
 
 // Current returns certificate metadata for the configured mode. Pass 0 for
-// the installation view, which only describes a custom certificate.
+// the installation view, which only describes a shared certificate.
 func (m *Manager) Current(ctx context.Context, id int64) (Info, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -237,7 +237,7 @@ func (m *Manager) Current(ctx context.Context, id int64) (Info, error) {
 }
 
 // Ensure prepares a server's mount and returns the selected certificate.
-// In custom mode it never generates a missing pair.
+// In shared modes it never generates a missing pair.
 func (m *Manager) Ensure(ctx context.Context, id int64, gameHost func(context.Context) (string, error)) (Info, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -250,7 +250,7 @@ func (m *Manager) Ensure(ctx context.Context, id int64, gameHost func(context.Co
 		return Info{}, err
 	}
 	dir := m.ServerDir(id)
-	if mode == ModeCustom {
+	if mode != ModeSelfSigned {
 		info, err := load(m.dir)
 		info.Mode = mode
 		if err != nil {
@@ -321,9 +321,13 @@ func (m *Manager) UseCustom(ctx context.Context, chainPEM, keyPEM []byte) (Info,
 	if err != nil {
 		return Info{}, err
 	}
+	return m.useShared(ctx, ModeCustom, chain, key)
+}
+
+func (m *Manager) useShared(ctx context.Context, mode Mode, chain, key []byte) (Info, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.change(ctx, ModeCustom, func(stage string, ids []int64) error {
+	if err := m.change(ctx, mode, func(stage string, ids []int64) error {
 		if err := m.install(filepath.Join(stage, "custom"), chain, key); err != nil {
 			return err
 		}
@@ -337,7 +341,7 @@ func (m *Manager) UseCustom(ctx context.Context, chainPEM, keyPEM []byte) (Info,
 		return Info{}, err
 	}
 	info, err := load(m.dir)
-	info.Mode = ModeCustom
+	info.Mode = mode
 	return info, err
 }
 
@@ -400,6 +404,9 @@ func (m *Manager) check(ctx context.Context, host func(context.Context) (string,
 		}
 		return nil
 	}
+	if mode == ModeACME {
+		return nil // automatic certificates are checked by Automation
+	}
 	h, err := host(ctx)
 	if err != nil {
 		return err
@@ -426,7 +433,7 @@ func (m *Manager) check(ctx context.Context, host func(context.Context) (string,
 
 // selfSignedOK reports whether info is a usable generated certificate for
 // host.
-func (m *Manager) selfSignedOK(info Info, host string) bool {
+func (m *Manager) selfSignedOK(info Info, hosts ...string) bool {
 	now := m.now()
 	if !info.SelfSigned || info.NotBefore.After(now) || info.NotAfter.Sub(now) < RenewBefore {
 		return false
@@ -435,7 +442,7 @@ func (m *Manager) selfSignedOK(info Info, host string) bool {
 	if info.NotAfter.Sub(info.NotBefore) > SelfSignedValidity || !ok || key.Curve != elliptic.P256() {
 		return false
 	}
-	dns, ips := selfSignedNames(host)
+	dns, ips := selfSignedNames(hosts...)
 	return slices.Equal(sortedCopy(info.DNSNames), sortedCopy(dns)) && slices.Equal(sortedCopy(info.IPAddresses), sortedCopy(ips))
 }
 
@@ -520,21 +527,18 @@ func clean(s string, max int) string {
 }
 
 // selfSignedNames returns the SANs of a generated certificate for host.
-func selfSignedNames(host string) (dns, ips []string) {
+func selfSignedNames(hosts ...string) (dns, ips []string) {
 	dns = []string{"localhost"}
 	ips = []string{"127.0.0.1", "::1"}
-	if host == "" {
-		return dns, ips
-	}
-	if ip, err := netip.ParseAddr(host); err == nil {
-		s := ip.Unmap().String()
-		if !slices.Contains(ips, s) {
-			ips = append(ips, s)
+	for _, host := range hosts {
+		if ip, err := netip.ParseAddr(host); err == nil {
+			s := ip.Unmap().String()
+			if !slices.Contains(ips, s) {
+				ips = append(ips, s)
+			}
+		} else if host != "" && !slices.Contains(dns, host) {
+			dns = append(dns, host)
 		}
-		return dns, ips
-	}
-	if !slices.Contains(dns, host) {
-		dns = append(dns, host)
 	}
 	return dns, ips
 }

@@ -103,7 +103,7 @@ func (m *Manager) publish(mode Mode) error {
 	if err != nil {
 		return err
 	}
-	if mode == ModeCustom {
+	if mode != ModeSelfSigned {
 		if err := m.copyPair(filepath.Join(stage, "custom"), m.dir); err != nil {
 			return err
 		}
@@ -114,7 +114,7 @@ func (m *Manager) publish(mode Mode) error {
 			continue
 		}
 		src := filepath.Join(stage, entry.Name())
-		if mode == ModeCustom {
+		if mode != ModeSelfSigned {
 			src = filepath.Join(stage, "custom")
 		}
 		if err := m.copyPair(src, m.ServerDir(id)); err != nil {
@@ -159,6 +159,9 @@ func (m *Manager) openFiles(ctx context.Context) error {
 		return err
 	}
 	if err := m.recoverPending(m.dir); err != nil {
+		return err
+	}
+	if err := os.Chmod(filepath.Join(m.dir, KeyFile), 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if mode == ModeSelfSigned {

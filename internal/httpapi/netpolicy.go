@@ -26,6 +26,10 @@ func NormalizePublicHosts(in []string) ([]string, error) {
 		if h == "" {
 			continue
 		}
+		if ip, err := netip.ParseAddr(h); err == nil && ip.Zone() == "" {
+			out = append(out, ip.Unmap().String())
+			continue
+		}
 		if len(h) > 253 || strings.ContainsAny(h, ":/[]*@ \t") {
 			return nil, fmt.Errorf("invalid public host %q: give a bare host name such as deploy.example.com (no scheme, port or path)", raw)
 		}
@@ -76,20 +80,25 @@ func unmappedBits(p netip.Prefix) int {
 // literals and "localhost" with any port, or a configured public host name.
 // An empty Host is refused.
 func (s *Server) hostAllowed(host string) bool {
+	h := requestHostname(host)
+	if h == "" {
+		return false
+	}
+	if ip, err := netip.ParseAddr(h); err == nil && ip.Zone() == "" {
+		return true
+	}
+	return h == "localhost" || s.publicHosts[h] ||
+		(len(s.publicHosts) == 0 && s.automation != nil && s.automation.IsPanelHost(h))
+}
+
+func requestHostname(host string) string {
 	h := host
 	if hh, _, err := net.SplitHostPort(host); err == nil {
 		h = hh
 	} else if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
 		h = h[1 : len(h)-1]
 	}
-	h = strings.TrimSuffix(strings.ToLower(h), ".")
-	if h == "" {
-		return false
-	}
-	if _, err := netip.ParseAddr(h); err == nil {
-		return true
-	}
-	return h == "localhost" || s.publicHosts[h]
+	return strings.TrimSuffix(strings.ToLower(h), ".")
 }
 
 var errBadHost = newError(http.StatusMisdirectedRequest, apitypes.ErrorCodeBadHost,

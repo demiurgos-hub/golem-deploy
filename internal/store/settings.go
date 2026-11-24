@@ -15,7 +15,9 @@ const (
 	SettingGameHost = "game_host"
 	// SettingGameCertificateMode is the game certificate mode and its
 	// committed file generation (internal/certs; "" means self-signed).
-	SettingGameCertificateMode = "game_certificate_mode"
+	SettingGameCertificateMode  = "game_certificate_mode"
+	SettingPanelCertificateMode = "panel_certificate_mode"
+	SettingACME                 = "acme_settings"
 )
 
 // Settings is the typed view of the settings table. Missing keys take the
@@ -50,7 +52,7 @@ func (s *Store) GetSetting(ctx context.Context, key string) (string, bool, error
 func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 	const upsert = `INSERT INTO settings (key, value) VALUES (?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`
-	if key == SettingGameCertificateMode {
+	if key == SettingGameCertificateMode || key == SettingPanelCertificateMode || key == SettingACME {
 		return mapErr("set certificate state", s.durableWrite(ctx, upsert, key, value))
 	}
 	_, err := s.db.ExecContext(ctx, upsert, key, value)
@@ -75,14 +77,17 @@ func (s *Store) GetSettings(ctx context.Context) (Settings, error) {
 
 // UpdateSettings applies upd and returns the resulting settings.
 func (s *Store) UpdateSettings(ctx context.Context, upd SettingsUpdate) (Settings, error) {
-	if upd.RegistrationEnabled != nil {
-		if err := s.SetSetting(ctx, SettingRegistrationEnabled, strconv.FormatBool(*upd.RegistrationEnabled)); err != nil {
-			return Settings{}, err
+	if upd.RegistrationEnabled != nil || upd.GameHost != nil {
+		var registration any
+		if upd.RegistrationEnabled != nil {
+			registration = strconv.FormatBool(*upd.RegistrationEnabled)
 		}
-	}
-	if upd.GameHost != nil {
-		if err := s.SetSetting(ctx, SettingGameHost, *upd.GameHost); err != nil {
-			return Settings{}, err
+		const update = `WITH changes(key, value) AS (VALUES (?, ?), (?, ?))
+			INSERT INTO settings (key, value)
+			SELECT key, value FROM changes WHERE value IS NOT NULL
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+		if err := s.durableWrite(ctx, update, SettingRegistrationEnabled, registration, SettingGameHost, upd.GameHost); err != nil {
+			return Settings{}, mapErr("update settings", err)
 		}
 	}
 	return s.GetSettings(ctx)
