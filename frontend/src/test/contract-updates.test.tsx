@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, screen, waitFor, within } from "@testing-library/react";
-import type { Image, Job, Project, Server, StaticFileList } from "@/api/types.gen";
+import type { Job, Project, Server, StaticFileList } from "@/api/types.gen";
+import { buildFixture, projectFixture, serverFixture } from "@/test/fixtures";
 import { account, errorResponse, job, jsonResponse, streamResponse, type FakeRequest } from "@/test/fake-api";
 import { renderApp } from "@/test/render-app";
 
@@ -9,49 +10,8 @@ import { renderApp } from "@/test/render-app";
 // and state rules for servers, static store usage, quota and upload limits,
 // escaped log output, and list polling.
 
-const project: Project = {
-  id: 5,
-  name: "arena",
-  repo_url: "https://github.com/example/arena.git",
-  branch: "main",
-  auth_type: "https",
-  auth_username: "deploy-bot",
-  has_secret: true,
-  last_commit: "4f1c2a9e0b7d3c5a8e6f1b2c3d4e5f6a7b8c9d0e",
-  last_pulled_at: "2026-11-20T10:00:00Z",
-  status: "idle",
-  created_at: "2026-11-01T10:00:00Z",
-  updated_at: "2026-11-20T10:00:00Z",
-};
-
-const IMAGE_ID = "sha256:" + "ab".repeat(32);
-const image: Image = {
-  id: IMAGE_ID,
-  tags: ["gdm2i-echo:latest"],
-  project_id: null,
-  commit: "",
-  size_bytes: 4_000_000,
-  created_at: "2026-11-20T10:00:00Z",
-  server_ids: [],
-  in_use: false,
-};
-
-const server: Server = {
-  id: 3,
-  name: "echo",
-  project_id: null,
-  image: IMAGE_ID,
-  port: 7830,
-  env_keys: ["GREETING"],
-  desired_state: "running",
-  state: "running",
-  container_id: "c0ffee",
-  started_at: "2026-11-20T10:00:00Z",
-  exit_code: null,
-  restart_required: false,
-  created_at: "2026-11-20T10:00:00Z",
-  updated_at: "2026-11-20T11:00:00Z",
-};
+const project: Project = projectFixture({ auth_type: "https", auth_username: "deploy-bot", has_secret: true });
+const server: Server = serverFixture({ port: 7830, public_url: "https://localhost:7830/" });
 
 const KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ==\n-----END OPENSSH PRIVATE KEY-----";
 
@@ -59,9 +19,9 @@ function serverRoutes(s: Server, extra: Record<string, (req: FakeRequest) => Res
   return {
     "GET /servers/{id}": () => jsonResponse(200, s),
     "GET /projects": () => jsonResponse(200, { items: [] }),
-    "GET /images": () => jsonResponse(200, { items: [image] }),
     "GET /jobs": () => jsonResponse(200, { items: [] }),
     "GET /servers/{id}/stats": () => errorResponse(409, "conflict", "the server is not running"),
+    "GET /servers/{id}/runtime": () => errorResponse(409, "conflict", "the server is not running"),
     "GET /servers/{id}/logs": () => streamResponse().response,
     ...extra,
   };
@@ -262,19 +222,19 @@ describe("server environment", () => {
     expect(await screen.findByText(/was saved at the same moment, so yours was not.*save again/)).toBeInTheDocument();
   });
 
-  it("routes env.<KEY> errors on create to the row and the image volume limit to the image field", async () => {
+  it("routes env.<KEY> errors on create to the row and a build_id error to the build field", async () => {
     let n = 0;
     const { user } = renderApp({
       path: "/servers",
       signedInAs: account(),
       routes: {
         "GET /servers": () => jsonResponse(200, { items: [] }),
-        "GET /projects": () => jsonResponse(200, { items: [] }),
-        "GET /images": () => jsonResponse(200, { items: [image] }),
+        "GET /projects": () => jsonResponse(200, { items: [project] }),
+        "GET /builds": () => jsonResponse(200, { items: [buildFixture()] }),
         "POST /servers": () =>
           ++n === 1
             ? errorResponse(400, "validation_failed", "the variable exceeds 32768 bytes", { field: "env.SECRET" })
-            : errorResponse(400, "validation_failed", "the image declares more than 8 volumes", { field: "image" }),
+            : errorResponse(400, "validation_failed", "the build was deleted meanwhile; choose another build", { field: "build_id" }),
       },
     });
     await user.click((await screen.findAllByRole("button", { name: "New server" }))[0]);
@@ -288,9 +248,9 @@ describe("server environment", () => {
     expect(row?.getAttribute("data-env-row")).toBe("SECRET");
     expect(dialog.textContent).not.toContain("s3cret");
     await user.click(within(dialog).getByRole("button", { name: "Create server" }));
-    const imageField = within(dialog).getByLabelText("Image");
-    expect(await within(dialog).findByText("The image declares more than 8 volumes.")).toBeInTheDocument();
-    expect(imageField.getAttribute("aria-describedby")).toBeTruthy();
+    const buildField = within(dialog).getByLabelText("Build");
+    expect(await within(dialog).findByText("The build was deleted meanwhile; choose another build.")).toBeInTheDocument();
+    expect(buildField.getAttribute("aria-describedby")).toBeTruthy();
   });
 
   it("names the variable of an import value error", async () => {
@@ -300,14 +260,13 @@ describe("server environment", () => {
       routes: {
         "GET /servers": () => jsonResponse(200, { items: [] }),
         "GET /projects": () => jsonResponse(200, { items: [] }),
-        "GET /images": () => jsonResponse(200, { items: [] }),
         "POST /servers/import": () => errorResponse(400, "validation_failed", "the value contains a NUL byte", { field: "servers[0].env.MOTD" }),
       },
     });
     await user.click(await screen.findByRole("button", { name: "Import" }));
     const input = container.ownerDocument.querySelector<HTMLInputElement>("input[type=file]");
     if (!input) throw new Error("no file input");
-    await user.upload(input, new File([JSON.stringify({ format_version: 1, servers: [{ name: "a", image: "x", env: { MOTD: "ok" } }] })], "s.json"));
+    await user.upload(input, new File([JSON.stringify({ format_version: 2, servers: [{ name: "a", project: "arena", env: { MOTD: "ok" } }] })], "s.json"));
     await user.click(await screen.findByRole("button", { name: "Import 1 server" }));
     expect(await screen.findByText("Server 1 (a), environment variable MOTD:")).toBeInTheDocument();
   });
@@ -324,8 +283,8 @@ describe("server port and state", () => {
         "PATCH /servers/{id}": () => errorResponse(409, "conflict", "stop the server before changing its port"),
       }),
     });
-    await user.click(await screen.findByRole("button", { name: "Edit" }));
-    let dialog = await screen.findByRole("dialog", { name: "Edit echo" });
+    await user.click(await screen.findByRole("button", { name: "Change port" }));
+    let dialog = await screen.findByRole("dialog", { name: "Change the port of echo" });
     expect(within(dialog).getByLabelText("Port")).toBeDisabled();
     expect(within(dialog).getByText(/Stop the server to change its port/)).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
@@ -335,8 +294,8 @@ describe("server port and state", () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 4200));
     });
-    await user.click(screen.getByRole("button", { name: "Edit" }));
-    dialog = await screen.findByRole("dialog", { name: "Edit echo" });
+    await user.click(screen.getByRole("button", { name: "Change port" }));
+    dialog = await screen.findByRole("dialog", { name: "Change the port of echo" });
     const port = within(dialog).getByLabelText("Port");
     expect(port).toBeEnabled();
     await user.clear(port);

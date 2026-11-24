@@ -1,7 +1,7 @@
 import { useQuery, type QueryClient } from "@tanstack/react-query";
 import { useApi } from "@/app/services";
 import { qk } from "@/api/query-keys";
-import type { Job, Project, Server, SubjectType } from "@/api/types.gen";
+import type { Build, Job, Project, Server, SubjectType } from "@/api/types.gen";
 
 export function isJobActive(job: Pick<Job, "status"> | undefined): boolean {
   return job?.status === "queued" || job?.status === "running";
@@ -24,6 +24,10 @@ function isServerSettling(s: Pick<Server, "state" | "desired_state">): boolean {
   return s.state === "restarting" || (s.desired_state === "running" ? s.state !== "running" : s.state === "running");
 }
 
+export function isBuildActive(b: Pick<Build, "status"> | undefined): boolean {
+  return b?.status === "queued" || b?.status === "running";
+}
+
 export function isProjectBusy(p: Pick<Project, "status">): boolean {
   return p.status === "cloning" || p.status === "pulling" || p.status === "switching_branch";
 }
@@ -35,9 +39,12 @@ export function invalidateJobSubject(queryClient: QueryClient, job: Job) {
   void queryClient.invalidateQueries({ queryKey: qk.status });
   if (job.subject_type === "project") {
     void queryClient.invalidateQueries({ queryKey: qk.projects.all });
+    void queryClient.invalidateQueries({ queryKey: qk.builds.all });
     void queryClient.invalidateQueries({ queryKey: qk.images });
   } else if (job.subject_type === "server") {
     void queryClient.invalidateQueries({ queryKey: qk.servers.all });
+    // A start records the game's schema fingerprint on the build.
+    void queryClient.invalidateQueries({ queryKey: qk.builds.all });
     void queryClient.invalidateQueries({ queryKey: qk.volumes });
     void queryClient.invalidateQueries({ queryKey: qk.images });
   }
@@ -161,6 +168,59 @@ export function useServerStats(server: Server | undefined) {
     staleTime: 0,
     refetchInterval: running ? 3000 : false,
   });
+}
+
+/** The project's builds, newest first; polled fast while one is queued or running, slowly otherwise. */
+export function useProjectBuilds(projectId: number) {
+  const api = useApi();
+  return useQuery({
+    queryKey: qk.builds.forProject(projectId),
+    queryFn: ({ signal }) => api.projects.builds(projectId, { limit: 100 }, signal),
+    refetchInterval: (q) => listPollInterval(q.state.data?.items.some(isBuildActive) ?? false),
+  });
+}
+
+/** Successful builds of every project, newest first: what a server can run. */
+export function useSuccessfulBuilds(enabled = true) {
+  const api = useApi();
+  return useQuery({
+    queryKey: qk.builds.successful,
+    queryFn: ({ signal }) => api.builds.list({ status: "success", limit: 500 }, signal),
+    enabled,
+  });
+}
+
+export function useBuild(id: number) {
+  const api = useApi();
+  return useQuery({
+    queryKey: qk.builds.detail(id),
+    queryFn: ({ signal }) => api.builds.get(id, signal),
+    // Active builds change on their own; a finished one only gains a schema fingerprint or servers.
+    refetchInterval: (q) => (isBuildActive(q.state.data) ? 1500 : POLL_IDLE_MS),
+  });
+}
+
+/**
+ * The running game's runtime view, sampled while the server runs and the page
+ * is visible. 409 (not running) and 503 (admin endpoint silent, Docker
+ * unreachable) are expected answers, not failures to retry.
+ */
+export function useServerRuntime(server: Server | undefined) {
+  const api = useApi();
+  const running = server?.state === "running";
+  return useQuery({
+    queryKey: qk.servers.runtime(server?.id ?? 0),
+    queryFn: ({ signal }) => api.servers.runtime(server?.id ?? 0, signal),
+    enabled: running,
+    staleTime: 0,
+    retry: false,
+    refetchInterval: running ? 3000 : false,
+  });
+}
+
+export function useGameCertificate() {
+  const api = useApi();
+  return useQuery({ queryKey: qk.certificate, queryFn: ({ signal }) => api.certificates.game(signal), retry: false });
 }
 
 export function useImages() {

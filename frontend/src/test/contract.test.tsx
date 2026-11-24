@@ -1,55 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
-import type { Image, Project, Server } from "@/api/types.gen";
+import type { Project, Server } from "@/api/types.gen";
+import { buildFixture, projectFixture, serverFixture } from "@/test/fixtures";
 import { account, errorResponse, job, jsonResponse, streamResponse } from "@/test/fake-api";
 import { renderApp } from "@/test/render-app";
 
 // Behaviour that follows the final API v1 contract (docs/API.md).
 
-const project: Project = {
-  id: 5,
-  name: "arena",
-  repo_url: "https://github.com/example/arena.git",
-  branch: "main",
-  auth_type: "none",
-  auth_username: "",
-  has_secret: false,
-  last_commit: "",
-  last_pulled_at: null,
-  status: "cloning",
-  created_at: "2026-11-01T10:00:00Z",
-  updated_at: "2026-11-20T10:00:00Z",
-};
-
-const IMAGE_ID = "sha256:" + "ab".repeat(32);
-
-const image: Image = {
-  id: IMAGE_ID,
-  tags: ["gdm2f-echo:latest"],
-  project_id: null,
-  commit: "",
-  size_bytes: 4_000_000,
-  created_at: "2026-11-20T10:00:00Z",
-  server_ids: [],
-  in_use: false,
-};
-
-const server: Server = {
-  id: 3,
-  name: "echo",
-  project_id: null,
-  image: IMAGE_ID,
-  port: 7810,
-  env_keys: ["GREETING"],
-  desired_state: "running",
-  state: "running",
-  container_id: "c0ffee",
-  started_at: "2026-11-20T10:00:00Z",
-  exit_code: null,
-  restart_required: true,
-  created_at: "2026-11-20T10:00:00Z",
-  updated_at: "2026-11-20T11:00:00Z",
-};
+const project: Project = projectFixture({ last_commit: "", last_pulled_at: null, status: "cloning" });
+const build = buildFixture();
+const server: Server = serverFixture({ restart_required: true });
 
 describe("login page and /auth/options", () => {
   it("offers registration only when it is enabled", async () => {
@@ -172,30 +132,30 @@ describe("jobs and the developer role", () => {
 });
 
 describe("servers", () => {
-  it("explains that images come from builds when no managed image exists", async () => {
+  it("explains that servers run builds when no successful build exists", async () => {
     const { user } = renderApp({
       path: "/servers",
       signedInAs: account(),
       routes: {
         "GET /servers": () => jsonResponse(200, { items: [] }),
-        "GET /projects": () => jsonResponse(200, { items: [] }),
-        "GET /images": () => jsonResponse(200, { items: [] }),
+        "GET /projects": () => jsonResponse(200, { items: [projectFixture()] }),
       },
     });
     await user.click((await screen.findAllByRole("button", { name: "New server" }))[0]);
     const dialog = await screen.findByRole("dialog", { name: "New server" });
-    expect(await within(dialog).findByText("No managed images yet")).toBeInTheDocument();
+    expect(await within(dialog).findByText("No successful builds yet")).toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "Create server" })).toBeDisabled();
   });
 
-  it("creates a server from a managed image by id", async () => {
+  it("creates a server from the newest successful build of a project", async () => {
+    const older = buildFixture({ id: 9, commit: "0d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e" });
     const { user, calls } = renderApp({
       path: "/servers",
       signedInAs: account(),
       routes: {
         "GET /servers": () => jsonResponse(200, { items: [] }),
-        "GET /projects": () => jsonResponse(200, { items: [] }),
-        "GET /images": () => jsonResponse(200, { items: [image] }),
+        "GET /projects": () => jsonResponse(200, { items: [projectFixture()] }),
+        "GET /builds": () => jsonResponse(200, { items: [build, older] }),
         "POST /servers": () => jsonResponse(201, { ...server, restart_required: false, state: "missing" }),
         "GET /servers/{id}": () => jsonResponse(200, { ...server, restart_required: false, state: "missing" }),
         "GET /jobs": () => jsonResponse(200, { items: [] }),
@@ -203,11 +163,12 @@ describe("servers", () => {
     });
     await user.click((await screen.findAllByRole("button", { name: "New server" }))[0]);
     const dialog = await screen.findByRole("dialog", { name: "New server" });
-    const select = await within(dialog).findByLabelText("Image");
-    expect(within(select).getAllByRole("option").map((o) => (o as HTMLOptionElement).value)).toEqual([IMAGE_ID]);
+    const select = await within(dialog).findByLabelText("Build");
+    expect(within(select).getAllByRole("option").map((o) => (o as HTMLOptionElement).value)).toEqual(["12", "9"]);
+    expect(select).toHaveValue("12");
     await user.type(within(dialog).getByLabelText("Name"), "echo");
     await user.click(within(dialog).getByRole("button", { name: "Create server" }));
-    await waitFor(() => expect(calls.find((c) => c.method === "POST" && c.path === "/servers")?.body).toEqual({ name: "echo", image: IMAGE_ID, desired_state: "stopped" }));
+    await waitFor(() => expect(calls.find((c) => c.method === "POST" && c.path === "/servers")?.body).toEqual({ name: "echo", build_id: 12, desired_state: "stopped" }));
   });
 
   it("shows restart_required and a 429 on the log stream inside the viewer with a retry", async () => {
@@ -218,9 +179,9 @@ describe("servers", () => {
       routes: {
         "GET /servers/{id}": () => jsonResponse(200, server),
         "GET /projects": () => jsonResponse(200, { items: [] }),
-        "GET /images": () => jsonResponse(200, { items: [image] }),
         "GET /jobs": () => jsonResponse(200, { items: [] }),
         "GET /servers/{id}/stats": () => errorResponse(409, "conflict", "the server is not running"),
+        "GET /servers/{id}/runtime": () => errorResponse(409, "conflict", "the server is not running"),
         "GET /servers/{id}/logs": () => {
           attempts++;
           return errorResponse(429, "rate_limited", "too many open log streams; close one and retry", { headers: { "Retry-After": "5" } });
@@ -237,6 +198,7 @@ describe("servers", () => {
     await waitFor(() => expect(attempts).toBe(2));
     // A race with a stopped container shows as text, not an error.
     expect(await screen.findByText(/The server is not running\. Statistics are available/)).toBeInTheDocument();
+    expect(await screen.findByText(/The server is not running\. The game reports its runtime/)).toBeInTheDocument();
   });
 
   it("shows the import error the daemon returns, naming the entry", async () => {
@@ -246,19 +208,18 @@ describe("servers", () => {
       routes: {
         "GET /servers": () => jsonResponse(200, { items: [] }),
         "GET /projects": () => jsonResponse(200, { items: [] }),
-        "GET /images": () => jsonResponse(200, { items: [] }),
         "POST /servers/import": () =>
-          errorResponse(400, "validation_failed", "image must be the id or a tag of a managed image", { field: "servers[1].image" }),
+          errorResponse(400, "validation_failed", 'project "kart" has no successful build', { field: "servers[1].project" }),
       },
     });
     await user.click(await screen.findByRole("button", { name: "Import" }));
-    const doc = { format_version: 1, servers: [{ name: "a", image: "x" }, { name: "b", image: "y" }] };
+    const doc = { format_version: 2, servers: [{ name: "a", project: "arena" }, { name: "b", project: "kart" }] };
     const input = container.ownerDocument.querySelector<HTMLInputElement>("input[type=file]");
     if (!input) throw new Error("no file input");
     await user.upload(input, new File([JSON.stringify(doc)], "servers.json", { type: "application/json" }));
     await user.click(await screen.findByRole("button", { name: "Import 2 servers" }));
-    expect(await screen.findByText("Server 2 (b), image:")).toBeInTheDocument();
-    expect(screen.getByText(/Image must be the id or a tag of a managed image\. Nothing was imported\./)).toBeInTheDocument();
+    expect(await screen.findByText("Server 2 (b), project:")).toBeInTheDocument();
+    expect(screen.getByText(/Project "kart" has no successful build\. Nothing was imported\./)).toBeInTheDocument();
   });
 });
 

@@ -5,15 +5,21 @@ import type {
   AccountList,
   AuthOptions,
   BranchList,
+  Build,
+  BuildList,
+  BuildStatus,
   ChangePasswordRequest,
   ChangePasswordResponse,
   CreateAPITokenRequest,
   CreateAPITokenResponse,
   CreateAccountRequest,
+  CreateBuildRequest,
+  CreateBuildResponse,
   CreateProjectRequest,
   CreateProjectResponse,
   CreateServerRequest,
   CurrentAccount,
+  GameCertificate,
   ImageList,
   Job,
   JobList,
@@ -25,6 +31,7 @@ import type {
   ServerExport,
   ServerImportResult,
   ServerList,
+  ServerRuntime,
   ServerStats,
   SessionResponse,
   Settings,
@@ -33,6 +40,7 @@ import type {
   SubjectType,
   SwitchBranchRequest,
   UpdateAccountRequest,
+  UpdateGameCertificateRequest,
   UpdateProjectRequest,
   UpdateServerRequest,
   UpdateSettingsRequest,
@@ -104,6 +112,22 @@ export function createEndpoints(c: ApiClient) {
         c.request<Job>("POST", `/projects/${seg(id)}/branch`, { body }),
       branches: (id: number, signal?: AbortSignal) =>
         c.request<BranchList>("GET", `/projects/${seg(id)}/branches`, { signal }),
+      /** An empty body builds the current checkout; `pull` updates it first in the same job. */
+      build: (id: number, body: CreateBuildRequest) =>
+        c.request<CreateBuildResponse>("POST", `/projects/${seg(id)}/builds`, { body }),
+      builds: (id: number, filter: { status?: BuildStatus; limit?: number }, signal?: AbortSignal) =>
+        c.request<BuildList>("GET", `/projects/${seg(id)}/builds`, { query: filter, signal }),
+    },
+    builds: {
+      list: (filter: { project_id?: number; status?: BuildStatus; limit?: number }, signal?: AbortSignal) =>
+        c.request<BuildList>("GET", "/builds", { query: filter, signal }),
+      get: (id: number, signal?: AbortSignal) => c.request<Build>("GET", `/builds/${seg(id)}`, { signal }),
+      remove: (id: number) => c.request<void>("DELETE", `/builds/${seg(id)}`),
+    },
+    certificates: {
+      game: (signal?: AbortSignal) => c.request<GameCertificate>("GET", "/certificates/game", { signal }),
+      updateGame: (body: UpdateGameCertificateRequest) =>
+        c.request<GameCertificate>("PUT", "/certificates/game", { body }),
     },
     servers: {
       list: (signal?: AbortSignal) => c.request<ServerList>("GET", "/servers", { signal }),
@@ -118,6 +142,8 @@ export function createEndpoints(c: ApiClient) {
       restart: (id: number) => c.request<Job>("POST", `/servers/${seg(id)}/restart`),
       stats: (id: number, signal?: AbortSignal) =>
         c.request<ServerStats>("GET", `/servers/${seg(id)}/stats`, { signal }),
+      runtime: (id: number, signal?: AbortSignal) =>
+        c.request<ServerRuntime>("GET", `/servers/${seg(id)}/runtime`, { signal }),
       logsPath: (id: number) => `/servers/${seg(id)}/logs`,
       exportAll: () => c.request<ServerExport>("GET", "/servers/export"),
       importAll: (body: ServerExport) =>

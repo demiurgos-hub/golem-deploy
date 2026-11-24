@@ -7,6 +7,7 @@ import { isApiError, sentence } from "@/api/errors";
 import { isProjectBusy, useAccount, useProjects } from "@/api/queries";
 import { qk } from "@/api/query-keys";
 import type { Job, Project } from "@/api/types.gen";
+import { GettingStarted } from "@/components/getting-started";
 import { InlineJob } from "@/components/jobs";
 import {
   ProjectAuthFields,
@@ -43,7 +44,7 @@ export function ProjectsPage() {
     <>
       <PageHeader
         title="Projects"
-        description="Git repositories the daemon clones and builds into game server images."
+        description="Git repositories the daemon clones. Open a project to build it into an image that servers run."
         actions={
           isAdmin && (
             <Button onClick={() => setCreating(true)}>
@@ -53,6 +54,7 @@ export function ProjectsPage() {
           )
         }
       />
+      <GettingStarted />
       {projects.isPending ? (
         <LoadingState label="Loading projects" />
       ) : projects.isError ? (

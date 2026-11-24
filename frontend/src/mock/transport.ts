@@ -1,12 +1,14 @@
 /**
- * Dev-only stand-in for the Docker- and git-backed routes (projects,
- * servers, images, static files, volumes, and their jobs), so the web
- * client can be developed without Docker, git or network access. It follows
- * the final API v1 contract (docs/API.md) and the generated wire types:
- * access levels, restricted jobs, error codes and messages, the follow
- * stream cap, tail bounds, static replace semantics and import validation.
+ * Dev-only stand-in for the Docker-, git- and file-backed routes (projects,
+ * builds, servers and their runtime view, images, static files, volumes, the
+ * game certificate, and their jobs), so the web client can be developed
+ * without Docker, git or network access. It follows the API v1 contract
+ * (docs/API.md) and the generated wire types: access levels, restricted
+ * jobs, error codes and messages, the follow stream cap, tail bounds, static
+ * replace semantics, build and deploy rules and import validation.
  * Everything else (auth, account, admin, settings, status, other jobs) and
- * the caller's identity come from the real daemon.
+ * the caller's identity come from the real daemon; the game host is the
+ * page's host name.
  *
  * Enabled with VITE_API_MOCK=1 under `vite` (dev). It is imported only behind
  * `import.meta.env.DEV`, so production builds drop it; vite.config.ts fails
@@ -14,10 +16,16 @@
  */
 import type { RawResponse, Transport, UploadRequest } from "@/api/client";
 import type {
+  Build,
+  BuildStatus,
+  CertificateInfo,
+  CertificateMode,
+  CreateBuildRequest,
   CreateProjectRequest,
   CreateServerRequest,
   CurrentAccount,
   ErrorCode,
+  GameCertificate,
   Image,
   Job,
   JobKind,
@@ -25,9 +33,12 @@ import type {
   ProjectAuth,
   Server,
   ServerExport,
+  ServerRuntime,
+  StaticAddon,
   StaticFile,
   SubjectType,
   SwitchBranchRequest,
+  UpdateGameCertificateRequest,
   UpdateProjectRequest,
   UpdateServerRequest,
   Volume,
@@ -46,11 +57,18 @@ const STATIC_QUOTA = 200 * 1024 * 1024;
 const STATIC_MAX_FILES = 2000;
 const MAX_UPLOADS = 2;
 const MAX_IMPORT = 128;
-const MAX_IMAGE_VOLUMES = 8;
+const MAX_ACTIVE_BUILDS = 4;
+const MAX_ADDONS = 16;
+const MAX_ORIGINS = 16;
 
 interface MockState {
   projects: Project[];
+  builds: Build[];
   servers: Server[];
+  /** Per-server self-signed certificates (created by the first start). */
+  serverCerts: Map<number, CertificateInfo>;
+  certMode: CertificateMode;
+  customCert: CertificateInfo | null;
   env: Map<number, Record<string, string>>;
   images: Image[];
   statics: Map<string, { meta: StaticFile; blob: Blob }>;
@@ -60,6 +78,7 @@ interface MockState {
   follows: Map<number, number>;
   uploads: Map<number, number>;
   nextId: number;
+  nextBuildId: number;
   nextJobId: number;
   requestSeq: number;
 }
@@ -72,9 +91,46 @@ const DAY = 24 * HOUR;
 const IMG_ARENA = "sha256:4f1c2a9e0b7d3c5a8e6f1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e";
 const IMG_ARENA_OLD = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const IMG_KART = "sha256:9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9a8b7c6d5e4f3a2b1c0d9e8f";
-// Declares more than 8 VOLUMEs: the daemon refuses to run it.
-const IMG_VOLUMES = "sha256:5555555555555555555555555555555555555555555555555555555555555555";
-const VOLUME_COUNT: Record<string, number> = { [IMG_VOLUMES]: 12 };
+// Left behind by a build whose image could not be removed: no build records it.
+const IMG_ORPHAN = "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+const COMMIT_ARENA = "4f1c2a9e0b7d3c5a8e6f1b2c3d4e5f6a7b8c9d0e";
+const COMMIT_ARENA_OLD = "0d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e";
+const COMMIT_KART = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b";
+const ENGINE = "v0.4.0-rc.1";
+const FINGERPRINT = "3b6f0c2a91d4e8f7";
+
+/** The game host servers use: the page's host name (the real one comes from the daemon's settings). */
+function gameHost(): string {
+  return typeof window !== "undefined" && window.location.hostname ? window.location.hostname : "localhost";
+}
+
+function fakeFingerprint(seed: string): string {
+  let h = 2166136261;
+  let out = "";
+  for (let i = 0; out.length < 64; i++) {
+    h = Math.imul(h ^ seed.charCodeAt(i % Math.max(1, seed.length)) ^ i, 16777619) >>> 0;
+    out += h.toString(16).padStart(8, "0");
+  }
+  return out.slice(0, 64);
+}
+
+/** A self-signed certificate like the daemon generates per server: 13 days, game host, localhost and loopback. */
+function selfSignedCert(seed: string, ageMs = 0): CertificateInfo {
+  const host = gameHost();
+  const from = Date.now() - ageMs - HOUR;
+  return {
+    subject: `CN=${host}`,
+    issuer: `CN=${host}`,
+    dns_names: [...new Set([host, "localhost"])].filter((h) => !/^[\d.:]+$/.test(h)),
+    ip_addresses: ["127.0.0.1", "::1"],
+    not_before: new Date(from).toISOString(),
+    not_after: new Date(from + 13 * DAY).toISOString(),
+    fingerprint_sha256: fakeFingerprint(seed),
+    self_signed: true,
+    chain_length: 1,
+    covers_game_host: true,
+  };
+}
 
 function seed(): MockState {
   const project = (id: number, name: string, repo: string, extra: Partial<Project>): Project => ({
@@ -85,20 +141,25 @@ function seed(): MockState {
     auth_type: "none",
     auth_username: "",
     has_secret: false,
-    last_commit: "4f1c2a9e0b7d3c5a8e6f1b2c3d4e5f6a7b8c9d0e",
+    last_commit: COMMIT_ARENA,
     last_pulled_at: iso(2 * HOUR),
     status: "idle",
+    static_addons: [],
+    allow_custom_dockerfile: false,
     created_at: iso(20 * DAY),
     updated_at: iso(2 * HOUR),
     ...extra,
   });
   const projects: Project[] = [
-    project(1, "arena-shooter", "https://github.com/example/arena-shooter.git", {}),
+    project(1, "arena-shooter", "https://github.com/example/arena-shooter.git", {
+      static_addons: [{ name: "maps-pack-v3.zip", target: "assets/maps" }],
+    }),
+    // Its newest build failed the engine version check.
     project(2, "kart-racer", "git@gitlab.example.com:studio/kart-racer.git", {
       branch: "develop",
       auth_type: "ssh",
       has_secret: true,
-      last_commit: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b",
+      last_commit: COMMIT_KART,
       last_pulled_at: iso(3 * DAY),
     }),
     // A failed clone: no checkout, repaired by pulling.
@@ -111,12 +172,93 @@ function seed(): MockState {
       status: "error",
     }),
   ];
+
+  const jobs: Job[] = [];
+  const jobLogs = new Map<number, string[]>();
+  let nextJobId = 900_001;
+  const build = (id: number, projectId: number, status: BuildStatus, ageMs: number, extra: Partial<Build>, log: string[]): Build => {
+    const p = projects.find((x) => x.id === projectId);
+    const job: Job = {
+      id: nextJobId++,
+      kind: "project.build",
+      subject_type: "project",
+      subject_id: String(projectId),
+      status,
+      detail: extra.detail ?? "",
+      restricted: false,
+      created_by: null,
+      created_by_username: null,
+      created_at: iso(ageMs),
+      started_at: iso(ageMs - 1000),
+      finished_at: iso(ageMs - 4 * 60_000),
+    };
+    jobs.push(job);
+    jobLogs.set(job.id, log);
+    const ok = status === "success";
+    const commit = extra.commit ?? p?.last_commit ?? "";
+    return {
+      id,
+      project_id: projectId,
+      branch: p?.branch ?? "main",
+      commit,
+      status,
+      detail: "",
+      job_id: job.id,
+      image_id: "",
+      image_tag: ok ? `golem-deploy/${p?.name}:${commit.slice(0, 12)}-b${id}` : "",
+      engine_version: ENGINE,
+      schema_fingerprint: "",
+      webtransport_path: ok ? "/wt" : "",
+      websocket_path: ok ? "/api/ws" : "",
+      server_ids: [],
+      created_by: null,
+      created_at: iso(ageMs),
+      started_at: iso(ageMs - 1000),
+      finished_at: iso(ageMs - 4 * 60_000),
+      ...extra,
+    };
+  };
+  const okLog = (name: string) => [
+    "# generated Dockerfile",
+    "FROM golang:1.26-bookworm AS build",
+    `#12 [build 6/9] RUN go run github.com/demiurgos-hub/golem-engine/cmd/golem-bake@${ENGINE}`,
+    "#14 [build 8/9] RUN CGO_ENABLED=0 go build -trimpath -o /out/golem-server ./cmd/server",
+    `#18 naming to docker.io/golem-deploy/${name} done`,
+    "build succeeded",
+  ];
+  const builds: Build[] = [
+    build(1, 1, "success", 9 * DAY, { commit: COMMIT_ARENA_OLD, image_id: IMG_ARENA_OLD, schema_fingerprint: "a0c3d9e1f2b47c55" }, okLog("arena-shooter")),
+    build(2, 1, "error", 3 * DAY, { detail: "docker build failed; see the build log" }, [
+      "#14 [build 8/9] RUN CGO_ENABLED=0 go build -trimpath ./cmd/server",
+      "#14 0.912 cmd/server/main.go:41:2: undefined: host.Run",
+      "error: docker build failed",
+    ]),
+    build(3, 1, "success", 2 * HOUR, { commit: COMMIT_ARENA, image_id: IMG_ARENA, schema_fingerprint: FINGERPRINT }, okLog("arena-shooter")),
+    build(4, 2, "success", 3 * DAY, { commit: COMMIT_KART, image_id: IMG_KART }, okLog("kart-racer")),
+    build(
+      5,
+      2,
+      "error",
+      1 * DAY,
+      { detail: "go.mod requires github.com/demiurgos-hub/golem-engine v0.3.2; Golem Deploy needs v0.4.0-rc.1 or newer", engine_version: "v0.3.2" },
+      [
+        "preflight: reading golem-deploy.yaml, golem.yaml, go.mod",
+        "error: go.mod requires github.com/demiurgos-hub/golem-engine v0.3.2; Golem Deploy needs v0.4.0-rc.1 or newer",
+      ],
+    ),
+  ];
+
   const server = (id: number, name: string, port: number, desired: Server["desired_state"], state: Server["state"], extra: Partial<Server> = {}): Server => ({
     id,
     name,
+    build_id: 3,
     project_id: 1,
     image: IMG_ARENA,
+    commit: COMMIT_ARENA,
+    engine_version: ENGINE,
     port,
+    public_url: `https://${gameHost()}:${port}/`,
+    allowed_origins: [],
     env_keys: ["ADMIN_TOKEN", "MAX_PLAYERS"],
     desired_state: desired,
     state,
@@ -124,20 +266,29 @@ function seed(): MockState {
     started_at: state === "running" ? iso(5 * HOUR) : null,
     exit_code: state === "exited" ? 0 : null,
     restart_required: false,
+    certificate: null,
     created_at: iso(10 * DAY),
     updated_at: iso(6 * HOUR),
     ...extra,
   });
+  const kart = { build_id: 4, project_id: 2, image: IMG_KART, commit: COMMIT_KART };
   const servers: Server[] = [
-    server(11, "eu-arena", 7000, "running", "running"),
-    server(12, "staging", 7001, "stopped", "exited"),
+    server(11, "eu-arena", 7000, "running", "running", { allowed_origins: ["https://play.example.com"] }),
+    server(12, "staging", 7001, "stopped", "exited", { build_id: 1, image: IMG_ARENA_OLD, commit: COMMIT_ARENA_OLD }),
     server(13, "crashy", 7002, "running", "exited", { exit_code: 137, updated_at: iso(HOUR) }),
+    // Its game's admin endpoint never answers: the runtime view answers 503.
     server(14, "flood-test", 7003, "running", "running", { env_keys: [] }),
-    server(15, "kart-eu", 7004, "running", "running", { project_id: 2, image: IMG_KART, restart_required: true }),
+    server(15, "kart-eu", 7004, "running", "running", { ...kart, restart_required: true }),
     server(16, "fresh", 7005, "stopped", "missing", { env_keys: [] }),
     // Has a container, but "Docker" cannot be queried for it: every action fails, delete answers 503.
     server(17, "docker-lost", 7006, "running", "unknown", { env_keys: [], started_at: null }),
+    // Created before servers ran builds: cannot start until a build is assigned.
+    server(18, "legacy", 7007, "stopped", "missing", { build_id: null, project_id: null, image: "", commit: "", engine_version: "", env_keys: [] }),
   ];
+  const serverCerts = new Map<number, CertificateInfo>();
+  for (const s of servers) {
+    if (s.container_id) serverCerts.set(s.id, selfSignedCert(`server-${s.id}`, 2 * DAY));
+  }
   const env = new Map<number, Record<string, string>>();
   for (const s of servers) env.set(s.id, Object.fromEntries(s.env_keys.map((k) => [k, "secret"])));
   const image = (id: string, tags: string[], projectId: number | null, commit: string, ageMs: number, size: number): Image => ({
@@ -148,23 +299,44 @@ function seed(): MockState {
     size_bytes: size,
     created_at: iso(ageMs),
     server_ids: [],
+    build_ids: [],
     in_use: false,
   });
   const images: Image[] = [
-    image(IMG_ARENA, ["golem/arena-shooter:4f1c2a9", "golem/arena-shooter:latest"], 1, "4f1c2a9e0b7d3c5a8e6f1b2c3d4e5f6a7b8c9d0e", 2 * HOUR, 187_400_000),
-    image(IMG_ARENA_OLD, ["golem/arena-shooter:0d3e2f1"], 1, "0d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e", 9 * DAY, 185_100_000),
-    image(IMG_KART, ["golem/kart-racer:9a8b7c6"], 2, "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b", 3 * DAY, 243_900_000),
-    image(IMG_VOLUMES, ["golem/many-volumes:latest"], null, "", 4 * DAY, 12_000_000),
+    image(IMG_ARENA, [`golem-deploy/arena-shooter:${COMMIT_ARENA.slice(0, 12)}-b3`], 1, COMMIT_ARENA, 2 * HOUR, 187_400_000),
+    image(IMG_ARENA_OLD, [`golem-deploy/arena-shooter:${COMMIT_ARENA_OLD.slice(0, 12)}-b1`], 1, COMMIT_ARENA_OLD, 9 * DAY, 185_100_000),
+    image(IMG_KART, [`golem-deploy/kart-racer:${COMMIT_KART.slice(0, 12)}-b4`], 2, COMMIT_KART, 3 * DAY, 243_900_000),
+    image(IMG_ORPHAN, ["golem-deploy/kart-racer:0123456789ab-b0"], 2, "0123456789abcdef0123456789abcdef01234567", 4 * DAY, 12_000_000),
   ];
   const statics = new Map<string, { meta: StaticFile; blob: Blob }>();
   for (const [name, text, size] of [
     ["maps-pack-v3.zip", "PK\u0003\u0004pretend zip", 48_300_000],
+    ["textures.zip", "PK\u0003\u0004pretend zip", 12_500_000],
     ["sound_bank.bin", "pretend audio", 9_100_000],
   ] as const) {
     statics.set(name, { meta: { name, size_bytes: size, modified_at: iso(5 * DAY), is_zip: name.endsWith(".zip") }, blob: new Blob([text]) });
   }
   // Servers have no data volumes yet (a later milestone), so the list starts empty like on a real host.
-  return { projects, servers, env, images, statics, volumes: [], jobs: [], jobLogs: new Map(), follows: new Map(), uploads: new Map(), nextId: 100, nextJobId: 900_001, requestSeq: 0 };
+  return {
+    projects,
+    builds,
+    servers,
+    serverCerts,
+    certMode: "self_signed",
+    customCert: null,
+    env,
+    images,
+    statics,
+    volumes: [],
+    jobs: jobs.reverse(),
+    jobLogs,
+    follows: new Map(),
+    uploads: new Map(),
+    nextId: 100,
+    nextBuildId: 6,
+    nextJobId,
+    requestSeq: 0,
+  };
 }
 
 function headers(st: MockState, extra: Record<string, string> = {}): Headers {
@@ -305,17 +477,62 @@ function nextPort(st: MockState): number | null {
   return null;
 }
 
-/** Image id or tag of a managed image, resolved to its id (like the daemon). */
-function resolveImage(st: MockState, ref: string): string | null {
-  const r = ref.trim();
-  if (!r) return null;
-  const img = st.images.find((i) => i.id === r || i.tags.includes(r) || (r.length >= 12 && i.id.replace(/^sha256:/, "").startsWith(r.replace(/^sha256:/, ""))));
-  return img ? img.id : null;
+/** The server fields derived from its build (docs/API.md, Servers). */
+function applyBuild(s: Server, b: Build | null) {
+  s.build_id = b?.id ?? null;
+  s.project_id = b?.project_id ?? null;
+  s.image = b?.image_id ?? "";
+  s.commit = b?.commit ?? "";
+  s.engine_version = b?.engine_version ?? "";
 }
 
-const IMAGE_MESSAGE = "image must be a managed image (built and labelled by golem-deploy)";
-const VOLUMES_MESSAGE = `the image declares more than ${MAX_IMAGE_VOLUMES} volumes`;
-const tooManyVolumes = (id: string) => (VOLUME_COUNT[id] ?? 0) > MAX_IMAGE_VOLUMES;
+/** Like the daemon's build lookup for servers: field `build_id`, successful builds only. */
+function buildError(st: MockState, id: number | undefined): { message: string } | { build: Build } {
+  if (id === undefined || id === null || id === 0) return { message: "build_id is required (the id of a successful build)" };
+  const b = st.builds.find((x) => x.id === id);
+  if (!b) return { message: `build ${id} does not exist` };
+  if (b.status !== "success") return { message: `build ${id} has not succeeded; servers run successful builds only` };
+  return { build: b };
+}
+
+/** Allowed origins: http(s)://host[:port], normalised; errors name the entry (allowed_origins[i]). */
+function originsError(origins: unknown, field: string): { field: string; message: string } | { value: string[] } {
+  if (origins === undefined || origins === null) return { value: [] };
+  if (!Array.isArray(origins)) return { field, message: "allowed_origins must be a list" };
+  if (origins.length > MAX_ORIGINS) return { field, message: `at most ${MAX_ORIGINS} allowed origins` };
+  const out: string[] = [];
+  for (const [i, raw] of origins.entries()) {
+    const f = `${field}[${i}]`;
+    if (typeof raw !== "string") return { field: f, message: "origin must be a string" };
+    let u: URL;
+    try {
+      u = new URL(raw);
+    } catch {
+      return { field: f, message: `origin ${raw} is not a URL` };
+    }
+    if (u.protocol !== "http:" && u.protocol !== "https:") return { field: f, message: `origin ${raw} must use http or https` };
+    if (u.username || u.password) return { field: f, message: `origin ${raw} must not contain credentials` };
+    if ((u.pathname !== "/" && u.pathname !== "") || u.search || u.hash || /\/./.test(raw.replace(/^https?:\/\//, ""))) {
+      return { field: f, message: `origin ${raw} must not have a path, query or fragment` };
+    }
+    const norm = `${u.protocol}//${u.host}`.toLowerCase();
+    if (!out.includes(norm)) out.push(norm);
+  }
+  return { value: out };
+}
+
+const ADDON_TARGET_RE = /^(?!-)[A-Za-z0-9._-]+(\/(?!-)[A-Za-z0-9._-]+)*$/;
+const ADDON_TARGET_MESSAGE = "target must be a relative path below the game root of letters, digits, '.', '_', '-' and '/' (no '..', no .git)";
+
+/** Normalises a static add-on target like the daemon ("./assets/" becomes "assets", "" and "." the root). */
+function normaliseTarget(raw: string): string | null {
+  let t = raw.trim().replace(/^\.\/+/, "").replace(/\/+$/, "");
+  if (t === "" || t === ".") return ".";
+  t = t.replace(/\/+/g, "/");
+  if (!ADDON_TARGET_RE.test(t)) return null;
+  if (t.split("/").some((seg) => seg === "." || seg === ".." || seg === ".git")) return null;
+  return t;
+}
 
 /** Like the daemon's validateEnv: names and limits name `field`, a rejected value `field.KEY`. */
 function envError(env: Record<string, string> | undefined, field: string): { field: string; message: string } | null {
@@ -366,7 +583,7 @@ function authError(auth: ProjectAuth | undefined, kind: "https" | "ssh"): { fiel
 export function createMockTransport(real: Transport): Transport {
   const st = seed();
   const identities = new Map<string, Me>();
-  console.info(`${MOCK_MARKER}: VITE_API_MOCK=1, projects/servers/images/static/volumes are simulated in the browser.`);
+  console.info(`${MOCK_MARKER}: VITE_API_MOCK=1, projects/builds/servers/images/static/volumes/certificates are simulated in the browser.`);
 
   /** The caller, as the real daemon sees the bearer token; null lets the request through to the daemon (which answers 401). */
   async function identify(init: RequestInit | { headers: Record<string, string> }): Promise<Me | null> {
@@ -384,11 +601,33 @@ export function createMockTransport(real: Transport): Transport {
 
   const forbidden = () => fail(st, 403, "forbidden", "your role does not allow this action");
 
-  function refreshImages() {
+  /** Recomputes the cross references the daemon derives on read: builds' servers, images' builds and servers. */
+  function refreshDerived() {
+    for (const b of st.builds) b.server_ids = st.servers.filter((s) => s.build_id === b.id).map((s) => s.id);
     for (const img of st.images) {
+      img.build_ids = st.builds.filter((b) => b.status === "success" && b.image_id === img.id).map((b) => b.id);
       img.server_ids = st.servers.filter((s) => s.image === img.id).map((s) => s.id);
-      img.in_use = img.server_ids.length > 0;
+      img.in_use = img.build_ids.length > 0 || img.server_ids.length > 0 || containerUsers(img.id).length > 0;
     }
+    for (const s of st.servers) {
+      // Self-signed: each server's own certificate (from its first start); custom: the shared one.
+      s.certificate = st.certMode === "custom" ? st.customCert : (st.serverCerts.get(s.id) ?? null);
+    }
+  }
+
+  /** Servers whose container was created from the image (a server keeps its container until its next start). */
+  function containerUsers(imageId: string): number[] {
+    return st.servers.filter((s) => s.container_id && (containerImage.get(s.id) ?? s.image) === imageId).map((s) => s.id);
+  }
+  /** The image each server's current container runs, when it differs from its configured build's image. */
+  const containerImage = new Map<number, string>();
+
+  function gameCertificate(): GameCertificate {
+    return { mode: st.certMode, game_host: gameHost(), certificate: st.certMode === "custom" ? st.customCert : null };
+  }
+
+  function markRestartRequired() {
+    for (const s of st.servers) if (s.state === "running") s.restart_required = true;
   }
 
   function jobLogStream(job: Job, follow: boolean, onEnd: () => void): ReadableStream<Uint8Array> {
@@ -480,7 +719,8 @@ export function createMockTransport(real: Transport): Transport {
     const body = <T,>(): T => JSON.parse(typeof init.body === "string" ? init.body : "{}") as T;
     let m: RegExpMatchArray | null;
     const mocked =
-      /^\/(projects|servers|images|static|volumes)(\/|$)/.test(path) ||
+      /^\/(projects|builds|servers|images|static|volumes)(\/|$)/.test(path) ||
+      path === "/certificates/game" ||
       (path === "/jobs" && (query.get("subject_type") === "project" || query.get("subject_type") === "server")) ||
       (/^\/jobs\/\d+(\/log|\/cancel)?$/.test(path) && st.jobs.some((j) => path.split("/")[2] === String(j.id)));
     if (!mocked) return null;
@@ -546,6 +786,8 @@ export function createMockTransport(real: Transport): Transport {
         last_commit: "",
         last_pulled_at: null,
         status: "cloning",
+        static_addons: [],
+        allow_custom_dockerfile: false,
         created_at: iso(),
         updated_at: iso(),
       };
@@ -563,7 +805,7 @@ export function createMockTransport(real: Transport): Transport {
       }, gitFailDetail(req.repo_url));
       return json(st, 201, { project: p, job });
     }
-    if ((m = path.match(/^\/projects\/(\d+)(\/pull|\/branch|\/branches)?$/))) {
+    if ((m = path.match(/^\/projects\/(\d+)(\/pull|\/branch|\/branches|\/builds)?$/))) {
       const p = st.projects.find((x) => x.id === Number(m?.[1]));
       if (!p) return fail(st, 404, "not_found", "project not found");
       const sub = m[2];
@@ -587,26 +829,62 @@ export function createMockTransport(real: Transport): Transport {
         } else if (p.auth_type !== "none" && p.auth_type !== url.kind) {
           return fail(st, 400, "validation_failed", `${p.auth_type === "https" ? "https credentials require an https:// repository URL" : "an SSH key requires an ssh:// or user@host:path repository URL"}; send new auth together with the URL`, "repo_url");
         }
+        let addons: StaticAddon[] | undefined;
+        if (req.static_addons !== undefined) {
+          if (!Array.isArray(req.static_addons)) return fail(st, 400, "bad_request", "static_addons must be a list", "static_addons");
+          if (req.static_addons.length > MAX_ADDONS) return fail(st, 400, "validation_failed", `at most ${MAX_ADDONS} static add-ons are allowed`, "static_addons");
+          addons = [];
+          for (const [i, a] of req.static_addons.entries()) {
+            const f = `static_addons[${i}]`;
+            const target = normaliseTarget(a.target ?? "");
+            if (target === null) return fail(st, 400, "validation_failed", ADDON_TARGET_MESSAGE, `${f}.target`);
+            const file = st.statics.get(a.name ?? "");
+            if (!file) return fail(st, 400, "validation_failed", "no static file has this name", `${f}.name`);
+            if (!file.meta.is_zip) return fail(st, 400, "validation_failed", "the static file is not a ZIP archive", `${f}.name`);
+            addons.push({ name: a.name, target });
+          }
+        }
         if (req.repo_url !== undefined) p.repo_url = req.repo_url;
         if (req.auth) {
           p.auth_type = req.auth.type;
           p.auth_username = req.auth.username ?? "";
           p.has_secret = req.auth.type !== "none";
         }
+        if (addons) p.static_addons = addons;
+        if (req.allow_custom_dockerfile !== undefined) p.allow_custom_dockerfile = req.allow_custom_dockerfile;
         p.updated_at = iso();
         return json(st, 200, p);
       }
       if (!sub && method === "DELETE") {
         if (!admin) return forbidden();
-        if (activeJobFor(st, "project", p.id)) return fail(st, 409, "job_in_progress", "another job is already running for this project");
+        if (activeJobFor(st, "project", p.id)) return fail(st, 409, "job_in_progress", "a job is running for this project; wait for it or cancel it");
+        refreshDerived();
+        const builds = st.builds.filter((b) => b.project_id === p.id);
+        const configured = st.servers.filter((s) => s.build_id !== null && builds.some((b) => b.id === s.build_id)).map((s) => s.id);
+        if (configured.length) {
+          return fail(st, 409, "conflict", `servers are configured with builds of this project (server ids ${configured.join(", ")}); assign them another build or delete them first`);
+        }
+        const holders = [...new Set(builds.filter((b) => b.image_id).flatMap((b) => containerUsers(b.image_id)))];
+        if (holders.length) {
+          return fail(st, 409, "conflict", `the container of server ${holders.join(", ")} still uses this project's images (a server keeps its container, also when stopped, until it is started again or deleted); restart or delete those servers first`);
+        }
         st.projects = st.projects.filter((x) => x.id !== p.id);
-        for (const s of st.servers) if (s.project_id === p.id) s.project_id = null;
+        const imageIds = new Set(builds.map((b) => b.image_id).filter(Boolean));
+        st.builds = st.builds.filter((b) => b.project_id !== p.id);
+        st.images = st.images.filter((i) => !imageIds.has(i.id));
         return json(st, 204, null);
       }
       if (sub === "/branches" && method === "GET") {
         if (p.repo_url.includes("unreachable")) return fail(st, 503, "service_unavailable", "the Git remote could not be reached");
         return json(st, 200, { current: p.branch, items: ["develop", "feature/netcode", "main"] });
       }
+      if (sub === "/builds" && method === "GET") {
+        const r = buildListFilter(query);
+        if ("error" in r) return r.error;
+        refreshDerived();
+        return json(st, 200, { items: listBuilds({ ...r, projectId: p.id }) });
+      }
+      if (sub === "/builds" && method === "POST") return createBuild(p, typeof init.body === "string" && init.body ? body<CreateBuildRequest>() : {}, me);
       if ((sub === "/pull" || sub === "/branch") && method === "POST") {
         let branch = p.branch;
         if (sub === "/branch") {
@@ -614,93 +892,102 @@ export function createMockTransport(real: Transport): Transport {
           if (!branch) return fail(st, 400, "validation_failed", "branch is required", "branch");
         }
         if (activeJobFor(st, "project", p.id)) return fail(st, 409, "job_in_progress", "another job is already running for this project");
-        // Without a checkout (failed clone) both re-clone.
-        const clone = p.last_commit === "";
-        const prev = p.status;
-        p.status = clone ? "cloning" : sub === "/pull" ? "pulling" : "switching_branch";
-        const kind: JobKind = clone ? "project.clone" : sub === "/pull" ? "project.pull" : "project.branch";
-        const steps = clone ? ["Cloning into repository", "Checking out files"] : sub === "/pull" ? ["Fetching origin", "Resetting to origin"] : [`Fetching ${branch}`, `Switched to branch '${branch}'`];
-        if (failsGit(p.repo_url)) steps.push("FAIL");
-        return json(
-          st,
-          202,
-          startJob(st, me, false, kind, "project", p.id, steps, (ok) => {
-            // A failure before the tree is touched leaves the status as it was.
-            p.status = ok ? "idle" : clone ? "error" : prev;
-            if (!ok) return;
-            p.branch = branch || "main";
-            p.last_pulled_at = iso();
-            p.last_commit = Math.random().toString(16).slice(2).padEnd(40, "0").slice(0, 40);
-          }, gitFailDetail(p.repo_url)),
-        );
+        return json(st, 202, startProjectUpdate(p, sub === "/pull" ? "pull" : "branch", branch, me));
+      }
+      return null;
+    }
+
+    // Builds.
+    if (path === "/builds" && method === "GET") {
+      const r = buildListFilter(query);
+      if ("error" in r) return r.error;
+      const pid = query.get("project_id");
+      if (pid !== null && pid !== "" && !/^[1-9]\d*$/.test(pid)) return fail(st, 400, "bad_request", "project_id must be a positive integer");
+      refreshDerived();
+      return json(st, 200, { items: listBuilds({ ...r, projectId: pid ? Number(pid) : undefined }) });
+    }
+    if ((m = path.match(/^\/builds\/(\d+)$/))) {
+      const b = st.builds.find((x) => x.id === Number(m?.[1]));
+      if (!b) return fail(st, 404, "not_found", "build not found");
+      refreshDerived();
+      if (method === "GET") return json(st, 200, b);
+      if (method === "DELETE") {
+        if (!admin) return forbidden();
+        if (b.status === "queued" || b.status === "running") return fail(st, 409, "conflict", "the build is still queued or running; cancel its job first");
+        if (b.server_ids.length) return fail(st, 409, "conflict", "servers are configured with this build; assign them another build or delete them first");
+        const holders = b.image_id ? containerUsers(b.image_id) : [];
+        if (holders.length) {
+          return fail(st, 409, "conflict", `the container of server ${holders.join(", ")} still uses this build's image (a server keeps its container, also when stopped, until it is started again or deleted); restart or delete those servers first`);
+        }
+        st.builds = st.builds.filter((x) => x.id !== b.id);
+        if (b.image_id && !st.builds.some((x) => x.status === "success" && x.image_id === b.image_id)) st.images = st.images.filter((i) => i.id !== b.image_id);
+        return json(st, 204, null);
       }
       return null;
     }
 
     // Servers.
-    if (path === "/servers" && method === "GET") return json(st, 200, { items: st.servers });
+    if (path === "/servers" && method === "GET") {
+      refreshDerived();
+      return json(st, 200, { items: st.servers });
+    }
     if (path === "/servers" && method === "POST") {
       const req = body<CreateServerRequest>();
       if (!NAME_RE.test(req.name ?? "")) return fail(st, 400, "validation_failed", "name must be 1-63 characters of a-z, 0-9 and '-', starting with a letter or digit", "name");
-      const image = resolveImage(st, req.image ?? "");
-      if (!image) return fail(st, 400, "validation_failed", IMAGE_MESSAGE, "image");
-      if (tooManyVolumes(image)) return fail(st, 400, "validation_failed", VOLUMES_MESSAGE, "image");
-      if (req.project_id !== undefined && !st.projects.some((p) => p.id === req.project_id)) return fail(st, 400, "validation_failed", "project does not exist", "project_id");
+      const be = buildError(st, req.build_id);
+      if ("message" in be) return fail(st, 400, "validation_failed", be.message, "build_id");
       if (req.port !== undefined) {
         const pe = portError(req.port);
         if (pe) return fail(st, 400, "validation_failed", pe, "port");
       }
+      const oe = originsError(req.allowed_origins, "allowed_origins");
+      if ("message" in oe) return fail(st, 400, "validation_failed", oe.message, oe.field);
       const ee = envError(req.env, "env");
       if (ee) return fail(st, 400, "validation_failed", ee.message, ee.field);
       if (st.servers.some((s) => s.name === req.name)) return fail(st, 409, "name_taken", "a server with that name already exists");
       const port = req.port ?? nextPort(st);
       if (port === null || st.servers.some((s) => s.port === port)) return fail(st, 409, "port_in_use", "that port is already assigned to another server (or the port range is full)");
-      const s: Server = {
-        id: st.nextId++,
-        name: req.name,
-        project_id: req.project_id ?? null,
-        image,
-        port,
-        env_keys: Object.keys(req.env ?? {}).sort(),
-        desired_state: req.desired_state ?? "stopped",
-        state: "missing",
-        container_id: "",
-        started_at: null,
-        exit_code: null,
-        restart_required: false,
-        created_at: iso(),
-        updated_at: iso(),
-      };
+      const s = newServer(req.name, port, oe.value, req.env, req.desired_state ?? "stopped");
+      applyBuild(s, be.build);
       st.servers.push(s);
-      st.env.set(s.id, { ...(req.env ?? {}) });
       if (s.desired_state === "running") startServerAction(s, "start", me);
+      refreshDerived();
       return json(st, 201, s);
     }
     if (path === "/servers/export" && method === "GET") {
       if (!admin) return forbidden();
       const out: ServerExport = {
-        format_version: 1,
-        servers: st.servers.map((s) => ({
-          name: s.name,
-          ...(s.project_id !== null ? { project: st.projects.find((p) => p.id === s.project_id)?.name } : {}),
-          image: s.image,
-          port: s.port,
-          env: st.env.get(s.id) ?? {},
-          desired_state: s.desired_state,
-        })),
+        format_version: 2,
+        servers: st.servers.map((s) => {
+          const b = st.builds.find((x) => x.id === s.build_id);
+          return {
+            name: s.name,
+            project: b ? (st.projects.find((p) => p.id === b.project_id)?.name ?? "") : "",
+            ...(b?.commit ? { commit: b.commit } : {}),
+            port: s.port,
+            allowed_origins: s.allowed_origins,
+            env: st.env.get(s.id) ?? {},
+            desired_state: s.desired_state,
+          };
+        }),
       };
       return json(st, 200, out);
     }
     if (path === "/servers/import" && method === "POST") {
       if (!admin) return forbidden();
-      const req = body<ServerExport>();
-      if (req.format_version !== 1) return fail(st, 400, "validation_failed", "format_version must be 1", "format_version");
+      const req = body<ServerExport & { servers?: Record<string, unknown>[] }>();
+      // Unknown fields are a decode error (400 bad_request), e.g. the image of a version 1 document.
+      for (const spec of req.servers ?? []) {
+        const extra = Object.keys(spec).find((k) => !["name", "project", "commit", "port", "allowed_origins", "env", "desired_state"].includes(k));
+        if (extra) return fail(st, 400, "bad_request", `unknown field "${extra}"`, extra);
+      }
+      if (req.format_version !== 2) return fail(st, 400, "validation_failed", "format_version must be 2", "format_version");
       if (!req.servers?.length) return fail(st, 400, "validation_failed", "the document contains no servers", "servers");
       if (req.servers.length > MAX_IMPORT) return fail(st, 400, "validation_failed", `at most ${MAX_IMPORT} servers can be imported at once`, "servers");
       // Like the daemon: stop at the first problem, one error envelope, nothing created.
       const names = new Set<string>();
       const ports = new Set<number>();
-      const resolved: { image: string; projectId: number | null }[] = [];
+      const resolved: { build: Build; origins: string[] }[] = [];
       for (const [i, spec] of req.servers.entries()) {
         const f = (n: string) => `servers[${i}].${n}`;
         if (!NAME_RE.test(spec.name ?? "")) return fail(st, 400, "validation_failed", "name must be 1-63 characters of a-z, 0-9 and '-', starting with a letter or digit", f("name"));
@@ -710,11 +997,17 @@ export function createMockTransport(real: Transport): Transport {
         if (spec.desired_state && spec.desired_state !== "running" && spec.desired_state !== "stopped") return fail(st, 400, "validation_failed", 'desired_state must be "running" or "stopped"', f("desired_state"));
         const ee = envError(spec.env, f("env"));
         if (ee) return fail(st, 400, "validation_failed", ee.message, ee.field);
-        let projectId: number | null = null;
-        if (spec.project) {
-          const p = st.projects.find((x) => x.name === spec.project?.toLowerCase());
-          if (!p) return fail(st, 400, "validation_failed", `project "${spec.project}" does not exist`, f("project"));
-          projectId = p.id;
+        const oe = originsError(spec.allowed_origins, f("allowed_origins"));
+        if ("message" in oe) return fail(st, 400, "validation_failed", oe.message, oe.field);
+        if (!spec.project) return fail(st, 400, "validation_failed", "project is required (the server runs a build of that project)", f("project"));
+        if (spec.commit && !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(spec.commit)) return fail(st, 400, "validation_failed", "commit must be a full lower-case commit hash", f("commit"));
+        const p = st.projects.find((x) => x.name === spec.project);
+        if (!p) return fail(st, 400, "validation_failed", `project "${spec.project}" does not exist`, f("project"));
+        const candidates = listBuilds({ projectId: p.id, status: "success" }).filter((b) => !spec.commit || b.commit === spec.commit);
+        if (!candidates.length) {
+          return spec.commit
+            ? fail(st, 400, "validation_failed", `project "${spec.project}" has no successful build of commit ${spec.commit}`, f("commit"))
+            : fail(st, 400, "validation_failed", `project "${spec.project}" has no successful build`, f("project"));
         }
         if (spec.port !== undefined) {
           const pe = portError(spec.port);
@@ -723,76 +1016,81 @@ export function createMockTransport(real: Transport): Transport {
           if (st.servers.some((s) => s.port === spec.port)) return fail(st, 409, "port_in_use", "that port is already assigned to another server (or the port range is full)");
           ports.add(spec.port);
         }
-        const image = resolveImage(st, spec.image ?? "");
-        if (!image) return fail(st, 400, "validation_failed", IMAGE_MESSAGE, f("image"));
-        if (tooManyVolumes(image)) return fail(st, 400, "validation_failed", VOLUMES_MESSAGE, f("image"));
-        resolved.push({ image, projectId });
+        resolved.push({ build: candidates[0], origins: oe.value });
       }
       const created = req.servers.map((spec, i) => {
-        const port = spec.port ?? nextPort(st) ?? 0;
-        const s: Server = {
-          id: st.nextId++,
-          name: spec.name,
-          project_id: resolved[i].projectId,
-          image: resolved[i].image,
-          port,
-          env_keys: Object.keys(spec.env ?? {}).sort(),
-          desired_state: "stopped",
-          state: "missing",
-          container_id: "",
-          started_at: null,
-          exit_code: null,
-          restart_required: false,
-          created_at: iso(),
-          updated_at: iso(),
-        };
+        const s = newServer(spec.name, spec.port ?? nextPort(st) ?? 0, resolved[i].origins, spec.env, "stopped");
+        applyBuild(s, resolved[i].build);
         st.servers.push(s);
-        st.env.set(s.id, { ...(spec.env ?? {}) });
         return s;
       });
+      refreshDerived();
       return json(st, 201, { created });
     }
-    if ((m = path.match(/^\/servers\/(\d+)(\/start|\/stop|\/restart|\/logs|\/stats)?$/))) {
+    if ((m = path.match(/^\/servers\/(\d+)(\/start|\/stop|\/restart|\/logs|\/stats|\/runtime)?$/))) {
       const s = st.servers.find((x) => x.id === Number(m?.[1]));
       if (!s) return fail(st, 404, "not_found", "server not found");
       const sub = m[2];
+      refreshDerived();
       if (!sub && method === "GET") return json(st, 200, s);
       if (!sub && method === "PATCH") {
         const req = body<UpdateServerRequest>();
         for (const k of req.env_unset ?? []) {
-          if (req.env_set && k in req.env_set) return fail(st, 400, "validation_failed", `"${k}" is in both env_set and env_unset`, "env_unset");
+          if (req.env_set && k in req.env_set) return fail(st, 400, "validation_failed", "a variable cannot be in both env_set and env_unset", "env_unset");
         }
         const ee = envError(req.env_set, "env_set");
         if (ee) return fail(st, 400, "validation_failed", ee.message, ee.field);
-        let image = s.image;
-        if (req.image !== undefined) {
-          const r = resolveImage(st, req.image);
-          if (!r) return fail(st, 400, "validation_failed", IMAGE_MESSAGE, "image");
-          if (tooManyVolumes(r)) return fail(st, 400, "validation_failed", VOLUMES_MESSAGE, "image");
-          image = r;
+        let build: Build | null = st.builds.find((b) => b.id === s.build_id) ?? null;
+        if (req.build_id !== undefined) {
+          const be = buildError(st, req.build_id);
+          if ("message" in be) return fail(st, 400, "validation_failed", be.message, "build_id");
+          // A server's project is fixed at creation (servers without a build may take any).
+          if (s.project_id !== null && be.build.project_id !== s.project_id) {
+            return fail(st, 400, "validation_failed", `build ${be.build.id} belongs to another project; a server only runs builds of its own project`, "build_id");
+          }
+          build = be.build;
         }
+        let origins = s.allowed_origins;
+        if (req.allowed_origins !== undefined) {
+          const oe = originsError(req.allowed_origins, "allowed_origins");
+          if ("message" in oe) return fail(st, 400, "validation_failed", oe.message, oe.field);
+          origins = oe.value;
+        }
+        const portChange = req.port !== undefined && req.port !== s.port;
+        const buildChange = req.build_id !== undefined && req.build_id !== s.build_id;
         if (req.port !== undefined) {
           const pe = portError(req.port);
           if (pe) return fail(st, 400, "validation_failed", pe, "port");
           if (st.servers.some((x) => x.id !== s.id && x.port === req.port)) return fail(st, 409, "port_in_use", "that port is already assigned to another server (or the port range is full)");
-          if (req.port !== s.port) {
-            if (s.state === "unknown") return fail(st, 503, "service_unavailable", "Docker is unreachable");
-            if (s.state === "running" || s.state === "restarting" || s.state === "paused") return fail(st, 409, "conflict", "stop the server before changing its port");
-          }
+        }
+        if ((portChange || buildChange) && activeJobFor(st, "server", s.id)) {
+          return fail(st, 409, "job_in_progress", "a job is running for this server; wait for it to finish before changing its port or build");
+        }
+        if (portChange) {
+          if (s.state === "unknown") return fail(st, 503, "service_unavailable", "Docker is unreachable");
+          if (s.state === "running" || s.state === "restarting" || s.state === "paused") return fail(st, 409, "conflict", "stop the server before changing its port");
         }
         // A variable named RACE simulates a concurrent env change that keeps colliding.
         if (req.env_set && "RACE" in req.env_set) return fail(st, 409, "conflict", "the change conflicts with a concurrent change; retry");
         const env = { ...(st.env.get(s.id) ?? {}) };
         for (const k of req.env_unset ?? []) delete env[k];
         Object.assign(env, req.env_set ?? {});
-        const changed = image !== s.image || (req.port !== undefined && req.port !== s.port) || Object.keys(req.env_set ?? {}).length > 0 || (req.env_unset ?? []).length > 0;
+        const originsChanged = origins.join(",") !== s.allowed_origins.join(",");
+        const changed = buildChange || portChange || originsChanged || Object.keys(req.env_set ?? {}).length > 0 || (req.env_unset ?? []).length > 0;
         st.env.set(s.id, env);
-        s.image = image;
-        if (req.port !== undefined) s.port = req.port;
+        // The current container keeps the old build's image until the next start.
+        if (buildChange && s.container_id && !containerImage.has(s.id)) containerImage.set(s.id, s.image);
+        applyBuild(s, build);
+        s.allowed_origins = origins;
+        if (req.port !== undefined) {
+          s.port = req.port;
+          s.public_url = `https://${gameHost()}:${req.port}/`;
+        }
         s.env_keys = Object.keys(env).sort();
         s.updated_at = iso();
         // PATCH never restarts; a running container now runs an older definition.
         if (changed && s.state === "running") s.restart_required = true;
+        refreshDerived();
         return json(st, 200, s);
       }
       if (!sub && method === "DELETE") {
@@ -814,6 +1112,8 @@ export function createMockTransport(real: Transport): Transport {
         if (lost) return fail(st, 503, "service_unavailable", "Docker is unreachable");
         st.servers = st.servers.filter((x) => x.id !== s.id);
         st.env.delete(s.id);
+        st.serverCerts.delete(s.id);
+        containerImage.delete(s.id);
         return json(st, 204, null);
       }
       if ((sub === "/start" || sub === "/stop" || sub === "/restart") && method === "POST") {
@@ -839,14 +1139,15 @@ export function createMockTransport(real: Transport): Transport {
         }
         return textStream(serverLogStream(s, tail, follow, release));
       }
-      if (sub === "/stats" && method === "GET") {
+      if ((sub === "/stats" || sub === "/runtime") && method === "GET") {
         if (s.state === "missing") return fail(st, 409, "conflict", "the server has no container yet; start it first");
         if (s.state === "unknown") return fail(st, 503, "service_unavailable", "Docker is unreachable");
         if (s.state !== "running") return fail(st, 409, "conflict", "the server is not running");
+        if (sub === "/runtime") return runtime(s);
         return json(st, 200, {
           cpu_percent: 5 + Math.random() * 40,
           memory_bytes: Math.round(300_000_000 + Math.random() * 50_000_000),
-          memory_limit_bytes: 0,
+          memory_limit_bytes: 2048 * 1024 * 1024,
           network_rx_bytes: Math.round((Date.now() / 10) % 1e9),
           network_tx_bytes: Math.round((Date.now() / 7) % 1e9),
           pids: 23,
@@ -856,17 +1157,63 @@ export function createMockTransport(real: Transport): Transport {
       return null;
     }
 
+    // The game certificate (admin).
+    if (path === "/certificates/game") {
+      if (!admin) return forbidden();
+      if (method === "GET") return json(st, 200, gameCertificate());
+      if (method === "PUT") {
+        const req = body<UpdateGameCertificateRequest>();
+        if (req.mode === "self_signed") {
+          if (req.certificate_pem || req.private_key_pem) {
+            return fail(st, 400, "validation_failed", "certificate_pem and private_key_pem are only accepted with mode custom", "certificate_pem");
+          }
+          if (st.certMode !== "self_signed") markRestartRequired();
+          st.certMode = "self_signed";
+          // A new self-signed certificate for each server, picked up without a restart.
+          for (const id of st.serverCerts.keys()) st.serverCerts.set(id, selfSignedCert(`server-${id}-${Date.now()}`));
+        } else if (req.mode === "custom") {
+          const chain = req.certificate_pem ?? "";
+          const key = req.private_key_pem ?? "";
+          if (!chain.includes("-----BEGIN CERTIFICATE-----")) return fail(st, 400, "validation_failed", "certificate_pem contains no PEM CERTIFICATE block", "certificate_pem");
+          if (chain.includes("EXPIRED")) return fail(st, 400, "validation_failed", "the certificate is not currently valid (it expired)", "certificate_pem");
+          if (!/-----BEGIN (RSA |EC )?PRIVATE KEY-----/.test(key)) return fail(st, 400, "validation_failed", "private_key_pem contains no unencrypted PEM private key", "private_key_pem");
+          if (key.includes("MISMATCH")) return fail(st, 400, "validation_failed", "the private key does not match the certificate", "private_key_pem");
+          if (st.certMode !== "custom") markRestartRequired();
+          st.certMode = "custom";
+          const names = ["play.example.com", ...(chain.includes("COVERS") ? [gameHost()] : [])];
+          st.customCert = {
+            subject: "CN=play.example.com,O=Example Games",
+            issuer: "CN=Example Issuing CA,O=Example Trust",
+            dns_names: names,
+            ip_addresses: [],
+            not_before: iso(10 * DAY),
+            not_after: iso(-80 * DAY),
+            fingerprint_sha256: fakeFingerprint(chain),
+            self_signed: false,
+            chain_length: (chain.match(/-----BEGIN CERTIFICATE-----/g) ?? []).length,
+            covers_game_host: names.includes(gameHost()),
+          };
+        } else {
+          return fail(st, 400, "validation_failed", 'mode must be "self_signed" or "custom"', "mode");
+        }
+        refreshDerived();
+        return json(st, 200, gameCertificate());
+      }
+      return null;
+    }
+
     // Images, static files, volumes.
     if (path === "/images" && method === "GET") {
-      refreshImages();
+      refreshDerived();
       return json(st, 200, { items: st.images });
     }
     if ((m = path.match(/^\/images\/(.+)$/)) && method === "DELETE") {
       if (!admin) return forbidden();
-      refreshImages();
+      refreshDerived();
       const id = decodeURIComponent(m[1]);
       const img = st.images.find((i) => i.id === id);
       if (!img) return fail(st, 404, "not_found", "image not found");
+      if (img.build_ids.length) return fail(st, 409, "conflict", `the image belongs to build ${img.build_ids.join(", ")}; delete the build instead (DELETE /api/v1/builds/{id})`);
       if (img.in_use) return fail(st, 409, "conflict", "the image is in use");
       st.images = st.images.filter((i) => i.id !== id);
       return json(st, 204, null);
@@ -885,6 +1232,8 @@ export function createMockTransport(real: Transport): Transport {
         });
       }
       if (method === "DELETE") {
+        const users = addonUsers(name);
+        if (users.length) return fail(st, 409, "conflict", `the file is a static add-on of project ${users.join(", ")}; remove it from the project first`);
         st.statics.delete(name);
         return json(st, 204, null);
       }
@@ -898,22 +1247,240 @@ export function createMockTransport(real: Transport): Transport {
     return null;
   }
 
+  /** Names of the projects that use a static file as an add-on. */
+  function addonUsers(name: string): string[] {
+    return st.projects.filter((p) => p.static_addons.some((a) => a.name === name)).map((p) => p.name);
+  }
+
+  function newServer(name: string, port: number, origins: string[], env: Record<string, string> | undefined, desired: Server["desired_state"]): Server {
+    const s: Server = {
+      id: st.nextId++,
+      name,
+      build_id: null,
+      project_id: null,
+      image: "",
+      commit: "",
+      engine_version: "",
+      port,
+      public_url: `https://${gameHost()}:${port}/`,
+      allowed_origins: origins,
+      env_keys: Object.keys(env ?? {}).sort(),
+      desired_state: desired,
+      state: "missing",
+      container_id: "",
+      started_at: null,
+      exit_code: null,
+      restart_required: false,
+      certificate: null,
+      created_at: iso(),
+      updated_at: iso(),
+    };
+    st.env.set(s.id, { ...(env ?? {}) });
+    return s;
+  }
+
+  function buildListFilter(query: URLSearchParams): { status?: string; limit: number } | { error: Response } {
+    const status = query.get("status") ?? "";
+    if (status && !["queued", "running", "success", "error", "cancelled"].includes(status)) {
+      return { error: fail(st, 400, "bad_request", "status must be queued, running, success, error or cancelled") };
+    }
+    const rawLimit = query.get("limit");
+    const limit = rawLimit === null || rawLimit === "" ? 50 : Number(rawLimit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) return { error: fail(st, 400, "bad_request", "limit must be an integer from 1 to 500") };
+    return { status: status || undefined, limit };
+  }
+
+  function listBuilds(f: { projectId?: number; status?: string; limit?: number }): Build[] {
+    return st.builds
+      .filter((b) => (f.projectId === undefined || b.project_id === f.projectId) && (!f.status || b.status === f.status))
+      .sort((a, b) => b.id - a.id)
+      .slice(0, f.limit ?? 50);
+  }
+
+  /** A pull, branch switch or (without a checkout) clone, as its own job or as the first part of a build. */
+  function updateSteps(p: Project, op: "pull" | "branch", branch: string): { kind: JobKind; steps: string[]; clone: boolean } {
+    const clone = p.last_commit === "";
+    const kind: JobKind = clone ? "project.clone" : op === "pull" ? "project.pull" : "project.branch";
+    const steps = clone ? ["Cloning into repository", "Checking out files"] : op === "pull" ? ["Fetching origin", "Resetting to origin"] : [`Fetching ${branch}`, `Switched to branch '${branch}'`];
+    return { kind, steps, clone };
+  }
+
+  function finishUpdate(p: Project, ok: boolean, clone: boolean, prev: Project["status"], branch: string) {
+    // A failure before the tree is touched leaves the status as it was.
+    p.status = ok ? "idle" : clone ? "error" : prev;
+    if (!ok) return;
+    p.branch = branch || "main";
+    p.last_pulled_at = iso();
+    p.last_commit = Math.random().toString(16).slice(2).padEnd(40, "0").slice(0, 40);
+  }
+
+  function startProjectUpdate(p: Project, op: "pull" | "branch", branch: string, me: Me): Job {
+    const { kind, steps, clone } = updateSteps(p, op, branch);
+    const prev = p.status;
+    p.status = clone ? "cloning" : op === "pull" ? "pulling" : "switching_branch";
+    if (failsGit(p.repo_url)) steps.push("FAIL");
+    return startJob(st, me, false, kind, "project", p.id, steps, (ok) => finishUpdate(p, ok, clone, prev, branch), gitFailDetail(p.repo_url));
+  }
+
+  /** POST /projects/{id}/builds. Repositories with "fail" in their URL fail the pull; project 2 fails the preflight. */
+  function createBuild(p: Project, req: CreateBuildRequest, me: Me): Response {
+    const pull = req.pull === true;
+    if (p.last_commit === "" && !pull) return fail(st, 409, "conflict", "the project has no checkout yet; pull it first (or build with pull)");
+    if (activeJobFor(st, "project", p.id)) return fail(st, 409, "job_in_progress", "another job is already running for this project");
+    if (p.status !== "idle" && !pull) return fail(st, 409, "conflict", "the project's checkout is in an error state; pull the project first (or build with pull)");
+    if (st.builds.filter((b) => b.status === "queued" || b.status === "running").length >= MAX_ACTIVE_BUILDS) {
+      return fail(st, 409, "conflict", `too many builds are queued (at most ${MAX_ACTIVE_BUILDS}); wait for one to finish`);
+    }
+    const b: Build = {
+      id: st.nextBuildId++,
+      project_id: p.id,
+      branch: p.branch,
+      commit: "",
+      status: "queued",
+      detail: "",
+      job_id: null,
+      image_id: "",
+      image_tag: "",
+      engine_version: "",
+      schema_fingerprint: "",
+      webtransport_path: "",
+      websocket_path: "",
+      server_ids: [],
+      created_by: me.id,
+      created_at: iso(),
+      started_at: null,
+      finished_at: null,
+    };
+    st.builds.push(b);
+    const update = pull ? updateSteps(p, "pull", p.branch) : null;
+    const prev = p.status;
+    const steps = [
+      ...(update ? update.steps : []),
+      "# generated Dockerfile",
+      "preflight: golem.yaml, go.mod, package.json",
+      `#9 [build 4/9] RUN npm ci`,
+      `#12 [build 6/9] RUN go run github.com/demiurgos-hub/golem-engine/cmd/golem-bake@${ENGINE}`,
+      "#14 [build 8/9] RUN CGO_ENABLED=0 go build -trimpath ./cmd/server",
+    ];
+    const pullFails = pull && failsGit(p.repo_url);
+    const preflightFails = p.id === 2;
+    const pulled = update ? update.steps.length : 0;
+    if (pullFails) steps.splice(pulled, steps.length, "FAIL");
+    else if (preflightFails) steps.splice(pulled + 2, steps.length, "FAIL");
+    const detail = pullFails
+      ? `updating the checkout failed: ${gitFailDetail(p.repo_url)}`
+      : "go.mod requires github.com/demiurgos-hub/golem-engine v0.3.2; Golem Deploy needs v0.4.0-rc.1 or newer";
+    const job = startJob(st, me, false, "project.build", "project", p.id, steps, (ok) => {
+      if (update) finishUpdate(p, !pullFails, update.clone, prev, p.branch);
+      b.commit = p.last_commit;
+      b.branch = p.branch;
+      b.finished_at = iso();
+      b.engine_version = preflightFails ? "v0.3.2" : ENGINE;
+      if (job.status === "cancelled") {
+        b.status = "cancelled";
+        b.detail = "cancelled";
+        return;
+      }
+      if (!ok) {
+        b.status = "error";
+        b.detail = detail;
+        return;
+      }
+      b.status = "success";
+      b.image_id = `sha256:${fakeFingerprint(`${p.id}-${b.id}-${b.commit}`)}`;
+      b.image_tag = `golem-deploy/${p.name}:${b.commit.slice(0, 12)}-b${b.id}`;
+      b.webtransport_path = "/wt";
+      b.websocket_path = "/api/ws";
+      st.images.unshift({
+        id: b.image_id,
+        tags: [b.image_tag],
+        project_id: p.id,
+        commit: b.commit,
+        size_bytes: 190_000_000,
+        created_at: iso(),
+        server_ids: [],
+        build_ids: [b.id],
+        in_use: true,
+      });
+    }, detail);
+    b.job_id = job.id;
+    if (update) p.status = update.clone ? "cloning" : "pulling";
+    // The job's own status drives the build's (running once the job runs; cancelled with it).
+    const watch = setInterval(() => {
+      if (b.status === "queued" && job.status === "running") {
+        b.status = "running";
+        b.started_at = iso();
+      }
+      if (job.status === "cancelled" && (b.status === "queued" || b.status === "running")) {
+        b.status = "cancelled";
+        b.detail = "cancelled";
+        b.finished_at = iso();
+        if (update) p.status = prev === "error" ? "error" : "idle";
+      }
+      if (b.status !== "queued" && b.status !== "running") clearInterval(watch);
+    }, 100);
+    return json(st, 202, { build: { ...b }, job });
+  }
+
+  /** GET /servers/{id}/runtime of a running server, as the game's admin endpoint would report it. */
+  function runtime(s: Server): Response {
+    if (s.name === "flood-test") return fail(st, 503, "service_unavailable", "the game's admin endpoint did not answer; see the server log");
+    const b = st.builds.find((x) => x.id === s.build_id);
+    const uptime = s.started_at ? (Date.now() - new Date(s.started_at).getTime()) / 1000 : 0;
+    const loading = s.name === "kart-eu";
+    const tick = Math.round(uptime * 30);
+    const body: ServerRuntime = {
+      ready: !loading,
+      not_ready_reason: loading ? "loading world chunks (12/40)" : "",
+      sessions: loading ? 0 : 3 + (Math.round(uptime / 7) % 9),
+      entities: loading ? 0 : 412 + (Math.round(uptime) % 50),
+      uptime_seconds: uptime,
+      tick: { tick, rate: 30, budget_ms: 33.3, last_ms: 4 + (tick % 7) * 0.9, max_ms: 21.7, overruns: Math.floor(tick / 5000) },
+      game_name: st.projects.find((p) => p.id === s.project_id)?.name ?? "game",
+      engine_version: s.engine_version || ENGINE,
+      transport: "webtransport",
+      schema_fingerprint: b?.schema_fingerprint || FINGERPRINT,
+      certificate_hashes_published: st.certMode === "self_signed",
+      sampled_at: iso(),
+    };
+    return json(st, 200, body);
+  }
+
   function startServerAction(s: Server, action: "start" | "stop" | "restart", me: Me): Job {
     s.desired_state = action === "stop" ? "stopped" : "running";
     s.updated_at = iso();
-    const steps = action === "stop" ? [`stopping container golem-deploy-${s.name}`] : ["ensuring network golem-deploy", `starting container golem-deploy-${s.name}`, "container is running"];
-    if (s.name === "crashy" && action !== "stop") {
-      steps.push("container | panic: listen udp :7777: \\x1b[31mbind: address already in use\\x1b[0m", "container | exit status 1", "FAIL");
+    const steps = action === "stop" ? [`stopping container golem-deploy-${s.name}`] : ["ensuring network golem-deploy", `starting container golem-deploy-${s.name}`, "waiting for the game to report ready", "ready"];
+    let failDetail = "the container exited right after starting (exit code 1); its last output is in the job log";
+    const build = st.builds.find((b) => b.id === s.build_id);
+    if (action !== "stop" && !build) {
+      steps.splice(0, steps.length, "FAIL");
+      failDetail = "the server has no build; assign a successful build (PATCH /servers/{id} with build_id) and start it again";
+    } else if (action !== "stop" && st.certMode === "custom" && !st.customCert) {
+      steps.splice(0, steps.length, "FAIL");
+      failDetail = "no valid custom game certificate is installed; upload one or switch to self_signed";
+    } else if (s.name === "crashy" && action !== "stop") {
+      steps.splice(2, steps.length, "container | panic: listen udp :7777: \\x1b[31mbind: address already in use\\x1b[0m", "container | exit status 1", "FAIL");
+      failDetail = "the game exited with code 1 before it reported ready; see GET /servers/{id}/logs";
     }
-    if (s.state === "unknown") steps.splice(0, steps.length, `${action} server "${s.name}"`, "FAIL");
-    const failDetail = s.state === "unknown" ? "Docker is unreachable" : "the container exited right after starting (exit code 1); its last output is in the job log";
+    if (s.state === "unknown") {
+      steps.splice(0, steps.length, `${action} server "${s.name}"`, "FAIL");
+      failDetail = "Docker is unreachable";
+    }
     return startJob(st, me, false, `server.${action}`, "server", s.id, steps, (ok) => {
       if (action === "stop") {
         if (ok && s.state !== "unknown") Object.assign(s, { state: "exited", exit_code: 0, started_at: null, restart_required: false });
         return;
       }
-      if (ok) Object.assign(s, { state: "running", exit_code: null, started_at: iso(), restart_required: false, container_id: s.container_id || `c0ffee${s.id}0000` });
-      else if (s.state !== "unknown") Object.assign(s, { state: "exited", exit_code: 1, started_at: null, container_id: s.container_id || `c0ffee${s.id}0000` });
+      if (!build || s.state === "unknown") return;
+      // A start replaces the container: it now runs the configured build's image.
+      containerImage.delete(s.id);
+      if (st.certMode === "self_signed" && !st.serverCerts.has(s.id)) st.serverCerts.set(s.id, selfSignedCert(`server-${s.id}-${Date.now()}`));
+      if (ok) {
+        Object.assign(s, { state: "running", exit_code: null, started_at: iso(), restart_required: false, container_id: s.container_id || `c0ffee${s.id}0000` });
+        if (!build.schema_fingerprint) build.schema_fingerprint = FINGERPRINT;
+      } else {
+        Object.assign(s, { state: "exited", exit_code: 1, started_at: null, container_id: s.container_id || `c0ffee${s.id}0000` });
+      }
     }, failDetail);
   }
 

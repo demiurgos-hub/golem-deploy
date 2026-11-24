@@ -164,29 +164,54 @@ describe("validatePort", () => {
 });
 
 describe("checkServerImport", () => {
-  it("accepts a valid export", () => {
+  const COMMIT = "4f1c2a9e0b7d3c5a8e6f1b2c3d4e5f6a7b8c9d0e";
+
+  it("accepts a valid format 2 export", () => {
     const r = checkServerImport(
-      JSON.stringify({ format_version: 1, servers: [{ name: "a", image: "img:1", port: 7777, env: { K: "v" }, desired_state: "running" }] }),
+      JSON.stringify({
+        format_version: 2,
+        servers: [{ name: "a", project: "arena", commit: COMMIT, port: 7777, allowed_origins: ["https://play.example.com"], env: { K: "v" }, desired_state: "running" }],
+      }),
     );
     expect(r.errors).toEqual([]);
     expect(r.value?.servers).toHaveLength(1);
+    expect(r.value?.format_version).toBe(2);
+  });
+
+  it("explains that a format 1 export (image references) cannot be imported", () => {
+    const r = checkServerImport(JSON.stringify({ format_version: 1, servers: [{ name: "a", image: "img:1" }] }));
+    expect(r.value).toBeNull();
+    expect(r.errors[0]).toMatch(/format version 1 export .* needs format 2/);
+    expect(r.errors).toContain('Server 1 (a): unknown field "image".');
   });
 
   it("lists every problem", () => {
     const r = checkServerImport(
       JSON.stringify({
-        format_version: 2,
+        format_version: 3,
         servers: [
-          { name: "a", image: "", desired_state: "running", port: 7777 },
-          { name: "a", image: "x", desired_state: "maybe", port: 7777, env: { "1BAD": "v", golem_x: "x", Key: "1", KEY: "2", MOTD: "a\nb" }, extra: true },
+          { name: "a", project: "", desired_state: "running", port: 7777 },
+          {
+            name: "a",
+            project: "Arena!",
+            commit: "abc",
+            allowed_origins: "https://x",
+            desired_state: "maybe",
+            port: 7777,
+            env: { "1BAD": "v", golem_x: "x", Key: "1", KEY: "2", MOTD: "a\nb" },
+            extra: true,
+          },
         ],
       }),
     );
     expect(r.value).toBeNull();
     expect(r.errors).toEqual(
       expect.arrayContaining([
-        "format_version must be 1.",
-        "Server 1 (a): image is required.",
+        "format_version must be 2.",
+        "Server 1 (a): project is required (the server runs a build of that project). A server exported without a build has an empty project: fill it in.",
+        "Server 2 (a): project must be a project name.",
+        "Server 2 (a): commit must be a full lower-case commit hash (or empty for the newest successful build).",
+        "Server 2 (a): allowed_origins must be a list of origins.",
         "Server 2 (a): the name is also used by server 1.",
         "Server 2 (a): port 7777 is also used by server 1.",
         'Server 2 (a): desired_state must be "running" or "stopped".',
@@ -200,25 +225,32 @@ describe("checkServerImport", () => {
   });
 
   it("accepts at most 128 servers per document", () => {
-    const servers = Array.from({ length: 129 }, (_, i) => ({ name: `s${i}`, image: "x" }));
-    expect(checkServerImport(JSON.stringify({ format_version: 1, servers })).errors).toEqual([
+    const servers = Array.from({ length: 129 }, (_, i) => ({ name: `s${i}`, project: "arena" }));
+    expect(checkServerImport(JSON.stringify({ format_version: 2, servers })).errors).toEqual([
       "The file contains 129 servers; one import accepts at most 128. Split it into several files.",
     ]);
-    expect(checkServerImport(JSON.stringify({ format_version: 1, servers: servers.slice(0, 128) })).errors).toEqual([]);
+    expect(checkServerImport(JSON.stringify({ format_version: 2, servers: servers.slice(0, 128) })).errors).toEqual([]);
   });
 
   it("rejects non-JSON", () => {
     expect(checkServerImport("not json").errors).toEqual(["The file is not valid JSON. Choose a file saved with Export."]);
   });
 
-  it("accepts an export without desired_state or port", () => {
-    expect(checkServerImport(JSON.stringify({ format_version: 1, servers: [{ name: "a", image: "sha256:abc" }] })).errors).toEqual([]);
+  it("accepts an export without commit, desired_state, port or origins", () => {
+    expect(checkServerImport(JSON.stringify({ format_version: 2, servers: [{ name: "a", project: "arena", commit: "" }] })).errors).toEqual([]);
   });
 
   it("names the entry a daemon error points at", () => {
-    const doc = { format_version: 1, servers: [{ name: "a", image: "x", desired_state: "stopped" as const }, { name: "b", image: "y", desired_state: "stopped" as const }] };
-    expect(describeImportField("servers[1].image", doc)).toBe("Server 2 (b), image");
+    const doc = {
+      format_version: 2,
+      servers: [
+        { name: "a", project: "arena", desired_state: "stopped" as const },
+        { name: "b", project: "kart", desired_state: "stopped" as const },
+      ],
+    };
+    expect(describeImportField("servers[1].commit", doc)).toBe("Server 2 (b), commit");
     expect(describeImportField("servers[0].env.MOTD", doc)).toBe("Server 1 (a), environment variable MOTD");
+    expect(describeImportField("servers[1].allowed_origins[0]", doc)).toBe("Server 2 (b), allowed origin 1");
     expect(describeImportField("format_version", doc)).toBe("format_version");
     expect(describeImportField(undefined, doc)).toBeNull();
   });

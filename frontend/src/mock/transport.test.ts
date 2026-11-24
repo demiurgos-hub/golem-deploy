@@ -35,19 +35,18 @@ describe("mock transport contract", () => {
 
   it("names env value errors by key, reserves GOLEM_ and locks the port of a running server", async () => {
     const t = createMockTransport(real);
-    const image = "golem/arena-shooter:latest";
-    expect(await call(t, "POST", "/servers", { name: "a", image, env: { GOLEM_X: "1" } })).toMatchObject({ body: { error: { field: "env" } } });
-    expect(await call(t, "POST", "/servers", { name: "a", image, env: { MOTD: "a\nb" } })).toMatchObject({ body: { error: { field: "env.MOTD" } } });
-    expect((await call(t, "POST", "/servers", { name: "a", image, env: { PATH: "/x" } })).status).toBe(201);
+    const build_id = 3;
+    expect(await call(t, "POST", "/servers", { name: "a", build_id, env: { GOLEM_X: "1" } })).toMatchObject({ body: { error: { field: "env" } } });
+    expect(await call(t, "POST", "/servers", { name: "a", build_id, env: { MOTD: "a\nb" } })).toMatchObject({ body: { error: { field: "env.MOTD" } } });
+    expect((await call(t, "POST", "/servers", { name: "a", build_id, env: { PATH: "/x" } })).status).toBe(201);
     expect(await call(t, "PATCH", "/servers/11", { env_set: { MOTD: "a\u0000" } })).toMatchObject({ body: { error: { field: "env_set.MOTD" } } });
     expect(await call(t, "PATCH", "/servers/11", { port: 7050 })).toMatchObject({ status: 409, body: { error: { code: "conflict" } } });
-    expect(await call(t, "POST", "/servers", { name: "v", image: "golem/many-volumes:latest" })).toMatchObject({ body: { error: { field: "image" } } });
   });
 
   it("reports static usage, refuses uploads over the quota and a third concurrent upload", async () => {
     const t = createMockTransport(real);
     const list = await call(t, "GET", "/static");
-    expect(list.body).toMatchObject({ used_bytes: expect.any(Number), quota_bytes: expect.any(Number), file_count: 2, max_files: 2000 });
+    expect(list.body).toMatchObject({ used_bytes: expect.any(Number), quota_bytes: expect.any(Number), file_count: 3, max_files: 2000 });
     const upload = (files: File[]): Promise<RawResponse> => {
       const body = new FormData();
       for (const f of files) body.append("files", f); // no filename: the same File object (keeps the faked size)

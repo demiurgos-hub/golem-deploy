@@ -3,7 +3,6 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { Trash2 } from "lucide-react";
 import { useApi } from "@/app/services";
-import { ApiError, isApiError } from "@/api/errors";
 import { useAccount, useImages, useProjects, useServers } from "@/api/queries";
 import { qk } from "@/api/query-keys";
 import type { Image, Server } from "@/api/types.gen";
@@ -39,7 +38,7 @@ export function ImagesPage() {
     <>
       <PageHeader
         title="Images"
-        description="Docker images managed by Golem Deploy (labelled dev.golemengine.deploy.managed=true). Other images on the host are not listed and cannot be used by servers."
+        description="Docker images of this installation, made by project builds. Images of builds are removed by deleting the build; only images no build records (for example one a build could not remove) are deleted here."
       />
       {images.isPending ? (
         <LoadingState label="Loading images" />
@@ -47,8 +46,8 @@ export function ImagesPage() {
         <ErrorState error={images.error} title="Could not load images" onRetry={() => void images.refetch()} />
       ) : images.data.items.length === 0 ? (
         <EmptyState
-          title="No managed images"
-          description="Images will come from project builds, which are not available yet. Until then an operator can label an image on the host by hand (see docs/SERVERS.md)."
+          title="No images yet"
+          description="Images are made by builds: open a project and start a build. Every successful build records its image here."
         />
       ) : (
         <DataTable
@@ -101,6 +100,24 @@ export function ImagesPage() {
                   </span>
                 ) : (
                   <span className="text-muted-foreground">-</span>
+                ),
+            },
+            {
+              key: "builds",
+              header: "Builds",
+              cell: (i) =>
+                i.build_ids.length ? (
+                  <div className="flex flex-wrap gap-x-2">
+                    {i.build_ids.map((id) => (
+                      <Link key={id} to="/builds/$id" params={{ id: String(id) }} className="hover:underline">
+                        #{id}
+                      </Link>
+                    ))}
+                  </div>
+                ) : (
+                  <span className="text-muted-foreground" title="No build records this image: it can be deleted here once nothing uses it.">
+                    None
+                  </span>
                 ),
             },
             { key: "size", header: "Size", sortValue: (i) => i.size_bytes, cell: (i) => formatBytes(i.size_bytes) },
@@ -156,8 +173,8 @@ export function ImagesPage() {
           deleting && (
             <>
               Delete <span className="font-medium text-foreground">{deleting.tags.join(", ") || shortImageId(deleting.id)}</span> (
-              {formatBytes(deleting.size_bytes)})? Images that a server is configured with, or that any container was created
-              from, cannot be deleted.
+              {formatBytes(deleting.size_bytes)})? An image that a build records is deleted with that build instead, and an image
+              that a server&apos;s build uses or any container was created from cannot be deleted.
             </>
           )
         }
@@ -165,22 +182,8 @@ export function ImagesPage() {
         destructive
         onConfirm={async () => {
           if (!deleting) return;
-          try {
-            await api.images.remove(deleting.id);
-          } catch (err) {
-            if (isApiError(err) && err.code === "conflict") {
-              const users = usersOf(deleting, serverList).map((s) => s.name);
-              throw new ApiError({
-                status: err.status,
-                code: err.code,
-                requestId: err.requestId,
-                message: users.length
-                  ? `The image is still used by ${users.join(", ")}. Delete those servers or switch them to another image first.`
-                  : "A container on the host was created from this image. Remove that container first (it may not be managed by Golem Deploy).",
-              });
-            }
-            throw err;
-          }
+          // A 409 says why (the build that records it, or that it is in use); the dialog shows it as sent.
+          await api.images.remove(deleting.id);
           toast.success("Image deleted.");
           await queryClient.invalidateQueries({ queryKey: qk.images });
         }}

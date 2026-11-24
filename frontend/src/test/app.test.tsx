@@ -4,21 +4,9 @@ import type { APIToken, Job, Project } from "@/api/types.gen";
 import { STORAGE_KEY } from "@/api/session";
 import { account, errorResponse, fakeJwt, job as makeJob, jsonResponse, streamResponse } from "@/test/fake-api";
 import { renderApp } from "@/test/render-app";
+import { projectFixture } from "@/test/fixtures";
 
-const project: Project = {
-  id: 5,
-  name: "arena",
-  repo_url: "https://github.com/example/arena.git",
-  branch: "main",
-  auth_type: "none",
-  auth_username: "",
-  has_secret: false,
-  last_commit: "4f1c2a9e0b7d3c5a8e6f1b2c3d4e5f6a7b8c9d0e",
-  last_pulled_at: "2026-11-20T10:00:00Z",
-  status: "idle",
-  created_at: "2026-11-01T10:00:00Z",
-  updated_at: "2026-11-20T10:00:00Z",
-};
+const project: Project = projectFixture();
 
 describe("login", () => {
   it("redirects to login, validates fields and returns to the intended page", async () => {
