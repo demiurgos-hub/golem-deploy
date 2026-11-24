@@ -84,7 +84,8 @@ func TestIntegrationBuildToServer(t *testing.T) {
 	svc := servers.New(h.st, box, dc, servers.Config{Ports: ports.Range{Lo: lo, Hi: lo + 9}, BindAddress: "127.0.0.1", StopTimeout: 5 * time.Second,
 		StartTimeout: 60 * time.Second, DefaultGameHost: "localhost", Certs: cm}, logger)
 	builds := build.New(build.Options{Store: h.st, Docker: dc, InstanceID: dockertest.IntegrationInstanceID, RepoDir: repoDir, TempDir: tmpDir,
-		Timeout: 20 * time.Minute, Logger: logger})
+		Timeout: 20 * time.Minute, Logger: logger,
+		HeadCommit: func(context.Context, string) (string, error) { return p.LastCommit, nil }})
 	runner := jobs.New(h.st, t.TempDir(), jobs.Options{Logger: logger, Pools: map[string]int{build.JobPool: build.MaxActiveBuilds}})
 	srv, err := New(Config{Listen: "127.0.0.1:0", PublicHosts: []string{"example.com"}}, Deps{Store: h.st, Sessions: h.sessions, Hasher: h.hasher,
 		Secrets: box, Jobs: runner, Logger: logger, Docker: dc, Servers: svc, Certs: cm, Builds: builds})

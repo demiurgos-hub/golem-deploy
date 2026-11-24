@@ -14,6 +14,7 @@ package extract
 
 import (
 	"archive/zip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/demiurgos-hub/golem-deploy/internal/staticfiles"
 )
 
 // Limits bounds one extraction.
@@ -32,9 +35,10 @@ type Limits struct {
 	// MaxRatio bounds uncompressed/compressed size, checked for the whole
 	// archive, for each entry larger than ratioMinBytes and against the
 	// archive file's real size (declared and actually written bytes).
-	MaxRatio   int64
-	MaxDepth   int // path segments
-	MaxPathLen int // bytes of an entry path
+	MaxRatio     int64
+	MaxDepth     int   // path segments
+	MaxPathLen   int   // bytes of an entry path
+	ReserveBytes int64 // unallocated space to leave on the staging filesystem
 }
 
 // DefaultLimits suits game add-ons (a few GiB of assets at most).
@@ -46,6 +50,7 @@ func DefaultLimits() Limits {
 		MaxRatio:      200,
 		MaxDepth:      32,
 		MaxPathLen:    512,
+		ReserveBytes:  staticfiles.DefaultReserveBytes,
 	}
 }
 
@@ -192,104 +197,146 @@ func plan(files []*zip.File, lim Limits, archiveSize int64) ([]entry, error) {
 // Zip extracts the archive at zipPath into a new directory created with
 // os.MkdirTemp under tmpRoot and returns that directory. On any error
 // nothing is left behind. The caller removes the directory when done.
-func Zip(zipPath, tmpRoot string, lim Limits) (string, error) {
-	r, err := zip.OpenReader(zipPath)
-	if errors.Is(err, zip.ErrInsecurePath) {
-		if r != nil {
-			_ = r.Close()
-		}
-		return "", unsafe("archive contains insecure paths")
+func Zip(ctx context.Context, zipPath, tmpRoot string, lim Limits) (Result, error) {
+	fail := func(err error) (Result, error) { return Result{}, err }
+	if err := ctx.Err(); err != nil {
+		return fail(err)
 	}
-	if err != nil {
-		return "", fmt.Errorf("open zip: %w", err)
-	}
-	defer r.Close()
-	size, err := checkRecords(zipPath, r.File)
-	if err != nil {
-		return "", err
-	}
-	entries, err := plan(r.File, lim, size)
-	if err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(tmpRoot, 0o700); err != nil {
-		return "", err
-	}
-	dest, err := os.MkdirTemp(tmpRoot, "static-extract-")
-	if err != nil {
-		return "", err
-	}
-	if err := extractAll(entries, dest, lim, ratioBudget(lim, size)); err != nil {
-		_ = os.RemoveAll(dest)
-		return "", err
-	}
-	return dest, nil
-}
-
-// checkRecords validates the archive's own records against archive/zip's
-// view (see layout.go) and returns the archive's size.
-func checkRecords(zipPath string, files []*zip.File) (int64, error) {
 	f, err := os.Open(zipPath)
 	if err != nil {
-		return 0, err
+		return fail(err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return 0, err
+		return fail(err)
 	}
-	cd, cdOffset, err := readCentral(f, info.Size())
+	size := info.Size()
+	reader := contextReaderAt{ctx, f}
+	// Bound both the declared and actual metadata before archive/zip
+	// allocates its File records. Read from the same open file throughout.
+	cd, cdOffset, err := readCentral(reader, size, lim.MaxEntries)
 	if err != nil {
-		return 0, err
+		return fail(err)
 	}
-	if len(cd) != len(files) {
-		return 0, unsafe("central directory entry count mismatch")
+	if err := checkLayout(reader, cd, cdOffset); err != nil {
+		if ctx.Err() != nil {
+			return fail(ctx.Err())
+		}
+		return fail(err)
 	}
-	for i := range cd {
-		if string(cd[i].name) != files[i].Name {
-			return 0, unsafe("central directory mismatch at entry %d", i)
+	r, err := zip.NewReader(reader, size)
+	if err != nil {
+		if ctx.Err() != nil {
+			return fail(ctx.Err())
+		}
+		return fail(unsafe("invalid ZIP archive"))
+	}
+	if len(cd) != len(r.File) {
+		return fail(unsafe("central directory entry count mismatch"))
+	}
+	for i, entry := range cd {
+		zf := r.File[i]
+		if string(entry.name) != zf.Name || entry.compressed != zf.CompressedSize64 || entry.uncompressed != zf.UncompressedSize64 {
+			return fail(unsafe("central directory mismatch at entry %d", i))
 		}
 	}
-	if err := checkLayout(f, cd, cdOffset); err != nil {
+	entries, err := plan(r.File, lim, size)
+	if err != nil {
+		return fail(err)
+	}
+	if err := os.MkdirAll(tmpRoot, 0o700); err != nil {
+		return fail(err)
+	}
+	var total int64
+	for _, e := range entries {
+		if !e.dir {
+			total += int64(e.f.UncompressedSize64)
+		}
+	}
+	if err := staticfiles.CheckFreeSpace(tmpRoot, total, lim.ReserveBytes); err != nil {
+		return fail(err)
+	}
+	dest, err := os.MkdirTemp(tmpRoot, "static-extract-")
+	if err != nil {
+		return fail(err)
+	}
+	written, err := extractAll(ctx, entries, dest, lim, ratioBudget(lim, size))
+	if err != nil {
+		_ = os.RemoveAll(dest)
+		return fail(err)
+	}
+	return Result{Dir: dest, Entries: len(entries), Bytes: written}, nil
+}
+
+// Result reports the consumed build budget and the extracted directory.
+type Result struct {
+	Dir     string
+	Entries int
+	Bytes   int64
+}
+
+type contextReaderAt struct {
+	ctx context.Context
+	io.ReaderAt
+}
+
+type contextReader struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
 		return 0, err
 	}
-	return info.Size(), nil
+	return r.Reader.Read(p)
+}
+
+func (r contextReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.ReaderAt.ReadAt(p, off)
 }
 
 // extractAll writes the planned entries; budget bounds the bytes actually
 // written in total.
-func extractAll(entries []entry, dest string, lim Limits, budget int64) error {
+func extractAll(ctx context.Context, entries []entry, dest string, lim Limits, budget int64) (int64, error) {
 	var written int64
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		target := filepath.Join(dest, filepath.FromSlash(e.path))
 		if rel, err := filepath.Rel(dest, target); err != nil || !filepath.IsLocal(rel) {
-			return unsafe("entry %q escapes the destination", clip(e.path))
+			return 0, unsafe("entry %q escapes the destination", clip(e.path))
 		}
 		if e.dir {
 			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
+				return 0, err
 			}
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
+			return 0, err
 		}
 		mode := fs.FileMode(0o644)
 		if e.exec {
 			mode = 0o755
 		}
-		n, err := writeFile(e.f, target, mode, min(lim.MaxFileBytes, budget-written))
+		n, err := writeFile(ctx, e.f, target, mode, min(lim.MaxFileBytes, budget-written), dest, lim.ReserveBytes)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		written += n
 	}
-	return nil
+	return written, ctx.Err()
 }
 
 // writeFile copies one entry, never trusting its declared size: at most
 // limit bytes are accepted.
-func writeFile(f *zip.File, target string, mode fs.FileMode, limit int64) (int64, error) {
+func writeFile(ctx context.Context, f *zip.File, target string, mode fs.FileMode, limit int64, dest string, reserve int64) (int64, error) {
 	src, err := f.Open()
 	if err != nil {
 		return 0, fmt.Errorf("open entry %q: %w", clip(f.Name), err)
@@ -304,7 +351,25 @@ func writeFile(f *zip.File, target string, mode fs.FileMode, limit int64) (int64
 		}
 		return 0, err
 	}
-	n, err := io.Copy(dst, io.LimitReader(src, limit+1))
+	reader := io.LimitReader(contextReader{ctx, src}, limit+1)
+	var n int64
+	for err == nil {
+		if err = ctx.Err(); err != nil {
+			break
+		}
+		const chunk = 64 << 20
+		need := min(chunk, max(0, int64(f.UncompressedSize64)-n))
+		if err = staticfiles.CheckFreeSpace(dest, need, reserve); err != nil {
+			break
+		}
+		var copied int64
+		copied, err = io.CopyN(dst, reader, chunk)
+		n += copied
+		if errors.Is(err, io.EOF) {
+			err = nil
+			break
+		}
+	}
 	if cerr := dst.Close(); err == nil {
 		err = cerr
 	}

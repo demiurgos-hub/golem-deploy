@@ -31,6 +31,7 @@ const (
 	zip64EOCDLen    = 56
 	maxCommentLen   = 0xffff
 	flagDescriptor  = 0x8
+	maxCentralBytes = 16 << 20
 )
 
 // cdEntry is one central directory entry as recorded in the archive.
@@ -45,7 +46,7 @@ type cdEntry struct {
 
 // readCentral parses the end of central directory record(s) and the
 // central directory of the archive r (of size size).
-func readCentral(r io.ReaderAt, size int64) (entries []cdEntry, cdOffset uint64, err error) {
+func readCentral(r io.ReaderAt, size int64, maxEntries int) (entries []cdEntry, cdOffset uint64, err error) {
 	tailLen := min(size, eocdLen+maxCommentLen)
 	tail := make([]byte, tailLen)
 	if _, err := r.ReadAt(tail, size-tailLen); err != nil && !errors.Is(err, io.EOF) {
@@ -59,13 +60,17 @@ func readCentral(r io.ReaderAt, size int64) (entries []cdEntry, cdOffset uint64,
 		}
 	}
 	if at < 0 {
-		return nil, 0, unsafe("no end of central directory record")
+		return nil, 0, unsafe("not a valid ZIP archive (no end of central directory record)")
 	}
 	eocd := tail[at:]
+	if eocdLen+int(binary.LittleEndian.Uint16(eocd[20:])) != len(eocd) {
+		return nil, 0, unsafe("malformed end of central directory")
+	}
 	count := uint64(binary.LittleEndian.Uint16(eocd[10:]))
 	cdSize := uint64(binary.LittleEndian.Uint32(eocd[12:]))
 	cdOffset = uint64(binary.LittleEndian.Uint32(eocd[16:]))
 	eocdPos := size - tailLen + int64(at)
+	cdEnd := uint64(eocdPos)
 	if count == 0xffff || cdSize == 0xffffffff || cdOffset == 0xffffffff {
 		// Zip64: the locator sits right before the EOCD record.
 		if eocdPos < zip64LocatorLen {
@@ -79,7 +84,8 @@ func readCentral(r io.ReaderAt, size int64) (entries []cdEntry, cdOffset uint64,
 			return nil, 0, unsafe("missing zip64 locator")
 		}
 		recOff := binary.LittleEndian.Uint64(loc[8:])
-		if recOff > uint64(size)-zip64EOCDLen {
+		locOff := uint64(eocdPos - zip64LocatorLen)
+		if locOff < zip64EOCDLen || recOff > locOff-zip64EOCDLen {
 			return nil, 0, unsafe("zip64 record out of range")
 		}
 		rec := make([]byte, zip64EOCDLen)
@@ -89,12 +95,22 @@ func readCentral(r io.ReaderAt, size int64) (entries []cdEntry, cdOffset uint64,
 		if binary.LittleEndian.Uint32(rec) != sigZip64EOCD {
 			return nil, 0, unsafe("bad zip64 end of central directory")
 		}
+		if binary.LittleEndian.Uint64(rec[4:]) != locOff-recOff-12 {
+			return nil, 0, unsafe("malformed zip64 end of central directory")
+		}
 		count = binary.LittleEndian.Uint64(rec[32:])
 		cdSize = binary.LittleEndian.Uint64(rec[40:])
 		cdOffset = binary.LittleEndian.Uint64(rec[48:])
+		cdEnd = recOff
 	}
-	if cdOffset > uint64(size) || cdSize > uint64(size)-cdOffset {
+	if cdOffset > cdEnd || cdSize != cdEnd-cdOffset {
 		return nil, 0, unsafe("central directory out of range")
+	}
+	if maxEntries < 0 || count > uint64(maxEntries) {
+		return nil, 0, unsafe("archive exceeds the remaining build entry limit (%d entries)", maxEntries)
+	}
+	if cdSize > maxCentralBytes {
+		return nil, 0, unsafe("central directory exceeds the metadata limit")
 	}
 	if count > cdSize/centralLen {
 		return nil, 0, unsafe("central directory entry count does not fit")
@@ -104,7 +120,8 @@ func readCentral(r io.ReaderAt, size int64) (entries []cdEntry, cdOffset uint64,
 		return nil, 0, err
 	}
 	entries = make([]cdEntry, 0, count)
-	for p := 0; uint64(len(entries)) < count; {
+	p := 0
+	for uint64(len(entries)) < count {
 		if p+centralLen > len(cd) || binary.LittleEndian.Uint32(cd[p:]) != sigCentral {
 			return nil, 0, unsafe("malformed central directory")
 		}
@@ -128,6 +145,9 @@ func readCentral(r io.ReaderAt, size int64) (entries []cdEntry, cdOffset uint64,
 		}
 		entries = append(entries, e)
 		p = end
+	}
+	if p != len(cd) {
+		return nil, 0, unsafe("central directory entry count mismatch")
 	}
 	return entries, cdOffset, nil
 }

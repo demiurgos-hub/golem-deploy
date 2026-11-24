@@ -47,7 +47,7 @@ Git runs non-interactively with an isolated configuration: system and global git
 
 ## Size limits
 
-A checkout (working tree and `.git`, including Git LFS content) may not grow beyond `--max-repo-size-mb` (default 10240 MiB; `0` disables the limit). The size is sampled every few seconds while clone, fetch, checkout and `git lfs pull` run, and after each of them; an operation that exceeds it is stopped and the job fails with "the checkout exceeds the maximum repository size configured on the host" (a failed clone leaves nothing behind, a failed pull leaves the previous checkout). A clone, pull or branch switch does not start when less than 512 MiB is free on the data directory's filesystem. Each job log is capped at 16 MiB; further output is replaced by a truncation note.
+A checkout (working tree and `.git`, including Git LFS content) may not grow beyond `--max-repo-size-mb` (default 10240 MiB; `0` disables the limit). The size is sampled every few seconds while clone, fetch, checkout and `git lfs pull` run, and after each of them; an operation that exceeds it is stopped and the job fails with "the checkout exceeds the maximum repository size configured on the host" (a failed clone leaves nothing behind, a failed pull can leave a partially updated checkout). A clone, pull or branch switch does not start when less than 512 MiB is free on the data directory's filesystem. Each job log is capped at 16 MiB; further output is replaced by a truncation note.
 
 ## Git LFS
 
@@ -57,4 +57,4 @@ The LFS server is always derived from the project's URL, never from the reposito
 
 ## Troubleshooting
 
-The job's detail gives the reason (authentication failed, repository not found, branch does not exist, host key verification failed, remote unreachable, timeout); the job log (`GET /api/v1/jobs/{id}/log`) has the git output. A project in status `error` is repaired by pulling it, which re-clones when there is no checkout.
+The job's detail gives the reason (authentication failed, repository not found, branch does not exist, host key verification failed, remote unreachable, timeout); the job log (`GET /api/v1/jobs/{id}/log`) has the git output. A project in status `error` is repaired by pulling it, which re-clones when there is no checkout. A build requires an idle checkout with a Git HEAD that matches the recorded commit. Use `pull: true` to update the checkout and build in one job.

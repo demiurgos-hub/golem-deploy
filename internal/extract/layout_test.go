@@ -4,14 +4,18 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/flate"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/demiurgos-hub/golem-deploy/internal/staticfiles"
 )
 
 // rawEntry is one entry of a hand-built archive.
@@ -132,6 +136,38 @@ func overlapping(t *testing.T, n int, plain []byte) []byte {
 	return centralAndEnd(body, entries)
 }
 
+func TestZipRejectsCentralDirectoryBeforeLayout(t *testing.T) {
+	archive := centralAndEnd(nil, []rawEntry{{name: "a"}, {name: "b"}})
+	lim := DefaultLimits()
+	lim.MaxEntries = 1
+	if _, err := Zip(t.Context(), save(t, archive), t.TempDir(), lim); !errors.Is(err, ErrUnsafe) || !strings.Contains(err.Error(), "remaining build entry limit") {
+		t.Fatalf("entry cap must precede local record parsing: %v", err)
+	}
+	archive = make([]byte, maxCentralBytes+1+eocdLen)
+	eocd := archive[len(archive)-eocdLen:]
+	binary.LittleEndian.PutUint32(eocd, sigEOCD)
+	binary.LittleEndian.PutUint32(eocd[12:], maxCentralBytes+1)
+	if _, err := Zip(t.Context(), save(t, archive), t.TempDir(), DefaultLimits()); !errors.Is(err, ErrUnsafe) || !strings.Contains(err.Error(), "metadata limit") {
+		t.Fatalf("metadata cap: %v", err)
+	}
+}
+
+func TestZipHonorsCancellationAndDiskReserve(t *testing.T) {
+	path := writeZip(t, zentry{name: "asset", content: []byte("asset")})
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := Zip(ctx, path, root, DefaultLimits()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled extraction: %v", err)
+	}
+	lim := DefaultLimits()
+	lim.ReserveBytes = math.MaxInt64
+	if _, err := Zip(t.Context(), path, root, lim); !errors.Is(err, staticfiles.ErrNoSpace) {
+		t.Fatalf("disk reserve: %v", err)
+	}
+	assertEmpty(t, root)
+}
+
 // D7: overlapping entries are rejected although each is small enough and
 // archive/zip lists them as distinct files.
 func TestD7_OverlappingEntries(t *testing.T) {
@@ -147,7 +183,7 @@ func TestD7_OverlappingEntries(t *testing.T) {
 		rc.Close()
 	}
 	root := t.TempDir()
-	_, err = Zip(save(t, archive), root, DefaultLimits())
+	_, err = Zip(context.Background(), save(t, archive), root, DefaultLimits())
 	if !errors.Is(err, ErrUnsafe) || !strings.Contains(err.Error(), "overlap") {
 		t.Fatalf("got %v", err)
 	}
@@ -156,7 +192,7 @@ func TestD7_OverlappingEntries(t *testing.T) {
 	// At scale (the reviewer's 58 KB -> 320 MiB): rejected too.
 	big := overlapping(t, 1000, make([]byte, 320<<10))
 	t.Logf("overlapping archive: %d bytes declaring %d MiB", len(big), 1000*320/1024)
-	if _, err := Zip(save(t, big), root, DefaultLimits()); !errors.Is(err, ErrUnsafe) {
+	if _, err := Zip(context.Background(), save(t, big), root, DefaultLimits()); !errors.Is(err, ErrUnsafe) {
 		t.Fatalf("got %v", err)
 	}
 	assertEmpty(t, root)
@@ -169,7 +205,7 @@ func TestD7_LocalNameMismatch(t *testing.T) {
 		compressed: uint32(len(data)), size: uint32(len(data))}
 	archive := centralAndEnd(append(localHeader(e), data...), []rawEntry{e})
 	root := t.TempDir()
-	if _, err := Zip(save(t, archive), root, DefaultLimits()); !errors.Is(err, ErrUnsafe) || !strings.Contains(err.Error(), "different name") {
+	if _, err := Zip(context.Background(), save(t, archive), root, DefaultLimits()); !errors.Is(err, ErrUnsafe) || !strings.Contains(err.Error(), "different name") {
 		t.Fatalf("got %v", err)
 	}
 	assertEmpty(t, root)
@@ -182,7 +218,7 @@ func TestD7_QuineStyleEntryCoversDirectory(t *testing.T) {
 	e := rawEntry{name: "self.zip", method: zip.Store, crc: crc32.ChecksumIEEE(data), compressed: uint32(len(data)) + 200, size: uint32(len(data)) + 200}
 	archive := centralAndEnd(append(localHeader(e), data...), []rawEntry{e})
 	root := t.TempDir()
-	if _, err := Zip(save(t, archive), root, DefaultLimits()); !errors.Is(err, ErrUnsafe) || !strings.Contains(err.Error(), "central directory") {
+	if _, err := Zip(context.Background(), save(t, archive), root, DefaultLimits()); !errors.Is(err, ErrUnsafe) || !strings.Contains(err.Error(), "central directory") {
 		t.Fatalf("got %v", err)
 	}
 	assertEmpty(t, root)
@@ -201,12 +237,12 @@ func TestD7_NestedArchiveIsNotExpanded(t *testing.T) {
 	}
 	_ = zw.Close()
 	root := t.TempDir()
-	dir, err := Zip(save(t, outer.Bytes()), root, DefaultLimits())
+	dir, err := Zip(context.Background(), save(t, outer.Bytes()), root, DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
 	var total int64
-	_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(dir.Dir, func(p string, info os.FileInfo, err error) error {
 		if err == nil && info.Mode().IsRegular() {
 			total += info.Size()
 			if !strings.HasSuffix(p, ".zip") {
@@ -231,7 +267,7 @@ func TestD7_RatioAgainstArchiveSize(t *testing.T) {
 		es = append(es, zentry{name: fmt.Sprintf("f%d", i), content: make([]byte, 512<<10)})
 	}
 	root := t.TempDir()
-	if _, err := Zip(writeZip(t, es...), root, lim); !errors.Is(err, ErrUnsafe) {
+	if _, err := Zip(context.Background(), writeZip(t, es...), root, lim); !errors.Is(err, ErrUnsafe) {
 		t.Fatalf("got %v", err)
 	}
 	assertEmpty(t, root)

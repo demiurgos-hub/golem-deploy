@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -35,17 +36,19 @@ type BuildSpec struct {
 	EngineVersion string
 }
 
-// BuildEnv are fixed variables added to the docker CLI's environment for
+// buildEnv returns fixed variables added to the docker CLI's environment for
 // builds: BuildKit is required (no fallback to the legacy builder), the
 // CLI never runs git in the context to collect VCS information and adds no
 // attestations, and the metadata file carries no provenance.
-var BuildEnv = []string{
-	"DOCKER_BUILDKIT=1",
-	"BUILDX_GIT_INFO=false",
-	"BUILDX_GIT_LABELS=false",
-	"BUILDX_NO_DEFAULT_ATTESTATIONS=1",
-	"BUILDX_METADATA_PROVENANCE=disabled",
-	"BUILDX_METADATA_WARNINGS=false",
+func buildEnv() []string {
+	return []string{
+		"DOCKER_BUILDKIT=1",
+		"BUILDX_GIT_INFO=false",
+		"BUILDX_GIT_LABELS=false",
+		"BUILDX_NO_DEFAULT_ATTESTATIONS=1",
+		"BUILDX_METADATA_PROVENANCE=disabled",
+		"BUILDX_METADATA_WARNINGS=false",
+	}
 }
 
 // LabelPrefix is the namespace of the daemon's labels.
@@ -112,12 +115,14 @@ func buildLabels(instance string, projectID int64, commit string, buildID int64,
 // server start (BuildImage) verify an image with it.
 func matchBuildLabels(labels, want map[string]string) bool {
 	for k, v := range labels {
-		if strings.HasPrefix(k, LabelPrefix) && want[k] != v {
-			return false
+		if strings.HasPrefix(k, LabelPrefix) {
+			if expected, ok := want[k]; !ok || expected != v {
+				return false
+			}
 		}
 	}
 	for k, v := range want {
-		if labels[k] != v {
+		if actual, ok := labels[k]; !ok || actual != v {
 			return false
 		}
 	}
@@ -141,23 +146,13 @@ func hostPathOK(p string) bool {
 
 // Args validates the spec and returns the "docker build" arguments.
 func (s BuildSpec) Args(instance string) ([]string, error) {
-	if !ValidInstanceID(instance) {
-		return nil, invalid("instance", "invalid instance id")
+	if err := s.validateIdentity(instance); err != nil {
+		return nil, err
 	}
 	for _, p := range []string{s.ContextDir, s.Dockerfile, s.StaticDir, s.IIDFile, s.MetadataFile} {
 		if !hostPathOK(p) {
 			return nil, invalid("build", "build paths must be absolute and clean")
 		}
-	}
-	switch {
-	case !buildTagNameRE.MatchString(s.ProjectName):
-		return nil, invalid("build", "invalid project name")
-	case s.ProjectID <= 0 || s.BuildID <= 0:
-		return nil, invalid("build", "invalid project or build id")
-	case !commitRE.MatchString(s.Commit):
-		return nil, invalid("build", "invalid commit")
-	case !engineVersionRE.MatchString(s.EngineVersion):
-		return nil, invalid("build", "invalid engine version")
 	}
 	labels := s.Labels(instance)
 	args := []string{"build",
@@ -180,6 +175,22 @@ func (s BuildSpec) Args(instance string) ([]string, error) {
 	return args, nil
 }
 
+func (s BuildSpec) validateIdentity(instance string) error {
+	switch {
+	case !ValidInstanceID(instance):
+		return invalid("instance", "invalid instance id")
+	case !buildTagNameRE.MatchString(s.ProjectName):
+		return invalid("build", "invalid project name")
+	case s.ProjectID <= 0 || s.BuildID <= 0:
+		return invalid("build", "invalid project or build id")
+	case !commitRE.MatchString(s.Commit):
+		return invalid("build", "invalid commit")
+	case !engineVersionRE.MatchString(s.EngineVersion):
+		return invalid("build", "invalid engine version")
+	}
+	return nil
+}
+
 // Build runs "docker build" for spec, streaming the CLI's output to out.
 // Cancelling ctx kills the CLI, which cancels the build. Errors are
 // *CmdError values; their Detail is never set from build output (which is
@@ -193,8 +204,12 @@ func (c *Client) Build(ctx context.Context, spec BuildSpec, out io.Writer) error
 		return err
 	}
 	head := &capBuffer{max: maxStderr}
+	env, err := c.buildClientEnv(ctx, spec)
+	if err != nil {
+		return err
+	}
 	c.logger.Info("docker build", "project_id", spec.ProjectID, "build_id", spec.BuildID, "tag", spec.Tag())
-	err = c.execEnv(ctx, 0, args, BuildEnv, nil, out, io.MultiWriter(out, head))
+	err = c.execEnv(ctx, 0, args, env, nil, out, io.MultiWriter(out, head), true)
 	if err == nil {
 		return nil
 	}
@@ -221,9 +236,11 @@ const maxMetadataBytes = 1 << 20
 // --iidfile holds) and the manifest digest with the containerd image store
 // (containerimage.digest in the metadata file), so both are tried, each
 // only as an exact full id. The image must carry exactly spec's
-// dev.golemengine.deploy.* labels (ErrLabelMismatch otherwise, with the
-// image returned so the caller can remove it).
+// dev.golemengine.deploy.* labels (ErrLabelMismatch otherwise).
 func (c *Client) BuiltImage(ctx context.Context, spec BuildSpec) (Image, error) {
+	if err := ctx.Err(); err != nil {
+		return Image{}, err
+	}
 	if err := c.needInstance(); err != nil {
 		return Image{}, err
 	}
@@ -245,6 +262,9 @@ func (c *Client) BuiltImage(ctx context.Context, spec BuildSpec) (Image, error) 
 			continue
 		}
 		list, err := c.inspectImages(ctx, []string{id})
+		if ctx.Err() != nil {
+			return Image{}, ctx.Err()
+		}
 		if errors.Is(err, ErrNotFound) {
 			continue
 		}
@@ -258,9 +278,39 @@ func (c *Client) BuiltImage(ctx context.Context, spec BuildSpec) (Image, error) 
 		if !matchBuildLabels(img.Labels, spec.Labels(c.instance)) {
 			return img, ErrLabelMismatch
 		}
+		if !slices.Contains(img.Tags, spec.Tag()) {
+			continue
+		}
 		return img, nil
 	}
 	return Image{}, &CmdError{Op: "image inspect", Kind: ErrNotFound, Detail: "the built image was not found"}
+}
+
+// RemoveBuildOutput removes only this build's unique tag, after proving
+// ownership with all CLI-supplied labels. Extra reserved labels are allowed
+// here so a rejected export can be cleaned up. Never force removal.
+func (c *Client) RemoveBuildOutput(ctx context.Context, spec BuildSpec) error {
+	if err := spec.validateIdentity(c.instance); err != nil {
+		return err
+	}
+	tag := spec.Tag()
+	img, err := c.ManagedImage(ctx, tag)
+	if err != nil {
+		return err
+	}
+	for key, value := range spec.Labels(c.instance) {
+		if img.Labels[key] != value {
+			return ErrNotOurs
+		}
+	}
+	used, err := c.ContainersUsingImage(ctx, img.ID)
+	if err != nil {
+		return err
+	}
+	if len(used) > 0 {
+		return ErrInUse
+	}
+	return c.exec(ctx, quickTimeout, []string{"image", "rm", "--", tag}, nil, nil, nil)
 }
 
 func readCapped(path string, limit int64) ([]byte, error) {

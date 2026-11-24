@@ -638,14 +638,14 @@ func TestDynamicAdminPort(t *testing.T) {
 func TestD14_RemoveImageByID(t *testing.T) {
 	c, f, _ := newClient(t)
 	id := managedImage(f, 1, "game:v1", "game:latest")
-	if err := c.RemoveImage(context.Background(), id); err != nil {
-		t.Fatal(err)
+	if err := c.RemoveImage(context.Background(), id); !errors.Is(err, docker.ErrImageMultipleTags) {
+		t.Fatalf("multi-tag image removal: %v", err)
 	}
-	if f.HasImage(id) {
-		t.Fatal("image not removed")
+	if !f.HasImage(id) {
+		t.Fatal("multi-tag image forcibly removed")
 	}
 	rms := f.CallsTo("image", "rm")
-	if len(rms) != 1 || !slices.Equal(rms[0].Args, []string{"image", "rm", "--force", "--", id}) {
+	if len(rms) != 0 {
 		t.Fatalf("rm calls %v", rms)
 	}
 	single := managedImage(f, 2, "solo:1")

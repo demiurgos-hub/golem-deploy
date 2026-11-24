@@ -4,11 +4,14 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +41,8 @@ func newBuildHarness(t *testing.T) *buildHarness {
 	d.srv.proj.repoDir = bh.repoDir
 	d.srv.proj.tmpDir = bh.tmpDir
 	d.srv.builds = build.New(build.Options{Store: d.st, Docker: d.dc, InstanceID: dockertest.InstanceID, RepoDir: bh.repoDir,
-		TempDir: bh.tmpDir, StaticDir: d.static.Dir(), Timeout: time.Minute})
+		TempDir: bh.tmpDir, StaticDir: d.static.Dir(), Timeout: time.Minute,
+		HeadCommit: func(context.Context, string) (string, error) { return strings.Repeat("a", 40), nil }})
 	bh.devSs = d.session(d.dev)
 	return bh
 }
@@ -326,7 +330,8 @@ func TestStaticAddonsAPI(t *testing.T) {
 		t.Fatalf("%+v", got.StaticAddons)
 	}
 	// Referenced static files cannot be deleted.
-	e := errBody(t, b.call("DELETE", "/api/v1/static/maps.zip", b.devTok, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	errBody(t, b.call("DELETE", "/api/v1/static/maps.zip", b.devTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
+	e := errBody(t, b.call("DELETE", "/api/v1/static/maps.zip", b.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
 	if !strings.Contains(e.Message, "arena") {
 		t.Fatal(e.Message)
 	}
@@ -375,5 +380,152 @@ func TestBuildsUnavailable(t *testing.T) {
 	errBody(t, b.call("DELETE", "/api/v1/builds/1", b.adminSs, nil), http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
 	if rr := b.call("GET", "/api/v1/builds", b.devTok, nil); rr.Code != http.StatusOK {
 		t.Fatalf("%d", rr.Code)
+	}
+}
+
+func TestCustomDockerfileRequiresAdminOptIn(t *testing.T) {
+	b := newBuildHarness(t)
+	p := b.project("arena")
+	path := fmt.Sprintf("/api/v1/projects/%d", p.ID)
+	checkout := filepath.Join(b.repoDir, fmt.Sprint(p.ID))
+	for f, content := range map[string]string{"golem-deploy.yaml": "dockerfile: Dockerfile.custom\n", "Dockerfile.custom": "FROM scratch\n"} {
+		if err := os.WriteFile(filepath.Join(checkout, f), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res := b.startBuild(b.devTok, p.ID, nil)
+	if j := b.waitJob(res.Job); j.Status != store.JobError || !strings.Contains(j.Detail, "enable allow_custom_dockerfile") || len(b.fake.CallsTo("build")) != 0 {
+		t.Fatalf("custom build without consent: %+v", j)
+	}
+	errBody(t, b.call("PATCH", path, b.devSs, `{"allow_custom_dockerfile":true}`), http.StatusForbidden, apitypes.ErrorCodeForbidden)
+	for _, allow := range []bool{true, false} {
+		rr := b.call("PATCH", path, b.adminSs, map[string]bool{"allow_custom_dockerfile": allow})
+		if rr.Code != http.StatusOK || decode[apitypes.Project](t, rr).AllowCustomDockerfile != allow {
+			t.Fatalf("opt-in PATCH: %d %s", rr.Code, rr.Body.String())
+		}
+		res := b.startBuild(b.devTok, p.ID, nil)
+		if j := b.waitJob(res.Job); (j.Status == store.JobSuccess) != allow {
+			t.Fatalf("build with allow=%t: %+v", allow, j)
+		}
+	}
+}
+
+func TestBuildWithoutPullRejectsFailedCheckout(t *testing.T) {
+	b := newBuildHarness(t)
+	p := b.project("arena")
+	if err := b.st.SetProjectStatus(t.Context(), p.ID, "error"); err != nil {
+		t.Fatal(err)
+	}
+	e := errBody(t, b.call("POST", fmt.Sprintf("/api/v1/projects/%d/builds", p.ID), b.devTok, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+	if !strings.Contains(e.Message, "pull it first") || len(b.fake.CallsTo("build")) != 0 {
+		t.Fatalf("unsafe checkout permitted: %+v", e)
+	}
+}
+
+func TestReferencedStaticFileMutationsRequireAdmin(t *testing.T) {
+	b := newBuildHarness(t)
+	p := b.project("arena")
+	data := zipBytes(t, map[string]string{"level": "original"})
+	if rr := b.upload("", map[string]string{"maps.zip": data}, "maps.zip"); rr.Code != http.StatusCreated {
+		t.Fatal(rr.Body.String())
+	}
+	path := fmt.Sprintf("/api/v1/projects/%d", p.ID)
+	name := "maps.zip"
+	if runtime.GOOS == "windows" {
+		name = "MAPS.ZIP"
+	}
+	rr := b.call("PATCH", path, b.adminSs, fmt.Sprintf(`{"static_addons":[{"name":%q,"target":"."}]}`, name))
+	if rr.Code != http.StatusOK {
+		t.Fatal(rr.Body.String())
+	}
+	replacement := zipBytes(t, map[string]string{"level": "replacement"})
+	errBody(t, b.upload("?replace=1", map[string]string{"maps.zip": replacement, "new.txt": "new"}, "maps.zip", "new.txt"), http.StatusForbidden, apitypes.ErrorCodeForbidden)
+	if rr := b.call("GET", "/api/v1/static/maps.zip", b.devTok, nil); rr.Body.String() != data {
+		t.Fatal("developer overwrote a referenced file")
+	}
+	errBody(t, b.call("GET", "/api/v1/static/new.txt", b.devTok, nil), http.StatusNotFound, apitypes.ErrorCodeNotFound)
+	errBody(t, b.call("DELETE", "/api/v1/static/maps.zip", b.devTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
+	errBody(t, b.call("DELETE", "/api/v1/static/maps.zip", b.adminSs, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+
+	body, ct := multipartBody(t, map[string]string{"maps.zip": replacement}, "maps.zip")
+	req := httptest.NewRequest("POST", "/api/v1/static?replace=1", body)
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("Authorization", "Bearer "+b.adminSs)
+	rr = httptest.NewRecorder()
+	b.srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("admin replacement: %d %s", rr.Code, rr.Body)
+	}
+}
+
+func TestStaticReplaceCannotInterleaveWithAttach(t *testing.T) {
+	b := newBuildHarness(t)
+	p := b.project("arena")
+	data := zipBytes(t, map[string]string{"level": "original"})
+	if rr := b.upload("", map[string]string{"maps.zip": data}, "maps.zip"); rr.Code != http.StatusCreated {
+		t.Fatal(rr.Body.String())
+	}
+	db, err := sql.Open("sqlite", b.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// Block the attach's write after its validation, while WAL still
+	// allows other requests to read the project and static references.
+	tx, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(t.Context(), "UPDATE projects SET branch = branch WHERE id = ?", p.ID); err != nil {
+		t.Fatal(err)
+	}
+	attached := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		attached <- b.call("PATCH", fmt.Sprintf("/api/v1/projects/%d", p.ID), b.adminSs,
+			`{"static_addons":[{"name":"maps.zip","target":"."}]}`)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for b.srv.proj.addonsMu.TryLock() {
+		b.srv.proj.addonsMu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("attach never acquired the static reference lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	replaced := make(chan *httptest.ResponseRecorder, 1)
+	go func() { replaced <- b.upload("?replace=1", map[string]string{"maps.zip": "replacement"}, "maps.zip") }()
+	select {
+	case rr := <-replaced:
+		t.Fatalf("replacement finished while attach was waiting to commit: %d %s", rr.Code, rr.Body)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if rr := <-attached; rr.Code != http.StatusOK {
+		t.Fatalf("attach: %d %s", rr.Code, rr.Body)
+	}
+	errBody(t, <-replaced, http.StatusForbidden, apitypes.ErrorCodeForbidden)
+}
+
+func TestProjectDeleteKeepsCheckoutWhenDatabaseDeleteFails(t *testing.T) {
+	b := newBuildHarness(t)
+	p := b.project("arena")
+	db, err := sql.Open("sqlite", b.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER refuse_project_delete BEFORE DELETE ON projects
+		BEGIN SELECT RAISE(ABORT, 'cannot delete project'); END`); err != nil {
+		t.Fatal(err)
+	}
+	errBody(t, b.call("DELETE", fmt.Sprintf("/api/v1/projects/%d", p.ID), b.adminSs, nil), http.StatusInternalServerError, apitypes.ErrorCodeInternal)
+	if _, err := os.Stat(filepath.Join(b.repoDir, fmt.Sprint(p.ID), "golem.yaml")); err != nil {
+		t.Fatalf("checkout lost after failed transaction: %v", err)
+	}
+	if _, err := b.st.GetProject(t.Context(), p.ID); err != nil {
+		t.Fatalf("project lost after failed transaction: %v", err)
 	}
 }

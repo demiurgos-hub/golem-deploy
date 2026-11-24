@@ -3,6 +3,7 @@ package extract
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"errors"
 	"hash/crc32"
 	"io/fs"
@@ -64,20 +65,20 @@ func TestZipExtractsWithMaskedModes(t *testing.T) {
 		zentry{name: "data/world.bin", mode: 0o666, content: bytes.Repeat([]byte{1}, 1000)},
 	)
 	root := t.TempDir()
-	dest, err := Zip(zp, root, DefaultLimits())
+	dest, err := Zip(context.Background(), zp, root, DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Dir(dest) != root || !strings.HasPrefix(filepath.Base(dest), "static-extract-") {
-		t.Fatalf("destination %s is not a fresh staging dir under %s", dest, root)
+	if filepath.Dir(dest.Dir) != root || !strings.HasPrefix(filepath.Base(dest.Dir), "static-extract-") {
+		t.Fatalf("destination %s is not a fresh staging dir under %s", dest.Dir, root)
 	}
-	b, err := os.ReadFile(filepath.Join(dest, "data", "config"))
+	b, err := os.ReadFile(filepath.Join(dest.Dir, "data", "config"))
 	if err != nil || string(b) != "cfg" {
 		t.Fatalf("%q %v", b, err)
 	}
 	if runtime.GOOS != "windows" {
 		for name, want := range map[string]fs.FileMode{"Server.x86_64": 0o755, "data/config": 0o644, "data/world.bin": 0o644} {
-			info, err := os.Stat(filepath.Join(dest, filepath.FromSlash(name)))
+			info, err := os.Stat(filepath.Join(dest.Dir, filepath.FromSlash(name)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -92,7 +93,7 @@ func TestZipExtractsWithMaskedModes(t *testing.T) {
 func TestZipRejectsZipSlip(t *testing.T) {
 	zp := writeZip(t, zentry{name: "../evil.txt", content: []byte("nope")})
 	root := filepath.Join(t.TempDir(), "tmp")
-	if _, err := Zip(zp, root, DefaultLimits()); !errors.Is(err, ErrUnsafe) {
+	if _, err := Zip(context.Background(), zp, root, DefaultLimits()); !errors.Is(err, ErrUnsafe) {
 		t.Fatalf("got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(root), "evil.txt")); !os.IsNotExist(err) {
@@ -111,7 +112,7 @@ func TestZipRejectsUnsafeNames(t *testing.T) {
 		t.Run(n, func(t *testing.T) {
 			zp := writeZip(t, zentry{name: n, content: []byte("x")})
 			root := t.TempDir()
-			if _, err := Zip(zp, root, DefaultLimits()); !errors.Is(err, ErrUnsafe) {
+			if _, err := Zip(context.Background(), zp, root, DefaultLimits()); !errors.Is(err, ErrUnsafe) {
 				t.Fatalf("%q: got %v", n, err)
 			}
 			assertEmpty(t, root)
@@ -133,7 +134,7 @@ func TestZipRejectsLinksAndCollisions(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			zp := writeZip(t, entries...)
 			root := t.TempDir()
-			if _, err := Zip(zp, root, DefaultLimits()); !errors.Is(err, ErrUnsafe) {
+			if _, err := Zip(context.Background(), zp, root, DefaultLimits()); !errors.Is(err, ErrUnsafe) {
 				t.Fatalf("got %v", err)
 			}
 			assertEmpty(t, root)
@@ -151,7 +152,7 @@ func TestZipBombs(t *testing.T) {
 		l := lim
 		l.MaxEntries = 50
 		root := t.TempDir()
-		if _, err := Zip(writeZip(t, es...), root, l); !errors.Is(err, ErrUnsafe) {
+		if _, err := Zip(context.Background(), writeZip(t, es...), root, l); !errors.Is(err, ErrUnsafe) {
 			t.Fatalf("got %v", err)
 		}
 		assertEmpty(t, root)
@@ -159,7 +160,7 @@ func TestZipBombs(t *testing.T) {
 	t.Run("ratio", func(t *testing.T) {
 		zp := writeZip(t, zentry{name: "zeros", content: make([]byte, 16<<20)})
 		root := t.TempDir()
-		if _, err := Zip(zp, root, lim); !errors.Is(err, ErrUnsafe) {
+		if _, err := Zip(context.Background(), zp, root, lim); !errors.Is(err, ErrUnsafe) {
 			t.Fatalf("got %v", err)
 		}
 		assertEmpty(t, root)
@@ -168,7 +169,7 @@ func TestZipBombs(t *testing.T) {
 		l := lim
 		l.MaxTotalBytes = 1500
 		zp := writeZip(t, zentry{name: "a", content: make([]byte, 1000)}, zentry{name: "b", content: make([]byte, 1000)})
-		if _, err := Zip(zp, t.TempDir(), l); !errors.Is(err, ErrUnsafe) {
+		if _, err := Zip(context.Background(), zp, t.TempDir(), l); !errors.Is(err, ErrUnsafe) {
 			t.Fatalf("got %v", err)
 		}
 	})
@@ -176,7 +177,7 @@ func TestZipBombs(t *testing.T) {
 		l := lim
 		l.MaxFileBytes = 100
 		zp := writeZip(t, zentry{name: "a", content: make([]byte, 101)})
-		if _, err := Zip(zp, t.TempDir(), l); !errors.Is(err, ErrUnsafe) {
+		if _, err := Zip(context.Background(), zp, t.TempDir(), l); !errors.Is(err, ErrUnsafe) {
 			t.Fatalf("got %v", err)
 		}
 	})
@@ -184,7 +185,7 @@ func TestZipBombs(t *testing.T) {
 		l := lim
 		l.MaxDepth = 3
 		zp := writeZip(t, zentry{name: "a/b/c/d", content: []byte("x")})
-		if _, err := Zip(zp, t.TempDir(), l); !errors.Is(err, ErrUnsafe) {
+		if _, err := Zip(context.Background(), zp, t.TempDir(), l); !errors.Is(err, ErrUnsafe) {
 			t.Fatalf("got %v", err)
 		}
 	})
@@ -202,7 +203,7 @@ func TestZipBombs(t *testing.T) {
 		zp := filepath.Join(t.TempDir(), "liar.zip")
 		_ = os.WriteFile(zp, buf.Bytes(), 0o600)
 		root := t.TempDir()
-		if _, err := Zip(zp, root, lim); err == nil {
+		if _, err := Zip(context.Background(), zp, root, lim); err == nil {
 			t.Fatal("lying entry extracted")
 		}
 		assertEmpty(t, root)
@@ -213,7 +214,7 @@ func TestZipNotAZip(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "x.zip")
 	_ = os.WriteFile(p, []byte("not a zip"), 0o600)
 	root := t.TempDir()
-	if _, err := Zip(p, root, DefaultLimits()); err == nil {
+	if _, err := Zip(context.Background(), p, root, DefaultLimits()); err == nil {
 		t.Fatal("accepted")
 	}
 	assertEmpty(t, root)

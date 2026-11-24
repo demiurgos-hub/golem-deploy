@@ -88,6 +88,9 @@ func (s *Server) handleCreateBuild(w http.ResponseWriter, r *http.Request) error
 	if _, busy := s.jobs.ActiveFor(jobs.Subject{Type: string(apitypes.SubjectTypeProject), ID: jobs.SubjectID(p.ID)}); busy {
 		return conflict(apitypes.ErrorCodeJobInProgress, "another job is already running for this project")
 	}
+	if p.Status != string(apitypes.ProjectStatusIdle) && !req.Pull {
+		return conflict(apitypes.ErrorCodeConflict, build.DetailCheckoutNotIdle)
+	}
 	release, err := s.builds.Reserve()
 	if errors.Is(err, build.ErrTooManyBuilds) {
 		return conflict(apitypes.ErrorCodeConflict, fmt.Sprintf("too many builds are queued (at most %d); wait for one to finish", build.MaxActiveBuilds))
@@ -283,11 +286,11 @@ func (s *Server) projectBuildsInUse(ctx context.Context, id int64) error {
 
 // removeProjectImages deletes the images of a deleted project's builds in
 // the background of the request (bounded); failures are logged.
-func (s *Server) removeProjectImages(builds []store.Build) {
-	if s.builds == nil || len(builds) == 0 {
+func (s *Server) removeProjectImages() {
+	if s.builds == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	s.builds.RemoveImages(ctx, builds)
+	s.builds.CleanupImages(ctx)
 }

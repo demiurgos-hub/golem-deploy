@@ -18,7 +18,7 @@ WORKDIR /src/games/arena/client
 RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-npm,target=/root/.npm ["npm","run","build:prod","--","--base=/game/"]
 WORKDIR /src/games/arena
 RUN test -d client/dist || { echo "golem-deploy: the web client directory client/dist (web.dist) does not exist after the web build" >&2; exit 1; }
-RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-gobuild,target=/root/.cache/go-build ["go","build","-trimpath","-ldflags=-s -w","-o","/out/golem-server","./cmd/arena"]
+RUN --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-gomod,target=/go/pkg/mod --mount=type=cache,id=golem-deploy-beabf00ccfad-p12-gobuild,target=/root/.cache/go-build ["sh","-ec","name=$(go list -f '{{.Name}}' \"$1\"); if [ \"$name\" != main ]; then echo 'the server must be a package main' >&2; exit 1; fi\ngo build -trimpath '-ldflags=-s -w' -o /out/golem-server \"$1\"\nif [ ! -f /out/golem-server ] || [ ! -x /out/golem-server ]; then echo 'the server build did not produce an executable' >&2; exit 1; fi","golem-deploy","./cmd/arena"]
 RUN ["mkdir","-p","/out/data"]
 
 FROM gcr.io/distroless/static-debian12:nonroot

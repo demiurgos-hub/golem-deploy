@@ -96,6 +96,16 @@ func TestBuildImageInUseByStoppedContainer(t *testing.T) {
 	}
 	// No server is configured with a1 any more, but the stopped container
 	// of the server still is a1's image.
+	// It must still prevent deletion after the first page of project builds.
+	for range 501 {
+		row, err := b.st.CreateBuild(t.Context(), store.NewBuild{ProjectID: pa.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.st.FinishBuild(t.Context(), row.ID, store.BuildResult{Status: store.BuildStatusError}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	images := decode[apitypes.ImageList](t, b.call("GET", "/api/v1/images", b.devTok, nil))
 	for _, img := range images.Items {
 		if img.ID == a1.ImageID && (!img.InUse || len(img.BuildIDs) != 1 || len(img.ServerIDs) != 0) {

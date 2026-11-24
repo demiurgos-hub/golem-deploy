@@ -1,6 +1,7 @@
 package build
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/json"
 	"errors"
@@ -25,7 +26,7 @@ const MinEngineVersion = "v0.4.0-rc.1"
 
 // Size caps of the files the daemon reads from a checkout.
 const (
-	maxGolemYAMLBytes  = 1 << 20
+	maxGolemYAMLBytes  = 64 << 10
 	maxGoModBytes      = 1 << 20
 	maxPackageJSON     = 1 << 20
 	maxDockerfileBytes = 1 << 20
@@ -108,16 +109,16 @@ func ValidEngineVersion(v string) bool { return engineVersionRE.MatchString(v) &
 // files and a custom Dockerfile, through repoFS (contained, no symbolic
 // links, size-capped), and lists directories to find the server package.
 // Problems with the repository are *UserError values.
-func Inspect(dir string) (*Plan, error) {
+func Inspect(dir string, allowCustomDockerfile bool) (*Plan, error) {
 	repo, err := openRepo(dir)
 	if err != nil {
 		return nil, err
 	}
 	defer repo.Close()
-	return inspect(repo)
+	return inspect(repo, allowCustomDockerfile)
 }
 
-func inspect(repo *repoFS) (*Plan, error) {
+func inspect(repo *repoFS, allowCustomDockerfile bool) (*Plan, error) {
 	raw, err := repo.readFile(ConfigFile, maxConfigBytes)
 	if err != nil && !errors.Is(err, errMissing) {
 		return nil, err
@@ -125,6 +126,9 @@ func inspect(repo *repoFS) (*Plan, error) {
 	cfg, err := ParseConfig(raw)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.Dockerfile != "" && !allowCustomDockerfile {
+		return nil, userErr("the repository requests a custom Dockerfile; ask an admin to enable allow_custom_dockerfile for this project")
 	}
 	p := &Plan{Root: cfg.Root, ServerArgs: cfg.Server.Args,
 		WebTransportPath: cmp.Or(cfg.Transport.WebTransportPath, DefaultWebTransportPath),
@@ -162,6 +166,9 @@ func inspect(repo *repoFS) (*Plan, error) {
 		if err != nil {
 			return nil, err
 		}
+		if selectsFrontend(p.CustomDockerfile) {
+			return nil, userErr("a custom Dockerfile cannot select a BuildKit frontend; remove the syntax directive")
+		}
 		p.Notes = append(p.Notes, "Using the repository's own Dockerfile "+p.DockerfilePath)
 		return p, nil
 	}
@@ -184,6 +191,29 @@ func inspect(repo *repoFS) (*Plan, error) {
 		p.Notes = append(p.Notes, "Generated Golem Engine code is not committed: golem-bake generates it during the build")
 	}
 	return p, nil
+}
+
+// BuildKit detects hash comments, C-style comments, and a JSON object,
+// with an optional BOM and shebang. Reject the comment forms anywhere
+// and reserve the JSON form entirely for the built-in frontend.
+func selectsFrontend(data []byte) bool {
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
+	if bytes.HasPrefix(data, []byte("#!")) {
+		_, data, _ = bytes.Cut(data, []byte("\n"))
+	}
+	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("{")) {
+		return true
+	}
+	for line := range bytes.SplitSeq(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		for _, prefix := range []string{"#", "//"} {
+			suffix, ok := bytes.CutPrefix(line, []byte(prefix))
+			if key, _, found := bytes.Cut(suffix, []byte("=")); ok && found && bytes.EqualFold(bytes.TrimSpace(key), []byte("syntax")) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // readGoMod validates the game's go.mod: the engine requirement and its
@@ -422,6 +452,9 @@ func readPackageJSON(repo *repoFS, rel string) (*packageJSON, error) {
 // generatedCommitted reports whether any output golem.yaml configures
 // (proto.out and every integration's out) exists in the checkout.
 func generatedCommitted(repo *repoFS, root string, golemYAML []byte) (bool, error) {
+	if err := checkYAML("golem.yaml", golemYAML); err != nil {
+		return false, err
+	}
 	var gy struct {
 		Proto struct {
 			Out string `yaml:"out"`

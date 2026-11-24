@@ -50,7 +50,7 @@ func baseRepo() map[string]string {
 }
 
 func TestInspectFixture(t *testing.T) {
-	p, err := Inspect(filepath.Join("testdata", "game"))
+	p, err := Inspect(filepath.Join("testdata", "game"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestInspectPlans(t *testing.T) {
 	t.Run("committed generated code is checked", func(t *testing.T) {
 		files := baseRepo()
 		files["internal/generated/golem_host.go"] = "package generated\n"
-		p, err := Inspect(writeRepo(t, files))
+		p, err := Inspect(writeRepo(t, files), true)
 		if err != nil || p.Bake != BakeCheck {
 			t.Fatalf("%+v %v", p, err)
 		}
@@ -73,7 +73,7 @@ func TestInspectPlans(t *testing.T) {
 	t.Run("empty output directory is not committed code", func(t *testing.T) {
 		files := baseRepo()
 		files["internal/generated/"] = ""
-		p, err := Inspect(writeRepo(t, files))
+		p, err := Inspect(writeRepo(t, files), true)
 		if err != nil || p.Bake != BakeGenerate {
 			t.Fatalf("%+v %v", p, err)
 		}
@@ -90,7 +90,7 @@ func TestInspectPlans(t *testing.T) {
 			"games/arena/package-lock.json":          `{}`,
 			"games/arena/client/npm-shrinkwrap.json": `{}`,
 		}
-		p, err := Inspect(writeRepo(t, files))
+		p, err := Inspect(writeRepo(t, files), true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -105,7 +105,7 @@ func TestInspectPlans(t *testing.T) {
 		files := baseRepo()
 		delete(files, "package.json")
 		delete(files, "package-lock.json")
-		p, err := Inspect(writeRepo(t, files))
+		p, err := Inspect(writeRepo(t, files), true)
 		if err != nil || len(p.NPM) != 0 || p.WebBuild != nil || p.WebDist != "" {
 			t.Fatalf("%+v %v", p, err)
 		}
@@ -114,7 +114,7 @@ func TestInspectPlans(t *testing.T) {
 		files := baseRepo()
 		files["package.json"] = `{"scripts":{"test":"x"}}`
 		delete(files, "package-lock.json")
-		p, err := Inspect(writeRepo(t, files))
+		p, err := Inspect(writeRepo(t, files), true)
 		if err != nil || p.WebBuild != nil || p.WebDist != "" || !reflect.DeepEqual(p.NPM, []NPMDir{{Dir: ".", Lockfile: false}}) {
 			t.Fatalf("%+v %v", p, err)
 		}
@@ -123,7 +123,7 @@ func TestInspectPlans(t *testing.T) {
 		files := baseRepo()
 		delete(files, "package.json")
 		files["golem-deploy.yaml"] = "web:\n  dist: public\n"
-		p, err := Inspect(writeRepo(t, files))
+		p, err := Inspect(writeRepo(t, files), true)
 		if err != nil || p.WebDist != "public" || p.WebBuild != nil {
 			t.Fatalf("%+v %v", p, err)
 		}
@@ -133,7 +133,7 @@ func TestInspectPlans(t *testing.T) {
 		delete(files, "cmd/server/main.go")
 		files["cmd/game/main.go"] = "package main\n"
 		files["cmd/tools/README"] = "no go files"
-		p, err := Inspect(writeRepo(t, files))
+		p, err := Inspect(writeRepo(t, files), true)
 		if err != nil || p.ServerPackage != "cmd/game" {
 			t.Fatalf("%+v %v", p, err)
 		}
@@ -142,7 +142,7 @@ func TestInspectPlans(t *testing.T) {
 		files := baseRepo()
 		delete(files, "cmd/server/main.go")
 		files["main.go"] = "package main\n"
-		p, err := Inspect(writeRepo(t, files))
+		p, err := Inspect(writeRepo(t, files), true)
 		if err != nil || p.ServerPackage != "." {
 			t.Fatalf("%+v %v", p, err)
 		}
@@ -150,7 +150,7 @@ func TestInspectPlans(t *testing.T) {
 	t.Run("pseudo-version newer than the minimum", func(t *testing.T) {
 		files := baseRepo()
 		files["go.mod"] = strings.Replace(testGoMod, "v0.4.0-rc.1", "v0.4.1-0.20261201000000-abcdefabcdef", 1)
-		p, err := Inspect(writeRepo(t, files))
+		p, err := Inspect(writeRepo(t, files), true)
 		if err != nil || p.EngineVersion != "v0.4.1-0.20261201000000-abcdefabcdef" {
 			t.Fatalf("%+v %v", p, err)
 		}
@@ -159,11 +159,69 @@ func TestInspectPlans(t *testing.T) {
 		files := baseRepo()
 		files["golem-deploy.yaml"] = "dockerfile: deploy/Dockerfile\n"
 		files["deploy/Dockerfile"] = "FROM scratch\n"
-		p, err := Inspect(writeRepo(t, files))
+		p, err := Inspect(writeRepo(t, files), true)
 		if err != nil || !p.Custom || string(p.CustomDockerfile) != "FROM scratch\n" || p.DockerfilePath != "deploy/Dockerfile" || p.EngineVersion == "" {
 			t.Fatalf("%+v %v", p, err)
 		}
 	})
+}
+
+func TestCustomDockerfileFrontendDirectives(t *testing.T) {
+	for name, content := range map[string]string{
+		"hash":    "# syntax=example.invalid/frontend\nFROM scratch\n",
+		"case":    "# escape=`\n# SyNtAx \t= frontend\r\nFROM scratch\r\n",
+		"c style": "// syntax=frontend\nFROM scratch\n",
+		"json":    "{\n  \"sy\\u006etax\": \"frontend\"\n}\n",
+		"shebang": "\xef\xbb\xbf#!/usr/bin/env docker\n#\u2003SYNTAX=frontend\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			files := baseRepo()
+			files[ConfigFile] = "dockerfile: Dockerfile.custom\n"
+			files["Dockerfile.custom"] = content
+			_, err := Inspect(writeRepo(t, files), true)
+			wantUserErr(t, err, "cannot select a BuildKit frontend")
+		})
+	}
+}
+
+func TestGolemYAMLRejectsComplexMappingsAndAliases(t *testing.T) {
+	for _, data := range []string{
+		"metadata:\n" + strings.Repeat("  key: a\n", 129),
+		"ignored: &value [1]\nother: *value\n",
+		"ignored: [" + strings.Repeat("0,", 1024) + "]\n",
+		"ignored: " + strings.Repeat("[", 40) + "0" + strings.Repeat("]", 40),
+	} {
+		files := baseRepo()
+		files["golem.yaml"] = data
+		_, err := Inspect(writeRepo(t, files), false)
+		wantUserErr(t, err, "YAML complexity limits")
+	}
+	_, err := ParseConfig([]byte("server: &s {package: .}\nweb: *s\n"))
+	wantUserErr(t, err, "YAML complexity limits")
+}
+
+func TestCheckoutOpenRejectsReplacedDirectory(t *testing.T) {
+	dir := writeRepo(t, baseRepo())
+	repo, err := openRepo(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	checked, err := repo.lstatChain("cmd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "cmd"), filepath.Join(dir, "old-cmd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "cmd"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := repo.openChecked("cmd", checked)
+	if f != nil {
+		f.Close()
+	}
+	wantUserErr(t, err, "changed before it could be read")
 }
 
 func TestInspectRejects(t *testing.T) {
@@ -216,7 +274,7 @@ func TestInspectRejects(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			files := baseRepo()
 			tc.mutate(files)
-			_, err := Inspect(writeRepo(t, files))
+			_, err := Inspect(writeRepo(t, files), true)
 			wantUserErr(t, err, tc.want)
 		})
 	}
@@ -280,7 +338,7 @@ func TestInspectRefusesSymlinks(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			dir := writeRepo(t, baseRepo())
 			plant(t, dir)
-			_, err := Inspect(dir)
+			_, err := Inspect(dir, true)
 			wantUserErr(t, err, "symbolic link")
 		})
 	}

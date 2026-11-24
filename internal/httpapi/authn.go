@@ -74,6 +74,19 @@ func (id *Identity) Role() store.Role {
 // IsAdmin reports whether the identity is an admin session.
 func (id *Identity) IsAdmin() bool { return id != nil && id.Role() == store.RoleAdmin }
 
+func (id *Identity) hasAdminAccess() bool {
+	return id != nil && id.Kind == KindSession && id.IsAdmin()
+}
+
+// authorizeStaticMutation applies the resource-level rule under the static
+// reference lock. The route itself also supports unreferenced files.
+func authorizeStaticMutation(r *http.Request, projects []string) error {
+	if len(projects) != 0 && !identityFrom(r).hasAdminAccess() {
+		return errForbidden
+	}
+	return nil
+}
+
 func identityFrom(r *http.Request) *Identity {
 	id, _ := r.Context().Value(identityKey).(*Identity)
 	return id
@@ -164,10 +177,7 @@ func (s *Server) authorize(access Access, next handlerFunc) handlerFunc {
 				return errSessionRequired
 			}
 		case AccessAdmin:
-			if id.Kind != KindSession {
-				return errForbidden
-			}
-			if id.Role() != store.RoleAdmin {
+			if !id.hasAdminAccess() {
 				return errForbidden
 			}
 		}

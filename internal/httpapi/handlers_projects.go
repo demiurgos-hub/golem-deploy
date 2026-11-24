@@ -16,6 +16,7 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/git"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
+	"github.com/demiurgos-hub/golem-deploy/internal/staticfiles"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -48,6 +49,7 @@ type projectState struct {
 	// project with the job start or deletion itself, so a delete can never
 	// race with a job starting on the same project.
 	mu       sync.Mutex
+	addonsMu sync.Mutex // serializes static references with static file mutations
 	branches branchCache
 }
 
@@ -68,19 +70,20 @@ func toAPIProject(p store.Project) apitypes.Project {
 		addons = append(addons, apitypes.StaticAddon{Name: a.Name, Target: a.Target})
 	}
 	return apitypes.Project{
-		StaticAddons: addons,
-		ID:           p.ID,
-		Name:         p.Name,
-		RepoURL:      p.RepoURL,
-		Branch:       p.Branch,
-		AuthType:     apitypes.ProjectAuthType(p.AuthType),
-		AuthUsername: p.AuthUsername,
-		HasSecret:    len(p.AuthSecret) > 0,
-		LastCommit:   p.LastCommit,
-		LastPulledAt: utcPtr(p.LastPulledAt),
-		Status:       apitypes.ProjectStatus(p.Status),
-		CreatedAt:    p.CreatedAt.UTC(),
-		UpdatedAt:    p.UpdatedAt.UTC(),
+		StaticAddons:          addons,
+		AllowCustomDockerfile: p.AllowCustomDockerfile,
+		ID:                    p.ID,
+		Name:                  p.Name,
+		RepoURL:               p.RepoURL,
+		Branch:                p.Branch,
+		AuthType:              apitypes.ProjectAuthType(p.AuthType),
+		AuthUsername:          p.AuthUsername,
+		HasSecret:             len(p.AuthSecret) > 0,
+		LastCommit:            p.LastCommit,
+		LastPulledAt:          utcPtr(p.LastPulledAt),
+		Status:                apitypes.ProjectStatus(p.Status),
+		CreatedAt:             p.CreatedAt.UTC(),
+		UpdatedAt:             p.UpdatedAt.UTC(),
 	}
 }
 
@@ -302,7 +305,7 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) err
 	if err != nil {
 		return invalidField("repo_url", err.Error())
 	}
-	var upd store.ProjectRemoteUpdate
+	upd := store.ProjectRemoteUpdate{AllowCustomDockerfile: req.AllowCustomDockerfile}
 	if req.RepoURL != nil {
 		upd.RepoURL = &url
 	}
@@ -323,13 +326,15 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) err
 		return invalidField("repo_url", err.Error()+"; send new auth together with the URL")
 	}
 	if req.StaticAddons != nil {
+		s.proj.addonsMu.Lock()
+		defer s.proj.addonsMu.Unlock()
 		addons, err := s.checkAddons(*req.StaticAddons)
 		if err != nil {
 			return err
 		}
 		upd.StaticAddons = &addons
 	}
-	if upd.RepoURL == nil && upd.Auth == nil && upd.StaticAddons == nil {
+	if upd.RepoURL == nil && upd.Auth == nil && upd.StaticAddons == nil && upd.AllowCustomDockerfile == nil {
 		writeJSON(w, http.StatusOK, toAPIProject(p))
 		return nil
 	}
@@ -375,10 +380,10 @@ func (s *Server) checkAddons(in []apitypes.StaticAddon) ([]store.StaticAddon, er
 		}
 		zips := map[string]bool{}
 		for _, f := range files {
-			zips[f.Name] = f.IsZip
+			zips[staticfiles.NameKey(f.Name)] = f.IsZip
 		}
 		for i, a := range norm {
-			isZip, ok := zips[a.Name]
+			isZip, ok := zips[staticfiles.NameKey(a.Name)]
 			switch {
 			case !ok:
 				return nil, invalidField(fmt.Sprintf("static_addons[%d].name", i), "no static file has this name")
@@ -391,12 +396,8 @@ func (s *Server) checkAddons(in []apitypes.StaticAddon) ([]store.StaticAddon, er
 	return out, nil
 }
 
-// handleDeleteProject removes the checkout first and the row second: if
-// removing the checkout fails the project is still listed and the delete
-// can be retried; if deleting the row fails afterwards, the project has no
-// checkout and a pull re-clones it. Leftovers are swept at startup. It is
-// refused while servers are configured with one of the project's builds;
-// the images of its builds are removed afterwards (best effort).
+// handleDeleteProject commits the database deletion before removing the
+// checkout and build images. Startup reconciliation retries leftovers.
 func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) error {
 	s.proj.mu.Lock()
 	defer s.proj.mu.Unlock()
@@ -410,14 +411,10 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) err
 	if err := s.projectBuildsInUse(r.Context(), p.ID); err != nil {
 		return err
 	}
-	builds, err := s.store.ListBuilds(r.Context(), store.BuildFilter{ProjectID: &p.ID, Limit: 500})
-	if err != nil {
-		return internal(err)
-	}
 	if s.builds != nil {
 		// The project's build images go with it, so the same rule as for
 		// deleting a build applies: refused while a container uses one.
-		switch err := s.builds.CheckProjectImages(r.Context(), builds); {
+		switch err := s.builds.CheckProjectImages(r.Context(), p.ID); {
 		case errors.Is(err, build.ErrImageInUse):
 			return imageInUseConflict(err, "an image of this project's builds")
 		case errors.Is(err, docker.ErrUnavailable):
@@ -426,16 +423,10 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) err
 			return internal(err)
 		}
 	}
-	if s.proj.repoDir != "" {
-		err := git.RemoveCheckout(s.proj.repoDir, p.ID, s.proj.tmpDir)
-		switch {
-		case errors.Is(err, git.ErrRemoveIncomplete):
-			s.logger.Warn("project checkout moved aside but not fully removed; it is swept at the next startup", "project_id", p.ID, "err", err)
-		case err != nil:
-			return internal(fmt.Errorf("remove checkout of project %d: %w", p.ID, err))
-		}
-	}
-	if err := s.store.DeleteProjectUnused(r.Context(), p.ID); err != nil {
+	s.proj.addonsMu.Lock()
+	err = s.store.DeleteProjectUnused(r.Context(), p.ID)
+	s.proj.addonsMu.Unlock()
+	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			return notFound("project")
@@ -447,8 +438,13 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) err
 		}
 		return internal(err)
 	}
+	if s.proj.repoDir != "" {
+		if err := git.RemoveCheckout(s.proj.repoDir, p.ID, s.proj.tmpDir); err != nil {
+			s.logger.Warn("could not fully remove project checkout; cleanup is retried at startup", "project_id", p.ID)
+		}
+	}
 	s.proj.branches.forget(p.ID)
-	s.removeProjectImages(builds)
+	s.removeProjectImages()
 	s.logger.Info("project deleted", "request_id", requestIDFrom(r.Context()), "by", identityFrom(r).Account.ID, "project_id", p.ID, "name", p.Name)
 	w.WriteHeader(http.StatusNoContent)
 	return nil

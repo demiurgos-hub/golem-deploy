@@ -54,7 +54,7 @@ func checkLines(t *testing.T, df []byte) {
 }
 
 func TestDockerfileGolden(t *testing.T) {
-	fixture, err := Inspect(filepath.Join("testdata", "game"))
+	fixture, err := Inspect(filepath.Join("testdata", "game"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
