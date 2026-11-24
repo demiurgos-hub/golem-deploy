@@ -19,6 +19,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
@@ -273,7 +274,7 @@ func TestShutdownDeadlineKeepsStoreAndLockForCertificateJob(t *testing.T) {
 			DataDir: dir, Listen: "127.0.0.1:0", docker: noDocker{}, dockerCLI: dockertest.New(),
 			Logger: slog.New(slog.DiscardHandler), bcryptCost: bcrypt.MinCost, stopTimeout: 50 * time.Millisecond,
 			storeClosed: func(err error) { closed <- err },
-			readyRunner: func(r *jobs.Runner) {
+			readyServices: func(r *jobs.Runner, _ *build.Service, _ *store.Store) {
 				j, err := r.Start(ctx, "certificate.renew", jobs.Subject{Type: "certificate", ID: "acme"}, nil,
 					func(ctx context.Context, _ io.Writer) error {
 						close(started)
@@ -333,5 +334,116 @@ func TestShutdownDeadlineKeepsStoreAndLockForCertificateJob(t *testing.T) {
 	j, err := st.GetJob(t.Context(), (<-submitted).ID)
 	if err != nil || j.Status != store.JobCancelled {
 		t.Fatalf("job could not save its final status: %+v %v", j, err)
+	}
+}
+
+func TestShutdownJoinsQueuedBuildWatcherBeforeClosingStore(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ready := make(chan net.Addr, 1)
+	stopped, closed := make(chan error, 1), make(chan error, 1)
+	created := make(chan int64, 1)
+	watching, release := make(chan struct{}), make(chan struct{})
+	finish := sync.OnceFunc(func() { close(release) })
+	defer finish()
+	startedBuild := make(chan struct{}, 1)
+	go func() {
+		stopped <- Run(ctx, Options{
+			DataDir: dir, Listen: "127.0.0.1:0", docker: noDocker{}, dockerCLI: dockertest.New(),
+			Logger: slog.New(slog.DiscardHandler), bcryptCost: bcrypt.MinCost, stopTimeout: 50 * time.Millisecond,
+			storeClosed: func(err error) { closed <- err },
+			Ready:       func(addr net.Addr) { ready <- addr },
+			readyServices: func(r *jobs.Runner, builds *build.Service, st *store.Store) {
+				setup := func() (int64, error) {
+					for i := range build.MaxActiveBuilds {
+						_, err := r.Start(ctx, "project.build", jobs.Subject{Type: "project", ID: strconv.Itoa(i)}, nil,
+							func(ctx context.Context, _ io.Writer) error { <-ctx.Done(); return ctx.Err() }, jobs.InPool(build.JobPool))
+						if err != nil {
+							return 0, err
+						}
+					}
+					project, err := st.CreateProject(ctx, store.Project{Name: "arena", RepoURL: "https://example.com/g.git"}, nil)
+					if err != nil {
+						return 0, err
+					}
+					record, err := st.CreateBuild(ctx, store.NewBuild{ProjectID: project.ID})
+					if err != nil {
+						return 0, err
+					}
+					job, err := r.Start(ctx, "project.build", jobs.Subject{Type: "project", ID: "queued"}, nil,
+						func(context.Context, io.Writer) error { startedBuild <- struct{}{}; return nil }, jobs.InPool(build.JobPool))
+					if err != nil {
+						return 0, err
+					}
+					if err := st.SetBuildJob(ctx, record.ID, job.ID); err != nil {
+						return 0, err
+					}
+					builds.Watch(record.ID, r.Done(job.ID), func() {
+						close(watching)
+						<-release
+					})
+					return record.ID, nil
+				}
+				id, err := setup()
+				if err != nil {
+					t.Error(err)
+				}
+				created <- id
+			},
+		})
+	}()
+	select {
+	case <-ready:
+	case err := <-stopped:
+		t.Fatalf("daemon exited before readiness: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not report readiness")
+	}
+	id := <-created
+	if id == 0 {
+		t.Fatal("queued build was not created")
+	}
+	cancel()
+	select {
+	case <-watching:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued build watcher did not wake after cancellation")
+	}
+	select {
+	case err := <-stopped:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("daemon finished before the watcher: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not observe the shutdown deadline")
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("store closed while build watcher was blocked: %v", err)
+	default:
+	}
+	finish()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("store did not close after the watcher finished")
+	}
+	select {
+	case <-startedBuild:
+		t.Fatal("the queued build started at shutdown")
+	default:
+	}
+	st, err := store.Open(t.Context(), (datadir.Layout{Root: dir}).DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	record, err := st.GetBuild(t.Context(), id)
+	if err != nil || record.Status != store.BuildStatusCancelled || record.Detail != jobs.DetailShutdown {
+		t.Fatalf("queued build did not save its final status: %+v, %v", record, err)
 	}
 }
