@@ -4,15 +4,17 @@ import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { ArrowLeft, ExternalLink, Pencil, Rocket, RotateCw, Trash2 } from "lucide-react";
 import { useApi } from "@/app/services";
 import { describeError, isApiError, sentence } from "@/api/errors";
-import { isJobActive, useProjects, useServer, useServerRuntime, useServerStats, useSubjectJobs, useSuccessfulBuilds } from "@/api/queries";
+import { isJobActive, useAccount, useProjects, useServer, useServerRuntime, useServerStats, useSubjectJobs, useSuccessfulBuilds } from "@/api/queries";
 import { qk } from "@/api/query-keys";
-import type { Job, Server, UpdateServerRequest } from "@/api/types.gen";
+import type { Backup, Job, Server, UpdateServerRequest } from "@/api/types.gen";
+import { BackupPickerDialog, ResetDataDialog, RestoreDialog, schemaMatch, serverBuildFingerprint, useBuildFingerprints } from "@/components/backups";
 import { buildName } from "@/components/builds";
 import { CertificateDetails } from "@/components/certificate";
 import { EnvEditor } from "@/components/env-editor";
 import { InlineJob, JobsPanel, useShownJob } from "@/components/jobs";
 import { OriginsEditor, hasOriginErrors, noOriginErrors, originErrorsFrom, validateOrigins, type OriginErrors } from "@/components/origins-editor";
 import { ServerActions } from "@/components/server-actions";
+import { SchemaMismatchNotice, ServerDataSection } from "@/components/server-data";
 import { ServerStateBadge, isContainerActive, portLocked, serverActionsBlocked } from "@/components/status-badges";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,7 +27,7 @@ import { ErrorState, ErrorText, LoadingState, Notice } from "@/components/ui/sta
 import { useToast } from "@/components/ui/toast";
 import { useLogStream } from "@/hooks/use-log-stream";
 import { computeEnvDiff, emptyDraft, envErrorsFrom, mergeEnvErrors, noEnvErrors, type EnvDraft, type EnvErrors } from "@/lib/env-diff";
-import { formatBytes, formatDateTime, formatDuration, formatPercent, formatRelative, shortCommit } from "@/lib/format";
+import { formatBytes, formatDateTime, formatDuration, formatPercent, formatRelative, shortCommit, shortFingerprint } from "@/lib/format";
 import { safeHttpUrl } from "@/lib/url";
 import { ConnectionTest } from "@/components/connection-test";
 import { validatePort } from "@/lib/validators";
@@ -67,7 +69,11 @@ function ServerDetail({ id }: { id: number }) {
   const server = useServer(id);
   const jobs = useSubjectJobs("server", id);
   const projects = useProjects();
-  const [dialog, setDialog] = useState<"edit" | "delete" | null>(null);
+  const account = useAccount();
+  const fingerprints = useBuildFingerprints();
+  const isAdmin = account.data?.role === "admin";
+  const [dialog, setDialog] = useState<"edit" | "delete" | "deploy" | "pick-backup" | "reset" | null>(null);
+  const [restoring, setRestoring] = useState<Backup | null>(null);
   // The server.delete job of a deletion that did not answer 204 (failed, or still running after the wait).
   const [deleteJob, setDeleteJob] = useState<Job | null>(null);
   const activeJob = jobs.data?.items.find(isJobActive) ?? null;
@@ -108,11 +114,12 @@ function ServerDetail({ id }: { id: number }) {
       void queryClient.invalidateQueries({ queryKey: qk.jobs.forSubject("server", target.id) });
       return;
     }
-    toast.success(`Server ${target.name} deleted: container removed and port ${target.port} freed.`);
+    toast.success(`Server ${target.name} deleted: container and saved data removed, port ${target.port} freed. Its backups are kept.`);
     queryClient.removeQueries({ queryKey: qk.servers.detail(target.id) });
     void queryClient.invalidateQueries({ queryKey: qk.servers.list });
     void queryClient.invalidateQueries({ queryKey: qk.builds.all });
     void queryClient.invalidateQueries({ queryKey: qk.volumes });
+    void queryClient.invalidateQueries({ queryKey: qk.backups.all });
     void queryClient.invalidateQueries({ queryKey: qk.status });
     void navigate({ to: "/servers" });
   }
@@ -135,6 +142,7 @@ function ServerDetail({ id }: { id: number }) {
   const project = s.project_id !== null ? projects.data?.items.find((p) => p.id === s.project_id) : undefined;
   const failed = failedStart(jobs.data?.items);
   const gameUrl = s.public_url ? safeHttpUrl(s.public_url) : null;
+  const buildFp = serverBuildFingerprint(s, fingerprints);
 
   return (
     <>
@@ -194,6 +202,17 @@ function ServerDetail({ id }: { id: number }) {
             restart, delete and port changes are unavailable until the daemon reaches Docker again; this page checks every
             few seconds.
           </Notice>
+        )}
+        {s.data.schema_mismatch && (
+          <SchemaMismatchNotice
+            server={s}
+            buildFingerprint={buildFp}
+            isAdmin={isAdmin}
+            busy={activeJob !== null}
+            onDeploy={() => setDialog("deploy")}
+            onPickBackup={() => setDialog("pick-backup")}
+            onReset={() => setDialog("reset")}
+          />
         )}
         {failed && failed.id !== currentJob?.id && (
           <Notice
@@ -286,7 +305,17 @@ function ServerDetail({ id }: { id: number }) {
           <RuntimeSection server={s} />
         </div>
         <ConnectionTest serverId={s.id} />
-        <BuildSection server={s} busy={activeJob !== null} onJob={shown.show} />
+        <BuildSection server={s} onDeploy={() => setDialog("deploy")} />
+        <ServerDataSection
+          server={s}
+          buildFingerprint={buildFp}
+          busy={activeJob !== null}
+          isAdmin={isAdmin}
+          onJob={shown.show}
+          onRestore={setRestoring}
+          onPickBackup={() => setDialog("pick-backup")}
+          onReset={() => setDialog("reset")}
+        />
         <div className="grid gap-6 lg:grid-cols-2">
           <OriginsSection server={s} />
           <CertificateSection server={s} />
@@ -294,12 +323,25 @@ function ServerDetail({ id }: { id: number }) {
         <StatsSection server={s} />
         <EnvSection server={s} />
         <LogsSection server={s} />
-        <Section title="Jobs" description="Recent start, stop, restart and delete operations.">
+        <Section title="Jobs" description="Recent starts, stops, restarts, backups, restores, data resets and deletions.">
           <JobsPanel subjectType="server" subjectId={id} />
         </Section>
       </div>
 
       {dialog === "edit" && <EditServerDialog server={s} busy={activeJob !== null} onClose={() => setDialog(null)} />}
+      {dialog === "deploy" && <DeployDialog server={s} busy={activeJob !== null} onJob={shown.show} onClose={() => setDialog(null)} />}
+      {dialog === "pick-backup" && (
+        <BackupPickerDialog
+          server={s}
+          onClose={() => setDialog(null)}
+          onPick={(b) => {
+            setDialog(null);
+            setRestoring(b);
+          }}
+        />
+      )}
+      {restoring && <RestoreDialog backup={restoring} target={s} onClose={() => setRestoring(null)} onJob={(job) => shown.show(job)} />}
+      {dialog === "reset" && <ResetDataDialog server={s} onClose={() => setDialog(null)} onJob={shown.show} />}
       <ConfirmDialog
         open={dialog === "delete"}
         onOpenChange={(o) => !o && setDialog(null)}
@@ -307,7 +349,10 @@ function ServerDetail({ id }: { id: number }) {
         description={
           <>
             Delete <span className="font-medium text-foreground">{s.name}</span>? The container is stopped gracefully (this can
-            take up to 30 seconds) and removed, its stored environment is deleted and port {s.port} is freed.
+            take up to 30 seconds) and removed, its stored environment is deleted and port {s.port} is freed.{" "}
+            {s.data.volume
+              ? "Its saved world is deleted with it. Its backups are kept: they stay on the Backups page and can be restored into another server."
+              : "Its backups, if any, are kept on the Backups page."}
           </>
         }
         confirmLabel="Delete server"
@@ -403,14 +448,13 @@ function RuntimeSection({ server }: { server: Server }) {
 }
 
 /** The build the server runs, and moving it to another successful build of the same project ("deploy"). */
-function BuildSection({ server, busy, onJob }: { server: Server; busy: boolean; onJob: (job: Job) => void }) {
-  const [deploying, setDeploying] = useState(false);
+function BuildSection({ server, onDeploy }: { server: Server; onDeploy: () => void }) {
   return (
     <Section
       title="Build"
       description="A server runs one successful build of its project. Deploying another build changes what the next start runs."
       actions={
-        <Button size="sm" variant={server.build_id === null ? "primary" : "outline"} onClick={() => setDeploying(true)}>
+        <Button size="sm" variant={server.build_id === null ? "primary" : "outline"} onClick={onDeploy}>
           <Rocket />
           {server.build_id === null ? "Choose a build" : "Deploy another build"}
         </Button>
@@ -434,7 +478,6 @@ function BuildSection({ server, busy, onJob }: { server: Server; busy: boolean; 
           .
         </p>
       )}
-      {deploying && <DeployDialog server={server} busy={busy} onJob={onJob} onClose={() => setDeploying(false)} />}
     </Section>
   );
 }
@@ -454,6 +497,9 @@ function DeployDialog({ server, busy, onJob, onClose }: { server: Server; busy: 
   const others = options.filter((b) => b.id !== server.build_id);
   const [choice, setChoice] = useState<number | null>(null);
   const selected = choice ?? others[0]?.id ?? null;
+  const selectedBuild = others.find((b) => b.id === selected) ?? null;
+  const saved = server.data.schema_fingerprint;
+  const fit = selectedBuild ? schemaMatch(saved, selectedBuild.schema_fingerprint) : "unknown";
   const [error, setError] = useState<string | null>(null);
   const running = isContainerActive(server.state);
   const projectName = (id: number) => projects.data?.items.find((p) => p.id === id)?.name ?? `project ${id}`;
@@ -564,6 +610,25 @@ function DeployDialog({ server, busy, onJob, onClose }: { server: Server; busy: 
               </Select>
             )}
           </Field>
+          {fit === "differs" && selectedBuild && (
+            <Notice tone="warning" title="This build cannot load the saved world">
+              The saved world has schema{" "}
+              <code className="font-mono text-xs" title={saved}>
+                {shortFingerprint(saved)}
+              </code>
+              ; build {buildName(selectedBuild)} has schema{" "}
+              <code className="font-mono text-xs" title={selectedBuild.schema_fingerprint}>
+                {shortFingerprint(selectedBuild.schema_fingerprint)}
+              </code>
+              . With this build the server will not start (starts and restarts fail) until it runs a build with the saved schema
+              again, or an administrator restores a backup with this build&apos;s schema or resets the data. You can still assign it.
+            </Notice>
+          )}
+          {fit === "match" && server.data.schema_mismatch && (
+            <Notice tone="info" title="This build can load the saved world">
+              Its schema matches the saved world, so the server can start again once it runs this build.
+            </Notice>
+          )}
           {running ? (
             <Notice tone="warning" title="Applying it restarts the server">
               The server is running. Deploy and restart stops the game, starts the new build and waits until it reports ready:
