@@ -1,7 +1,7 @@
 /**
  * Dev-only stand-in for the Docker-, git- and file-backed routes (projects,
  * builds, servers and their runtime view, images, static files, volumes, the
- * game certificate, and their jobs), so the web client can be developed
+ * certificate settings and their jobs), so the web client can be developed
  * without Docker, git or network access. It follows the API v1 contract
  * (docs/API.md) and the generated wire types: access levels, restricted
  * jobs, error codes and messages, the follow stream cap, tail bounds, static
@@ -16,6 +16,8 @@
  */
 import type { RawResponse, Transport, UploadRequest } from "@/api/client";
 import type {
+  ACME,
+  ACMECertificateUse,
   Build,
   BuildStatus,
   CertificateInfo,
@@ -29,16 +31,20 @@ import type {
   Image,
   Job,
   JobKind,
+  PanelCertificate,
   Project,
   ProjectAuth,
   Server,
+  ServerConnectivity,
   ServerExport,
   ServerRuntime,
   StaticAddon,
   StaticFile,
   SubjectType,
   SwitchBranchRequest,
+  UpdateACMERequest,
   UpdateGameCertificateRequest,
+  UpdatePanelCertificateRequest,
   UpdateProjectRequest,
   UpdateServerRequest,
   Volume,
@@ -69,6 +75,9 @@ interface MockState {
   serverCerts: Map<number, CertificateInfo>;
   certMode: CertificateMode;
   customCert: CertificateInfo | null;
+  panelMode: PanelCertificate["mode"];
+  panelSelfSigned: CertificateInfo;
+  acme: ACME;
   env: Map<number, Record<string, string>>;
   images: Image[];
   statics: Map<string, { meta: StaticFile; blob: Blob }>;
@@ -88,6 +97,8 @@ type Me = Pick<CurrentAccount, "id" | "username" | "role">;
 const iso = (msAgo = 0) => new Date(Date.now() - msAgo).toISOString();
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
+const ACME_PRODUCTION = "https://acme-v02.api.letsencrypt.org/directory";
+const ACME_STAGING = "https://acme-staging-v02.api.letsencrypt.org/directory";
 const IMG_ARENA = "sha256:4f1c2a9e0b7d3c5a8e6f1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e";
 const IMG_ARENA_OLD = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const IMG_KART = "sha256:9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9a8b7c6d5e4f3a2b1c0d9e8f";
@@ -324,6 +335,12 @@ function seed(): MockState {
     serverCerts,
     certMode: "self_signed",
     customCert: null,
+    panelMode: "self_signed",
+    panelSelfSigned: selfSignedCert("panel"),
+    acme: {
+      email: "", staging: false, terms_agreed: false, directory_url: ACME_PRODUCTION,
+      http01_available: true, tls_alpn01_available: false, certificates: [],
+    },
     env,
     images,
     statics,
@@ -362,7 +379,7 @@ function fail(st: MockState, status: number, code: ErrorCode, message: string, f
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const isActive = (j: Job) => j.status === "queued" || j.status === "running";
 
-function activeJobFor(st: MockState, type: SubjectType, id: number): Job | undefined {
+function activeJobFor(st: MockState, type: SubjectType, id: number | string): Job | undefined {
   return st.jobs.find((j) => j.subject_type === type && j.subject_id === String(id) && isActive(j));
 }
 
@@ -373,7 +390,7 @@ function startJob(
   restricted: boolean,
   kind: JobKind,
   type: SubjectType,
-  id: number,
+  id: number | string,
   steps: string[],
   finish: (ok: boolean) => void,
   failDetail = "authentication with the Git remote failed; check the project's credentials",
@@ -610,8 +627,7 @@ export function createMockTransport(real: Transport): Transport {
       img.in_use = img.build_ids.length > 0 || img.server_ids.length > 0 || containerUsers(img.id).length > 0;
     }
     for (const s of st.servers) {
-      // Self-signed: each server's own certificate (from its first start); custom: the shared one.
-      s.certificate = st.certMode === "custom" ? st.customCert : (st.serverCerts.get(s.id) ?? null);
+      s.certificate = st.certMode === "self_signed" ? (st.serverCerts.get(s.id) ?? null) : gameCertificate().certificate;
     }
   }
 
@@ -623,7 +639,53 @@ export function createMockTransport(real: Transport): Transport {
   const containerImage = new Map<number, string>();
 
   function gameCertificate(): GameCertificate {
-    return { mode: st.certMode, game_host: gameHost(), certificate: st.certMode === "custom" ? st.customCert : null };
+    return {
+      mode: st.certMode, game_host: gameHost(),
+      certificate: st.certMode === "custom" ? st.customCert : st.certMode === "acme" ? automaticCertificate() : null,
+    };
+  }
+
+  function automaticCertificate() {
+    return st.acme.certificates[0]?.certificate ?? null;
+  }
+
+  function panelCertificate(): PanelCertificate {
+    const certificate = st.panelMode === "acme" ? automaticCertificate() : st.panelSelfSigned;
+    return { mode: st.panelMode, configurable: true, hosts: [gameHost()], certificate, covers_hosts: Boolean(certificate) };
+  }
+
+  function refreshManagedCertificates(reissue = false) {
+    const uses: ACMECertificateUse[] = [];
+    if (st.certMode === "acme") uses.push("game");
+    if (st.panelMode === "acme") uses.push("panel");
+    if (uses.length === 0) {
+      st.acme.certificates = [];
+      return;
+    }
+    const old = st.acme.certificates[0];
+    const current = !reissue && old ? old : {
+      identifier: gameHost(),
+      status: "issued" as const,
+      certificate: {
+        ...selfSignedCert(`acme-${Date.now()}`),
+        self_signed: false,
+        issuer: st.acme.staging ? "CN=Example Staging CA" : "CN=Example ACME CA",
+        not_after: iso(-90 * DAY),
+      },
+      last_error: "",
+      last_attempt_at: iso(),
+    };
+    st.acme.certificates = [{ ...current, used_by: uses }];
+  }
+
+  function certificateJob(me: Me, kind: "certificate.issue" | "certificate.renew", publish: () => void) {
+    if (activeJobFor(st, "certificate", "acme")) return fail(st, 409, "job_in_progress", "another certificate job is already running");
+    if (!st.acme.terms_agreed) return fail(st, 409, "conflict", "accept the ACME subscriber agreement first");
+    return startJob(st, me, true, kind, "certificate", "acme", ["requesting a certificate", "answering HTTP-01 challenge"], () => {
+      publish();
+      refreshManagedCertificates(true);
+      refreshDerived();
+    });
   }
 
   function markRestartRequired() {
@@ -720,8 +782,8 @@ export function createMockTransport(real: Transport): Transport {
     let m: RegExpMatchArray | null;
     const mocked =
       /^\/(projects|builds|servers|images|static|volumes)(\/|$)/.test(path) ||
-      path === "/certificates/game" ||
-      (path === "/jobs" && (query.get("subject_type") === "project" || query.get("subject_type") === "server")) ||
+      /^\/certificates\/(game|panel|acme|acme\/renew)$/.test(path) ||
+      (path === "/jobs" && ["project", "server", "certificate"].includes(query.get("subject_type") ?? "")) ||
       (/^\/jobs\/\d+(\/log|\/cancel)?$/.test(path) && st.jobs.some((j) => path.split("/")[2] === String(j.id)));
     if (!mocked) return null;
     const me = await identify(init);
@@ -1027,12 +1089,25 @@ export function createMockTransport(real: Transport): Transport {
       refreshDerived();
       return json(st, 201, { created });
     }
-    if ((m = path.match(/^\/servers\/(\d+)(\/start|\/stop|\/restart|\/logs|\/stats|\/runtime)?$/))) {
+    if ((m = path.match(/^\/servers\/(\d+)(\/start|\/stop|\/restart|\/logs|\/stats|\/runtime|\/connectivity)?$/))) {
       const s = st.servers.find((x) => x.id === Number(m?.[1]));
       if (!s) return fail(st, 404, "not_found", "server not found");
       const sub = m[2];
       refreshDerived();
       if (!sub && method === "GET") return json(st, 200, s);
+      if (sub === "/connectivity" && method === "GET") {
+        if (s.state === "unknown") return fail(st, 503, "service_unavailable", "Docker is unreachable");
+        const build = st.builds.find((b) => b.id === s.build_id);
+        const running = s.state === "running";
+        const out: ServerConnectivity = {
+          running, page_url: s.public_url,
+          webtransport_url: new URL(build?.webtransport_path || "/wt", s.public_url).href,
+          websocket_url: new URL(build?.websocket_path || "/api/ws", s.public_url).href.replace(/^https:/, "wss:"),
+          pinned: st.certMode === "self_signed", certificate: s.certificate,
+          test_origins: [window.location.origin], test_origins_active: running && !s.restart_required,
+        };
+        return json(st, 200, out);
+      }
       if (!sub && method === "PATCH") {
         const req = body<UpdateServerRequest>();
         for (const k of req.env_unset ?? []) {
@@ -1163,6 +1238,17 @@ export function createMockTransport(real: Transport): Transport {
       if (method === "GET") return json(st, 200, gameCertificate());
       if (method === "PUT") {
         const req = body<UpdateGameCertificateRequest>();
+        if (activeJobFor(st, "certificate", "acme")) return fail(st, 409, "job_in_progress", "another certificate job is already running");
+        if (req.mode === "acme") {
+          if (req.certificate_pem || req.private_key_pem) {
+            return fail(st, 400, "validation_failed", "certificate_pem and private_key_pem are only accepted with mode custom", "certificate_pem");
+          }
+          const job = certificateJob(me, "certificate.issue", () => {
+            if (st.certMode === "self_signed") markRestartRequired();
+            st.certMode = "acme";
+          });
+          return job instanceof Response ? job : json(st, 202, { certificate: gameCertificate(), job });
+        }
         if (req.mode === "self_signed") {
           if (req.certificate_pem || req.private_key_pem) {
             return fail(st, 400, "validation_failed", "certificate_pem and private_key_pem are only accepted with mode custom", "certificate_pem");
@@ -1178,7 +1264,7 @@ export function createMockTransport(real: Transport): Transport {
           if (chain.includes("EXPIRED")) return fail(st, 400, "validation_failed", "the certificate is not currently valid (it expired)", "certificate_pem");
           if (!/-----BEGIN (RSA |EC )?PRIVATE KEY-----/.test(key)) return fail(st, 400, "validation_failed", "private_key_pem contains no unencrypted PEM private key", "private_key_pem");
           if (key.includes("MISMATCH")) return fail(st, 400, "validation_failed", "the private key does not match the certificate", "private_key_pem");
-          if (st.certMode !== "custom") markRestartRequired();
+          if (st.certMode === "self_signed") markRestartRequired();
           st.certMode = "custom";
           const names = ["play.example.com", ...(chain.includes("COVERS") ? [gameHost()] : [])];
           st.customCert = {
@@ -1194,12 +1280,53 @@ export function createMockTransport(real: Transport): Transport {
             covers_game_host: names.includes(gameHost()),
           };
         } else {
-          return fail(st, 400, "validation_failed", 'mode must be "self_signed" or "custom"', "mode");
+          return fail(st, 400, "validation_failed", 'mode must be "self_signed", "custom" or "acme"', "mode");
         }
+        refreshManagedCertificates();
         refreshDerived();
-        return json(st, 200, gameCertificate());
+        return json(st, 200, { certificate: gameCertificate(), job: null });
       }
       return null;
+    }
+
+    if (path === "/certificates/panel") {
+      if (!admin) return forbidden();
+      if (method === "GET") return json(st, 200, panelCertificate());
+      if (method === "PUT") {
+        const req = body<UpdatePanelCertificateRequest>();
+        if (activeJobFor(st, "certificate", "acme")) return fail(st, 409, "job_in_progress", "another certificate job is already running");
+        if (req.mode === "acme") {
+          const job = certificateJob(me, "certificate.issue", () => { st.panelMode = "acme"; });
+          return job instanceof Response ? job : json(st, 202, { certificate: panelCertificate(), job });
+        }
+        if (req.mode !== "self_signed") return fail(st, 400, "validation_failed", 'mode must be "self_signed" or "acme"', "mode");
+        st.panelMode = "self_signed";
+        st.panelSelfSigned = selfSignedCert(`panel-${Date.now()}`);
+        refreshManagedCertificates();
+        return json(st, 200, { certificate: panelCertificate(), job: null });
+      }
+    }
+    if (path === "/certificates/acme") {
+      if (!admin) return forbidden();
+      if (method === "GET") return json(st, 200, st.acme);
+      if (method === "PUT") {
+        const req = body<UpdateACMERequest>();
+        if (req.staging !== undefined && req.staging !== st.acme.staging && st.acme.certificates.length) {
+          return fail(st, 409, "conflict", "switch away from automatic certificates before changing staging");
+        }
+        if (req.email && (new TextEncoder().encode(req.email).length > 254 || !/^[^\s@]+@[^\s@]+$/.test(req.email))) {
+          return fail(st, 400, "validation_failed", "email must be a single address", "email");
+        }
+        Object.assign(st.acme, req);
+        st.acme.directory_url = st.acme.staging ? ACME_STAGING : ACME_PRODUCTION;
+        return json(st, 200, st.acme);
+      }
+    }
+    if (path === "/certificates/acme/renew" && method === "POST") {
+      if (!admin) return forbidden();
+      if (!st.acme.certificates.length) return fail(st, 409, "conflict", "there are no managed certificates to renew");
+      const job = certificateJob(me, "certificate.renew", () => {});
+      return job instanceof Response ? job : json(st, 202, job);
     }
 
     // Images, static files, volumes.

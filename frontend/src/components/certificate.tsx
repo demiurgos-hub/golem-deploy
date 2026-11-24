@@ -3,19 +3,31 @@ import { Badge } from "@/components/ui/badge";
 import { CopyButton } from "@/components/ui/copy-button";
 import { DetailList } from "@/components/ui/page";
 import type { CertificateInfo } from "@/api/types.gen";
-import { formatDateTime } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
 
 /** Days until a certificate expires (negative once expired). */
 export function daysLeft(notAfter: string, now = Date.now()): number {
   return Math.floor((new Date(notAfter).getTime() - now) / 86_400_000);
 }
 
+export function CertificateExpiry({ at }: { at: string }) {
+  const [now] = useState(Date.now);
+  const expired = new Date(at).getTime() <= now;
+  const near = daysLeft(at, now) < 5;
+  return (
+    <span className="inline-flex flex-wrap items-center gap-2">
+      <time dateTime={at}>{formatDateTime(at)}</time>
+      {expired || near ? (
+        <Badge tone={expired ? "danger" : "warning"}>{expired ? "Expired" : "Expiring soon"} ({formatRelative(at, now)})</Badge>
+      ) : (
+        <span className="text-xs text-muted-foreground">{formatRelative(at, now)}</span>
+      )}
+    </span>
+  );
+}
+
 /** One certificate's facts, shared by the server page and the settings page. */
-export function CertificateDetails({ cert }: { cert: CertificateInfo }) {
-  // When the page opened is precise enough for days of validity.
-  const [now] = useState(() => Date.now());
-  const left = daysLeft(cert.not_after, now);
-  const expired = new Date(cert.not_after).getTime() <= now;
+export function CertificateDetails({ cert, showGameHost = true }: { cert: CertificateInfo; showGameHost?: boolean }) {
   return (
     <DetailList
       items={[
@@ -39,22 +51,8 @@ export function CertificateDetails({ cert }: { cert: CertificateInfo }) {
             <span className="break-words font-mono text-xs">{[...cert.dns_names, ...cert.ip_addresses].join(", ") || "-"}</span>
           ),
         },
-        {
-          term: "Valid until",
-          value: (
-            <span className="inline-flex flex-wrap items-center gap-2">
-              <span title={formatDateTime(cert.not_after)}>{formatDateTime(cert.not_after)}</span>
-              {expired ? (
-                <Badge tone="danger">Expired</Badge>
-              ) : left < 5 ? (
-                <Badge tone="warning">{left < 1 ? "Expires within a day" : `${left} days left`}</Badge>
-              ) : (
-                <span className="text-xs text-muted-foreground">{left} days left</span>
-              )}
-            </span>
-          ),
-        },
-        {
+        { term: "Valid until", value: <CertificateExpiry at={cert.not_after} /> },
+        ...(showGameHost ? [{
           term: "Game host",
           value: cert.covers_game_host ? (
             <span>Covered</span>
@@ -63,7 +61,7 @@ export function CertificateDetails({ cert }: { cert: CertificateInfo }) {
               Not covered
             </Badge>
           ),
-        },
+        }] : []),
         {
           term: "SHA-256",
           value: (

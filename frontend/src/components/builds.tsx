@@ -7,6 +7,7 @@ import { isBuildActive, isProjectBusy, useAccount, useProjectBuilds, useServers,
 import { qk } from "@/api/query-keys";
 import type { Build, CurrentAccount, Job, Project, Server } from "@/api/types.gen";
 import { JobStatus } from "@/components/jobs";
+import { GameAddress } from "@/components/game-address";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/ui/data-table";
 import { ConfirmDialog } from "@/components/ui/dialog";
@@ -50,11 +51,17 @@ export function ServerLinks({ ids, servers }: { ids: readonly number[]; servers:
   if (ids.length === 0) return <span className="text-muted-foreground">None</span>;
   return (
     <span className="flex flex-wrap gap-x-2">
-      {ids.map((id) => (
-        <Link key={id} to="/servers/$id" params={{ id: String(id) }} className="hover:underline">
-          {servers?.find((s) => s.id === id)?.name ?? `server ${id}`}
-        </Link>
-      ))}
+      {ids.map((id) => {
+        const server = servers?.find((s) => s.id === id);
+        return (
+          <span key={id} className="flex flex-col items-start gap-1">
+            <Link to="/servers/$id" params={{ id: String(id) }} className="hover:underline">
+              {server?.name ?? `server ${id}`}
+            </Link>
+            {server && <GameAddress url={server.public_url} />}
+          </span>
+        );
+      })}
     </span>
   );
 }

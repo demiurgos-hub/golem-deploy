@@ -23,6 +23,8 @@ const KIND_LABELS: Record<string, string> = {
   "server.stop": "Stop",
   "server.restart": "Restart",
   "server.delete": "Delete",
+  "certificate.issue": "Issue certificate",
+  "certificate.renew": "Renew certificates",
 };
 
 /** Known kinds get a label; unknown kinds are shown verbatim, as the contract asks. */
@@ -212,14 +214,14 @@ export function InlineJob({
   const account = useAccount();
   const { data: job = initial, error } = useJob(initial.id, initial);
   const [showLog, setShowLog] = useState(defaultShowLog);
-  const wasActive = useRef(isJobActive(initial));
+  const refreshed = useRef(false);
 
   useEffect(() => {
-    if (wasActive.current && !isJobActive(job)) {
-      wasActive.current = false;
+    if (!refreshed.current && !isJobActive(job) && (isJobActive(initial) || job.subject_type === "certificate")) {
+      refreshed.current = true;
       invalidateJobSubject(queryClient, job);
     }
-  }, [job, queryClient]);
+  }, [initial, job, queryClient]);
 
   const cancel = useMutation({
     mutationFn: () => api.jobs.cancel(job.id),
@@ -268,7 +270,7 @@ export function InlineJob({
         </div>
       </div>
       {job.detail && (
-        <p className={(job.status === "error" ? "text-destructive" : "text-muted-foreground") + " whitespace-pre-wrap break-words text-sm"}>
+        <p className={(job.status === "error" ? "font-medium text-destructive" : "text-muted-foreground") + " whitespace-pre-wrap break-words text-sm"} role={job.status === "error" ? "alert" : undefined}>
           {job.detail}
         </p>
       )}

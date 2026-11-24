@@ -34,8 +34,7 @@ export function isProjectBusy(p: Pick<Project, "status">): boolean {
 
 /** Invalidates what a finished job may have changed. */
 export function invalidateJobSubject(queryClient: QueryClient, job: Job) {
-  const id = Number(job.subject_id);
-  void queryClient.invalidateQueries({ queryKey: qk.jobs.forSubject(job.subject_type, id) });
+  void queryClient.invalidateQueries({ queryKey: qk.jobs.forSubject(job.subject_type, job.subject_id) });
   void queryClient.invalidateQueries({ queryKey: qk.status });
   if (job.subject_type === "project") {
     void queryClient.invalidateQueries({ queryKey: qk.projects.all });
@@ -47,6 +46,9 @@ export function invalidateJobSubject(queryClient: QueryClient, job: Job) {
     void queryClient.invalidateQueries({ queryKey: qk.builds.all });
     void queryClient.invalidateQueries({ queryKey: qk.volumes });
     void queryClient.invalidateQueries({ queryKey: qk.images });
+  } else if (job.subject_type === "certificate") {
+    void queryClient.invalidateQueries({ queryKey: qk.certificates.all });
+    void queryClient.invalidateQueries({ queryKey: qk.servers.all });
   }
 }
 
@@ -220,7 +222,32 @@ export function useServerRuntime(server: Server | undefined) {
 
 export function useGameCertificate() {
   const api = useApi();
-  return useQuery({ queryKey: qk.certificate, queryFn: ({ signal }) => api.certificates.game(signal), retry: false });
+  return useQuery({
+    queryKey: qk.certificates.game,
+    queryFn: ({ signal }) => api.certificates.game(signal),
+    refetchInterval: 30_000,
+    retry: false,
+  });
+}
+
+export function usePanelCertificate() {
+  const api = useApi();
+  return useQuery({
+    queryKey: qk.certificates.panel,
+    queryFn: ({ signal }) => api.certificates.panel(signal),
+    refetchInterval: 30_000,
+    retry: false,
+  });
+}
+
+export function useACME() {
+  const api = useApi();
+  return useQuery({
+    queryKey: qk.certificates.acme,
+    queryFn: ({ signal }) => api.certificates.acme(signal),
+    refetchInterval: 30_000,
+    retry: false,
+  });
 }
 
 export function useImages() {
