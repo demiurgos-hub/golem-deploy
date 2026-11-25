@@ -226,7 +226,7 @@ func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 		s.hooks.afterEntryLogin()
 	}
 	var key string
-	var evicted []*session
+	var evicted []string
 	var createErr error
 	if !s.admit(tk.gen, func() bool {
 		key, _, evicted, createErr = s.sessions.create(acct.ID, acct.TokenVersion, sid)
@@ -240,8 +240,8 @@ func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 		hubError(w, http.StatusServiceUnavailable, "not_running")
 		return
 	}
-	for _, old := range evicted {
-		s.endSession(old)
+	for _, sid := range evicted {
+		s.logoutHub(sid)
 	}
 	s.logger.Info("inspector session started", "account_id", acct.ID)
 	h := w.Header()

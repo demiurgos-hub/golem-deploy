@@ -490,7 +490,9 @@ export function ServerInspectorSection({ server, busy, onJob }: { server: Server
       toast.success(
         s.inspector
           ? "Inspector switch turned on. It takes effect at the next start or restart."
-          : "Inspector switch turned off. It takes effect at the next start or restart.",
+          : s.inspector_active && s.state === "running"
+            ? "Inspector switch turned off. The Inspector stops showing this server within a minute; the game server keeps trying to connect until its next restart."
+            : "Inspector switch turned off. It takes effect at the next start or restart.",
       );
     },
   });
@@ -554,7 +556,7 @@ function ServerInspectorStatus({ server, busy, onJob }: { server: Server; busy: 
     case "leaving":
       return row(
         <Badge tone="warning">Restart required</Badge>,
-        "The switch is off, so the Inspector no longer shows this server. The running game server was started with it on and keeps trying to connect until its next restart.",
+        "The switch is off, so the Inspector stops showing this server within a minute. The running game server was started with it on and keeps trying to connect until its next restart.",
         restart,
       );
     case "installation-off":

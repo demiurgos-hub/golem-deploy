@@ -61,9 +61,12 @@ func isTransport(err error) bool {
 }
 
 // hubClient talks to the hub's loopback port: no proxy, no redirects, no
-// compression, short timeouts.
+// compression, short timeouts. The password login uses a client without
+// keep-alive, so it always goes out on a connection of its own, never on
+// one opened earlier.
 type hubClient struct {
-	http *http.Client
+	http  *http.Client
+	login *http.Client
 }
 
 func newHubTransport() *http.Transport {
@@ -81,16 +84,25 @@ func newHubTransport() *http.Transport {
 }
 
 func newHubClient() *hubClient {
-	return &hubClient{http: &http.Client{
-		Transport:     newHubTransport(),
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		Timeout:       15 * time.Second,
-	}}
+	noReuse := newHubTransport()
+	noReuse.DisableKeepAlives = true
+	client := func(tr http.RoundTripper) *http.Client {
+		return &http.Client{
+			Transport:     tr,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			Timeout:       15 * time.Second,
+		}
+	}
+	return &hubClient{http: client(newHubTransport()), login: client(noReuse)}
 }
 
 func hubBase(port int) string { return "http://127.0.0.1:" + strconv.Itoa(port) }
 
 func (c *hubClient) request(ctx context.Context, method string, port int, path string, body []byte, sid string) (*http.Response, error) {
+	return c.send(ctx, c.http, method, port, path, body, sid)
+}
+
+func (c *hubClient) send(ctx context.Context, client *http.Client, method string, port int, path string, body []byte, sid string) (*http.Response, error) {
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
@@ -108,7 +120,7 @@ func (c *hubClient) request(ctx context.Context, method string, port int, path s
 	if sid != "" {
 		req.AddCookie(&http.Cookie{Name: hubCookie, Value: sid})
 	}
-	resp, err := c.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil && ctx.Err() == nil {
 		return nil, &transportError{err}
 	}
@@ -121,10 +133,11 @@ type rateLimitedError struct{ retryAfter time.Duration }
 func (e *rateLimitedError) Error() string { return errHubRateLimited.Error() }
 func (e *rateLimitedError) Unwrap() error { return errHubRateLimited }
 
-// login logs in at the hub and returns its session id.
-func (c *hubClient) login(ctx context.Context, port int, password string) (string, error) {
+// signIn logs in at the hub on a new connection and returns its session
+// id.
+func (c *hubClient) signIn(ctx context.Context, port int, password string) (string, error) {
 	body, _ := json.Marshal(map[string]string{"password": password})
-	resp, err := c.request(ctx, http.MethodPost, port, "/auth/login", body, "")
+	resp, err := c.send(ctx, c.login, http.MethodPost, port, "/auth/login", body, "")
 	if err != nil {
 		return "", fmt.Errorf("%w: %w", errHubLogin, err)
 	}

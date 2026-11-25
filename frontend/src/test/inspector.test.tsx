@@ -416,7 +416,7 @@ describe("server page: the Inspector", () => {
     expect(within(section).queryByText(/not running/)).toBeNull();
   });
 
-  it("says that the Inspector no longer shows a running server whose switch was turned off, which keeps trying until its next restart", async () => {
+  it("says that the Inspector stops showing a running server whose switch was turned off, which keeps trying until its next restart", async () => {
     renderApp({
       path: "/servers/3",
       signedInAs: developer,
@@ -426,10 +426,31 @@ describe("server page: the Inspector", () => {
     expect(within(section).getByRole("switch", { name: "Connect this server to the Inspector" })).not.toBeChecked();
     expect(
       await within(section).findByText(
-        "The switch is off, so the Inspector no longer shows this server. The running game server was started with it on and keeps trying to connect until its next restart.",
+        "The switch is off, so the Inspector stops showing this server within a minute. The running game server was started with it on and keeps trying to connect until its next restart.",
       ),
     ).toBeInTheDocument();
     expect(within(section).getByRole("button", { name: "Restart echo" })).toBeInTheDocument();
+  });
+
+  it("says the same when the switch of a running connected server is turned off", async () => {
+    let current = serverFixture({ inspector: true, inspector_active: true });
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: serverRoutes(current, inspectorFixture({ targets: [targetFixture()] }), {
+        "GET /servers/{id}": () => jsonResponse(200, current),
+        "PATCH /servers/{id}": () => {
+          current = serverFixture({ inspector: false, inspector_active: true, restart_required: true });
+          return jsonResponse(200, current);
+        },
+      }),
+    });
+    const section = await serverSection();
+    await user.click(within(section).getByRole("switch", { name: "Connect this server to the Inspector" }));
+    expect(
+      await screen.findByText("Inspector switch turned off. The Inspector stops showing this server within a minute; the game server keeps trying to connect until its next restart."),
+    ).toBeInTheDocument();
+    expect(await within(section).findByText("The switch is off, so the Inspector stops showing this server within a minute. The running game server was started with it on and keeps trying to connect until its next restart.")).toBeInTheDocument();
   });
 
   it("shows a connected server with Open in Inspector", async () => {

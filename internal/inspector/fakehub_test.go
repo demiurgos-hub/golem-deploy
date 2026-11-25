@@ -31,8 +31,8 @@ import (
 
 // seen is one request the fake hub received.
 type seen struct {
-	Method, Path, Host string
-	Header             http.Header
+	Method, Path, Host, RemoteAddr string
+	Header                         http.Header
 }
 
 // fakeHub mimics the Golem Inspector hub's HTTP surface: login with the
@@ -81,6 +81,11 @@ type fakeHub struct {
 	badUpgrade bool
 	// readyStatus, when set, is the status of /ready.
 	readyStatus int
+	// acceptValue, when set, replaces the Sec-WebSocket-Accept of a 101.
+	acceptValue string
+	// wsStall, when set, makes /ws/client answer 400 with a body it never
+	// finishes (until the client goes).
+	wsStall bool
 }
 
 func newFakeHub(t *testing.T) *fakeHub {
@@ -176,7 +181,7 @@ func (h *fakeHub) authed(r *http.Request) (string, bool) {
 
 func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
-	h.requests = append(h.requests, seen{Method: r.Method, Path: r.URL.Path, Host: r.Host, Header: r.Header.Clone()})
+	h.requests = append(h.requests, seen{Method: r.Method, Path: r.URL.Path, Host: r.Host, RemoteAddr: r.RemoteAddr, Header: r.Header.Clone()})
 	h.mu.Unlock()
 	// Every answer tries to set a cookie; none may reach a browser.
 	http.SetCookie(w, &http.Cookie{Name: "hub_tracker", Value: "x", Path: "/"})
@@ -285,13 +290,24 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 			writeHubJSON(w, 401, map[string]string{"error": "auth_required"})
 			return
 		}
+		h.mu.Lock()
+		stall := h.wsStall
+		h.mu.Unlock()
+		if stall {
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, "{")
+			_ = http.NewResponseController(w).Flush()
+			<-r.Context().Done()
+			return
+		}
 		h.echo(w, r)
 	case "/ws/flood":
 		if _, ok := h.authed(r); !ok {
 			writeHubJSON(w, 401, map[string]string{"error": "auth_required"})
 			return
 		}
-		h.flood(w)
+		h.flood(w, r)
 	case "/ws/agent":
 		want := ""
 		if h.agentToken != nil {
@@ -305,7 +321,7 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		flood := h.agentFlood
 		h.mu.Unlock()
 		if flood {
-			h.flood(w)
+			h.flood(w, r)
 			return
 		}
 		h.echo(w, r)
@@ -359,7 +375,7 @@ func (h *fakeHub) echo(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close()
 		h.streamClosed <- struct{}{}
 	}()
-	_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n")
+	_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + h.accept(r) + "\r\n\r\n")
 	_ = brw.Flush()
 	buf := make([]byte, 1024)
 	for {
@@ -393,9 +409,21 @@ func (h *fakeHub) switchH2C(w http.ResponseWriter) {
 	_, _ = io.Copy(io.Discard, brw)
 }
 
+// accept is the Sec-WebSocket-Accept answer to r, or what acceptValue
+// says when set.
+func (h *fakeHub) accept(r *http.Request) string {
+	h.mu.Lock()
+	v := h.acceptValue
+	h.mu.Unlock()
+	if v != "" {
+		return v
+	}
+	return wsAccept(r.Header.Get("Sec-WebSocket-Key"))
+}
+
 // flood completes a WebSocket upgrade and writes until the connection
 // fails, ignoring what the client sends.
-func (h *fakeHub) flood(w http.ResponseWriter) {
+func (h *fakeHub) flood(w http.ResponseWriter, r *http.Request) {
 	conn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		return
@@ -406,7 +434,7 @@ func (h *fakeHub) flood(w http.ResponseWriter) {
 		_ = conn.Close()
 		h.streamClosed <- struct{}{}
 	}()
-	_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n")
+	_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + h.accept(r) + "\r\n\r\n")
 	_ = brw.Flush()
 	chunk := bytes.Repeat([]byte("x"), 64<<10)
 	for {
