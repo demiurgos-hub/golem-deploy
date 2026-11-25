@@ -60,9 +60,10 @@ func buildStandinImage(t *testing.T, tag string) {
 }
 
 // TestIntegrationInspector applies the Inspector for real with a stand-in
-// hub image: the hardened, labelled hub container, a ticket, the entry, a
-// proxied request, an agent relayed from a container on the managed
-// network, the target listing, and turning it off again.
+// hub image: the hardened, labelled hub container, the static UI with the
+// boot script, a ticket exchanged for a session key, a proxied request and
+// a browser WebSocket with that key, an agent relayed from a container on
+// the managed network, the target listing, and turning it off again.
 func TestIntegrationInspector(t *testing.T) {
 	if os.Getenv("GOLEM_DEPLOY_DOCKER_TESTS") != "1" {
 		t.Skip("set GOLEM_DEPLOY_DOCKER_TESTS=1 to run tests against a real Docker daemon")
@@ -186,23 +187,42 @@ func TestIntegrationInspector(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := "http://127.0.0.1:" + strconv.Itoa(s.port())
-	resp, err := plainClient().Get(base + ses.Path)
-	if err != nil || resp.StatusCode != 303 {
-		t.Fatalf("enter: %v %v", resp, err)
+	// The static UI comes without a session and carries the boot script.
+	resp, err := plainClient().Get(base + "/")
+	if err != nil {
+		t.Fatal(err)
 	}
+	page := readBody(t, resp)
 	resp.Body.Close()
-	var cookie string
-	for _, ck := range resp.Cookies() {
-		if ck.Name == SessionCookie {
-			cookie = ck.Value
-		}
+	if resp.StatusCode != 200 || !strings.Contains(page, "<head>"+bootTag) || len(resp.Header.Values("Set-Cookie")) != 0 {
+		t.Fatalf("static UI: %d %q", resp.StatusCode, page)
 	}
-	req, _ := testRequest("GET", base+"/api/targets", cookie)
+	entry := entryOf(t, postTicket(t, plainClient(), base, ticketOf(t, ses.Path), base, nil))
+	if entry.TargetID != sv.Name {
+		t.Fatalf("target %q", entry.TargetID)
+	}
+	req, _ := testRequest("GET", base+"/api/targets", entry.Key)
 	resp, err = plainClient().Do(req)
 	if err != nil || resp.StatusCode != 200 || len(resp.Header.Values("Set-Cookie")) != 0 {
 		t.Fatalf("proxied: %v %v", resp, err)
 	}
 	resp.Body.Close()
+	req, _ = testRequest("GET", base+"/api/targets", "")
+	req.Header.Set("Cookie", "golem_deploy_inspector="+entry.Key)
+	if resp, err = plainClient().Do(req); err != nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("cookie: %v %v", resp, err)
+	}
+	resp.Body.Close()
+	conn, br, wsResp := dialWSResponse(t, "127.0.0.1:"+strconv.Itoa(s.port()), "/ws/client", http.Header{
+		"Sec-WebSocket-Protocol": {WebSocketProtocol + ", " + WebSocketKeyPrefix + entry.Key}, "Origin": {base}})
+	if wsResp.StatusCode != http.StatusSwitchingProtocols || wsResp.Header.Get("Sec-WebSocket-Protocol") != WebSocketProtocol {
+		t.Fatalf("browser WebSocket: %d %v", wsResp.StatusCode, wsResp.Header)
+	}
+	echoOnce(t, conn, br, "ping")
+	conn.Close()
+	if strings.Contains(logs.String(), entry.Key) {
+		t.Fatal("the session key reached the log")
+	}
 
 	// An agent in a container on the managed network, relayed through the
 	// listener.
@@ -249,10 +269,12 @@ func TestIntegrationInspector(t *testing.T) {
 	}
 }
 
-func testRequest(method, url, cookie string) (*http.Request, error) {
+// testRequest builds a request with the session key as a bearer header
+// (when not empty).
+func testRequest(method, url, key string) (*http.Request, error) {
 	req, err := http.NewRequest(method, url, nil)
-	if err == nil && cookie != "" {
-		req.AddCookie(&http.Cookie{Name: SessionCookie, Value: cookie})
+	if err == nil && key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	return req, err
 }

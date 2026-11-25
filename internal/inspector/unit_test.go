@@ -119,11 +119,11 @@ func TestTickets(t *testing.T) {
 func TestSessionStore(t *testing.T) {
 	clock := &fakeClock{t: time.Unix(1000, 0)}
 	st := newSessionStore(clock.Now)
-	cookie, s, evicted, err := st.create(1, 7, "hub-1")
-	if err != nil || len(cookie) != 43 || len(evicted) != 0 || s.hubSession() != "hub-1" {
-		t.Fatalf("%q %v %v", cookie, evicted, err)
+	key, s, evicted, err := st.create(1, 7, "hub-1")
+	if err != nil || len(key) != 43 || len(evicted) != 0 || s.hubSession() != "hub-1" {
+		t.Fatalf("%q %v %v", key, evicted, err)
 	}
-	if got, _ := st.lookup(cookie); got != s {
+	if got, _ := st.lookup(key); got != s {
 		t.Fatal("lookup")
 	}
 	ctx, release, ok := s.track(context.Background())
@@ -141,9 +141,9 @@ func TestSessionStore(t *testing.T) {
 		t.Fatal("tracked after end")
 	}
 	// Expiry.
-	cookie, _, _, _ = st.create(1, 7, "")
+	key, _, _, _ = st.create(1, 7, "")
 	clock.Advance(SessionMaxAge)
-	if got, expired := st.lookup(cookie); got != nil || expired == nil {
+	if got, expired := st.lookup(key); got != nil || expired == nil {
 		t.Fatal("expired session returned")
 	}
 	// The account's oldest session is pushed out beyond the limit.

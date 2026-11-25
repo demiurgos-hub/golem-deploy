@@ -36,7 +36,7 @@ func (s *stubInspector) CreateSession(_ context.Context, acct store.Account, ser
 	if s.sessErr != nil {
 		return apitypes.InspectorSession{}, s.sessErr
 	}
-	return apitypes.InspectorSession{Path: inspector.EnterPath + "?ticket=t", Port: 8444, ExpiresAt: time.Unix(0, 0).UTC()}, nil
+	return apitypes.InspectorSession{Path: inspector.EnterPath + "#t=t", Port: 8444, ExpiresAt: time.Unix(0, 0).UTC()}, nil
 }
 
 func TestInspectorRoutes(t *testing.T) {

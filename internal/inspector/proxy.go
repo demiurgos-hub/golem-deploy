@@ -20,8 +20,6 @@ import (
 
 // Browser side of the Inspector listener.
 const (
-	// EnterPath consumes a ticket and starts a session.
-	EnterPath = "/_golem-deploy/enter"
 	// maxProxyBody bounds request bodies relayed to the hub (they are
 	// buffered so a request can be repeated after a hub restart).
 	maxProxyBody = 64 << 10
@@ -36,10 +34,39 @@ const (
 )
 
 // blockedPaths are never forwarded to the hub from browsers: the daemon
-// logs in itself, agents use the agent endpoint, metrics stay internal.
-var blockedPaths = map[string]bool{"/auth/login": true, "/ws/agent": true, "/metrics": true}
+// logs in itself, agents use the agent endpoint, metrics and health stay
+// internal.
+var blockedPaths = map[string]bool{"/auth/login": true, "/ws/agent": true, "/metrics": true, "/health": true, "/live": true, "/ready": true}
 
-type sessionKey struct{}
+// reservedPrefixes are the hub's paths outside its static UI (the hub's
+// own list). Everything under them needs a session; the rest is the
+// static UI, relayed without one.
+var reservedPrefixes = []string{"/api", "/auth", "/ws", "/health", "/live", "/ready", "/metrics"}
+
+func reservedPath(p string) bool {
+	for _, prefix := range reservedPrefixes {
+		if p == prefix || strings.HasPrefix(p, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// proxyKey carries a relayed request's proxyInfo.
+type proxyKey struct{}
+
+// proxyInfo is what the proxy knows about a relayed request: its session
+// (nil for the static UI) and whether a WebSocket upgrade offered the
+// marker subprotocol.
+type proxyInfo struct {
+	sess    *session
+	offered bool
+}
+
+func proxyInfoFrom(ctx context.Context) proxyInfo {
+	v, _ := ctx.Value(proxyKey{}).(proxyInfo)
+	return v
+}
 
 // hubError writes the hub's JSON error shape.
 func hubError(w http.ResponseWriter, status int, code string) {
@@ -48,21 +75,6 @@ func hubError(w http.ResponseWriter, status int, code string) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
-}
-
-// page writes one of the daemon's small static pages.
-func (s *Service) page(w http.ResponseWriter, status int, title, text string) {
-	h := w.Header()
-	h.Set("Content-Type", "text/html; charset=utf-8")
-	h.Set("Cache-Control", "no-store")
-	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
-	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("X-Frame-Options", "DENY")
-	h.Set("Referrer-Policy", "no-referrer")
-	w.WriteHeader(status)
-	_, _ = io.WriteString(w, `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">`+
-		`<title>`+title+`</title><style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;line-height:1.5;color:#222;background:#fff}`+
-		`@media (prefers-color-scheme:dark){body{color:#ddd;background:#111}}</style></head><body><h1>`+title+`</h1><p>`+text+`</p></body></html>`)
 }
 
 // browserHandler serves browsers: on the TLS side of a listener that
@@ -84,18 +96,21 @@ func (s *Service) browserHandler() http.Handler {
 			hubError(w, http.StatusMisdirectedRequest, "bad_host")
 			return
 		}
+		// The hub cleans paths too (it redirects to the clean path), so
+		// both spellings are classified and the stricter rule wins.
 		p := r.URL.Path
-		if blockedPaths[p] || blockedPaths[path.Clean("/"+p)] {
+		clean := path.Clean("/" + p)
+		switch {
+		case blockedPaths[p] || blockedPaths[clean]:
 			hubError(w, http.StatusNotFound, "not_found")
-			return
-		}
-		switch p {
-		case EnterPath:
-			s.handleEnter(w, r)
-		case "/auth/logout":
+		case strings.HasPrefix(p, ownPrefix) || strings.HasPrefix(clean, ownPrefix):
+			s.handleOwn(w, r)
+		case p == "/auth/logout":
 			s.handleLogout(w, r)
-		default:
+		case reservedPath(p) || reservedPath(clean):
 			s.handleProxy(w, r)
+		default:
+			s.handleStatic(w, r)
 		}
 	})
 }
@@ -110,118 +125,39 @@ func (s *Service) hostAllowed(host string) bool {
 	return ph != "" && netpolicy.Hostname(host) == strings.ToLower(strings.Trim(ph, "[]"))
 }
 
-// secureCookie reports whether the session cookie is marked Secure.
-func (s *Service) secureCookie() bool {
-	return s.tlsListener() || strings.HasPrefix(s.cfg.PublicURL, "https://")
-}
-
 func (s *Service) tlsListener() bool { return s.cfg.TLSConfig != nil }
 
-func (s *Service) clearCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{Name: SessionCookie, Value: "", Path: "/", HttpOnly: true, Secure: s.secureCookie(),
-		SameSite: http.SameSiteLaxMode, MaxAge: -1})
-}
-
-// handleEnter consumes a ticket, logs in at the hub for the new session,
-// sets the session cookie and redirects to the Inspector.
-func (s *Service) handleEnter(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		// Not HEAD either: a link preview must not use up the ticket.
-		hubError(w, http.StatusMethodNotAllowed, "method_not_allowed")
-		return
+// sessionFor returns the request's valid session: the presented key names
+// a live session whose account still exists, is approved and has the same
+// token version. A session that fails the check is ended. unavailable is
+// true when the database did not answer (the session is kept).
+func (s *Service) sessionFor(r *http.Request) (sess *session, unavailable bool) {
+	key, _ := presentedKey(r)
+	if key == "" {
+		return nil, false
 	}
-	res, wait, ok := s.entryLimit.Reserve(s.cfg.Policy.ClientIP(r))
-	if !ok {
-		w.Header().Set("Retry-After", strconv.Itoa(int(wait/time.Second)+1))
-		s.page(w, http.StatusTooManyRequests, "Too many attempts",
-			"Too many Inspector links failed from this address. Wait a few minutes, then open the Inspector again from Golem Deploy.")
-		return
-	}
-	tk, ok := s.tickets.consume(r.URL.Query().Get("ticket"))
-	if !ok {
-		s.page(w, http.StatusForbidden, "Inspector link not valid",
-			"This Inspector link was already used or has expired. Open the Inspector again from Golem Deploy.")
-		return
-	}
-	acct, err := s.cfg.Store.GetAccount(r.Context(), tk.accountID)
-	if err != nil || !acct.Approved || acct.TokenVersion != tk.tokenVersion {
-		s.page(w, http.StatusForbidden, "Inspector link not valid",
-			"The account of this Inspector link can no longer open it. Sign in to Golem Deploy and open the Inspector again.")
-		return
-	}
-	res.Refund()
-	if _, _, serving := s.agentTarget(); !serving {
-		s.page(w, http.StatusServiceUnavailable, "Inspector not running",
-			"The Inspector is not running. Check its state in Golem Deploy.")
-		return
-	}
-	lctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	sid, err := s.hubLogin(lctx)
-	cancel()
-	if err != nil {
-		s.logger.Warn("could not open an Inspector session at the hub", "account_id", acct.ID, "err", err)
-		s.page(w, http.StatusServiceUnavailable, "Inspector unavailable",
-			"The Inspector could not be opened right now. Try again in a moment from Golem Deploy.")
-		return
-	}
-	cookie, _, evicted, err := s.sessions.create(acct.ID, acct.TokenVersion, sid)
-	if err != nil {
-		s.logoutHub(sid)
-		s.page(w, http.StatusInternalServerError, "Inspector unavailable", "The Inspector session could not be created.")
-		return
-	}
-	for _, old := range evicted {
-		s.endSession(old)
-	}
-	s.logger.Info("inspector session started", "account_id", acct.ID)
-	http.SetCookie(w, &http.Cookie{Name: SessionCookie, Value: cookie, Path: "/", HttpOnly: true, Secure: s.secureCookie(),
-		SameSite: http.SameSiteLaxMode, MaxAge: int(SessionMaxAge / time.Second)})
-	target := "/"
-	if tk.target != "" {
-		target = "/?targetId=" + url.QueryEscape(tk.target)
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	http.Redirect(w, r, target, http.StatusSeeOther)
-}
-
-// sessionFor returns the request's valid session: the cookie names a live
-// session whose account still exists, is approved and has the same token
-// version. A session that fails the check is ended.
-func (s *Service) sessionFor(r *http.Request) *session {
-	ck, err := r.Cookie(SessionCookie)
-	if err != nil {
-		return nil
-	}
-	sess, expired := s.sessions.lookup(ck.Value)
+	sess, expired := s.sessions.lookup(key)
 	if expired != nil {
 		s.endSession(expired)
 	}
 	if sess == nil {
-		return nil
+		return nil, false
 	}
 	acct, err := s.cfg.Store.GetAccount(r.Context(), sess.accountID)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil // the database did not answer: refuse this request only
+		return nil, true // the database did not answer: refuse this request only
 	}
 	if err != nil || !acct.Approved || acct.TokenVersion != sess.tokenVersion {
 		s.endSession(sess)
-		return nil
+		return nil, false
 	}
-	return sess
+	return sess, false
 }
 
-// unauthenticated answers a request without a valid session: a static page
-// for a page navigation, the hub's JSON error otherwise.
-func (s *Service) unauthenticated(w http.ResponseWriter, r *http.Request) {
-	if _, err := r.Cookie(SessionCookie); err == nil {
-		s.clearCookie(w)
-	}
-	if r.Method == http.MethodGet && !isWebSocket(r) && strings.Contains(r.Header.Get("Accept"), "text/html") {
-		s.page(w, http.StatusUnauthorized, "Inspector session ended",
-			"Your Inspector session has ended. Open the Inspector again from Golem Deploy.")
-		return
-	}
+// unauthenticated answers a request without a valid session. The header
+// tells the boot script to drop its key.
+func (s *Service) unauthenticated(w http.ResponseWriter) {
+	w.Header().Set(SessionHeader, "ended")
 	hubError(w, http.StatusUnauthorized, "auth_required")
 }
 
@@ -237,23 +173,27 @@ func (s *Service) expectedOrigin(r *http.Request) string {
 	return scheme + "://" + strings.ToLower(r.Host)
 }
 
-// originOK checks the Origin of a WebSocket upgrade or a request that is
-// not GET or HEAD.
+// originOK checks the Origin of a WebSocket upgrade, a ticket exchange or
+// another request that is not GET or HEAD.
 func (s *Service) originOK(r *http.Request) bool {
 	o := r.Header.Get("Origin")
 	return o != "" && strings.EqualFold(o, s.expectedOrigin(r))
 }
 
 // handleLogout forwards a sign-out to the hub, then ends the daemon
-// session and clears the cookie.
+// session.
 func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		hubError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
-	sess := s.sessionFor(r)
+	sess, unavailable := s.sessionFor(r)
+	if unavailable {
+		hubError(w, http.StatusServiceUnavailable, "unavailable")
+		return
+	}
 	if sess == nil {
-		s.unauthenticated(w, r)
+		s.unauthenticated(w)
 		return
 	}
 	if !s.originOK(r) {
@@ -262,18 +202,45 @@ func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logger.Info("inspector session ended by sign-out", "account_id", sess.accountID)
 	s.endSessionSync(r.Context(), sess)
-	s.clearCookie(w)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, `{"authenticated":false}`+"\n")
 }
 
+// handleStatic relays a GET or HEAD of the hub's static UI without any
+// credentials: no session is looked up and none reaches the hub.
+func (s *Service) handleStatic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		hubError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if isWebSocket(r) {
+		hubError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if _, port, serving := s.agentTarget(); !serving || port == 0 {
+		hubError(w, http.StatusServiceUnavailable, "hub_unavailable")
+		return
+	}
+	r.Body, r.ContentLength = http.NoBody, 0
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(requestTimeout))
+	_ = rc.SetWriteDeadline(time.Now().Add(requestTimeout))
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	s.proxy.ServeHTTP(w, r.WithContext(context.WithValue(ctx, proxyKey{}, proxyInfo{})))
+}
+
 // handleProxy relays a request of a valid session to the hub.
 func (s *Service) handleProxy(w http.ResponseWriter, r *http.Request) {
-	sess := s.sessionFor(r)
+	sess, unavailable := s.sessionFor(r)
+	if unavailable {
+		hubError(w, http.StatusServiceUnavailable, "unavailable")
+		return
+	}
 	if sess == nil {
-		s.unauthenticated(w, r)
+		s.unauthenticated(w)
 		return
 	}
 	upgrade := isWebSocket(r)
@@ -297,7 +264,7 @@ func (s *Service) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, release, ok := sess.track(r.Context())
 	if !ok {
-		s.unauthenticated(w, r)
+		s.unauthenticated(w)
 		return
 	}
 	defer release()
@@ -309,13 +276,15 @@ func (s *Service) handleProxy(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel = context.WithTimeout(ctx, requestTimeout)
 		defer cancel()
 	}
-	s.proxy.ServeHTTP(w, r.WithContext(context.WithValue(ctx, sessionKey{}, sess)))
+	_, offered := presentedKey(r)
+	s.proxy.ServeHTTP(w, r.WithContext(context.WithValue(ctx, proxyKey{}, proxyInfo{sess: sess, offered: upgrade && offered})))
 }
 
 // newBrowserProxy relays browser requests to the hub with only the
-// session's hub cookie: the browser's cookies, credentials and forwarding
-// headers are dropped, the Origin is rewritten to the hub's fixed origin
-// and the hub's Set-Cookie never reaches the browser.
+// session's hub cookie: the browser's cookies, credentials, subprotocols
+// and forwarding headers are dropped, the Origin is rewritten to the hub's
+// fixed origin, the hub's Set-Cookie never reaches the browser, and HTML
+// documents get the boot script.
 func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -325,7 +294,12 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 			for _, h := range strippedHeaders {
 				pr.Out.Header.Del(h)
 			}
-			if sess, _ := pr.In.Context().Value(sessionKey{}).(*session); sess != nil {
+			// The Inspector UI offers no subprotocols of its own: these
+			// are the marker and the key.
+			pr.Out.Header.Del("Sec-WebSocket-Protocol")
+			// Documents are read to insert the boot script.
+			pr.Out.Header.Set("Accept-Encoding", "identity")
+			if sess := proxyInfoFrom(pr.In.Context()).sess; sess != nil {
 				if sid := sess.hubSession(); sid != "" {
 					pr.Out.Header.Set("Cookie", hubCookie+"="+sid)
 				}
@@ -334,11 +308,30 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 				pr.Out.Header.Set("Origin", HubOrigin)
 			}
 		},
-		Transport:      &retryTransport{s: s, base: newHubTransport()},
-		ModifyResponse: func(resp *http.Response) error { resp.Header.Del("Set-Cookie"); return nil },
+		Transport: &retryTransport{s: s, base: newHubTransport()},
+		ModifyResponse: func(resp *http.Response) error {
+			resp.Header.Del("Set-Cookie")
+			resp.Header.Del(SessionHeader)
+			if resp.StatusCode == http.StatusSwitchingProtocols {
+				// Browsers fail a connection that offered subprotocols
+				// and got none back.
+				resp.Header.Del("Sec-WebSocket-Protocol")
+				if resp.Request != nil && proxyInfoFrom(resp.Request.Context()).offered {
+					resp.Header.Set("Sec-WebSocket-Protocol", WebSocketProtocol)
+				}
+				return nil
+			}
+			return injectBoot(resp)
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if r.Context().Err() != nil {
 				return // the browser left, or the session ended
+			}
+			if errors.Is(err, errDocument) {
+				s.logger.Warn("an Inspector page from the hub could not carry the boot script and was not served")
+				s.page(w, http.StatusBadGateway, "Inspector unavailable",
+					"The Inspector page could not be prepared. Try again in a moment from Golem Deploy.")
+				return
 			}
 			s.logger.Debug("inspector proxy request failed", "err", err)
 			// Docker may have restarted the hub on another port.
@@ -362,7 +355,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	sess, _ := req.Context().Value(sessionKey{}).(*session)
+	sess := proxyInfoFrom(req.Context()).sess
 	if sess == nil {
 		return resp, nil
 	}

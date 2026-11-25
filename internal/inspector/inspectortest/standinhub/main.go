@@ -3,9 +3,9 @@
 // GOLEM_INSPECTOR_* variables and serves the part of the hub's HTTP
 // surface the daemon uses: /ready, /auth/login (bcrypt password, origin
 // check, session cookie), /auth/logout, /auth/session, /api/targets,
-// /ws/agent (bearer token) and /ws/client. WebSocket endpoints complete the
-// upgrade and then speak a line protocol: an agent sends
-// "register <target id>" and stays connected.
+// /ws/agent (bearer token), /ws/client and a UI document with a <head>.
+// WebSocket endpoints complete the upgrade and then speak a line protocol:
+// an agent sends "register <target id>" and stays connected.
 //
 // "standinhub agent" is a minimal agent: it dials GOLEM_INSPECTOR_HUB_URL
 // with GOLEM_INSPECTOR_TOKEN, registers GOLEM_INSPECTOR_TARGET_ID and
@@ -176,8 +176,8 @@ func hub() error {
 		_, _ = io.Copy(conn, br)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = io.WriteString(w, "<html>standin inspector</html>")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, `<!doctype html><html lang="en"><head><title>standin inspector</title></head><body>standin inspector</body></html>`)
 	})
 	srv := &http.Server{Addr: env("ADDR"), Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	return srv.ListenAndServe()

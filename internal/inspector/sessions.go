@@ -14,10 +14,6 @@ import (
 const (
 	// SessionMaxAge is the lifetime of an Inspector session.
 	SessionMaxAge = 8 * time.Hour
-	// SessionCookie is the daemon's cookie on the Inspector listener. It
-	// holds a random id; the hub's own session cookie never reaches
-	// browsers.
-	SessionCookie = "golem_deploy_inspector"
 	// maxSessionsPerAccount and maxSessions bound live sessions; a new
 	// session beyond the account's limit ends that account's oldest.
 	maxSessionsPerAccount = 16
@@ -27,8 +23,10 @@ const (
 	SweepInterval = 30 * time.Second
 )
 
-// session is a daemon-held Inspector session of one browser. hubSID is
-// the hub session the daemon logged in for it.
+// session is a daemon-held Inspector session of one browser tab, found by
+// the SHA-256 of its key (32 random bytes, base64url), which only the tab
+// holds. hubSID is the hub session the daemon logged in for it; it never
+// reaches the browser.
 type session struct {
 	key          [32]byte
 	accountID    int64
@@ -111,7 +109,7 @@ func newSessionStore(now func() time.Time) *sessionStore {
 	return &sessionStore{now: now, m: map[[32]byte]*session{}}
 }
 
-// create adds a session and returns its cookie value. Sessions it pushed
+// create adds a session and returns its key. Sessions it pushed
 // out (the account's oldest beyond the limit, the oldest overall beyond
 // the total) are returned so the caller ends them.
 func (st *sessionStore) create(accountID, tokenVersion int64, hubSID string) (string, *session, []*session, error) {
@@ -119,9 +117,9 @@ func (st *sessionStore) create(accountID, tokenVersion int64, hubSID string) (st
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", nil, nil, err
 	}
-	cookie := base64.RawURLEncoding.EncodeToString(raw[:])
+	k := base64.RawURLEncoding.EncodeToString(raw[:])
 	now := st.now()
-	s := &session{key: sha256.Sum256([]byte(cookie)), accountID: accountID, tokenVersion: tokenVersion, created: now,
+	s := &session{key: sha256.Sum256([]byte(k)), accountID: accountID, tokenVersion: tokenVersion, created: now,
 		expires: now.Add(SessionMaxAge), hubSID: hubSID, lastLogin: now, streams: map[uint64]context.CancelFunc{}}
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -149,17 +147,17 @@ func (st *sessionStore) create(accountID, tokenVersion int64, hubSID string) (st
 		evicted = append(evicted, oldest)
 	}
 	st.m[s.key] = s
-	return cookie, s, evicted, nil
+	return k, s, evicted, nil
 }
 
-// lookup returns the live session of a cookie value (nil when unknown or
-// expired; an expired session is removed and returned in expired so the
-// caller ends it).
-func (st *sessionStore) lookup(cookie string) (s *session, expired *session) {
-	if len(cookie) != 43 {
+// lookup returns the live session of a key (nil when unknown or expired;
+// an expired session is removed and returned in expired so the caller
+// ends it).
+func (st *sessionStore) lookup(k string) (s *session, expired *session) {
+	if len(k) != 43 {
 		return nil, nil
 	}
-	key := sha256.Sum256([]byte(cookie))
+	key := sha256.Sum256([]byte(k))
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	s = st.m[key]

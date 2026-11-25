@@ -42,16 +42,18 @@ type fakeHub struct {
 	t   *testing.T
 	srv *httptest.Server
 
-	mu           sync.Mutex
-	hash         func() string
-	agentToken   func() string
-	sessions     map[string]bool
-	logins       int
-	logouts      []string
-	loginStatus  int
-	retryAfter   string
-	targets      []map[string]any
-	requests     []seen
+	mu          sync.Mutex
+	hash        func() string
+	agentToken  func() string
+	sessions    map[string]bool
+	logins      int
+	logouts     []string
+	loginStatus int
+	retryAfter  string
+	targets     []map[string]any
+	requests    []seen
+	// static, when set, answers GET and HEAD of the static UI.
+	static       http.HandlerFunc
 	openStreams  atomic.Int32
 	streamClosed chan struct{}
 }
@@ -215,10 +217,21 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 			writeHubJSON(w, 200, map[string]string{"echo": string(body)})
 			return
 		}
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = io.WriteString(w, "<html>inspector ui</html>")
+		h.mu.Lock()
+		static := h.static
+		h.mu.Unlock()
+		if static != nil {
+			static(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, fakeDoc)
 	}
 }
+
+// fakeDoc is the fake hub's UI document.
+const fakeDoc = `<!doctype html><html lang="en"><head><meta charset="UTF-8"><title>Golem Inspector</title>` +
+	`<script type="module" src="/assets/index.js"></script></head><body>inspector ui</body></html>`
 
 // echo completes a WebSocket upgrade and echoes raw bytes until EOF.
 func (h *fakeHub) echo(w http.ResponseWriter, r *http.Request) {
@@ -279,6 +292,9 @@ type testEnv struct {
 	clock *fakeClock
 	acct  store.Account
 	logs  *syncBuffer
+	// keys are the session keys the env obtained; none may reach the hub
+	// or the log.
+	keys []string
 }
 
 type syncBuffer struct {
@@ -347,7 +363,26 @@ func newTestEnv(t *testing.T, mut func(*Config)) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &testEnv{t: t, s: s, st: st, hub: hub, clock: clock, acct: acct, logs: logs}
+	e := &testEnv{t: t, s: s, st: st, hub: hub, clock: clock, acct: acct, logs: logs}
+	t.Cleanup(func() {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		for _, key := range e.keys {
+			for _, req := range hub.requests {
+				for name, vs := range req.Header {
+					for _, v := range vs {
+						if strings.Contains(v, key) {
+							t.Errorf("a session key reached the hub in %s of %s", name, req.Path)
+						}
+					}
+				}
+			}
+			if strings.Contains(logs.String(), key) {
+				t.Error("a session key reached the daemon log")
+			}
+		}
+	})
+	return e
 }
 
 // addr is the listener's host:port.
@@ -361,41 +396,103 @@ func plainClient() *http.Client {
 		Transport: &http.Transport{Proxy: nil}, Timeout: 10 * time.Second}
 }
 
-// enter creates a ticket for the env's account and opens it; it returns
-// the session cookie value.
+// ticketOf returns the ticket in the fragment of an entry path.
+func ticketOf(t *testing.T, entryPath string) string {
+	t.Helper()
+	tok, ok := strings.CutPrefix(entryPath, EnterPath+"#t=")
+	if !ok || len(tok) != 43 {
+		t.Fatalf("entry path %q", entryPath)
+	}
+	return tok
+}
+
+// postTicket sends the ticket exchange of enter.js: POST SessionPath with
+// JSON and origin. hdr adds or replaces headers ("" removes one; "Host"
+// sets the Host).
+func postTicket(t *testing.T, client *http.Client, base, ticket, origin string, hdr map[string]string) *http.Response {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"ticket": ticket})
+	req, err := http.NewRequest("POST", base+SessionPath, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", origin)
+	for k, v := range hdr {
+		switch {
+		case strings.EqualFold(k, "Host"):
+			req.Host = v
+		case v == "":
+			req.Header.Del(k)
+		default:
+			req.Header.Set(k, v)
+		}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	if len(resp.Header.Values("Set-Cookie")) != 0 {
+		t.Errorf("the ticket exchange set a cookie: %v", resp.Header.Values("Set-Cookie"))
+	}
+	return resp
+}
+
+// entryOf decodes a successful ticket exchange.
+func entryOf(t *testing.T, resp *http.Response) sessionEntry {
+	t.Helper()
+	raw, _ := io.ReadAll(resp.Body)
+	var v sessionEntry
+	if resp.StatusCode != http.StatusOK || json.Unmarshal(raw, &v) != nil || len(v.Key) != 43 {
+		t.Fatalf("exchange: %d %s", resp.StatusCode, raw)
+	}
+	return v
+}
+
+// origin is the Origin the env's browser sends.
+func (e *testEnv) origin() string {
+	if e.s.cfg.PublicURL != "" {
+		return e.s.cfg.PublicURL
+	}
+	return "http://" + e.addr()
+}
+
+// exchange posts a ticket from the env's origin.
+func (e *testEnv) exchange(ticket string, hdr map[string]string) *http.Response {
+	e.t.Helper()
+	return postTicket(e.t, plainClient(), e.base(), ticket, e.origin(), hdr)
+}
+
+// enter creates a ticket for the env's account and exchanges it; it
+// returns the session key.
 func (e *testEnv) enter(serverID *int64) string {
 	e.t.Helper()
 	ses, err := e.s.CreateSession(context.Background(), e.acct, serverID)
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	resp, err := plainClient().Get(e.base() + ses.Path)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusSeeOther {
-		body, _ := io.ReadAll(resp.Body)
-		e.t.Fatalf("enter: %d %s", resp.StatusCode, body)
-	}
-	for _, c := range resp.Cookies() {
-		if c.Name == SessionCookie {
-			return c.Value
-		}
-	}
-	e.t.Fatal("no session cookie")
-	return ""
+	key := entryOf(e.t, e.exchange(ticketOf(e.t, ses.Path), nil)).Key
+	e.keys = append(e.keys, key)
+	return key
 }
 
-// do sends a request with the session cookie (when not empty).
-func (e *testEnv) do(method, path, cookie string, hdr map[string]string, body io.Reader) *http.Response {
+// wsAuth returns the headers of a browser WebSocket with the boot
+// script's subprotocols for key and the env's origin.
+func (e *testEnv) wsAuth(key string) http.Header {
+	return http.Header{"Sec-WebSocket-Protocol": {WebSocketProtocol + ", " + WebSocketKeyPrefix + key}, "Origin": {e.origin()}}
+}
+
+// do sends a request with the session key as a bearer header (when not
+// empty). Every answer of the listener is checked for Set-Cookie.
+func (e *testEnv) do(method, path, key string, hdr map[string]string, body io.Reader) *http.Response {
 	e.t.Helper()
 	req, err := http.NewRequest(method, e.base()+path, body)
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	if cookie != "" {
-		req.AddCookie(&http.Cookie{Name: SessionCookie, Value: cookie})
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	for k, v := range hdr {
 		if strings.EqualFold(k, "Host") {
@@ -409,6 +506,9 @@ func (e *testEnv) do(method, path, cookie string, hdr map[string]string, body io
 		e.t.Fatal(err)
 	}
 	e.t.Cleanup(func() { _ = resp.Body.Close() })
+	if len(resp.Header.Values("Set-Cookie")) != 0 {
+		e.t.Errorf("%s %s set a cookie: %v", method, path, resp.Header.Values("Set-Cookie"))
+	}
 	return resp
 }
 
@@ -421,6 +521,14 @@ func readBody(t *testing.T, resp *http.Response) string {
 // dialWS opens a raw WebSocket upgrade on path and returns the connection
 // after a 101, or the status code otherwise.
 func dialWS(t *testing.T, addr, path string, hdr http.Header) (net.Conn, *bufio.Reader, int) {
+	t.Helper()
+	conn, br, resp := dialWSResponse(t, addr, path, hdr)
+	return conn, br, resp.StatusCode
+}
+
+// dialWSResponse is dialWS with the whole response. No answer may set a
+// cookie.
+func dialWSResponse(t *testing.T, addr, path string, hdr http.Header) (net.Conn, *bufio.Reader, *http.Response) {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -444,12 +552,15 @@ func dialWS(t *testing.T, addr, path string, hdr http.Header) (net.Conn, *bufio.
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(resp.Header.Values("Set-Cookie")) != 0 {
+		t.Errorf("WebSocket %s set a cookie", path)
+	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		_ = conn.Close()
-		return nil, nil, resp.StatusCode
+		return nil, nil, resp
 	}
 	_ = conn.SetReadDeadline(time.Time{})
-	return conn, br, resp.StatusCode
+	return conn, br, resp
 }
 
 // echoOnce writes msg and expects it back.
