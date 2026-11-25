@@ -451,20 +451,31 @@ func TestOriginCanonical(t *testing.T) {
 	}
 }
 
-// The boot script goes only after a <head> tag that leads the document.
+// The boot script goes only after a <head> tag that leads the document:
+// a byte order mark, whitespace, one doctype and an <html> tag may come
+// first, nothing else (no comment), and tags end where a browser ends them.
 func TestHeadEnd(t *testing.T) {
 	for doc, want := range map[string]string{
 		"<head>x": "<head>",
-		"\xef\xbb\xbf <!doctype html>\n<html><head>":                                                           "\xef\xbb\xbf <!doctype html>\n<html><head>",
-		"<!-- a --><!DOCTYPE html><!-- b --><HTML lang=\"a>b\" data-x='>'><!-- <head> --><HEAD data-y=\"<\">x": "<!-- a --><!DOCTYPE html><!-- b --><HTML lang=\"a>b\" data-x='>'><!-- <head> --><HEAD data-y=\"<\">",
+		"\xef\xbb\xbf <!doctype html>\n<html><head>":                            "\xef\xbb\xbf <!doctype html>\n<html><head>",
+		"<!DOCTYPE html>\n<HTML lang=\"a>b\" data-x='>'>\n<HEAD data-y=\"<\">x": "<!DOCTYPE html>\n<HTML lang=\"a>b\" data-x='>'>\n<HEAD data-y=\"<\">",
 		"<html>\n  <head\n>": "<html>\n  <head\n>",
+		"<!doctype html SYSTEM \"about:legacy-compat\"><html lang=en dir='ltr'/><head/>": "<!doctype html SYSTEM \"about:legacy-compat\"><html lang=en dir='ltr'/><head/>",
+		"<html a='1'b=2 =c><head>": "<html a='1'b=2 =c><head>",
 	} {
 		if at := headEnd([]byte(doc)); at < 0 || doc[:at] != want {
 			t.Errorf("%q: %d", doc, at)
 		}
 	}
 	for _, doc := range []string{"", "<p>hi</p><head>", "<html><body><head>", "<!-- <head> -->", "<!-- open <head>", "<header>",
-		"<html><title>x</title><head>", "x<head>", "<!doctype html><!doctype html><head>", "<html lang=\"x><head>", "<head lang=\"x>"} {
+		"<html><title>x</title><head>", "x<head>", "<!doctype html><!doctype html><head>", "<html lang=\"x><head>", "<head lang=\"x>",
+		// Comments, also ones a browser ends before "-->".
+		"<!-- a --><head>", "<!doctype html><!-- x --><head>", "<html><!-- x --><head>", "<!--><script>x()</script>--><head>",
+		"<!---><script>x()</script>--><head>",
+		// A quote inside an unquoted value or an attribute name is no quote
+		// for a browser: the tag ends at the first ">".
+		"<html a=b\"><script>x()</script>\"><head>", "<html / =\"x><script>x()</script>\"><head>",
+		"<html a\"b><script>x()</script>\"><head>"} {
 		if at := headEnd([]byte(doc)); at >= 0 {
 			t.Errorf("%q accepted at %d", doc, at)
 		}
