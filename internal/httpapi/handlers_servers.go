@@ -225,7 +225,8 @@ func (s *Server) handleRestartServer() handlerFunc {
 // 204 once the container and the row are gone. The job first stores a last
 // backup of the server's data; skip_safety_backup=1 skips it and is for
 // admins only (the route is a developer route, like the static files'
-// mutations of referenced files).
+// mutations of referenced files). A failed last backup answers 503 when
+// Docker is unreachable and 409 otherwise.
 func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) error {
 	if err := s.needServers(); err != nil {
 		return err
@@ -235,12 +236,20 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 	o := servers.DeleteOptions{CreatedBy: creatorOf(r)}
-	switch r.URL.Query().Get("skip_safety_backup") {
-	case "", "0", "false":
-	case "1", "true":
-		o.SkipSafetyBackup = true
-	default:
-		return badRequest("skip_safety_backup must be 1 or 0")
+	if values, given := r.URL.Query()["skip_safety_backup"]; given {
+		// Present means one of 1, true, 0 or false: an empty value or a
+		// repeated parameter is not a choice.
+		value := ""
+		if len(values) == 1 {
+			value = values[0]
+		}
+		switch value {
+		case "0", "false":
+		case "1", "true":
+			o.SkipSafetyBackup = true
+		default:
+			return badRequest("skip_safety_backup must be 1, true, 0 or false")
+		}
 	}
 	if o.SkipSafetyBackup && !identityFrom(r).hasAdminAccess() {
 		return errForbidden

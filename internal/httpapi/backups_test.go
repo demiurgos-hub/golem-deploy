@@ -239,7 +239,8 @@ func TestBackupJobsAreSerialised(t *testing.T) {
 }
 
 // DELETE /servers/{id} stores a last backup first; a failed one is 409
-// with the reason, and skipping it is for admin sessions only.
+// with the reason (503 when Docker is unreachable), skipping it is for
+// admin sessions only, and skip_safety_backup takes 1, true, 0 or false.
 func TestDeleteServerLastBackup(t *testing.T) {
 	d, _ := newBackupHarness(t)
 	img := d.managedImage(1)
@@ -252,22 +253,36 @@ func TestDeleteServerLastBackup(t *testing.T) {
 	errBody(t, d.call("DELETE", base+"?skip_safety_backup=1", d.devTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
 	adminTok := d.apiToken(d.admin, nil) // API tokens are capped at developer
 	errBody(t, d.call("DELETE", base+"?skip_safety_backup=true", adminTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
-	errBody(t, d.call("DELETE", base+"?skip_safety_backup=yes", d.adminSs, nil), http.StatusBadRequest, apitypes.ErrorCodeBadRequest)
-	e := errBody(t, d.call("DELETE", base, d.devTok, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
-	if !strings.Contains(e.Message, "is incomplete") || !strings.Contains(e.Message, "nothing was deleted") || !strings.Contains(e.Message, "skip_safety_backup=1") {
-		t.Fatalf("%+v", e)
+	for _, q := range []string{"yes", "", "TRUE", "1&skip_safety_backup=1", "0&skip_safety_backup=1"} {
+		errBody(t, d.call("DELETE", base+"?skip_safety_backup="+q, d.adminSs, nil), http.StatusBadRequest, apitypes.ErrorCodeBadRequest)
+	}
+	for _, q := range []string{"", "?skip_safety_backup=0", "?skip_safety_backup=false"} {
+		e := errBody(t, d.call("DELETE", base+q, d.devTok, nil), http.StatusConflict, apitypes.ErrorCodeConflict)
+		if !strings.Contains(e.Message, "is incomplete") || !strings.Contains(e.Message, "nothing was deleted") || !strings.Contains(e.Message, "skip_safety_backup=1") {
+			t.Fatalf("%q: %+v", q, e)
+		}
 	}
 	list := decode[apitypes.BackupList](t, d.call("GET", "/api/v1/backups", d.devTok, nil))
-	if len(list.Items) != 1 || list.Items[0].Kind != apitypes.BackupKindPreDelete || list.Items[0].OmittedEntries != 1 {
+	if len(list.Items) != 3 || list.Items[0].Kind != apitypes.BackupKindPreDelete || list.Items[0].OmittedEntries != 1 {
 		t.Fatalf("%+v", list)
 	}
+	if got := d.getServer(d.devTok, s.ID); got.State != apitypes.ServerStateRunning {
+		t.Fatalf("%+v", got)
+	}
+	// The last backup fails because Docker is unreachable: 503, and nothing
+	// is deleted.
+	d.fake.SetCopyHook(func(dockertest.CopyCall) error {
+		return fmt.Errorf("Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?")
+	})
+	errBody(t, d.call("DELETE", base, d.devTok, nil), http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable)
+	d.fake.SetCopyHook(nil)
 	if got := d.getServer(d.devTok, s.ID); got.State != apitypes.ServerStateRunning {
 		t.Fatalf("%+v", got)
 	}
 	if rr := d.call("DELETE", base+"?skip_safety_backup=1", d.adminSs, nil); rr.Code != http.StatusNoContent {
 		t.Fatalf("%d %s", rr.Code, rr.Body.String())
 	}
-	if list := decode[apitypes.BackupList](t, d.call("GET", "/api/v1/backups", d.devTok, nil)); len(list.Items) != 1 {
+	if list := decode[apitypes.BackupList](t, d.call("GET", "/api/v1/backups", d.devTok, nil)); len(list.Items) != 3 {
 		t.Fatalf("%+v", list)
 	}
 	errBody(t, d.call("GET", base, d.devTok, nil), http.StatusNotFound, apitypes.ErrorCodeNotFound)
