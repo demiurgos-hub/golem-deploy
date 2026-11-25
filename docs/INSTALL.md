@@ -48,6 +48,7 @@ Settings. They only apply when the settings file is created; see [Configuration]
 |--------|---------|---------|
 | `--public-host NAMES` | this host's public address, if it has one | Comma-separated host names the panel is reached by (`GOLEM_DEPLOY_PUBLIC_HOST`); IP addresses and `localhost` always work |
 | `--listen ADDR` | `:443` (with HTTP on `:80`) when both ports are free, a free loopback port from 8000 to 8099 on conflict, or `:8443` with TLS files | Panel listen address (`GOLEM_DEPLOY_LISTEN`) |
+| `--http-listen ADDR` | `:80` with the default `--listen`, otherwise none | HTTP listener for certificate challenges and redirects to HTTPS (`GOLEM_DEPLOY_HTTP_LISTEN`). Give it together with `--listen`, for example `--listen :8443 --http-listen :80` when another program holds port 443. It needs a panel that serves HTTPS |
 | `--port-range LO-HI` | `7000-7099` | Host ports for game servers, within 1024-32767 (`GOLEM_DEPLOY_PORT_RANGE`) |
 | `--tls-cert FILE`, `--tls-key FILE` | none | Existing PEM certificate (chain) and private key, copied to `/etc/golem-deploy/tls/` |
 
@@ -166,7 +167,7 @@ The unit grants only `CAP_NET_BIND_SERVICE`, which lets the daemon bind ports be
 sudo systemctl restart golem-deploy
 ```
 
-The installer never overwrites this file. When it already exists, `--public-host`, `--listen` and `--port-range` are ignored with a warning. The one exception is a file the same run wrote: when the service then does not start (for example because the daemon refuses an option), the file is moved to `golem-deploy.env.failed`, so that running the installer again with corrected options writes a new one.
+The installer never overwrites this file. When it already exists, `--public-host`, `--listen`, `--http-listen` and `--port-range` are ignored with a warning. The one exception is a file the same run wrote: when the service then does not start (for example because the daemon refuses an option), the file is moved to `golem-deploy.env.failed`, so that running the installer again with corrected options writes a new one.
 
 To run the panel behind a TLS-terminating reverse proxy on the same host, keep it on loopback and add the proxy and host name, for example:
 
@@ -192,7 +193,7 @@ The Inspector (see [INSPECTOR.md](INSPECTOR.md)) is off until an admin turns it 
 
 ### TLS certificates
 
-To enable ACME, make TCP port 80 or 443 reachable for each requested identifier and accept the CA terms. Point `GOLEM_DEPLOY_HTTP_LISTEN` at the HTTP-01 listener if you use port 80. See [CERTIFICATES.md](CERTIFICATES.md).
+To enable ACME, make TCP port 80 or 443 reachable for each requested identifier and accept the CA terms. Point `GOLEM_DEPLOY_HTTP_LISTEN` at the HTTP-01 listener if you use port 80 (`--http-listen` on a new installation). See [CERTIFICATES.md](CERTIFICATES.md).
 
 With `--tls-cert` and `--tls-key`, the installer copies the files into `/etc/golem-deploy/tls/`. After renewing them, re-run the installer with both options to replace the copies and restart the service. On an existing installation, add the printed environment lines if needed and adjust `GOLEM_DEPLOY_LISTEN` before restarting.
 

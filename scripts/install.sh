@@ -81,6 +81,9 @@ Settings (they only shape a new $ENV_FILE; an existing one is kept):
   --listen ADDR         panel listen address (default :443 with :80 for HTTP
                         when both ports are free, $DEFAULT_LISTEN_HTTP
                         otherwise, or $DEFAULT_LISTEN_TLS with TLS files)
+  --http-listen ADDR    HTTP listener for certificate challenges and redirects
+                        to HTTPS, given with --listen (for example :80 when
+                        the panel cannot use port 443)
   --port-range LO-HI    host ports for game servers (default $DEFAULT_PORT_RANGE)
   --tls-cert FILE       TLS certificate (PEM), copied to $TLS_CERT_DEST
   --tls-key FILE        TLS private key (PEM), copied to $TLS_KEY_DEST
@@ -498,7 +501,7 @@ panel_fingerprint() {
 }
 
 main() {
-	local public_host='' listen='' http_listen='' port_range='' tls_cert='' tls_key=''
+	local public_host='' listen='' http_listen='' http_opt='' default_ports='' port_range='' tls_cert='' tls_key=''
 	local version='' binary='' archive='' sha256='' no_docker='' no_sysctl=''
 	local config_opts=() opt val
 
@@ -518,12 +521,12 @@ main() {
 			shift
 			continue
 			;;
-		--public-host | --listen | --port-range | --tls-cert | --tls-key | --version | --binary | --archive | --sha256)
+		--public-host | --listen | --http-listen | --port-range | --tls-cert | --tls-key | --version | --binary | --archive | --sha256)
 			need_value "$@"
 			opt=$1 val=$2
 			shift 2
 			;;
-		--public-host=* | --listen=* | --port-range=* | --tls-cert=* | --tls-key=* | --version=* | --binary=* | --archive=* | --sha256=*)
+		--public-host=* | --listen=* | --http-listen=* | --port-range=* | --tls-cert=* | --tls-key=* | --version=* | --binary=* | --archive=* | --sha256=*)
 			opt=${1%%=*} val=${1#*=}
 			shift
 			[ -n "$val" ] || die "$opt needs a value (see --help)"
@@ -538,6 +541,7 @@ main() {
 		case $opt in
 		--public-host) public_host=$val ;;
 		--listen) listen=$val ;;
+		--http-listen) http_opt=$val ;;
 		--port-range) port_range=$val ;;
 		--tls-cert) tls_cert=$val ;;
 		--tls-key) tls_key=$val ;;
@@ -547,7 +551,7 @@ main() {
 		--sha256) sha256=$val ;;
 		esac
 		case $opt in
-		--public-host | --listen | --port-range) config_opts+=("$opt") ;;
+		--public-host | --listen | --http-listen | --port-range) config_opts+=("$opt") ;;
 		esac
 	done
 
@@ -602,12 +606,16 @@ main() {
 		fi
 	fi
 
+	if [ -n "$http_opt" ] && [ -z "$listen" ]; then
+		die "--http-listen needs --listen as well (without either, the panel uses :443 with :80 for HTTP)"
+	fi
 	if [ -z "$listen" ]; then
 		if [ -n "$tls_cert" ]; then
 			listen=$DEFAULT_LISTEN_TLS
 		elif [ ! -e "$ENV_FILE" ]; then
 			listen=:443
 			http_listen=:80
+			default_ports=yes
 		else
 			listen=$DEFAULT_LISTEN_HTTP
 		fi
@@ -627,6 +635,22 @@ main() {
 	fi
 	if [ "$listen_port" -ge "$port_lo" ] && [ "$listen_port" -le "$port_hi" ]; then
 		die "--port-range $port_range contains the panel's listen port $listen_port"
+	fi
+
+	if [ -n "$http_opt" ]; then
+		split_hostport "$http_opt" ||
+			die "--http-listen must be HOST:PORT with a port between 1 and 65535, for example :80 (got $http_opt)"
+		[[ $split_host =~ ^[A-Za-z0-9.:-]*$ ]] || die "--http-listen host contains unexpected characters (got $http_opt)"
+		local http_port=$((10#$split_port))
+		[ "$http_port" -ne "$listen_port" ] || die "--http-listen and --listen need different ports (got $http_port twice)"
+		if [ "$http_port" -ge "$port_lo" ] && [ "$http_port" -le "$port_hi" ]; then
+			die "--port-range $port_range contains the HTTP listener's port $http_port"
+		fi
+		# The daemon only opens the HTTP listener next to an HTTPS panel.
+		if [ -z "$tls_cert" ] && is_loopback_host "$listen_host"; then
+			die "--http-listen needs a panel that serves HTTPS: a --listen address that is not loopback, or TLS files"
+		fi
+		http_listen=$http_opt
 	fi
 
 	if [ -n "$public_host" ]; then
@@ -661,7 +685,7 @@ main() {
 	fi
 	note "systemd: $(systemctl --version | head -n 1)"
 
-	if [ -n "$http_listen" ]; then
+	if [ -n "$default_ports" ]; then
 		local busy='' port owner
 		for port in 443 80; do
 			if owner=$(tcp_listener "$port"); then
@@ -1209,7 +1233,18 @@ $step. Create the first admin account, unless you already have one. It prompts f
 
 EOF
 	fi
-	if [ -n "$fingerprint" ]; then
+	if [ -n "$fingerprint" ] && [ "$link_rc" -eq 3 ]; then
+		# An installation that is already set up may serve an automatic
+		# certificate; the daemon logs the self-signed one either way.
+		cat <<EOF
+   If the browser warns about a self-signed certificate (the panel uses one
+   until an automatic certificate is set up in its settings), continue only
+   if the certificate's SHA-256 fingerprint is:
+
+     $fingerprint
+
+EOF
+	elif [ -n "$fingerprint" ]; then
 		cat <<EOF
    The panel uses a self-signed certificate until you set up an automatic one
    in its settings, so the browser warns about it. Continue only if the
