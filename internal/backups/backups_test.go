@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,18 +130,13 @@ func TestNormalizeKeepsFilesAndDirsOnly(t *testing.T) {
 	if got["setuid"].Mode != 0o755 || got["content/"].Mode != 0o755 {
 		t.Fatalf("modes %o %o", got["setuid"].Mode, got["content/"].Mode)
 	}
-	reasons := map[string]string{}
-	for _, s := range res.Skipped {
-		reasons[s.Name] = s.Reason
-		if strings.ContainsRune(s.Name, 0x1b) {
-			t.Fatalf("unsanitised name %q", s.Name)
-		}
+	want := map[string]int{SkipSymlink: 1, SkipHardLink: 1, SkipPipe: 1, SkipDevice: 2, SkipInvalidPath: 4, SkipOutside: 1, SkipDuplicate: 1}
+	if !maps.Equal(res.Skipped, want) {
+		t.Fatalf("%v", res.Skipped)
 	}
-	for name, reason := range map[string]string{"link": "symbolic link", "hard": "hard link", "fifo": "named pipe", "dev": "device", "blk": "device",
-		"a/../b": "invalid path", "missing/child": "outside a kept directory", "content/a.bin": "duplicate", "/abs": "invalid path"} {
-		if reasons[name] != reason {
-			t.Errorf("%s: %q (%v)", name, reasons[name], reasons)
-		}
+	if got := DescribeSkipped(res.Skipped); got != "1 symbolic link, 1 hard link, 1 named pipe, 2 devices, 4 with names that are not allowed, "+
+		"1 with a duplicate name, 1 inside a directory that was left out" {
+		t.Fatal(got)
 	}
 }
 
@@ -434,15 +430,6 @@ func TestNormalizeInputBudget(t *testing.T) {
 	}
 	if limit := int64(1000 + 3*EntryAllowance); cr.n > limit {
 		t.Fatalf("read %d bytes, budget %d", cr.n, limit)
-	}
-}
-
-// Names of skipped entries are redacted before they are sanitised.
-func TestNormalizeRedactsSkippedNames(t *testing.T) {
-	in := dockerTar(t, reg("a", "x"), entry{name: "data/sec-ret-value\x1b", typ: tar.TypeSymlink, link: "/"})
-	res, err := NormalizeRedacted(bytes.NewReader(in), "data", 1<<20, func(s string) string { return strings.ReplaceAll(s, "sec-ret-value", "[redacted]") }, io.Discard)
-	if err != nil || len(res.Skipped) != 1 || res.Skipped[0].Name != `[redacted]\x1b` {
-		t.Fatalf("%+v %v", res, err)
 	}
 }
 

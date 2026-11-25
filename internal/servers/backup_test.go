@@ -260,7 +260,7 @@ func TestBackupLiveAndStopped(t *testing.T) {
 		*b.BuildID != bf.b.ID || *b.ProjectID != bf.b.ProjectID || b.ProjectName != "game" || b.Commit != commitA || b.JobID == nil || *b.JobID != bf.lastJob || b.CreatedBy != nil {
 		t.Fatalf("%+v", b) // account 5 does not exist, so created_by is null
 	}
-	if !strings.Contains(log, "escape (symbolic link)") || !strings.Contains(log, "pipe (named pipe)") || !strings.Contains(log, "already in progress") {
+	if !strings.Contains(log, "left out 2 entries: 1 symbolic link, 1 named pipe\n") || strings.Contains(log, "escape") || !strings.Contains(log, "already in progress") {
 		t.Fatal(log)
 	}
 	if err := bf.svc.cfg.Backups.Verify(b.File, b.SizeBytes, b.SHA256); err != nil {
@@ -398,7 +398,7 @@ func TestRestoreSwitchesAfterCopy(t *testing.T) {
 	if vols := bf.f.Volumes(); len(vols) != 1 || vols[0] != old {
 		t.Fatalf("volumes %v", vols)
 	}
-	if ct, _ := bf.f.Container(bf.row(t).ContainerID); ct.State != "running" || !strings.Contains(log, "starting the server again") {
+	if ct, _ := bf.f.Container(bf.row(t).ContainerID); ct.State != "running" || !strings.Contains(log, "running again with its previous data") {
 		t.Fatalf("%+v\n%s", ct, log)
 	}
 	bf.noHelpers(t)

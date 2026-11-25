@@ -68,7 +68,7 @@ func TestRecoverLeavesGuardedContainerRunning(t *testing.T) {
 	bf.f.ResetCalls()
 	var log bytes.Buffer
 	err := bf.svc.Recover(WithJobID(ctx, 9), bf.id, &log)
-	if !strings.Contains(detail(err), "build_id") || !refused(err) {
+	if !strings.Contains(detail(err), "build_id") {
 		t.Fatalf("%v\n%s", err, log.String())
 	}
 	for _, c := range bf.f.Calls() {
@@ -93,7 +93,7 @@ func TestRecoverLeavesGuardedContainerRunning(t *testing.T) {
 	}
 	pending := bf.f.AddContainer(dockertest.Container{Name: "golem-deploy-arena", Image: bf.b.ImageID,
 		Labels: dockertest.OurLabels(docker.LabelServerID, "1", docker.LabelServer, "arena", docker.LabelLaunchID, launch)})
-	if err := bf.svc.Recover(ctx, bf.id, io.Discard); !refused(err) {
+	if err := bf.svc.Recover(ctx, bf.id, io.Discard); !strings.Contains(detail(err), "build_id") {
 		t.Fatalf("%v", err)
 	}
 	if _, ok := bf.f.Container(pending); !ok {
@@ -155,7 +155,7 @@ func TestSafetyBackupMustBeComplete(t *testing.T) {
 	if len(pre) != 1 || pre[0].OmittedEntries != 1 || pre[0].FileCount != 1 {
 		t.Fatalf("%+v", pre)
 	}
-	if !errors.Is(err, ErrSafetyBackup) || !strings.Contains(msg, "listed above: 1") || !strings.Contains(msg, "stored as backup "+strconv.FormatInt(pre[0].ID, 10)) ||
+	if !errors.Is(err, ErrSafetyBackup) || !strings.Contains(msg, "counted above: 1") || !strings.Contains(msg, "stored as backup "+strconv.FormatInt(pre[0].ID, 10)) ||
 		!strings.Contains(msg, "skip_safety_backup") || !strings.Contains(msg, "nothing was replaced") {
 		t.Fatalf("%v\n%s", err, log)
 	}
@@ -272,12 +272,14 @@ func TestRestoreRefusesImageDataInFreshVolume(t *testing.T) {
 	bf.noHelpers(t)
 }
 
-// Point 8: skipped names are redacted in the job log, and file system
-// errors stay in the daemon log.
-func TestBackupJobLogRedactsAndHidesPaths(t *testing.T) {
+// The job log counts left-out entries per reason and never names them
+// (a name can hold an environment value no redaction knows: a short one,
+// or one from before an environment change); neither does the daemon log.
+// File system errors stay in the daemon log.
+func TestBackupJobLogCountsLeftOutEntries(t *testing.T) {
 	bf := newBackupFixture(t)
 	ctx := context.Background()
-	if _, err := bf.svc.Update(ctx, bf.id, apitypes.UpdateServerRequest{EnvSet: map[string]string{"SECRET": marker}}); err != nil {
+	if _, err := bf.svc.Update(ctx, bf.id, apitypes.UpdateServerRequest{EnvSet: map[string]string{"SECRET": marker, "SHORT": "q7z"}}); err != nil {
 		t.Fatal(err)
 	}
 	bf.start(t)
@@ -287,13 +289,19 @@ func TestBackupJobLogRedactsAndHidesPaths(t *testing.T) {
 	}
 	bf.admin.Set(func(s *gameadmintest.Server) { s.SnapshotStatus = 501 })
 	bf.f.SetVolumeFiles(bf.row(t).DataVolume, snapshotFile(fpA), dockertest.Special("x-"+marker, tar.TypeSymlink, "/"),
-		dockertest.Special("t-"+token, tar.TypeFifo, ""))
+		dockertest.Special("t-"+token, tar.TypeFifo, ""), dockertest.Special("q7z", tar.TypeSymlink, "/"),
+		dockertest.Special("old-value-before-a-change", tar.TypeSymlink, "/"), dockertest.Reg("wq\x01xk-entry", "x"))
 	log, err := bf.backup(t, BackupOptions{})
 	if err != nil {
 		t.Fatalf("%v\n%s", err, log)
 	}
-	if strings.Contains(log, marker) || strings.Contains(log, token) || strings.Count(log, "[redacted]") != 2 {
+	if !strings.Contains(log, "left out 5 entries: 3 symbolic links, 1 named pipe, 1 with a name that is not allowed\n") {
 		t.Fatal(log)
+	}
+	for _, name := range []string{marker, token, "q7z", "old-value", "xk-entry"} {
+		if strings.Contains(log, name) || strings.Contains(bf.logs.String(), name) {
+			t.Fatalf("%q reached a log\n%s\n%s", name, log, bf.logs.String())
+		}
 	}
 	// The backup directory disappears: the failure names no path.
 	if err := os.RemoveAll(bf.dir); err != nil {

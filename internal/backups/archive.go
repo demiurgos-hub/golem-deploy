@@ -56,14 +56,47 @@ var (
 	ErrBadStream = errors.New("backups: the copied data is not a valid archive")
 )
 
-// Skipped is an entry left out of a backup.
-type Skipped struct {
-	// Name is the entry's name, sanitised for logs (logsafe) and clipped.
-	Name string
-	// Reason says why: "symbolic link", "hard link", "named pipe",
-	// "device", "unsupported type", "invalid path", "duplicate",
-	// "outside a kept directory".
-	Reason string
+// Reasons an entry is left out of a backup. Only these counts leave the
+// package: the names of left-out entries were chosen by the game and are
+// never reported anywhere.
+const (
+	SkipSymlink     = "symbolic link"
+	SkipHardLink    = "hard link"
+	SkipPipe        = "named pipe"
+	SkipDevice      = "device"
+	SkipUnsupported = "unsupported type"
+	SkipInvalidPath = "invalid path"
+	SkipDuplicate   = "duplicate"
+	SkipOutside     = "outside a kept directory"
+)
+
+// skipWords are the reasons in the order DescribeSkipped reports them,
+// with their wording for one entry and for several.
+var skipWords = []struct{ reason, one, many string }{
+	{SkipSymlink, "symbolic link", "symbolic links"},
+	{SkipHardLink, "hard link", "hard links"},
+	{SkipPipe, "named pipe", "named pipes"},
+	{SkipDevice, "device", "devices"},
+	{SkipUnsupported, "of an unsupported type", "of an unsupported type"},
+	{SkipInvalidPath, "with a name that is not allowed", "with names that are not allowed"},
+	{SkipDuplicate, "with a duplicate name", "with duplicate names"},
+	{SkipOutside, "inside a directory that was left out", "inside a directory that was left out"},
+}
+
+// DescribeSkipped words the counts per reason of a Result for a job log,
+// for example "2 symbolic links, 1 named pipe, 2 with names that are not
+// allowed".
+func DescribeSkipped(counts map[string]int) string {
+	var parts []string
+	for _, w := range skipWords {
+		switch n := counts[w.reason]; {
+		case n == 1:
+			parts = append(parts, "1 "+w.one)
+		case n > 1:
+			parts = append(parts, fmt.Sprintf("%d %s", n, w.many))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // Result describes a normalised archive.
@@ -73,25 +106,21 @@ type Result struct {
 	Files        int
 	Dirs         int
 	ContentBytes int64
-	// Skipped lists left-out entries (at most maxSkippedListed; SkippedCount
-	// is the total).
-	Skipped      []Skipped
+	// Skipped counts the left-out entries per reason (the Skip constants);
+	// SkippedCount is their total.
+	Skipped      map[string]int
 	SkippedCount int
 	// Fingerprint is the schema fingerprint of the top-level world.snapshot
 	// ("" without one or when its header is not readable).
 	Fingerprint string
 }
 
-const maxSkippedListed = 50
-
-func (r *Result) skip(name, reason string, redact func(string) string) {
-	r.SkippedCount++
-	if len(r.Skipped) < maxSkippedListed {
-		if redact != nil {
-			name = redact(name)
-		}
-		r.Skipped = append(r.Skipped, Skipped{Name: safeName(name), Reason: reason})
+func (r *Result) skip(reason string) {
+	if r.Skipped == nil {
+		r.Skipped = map[string]int{}
 	}
+	r.Skipped[reason]++
+	r.SkippedCount++
 }
 
 // errBudget: the copy stream is longer than its content limit plus
@@ -205,19 +234,14 @@ func newTree() *tree { return &tree{names: map[string]bool{}, dirs: map[string]b
 // Normalize reads the tar stream of "docker cp <helper>:<dir> -" (entries
 // start with base + "/") and writes a gzip-compressed tar of the kept
 // entries to w. Only regular files and directories are kept; links,
-// pipes, devices and entries with unsafe paths are skipped and reported.
+// pipes, devices and entries with unsafe paths are skipped and counted
+// per reason.
 // Kept entries get uid and gid 0, masked modes and no extended attributes.
 // Every entry's content counts against maxContent, also a skipped one's,
 // and is refused before it is read: more is ErrTooLarge, like a stream
 // longer than maxContent plus EntryAllowance per entry. More than
 // MaxEntries headers is ErrTooManyEntries. Both stop at once.
 func Normalize(r io.Reader, base string, maxContent int64, w io.Writer) (Result, error) {
-	return NormalizeRedacted(r, base, maxContent, nil, w)
-}
-
-// NormalizeRedacted is Normalize with redact applied to the raw name of
-// every listed skipped entry before it is sanitised (nil: none).
-func NormalizeRedacted(r io.Reader, base string, maxContent int64, redact func(string) string, w io.Writer) (Result, error) {
 	var res Result
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
@@ -249,7 +273,7 @@ func NormalizeRedacted(r io.Reader, base string, maxContent int64, redact func(s
 		}
 		rel, ok := strings.CutPrefix(name, base+"/")
 		if !ok {
-			res.skip(name, "invalid path", redact)
+			res.skip(SkipInvalidPath)
 			continue
 		}
 		kind := ""
@@ -257,28 +281,28 @@ func NormalizeRedacted(r io.Reader, base string, maxContent int64, redact func(s
 		case tar.TypeReg: // the reader reports old-style regular files as TypeReg too
 		case tar.TypeDir:
 		case tar.TypeSymlink:
-			kind = "symbolic link"
+			kind = SkipSymlink
 		case tar.TypeLink:
-			kind = "hard link"
+			kind = SkipHardLink
 		case tar.TypeFifo:
-			kind = "named pipe"
+			kind = SkipPipe
 		case tar.TypeChar, tar.TypeBlock:
-			kind = "device"
+			kind = SkipDevice
 		default:
-			kind = "unsupported type"
+			kind = SkipUnsupported
 		}
 		switch {
 		case kind != "":
-			res.skip(rel, kind, redact)
+			res.skip(kind)
 			continue
 		case !cleanRel(rel):
-			res.skip(rel, "invalid path", redact)
+			res.skip(SkipInvalidPath)
 			continue
 		case t.names[rel]:
-			res.skip(rel, "duplicate", redact)
+			res.skip(SkipDuplicate)
 			continue
 		case !t.dirs[path.Dir(rel)]:
-			res.skip(rel, "outside a kept directory", redact)
+			res.skip(SkipOutside)
 			continue
 		}
 		t.names[rel] = true
