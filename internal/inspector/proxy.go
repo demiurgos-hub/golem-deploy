@@ -528,6 +528,11 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		again.Body = body
 	}
 	again.Header.Set("Cookie", hubCookie+"="+sid)
+	// The replay carries a hub session too: it asks for a fresh
+	// confirmation itself.
+	if !t.s.freshHub(req.Context(), info.view) {
+		return nil, errHubUnverified
+	}
 	resp, err = t.base.RoundTrip(again)
 	if err != nil {
 		return nil, t.s.hubUnreachable(req.Context(), info.view.port, err)
@@ -621,8 +626,15 @@ func guardKey(v hubView) string {
 // hubLogin logs in at the hub of snapshot v with the daemon's password.
 // Logins run one at a time; none is tried while the guard holds logins at
 // that hub generation, and the password is sent only after Docker
-// confirmed that the container runs and publishes exactly v.port.
+// confirmed that the container runs and publishes exactly v.port, on a new
+// connection.
 func (s *Service) hubLogin(ctx context.Context, v hubView) (string, error) {
+	return s.hubLoginFor(ctx, v, 0)
+}
+
+// hubLoginFor is hubLogin; a send budget above zero bounds the request to
+// the hub from when it is sent, after the Docker check.
+func (s *Service) hubLoginFor(ctx context.Context, v hubView, send time.Duration) (string, error) {
 	if v.sec == nil || v.port == 0 || v.container == "" {
 		return "", errHubLogin
 	}
@@ -642,9 +654,15 @@ func (s *Service) hubLogin(ctx context.Context, v hubView) (string, error) {
 	if s.hooks.beforeHubLogin != nil {
 		s.hooks.beforeHubLogin()
 	}
-	sid, err := s.hub.login(ctx, v.port, v.sec.Password)
+	sctx := ctx
+	if send > 0 {
+		var cancel context.CancelFunc
+		sctx, cancel = context.WithTimeout(ctx, send)
+		defer cancel()
+	}
+	sid, err := s.hub.signIn(sctx, v.port, v.sec.Password)
 	if err != nil && isTransport(err) {
-		_ = s.hubUnreachable(ctx, v.port, err)
+		_ = s.hubUnreachable(sctx, v.port, err)
 	}
 	s.guard.record(key, s.cfg.Now(), err)
 	if errors.Is(err, errHubCredentials) || errors.Is(err, errHubRateLimited) {

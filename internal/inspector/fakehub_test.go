@@ -31,8 +31,8 @@ import (
 
 // seen is one request the fake hub received.
 type seen struct {
-	Method, Path, Host string
-	Header             http.Header
+	Method, Path, Host, RemoteAddr string
+	Header                         http.Header
 }
 
 // fakeHub mimics the Golem Inspector hub's HTTP surface: login with the
@@ -176,7 +176,7 @@ func (h *fakeHub) authed(r *http.Request) (string, bool) {
 
 func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
-	h.requests = append(h.requests, seen{Method: r.Method, Path: r.URL.Path, Host: r.Host, Header: r.Header.Clone()})
+	h.requests = append(h.requests, seen{Method: r.Method, Path: r.URL.Path, Host: r.Host, RemoteAddr: r.RemoteAddr, Header: r.Header.Clone()})
 	h.mu.Unlock()
 	// Every answer tries to set a cookie; none may reach a browser.
 	http.SetCookie(w, &http.Cookie{Name: "hub_tracker", Value: "x", Path: "/"})

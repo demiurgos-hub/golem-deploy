@@ -149,10 +149,14 @@ type Service struct {
 	maxConns     int
 	// publicOrigin is --inspector-public-url in canonical form.
 	publicOrigin string
-	// inspectHub reads the hub container and netQuery the managed
-	// network's addresses (Docker; tests replace them).
+	// inspectHub reads the hub container, listHubs lists the hub
+	// containers and netQuery the managed network's addresses (Docker;
+	// tests replace them).
 	inspectHub func(ctx context.Context, id string) (docker.Container, error)
+	listHubs   func(ctx context.Context) ([]docker.Container, error)
 	netQuery   func(ctx context.Context) (docker.NetworkAddresses, error)
+	// stepTimeout bounds each step of a sweep (tests lower it).
+	stepTimeout time.Duration
 	// hooks are test hooks; all nil outside tests.
 	hooks testHooks
 	// settingMu orders writes and reads of the setting with the copy in
@@ -167,11 +171,15 @@ type Service struct {
 	// hubContainer and hubPort are the hub container and its loopback port.
 	// The port is valid only for that container while it runs: it is
 	// cleared as soon as the daemon learns that the container stopped,
-	// went or changed, when Docker cannot confirm it, and on any transport
-	// error towards it; hubVerified is when Docker last confirmed it.
+	// went or changed, when Docker does not answer, and on any transport
+	// error towards it; hubVerified is when Docker last answered that it
+	// runs and publishes the port. hubSeq changes with every change of
+	// these fields (and of hubSick), so the result of a check that started
+	// before a change is discarded (observeHub).
 	hubContainer string
 	hubPort      int
 	hubVerified  time.Time
+	hubSeq       uint64
 	// hubSick is the hub container that failed hubSickAfter readiness
 	// checks in a row and hubFailures the failures so far: the port of a
 	// sick hub is not restored from Docker's metadata, and the repair
@@ -242,19 +250,26 @@ type testHooks struct {
 	// afterTicketConsumed runs in a ticket exchange after the ticket was
 	// consumed and the account checked.
 	afterTicketConsumed func()
+	// afterReadyCheck runs in checkHub after the hub answered (or not) and
+	// before the result is recorded.
+	afterReadyCheck func()
 }
 
 // The hub port. The password is sent only after a Docker check made for
-// that login. A hub session or the hub's agent token is sent only while
-// Docker confirmed the port within hubCheckInterval; an older confirmation
-// is renewed first, and traffic causes at most one Docker check per
-// hubCheckInterval. The 30-second sweep asks the hub's readiness endpoint
-// (hubReadyTimeout); hubSickAfter failures in a row make the hub "not
-// answering".
+// that login, on a connection of its own. A hub session or the hub's agent
+// token is sent only while Docker confirmed the port within
+// hubCheckInterval of its answer; an older confirmation is renewed first,
+// and traffic causes at most one Docker check per hubCheckInterval. The
+// 30-second sweep asks the hub's readiness endpoint (hubReadyTimeout);
+// hubSickAfter failures in a row make the hub "not answering". Each Docker
+// call that checks the hub gets hubDockerTimeout, each step of the sweep
+// sweepStepTimeout.
 const (
 	hubCheckInterval = 10 * time.Second
 	hubReadyTimeout  = 3 * time.Second
 	hubSickAfter     = 3
+	hubDockerTimeout = 10 * time.Second
+	sweepStepTimeout = 15 * time.Second
 	// sickDetail is the state's detail for a hub that does not answer.
 	sickDetail = "the Inspector hub is running but does not answer; it is repaired automatically or when the Inspector is applied again"
 )
@@ -302,6 +317,8 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		sniffTimeout: firstByteTimeout,
 		reqTimeout:   requestTimeout,
 		maxConns:     maxConns,
+
+		stepTimeout: sweepStepTimeout,
 	}
 	if cfg.PublicURL != "" {
 		o, err := canonicalOrigin(cfg.PublicURL)
@@ -312,6 +329,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 	}
 	if cfg.Docker != nil {
 		s.inspectHub = cfg.Docker.InspectorHub
+		s.listHubs = cfg.Docker.InspectorHubs
 		s.netQuery = cfg.Docker.ManagedNetworkAddresses
 	}
 	s.proxy = s.newBrowserProxy()
@@ -401,19 +419,94 @@ func (s *Service) kickRefresh() {
 	})
 }
 
-// dropHub stops using the port of hub container id at once (when id is
-// still the recorded hub): Docker reported it stopped, gone or replaced, or
-// could not be asked. forget also forgets the container.
-func (s *Service) dropHub(id string, forget bool) {
+// hubSeen is what one Docker check learned about a hub container.
+type hubSeen int
+
+const (
+	// seenRunning: it runs and publishes the hub port on the loopback
+	// port given.
+	seenRunning hubSeen = iota
+	// seenStopped: it exists but does not run, does not publish the hub
+	// port, or is not the current hub container any more.
+	seenStopped
+	// seenGone: it does not exist, or it is not this installation's hub.
+	seenGone
+	// seenNoAnswer: Docker did not answer (an error, a timeout, a
+	// cancelled context). This says nothing about the hub.
+	seenNoAnswer
+)
+
+// hubCheck is the start of one check of hub container id: the change
+// counter when it started.
+type hubCheck struct {
+	id  string
+	seq uint64
+}
+
+// startCheck starts a check of hub container id.
+func (s *Service) startCheck(id string) hubCheck {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if id == "" || s.hubContainer != id {
-		return
+	return hubCheck{id: id, seq: s.hubSeq}
+}
+
+// seenOf classifies a Docker answer about the hub container.
+func seenOf(ct docker.Container, err error) (hubSeen, int) {
+	switch {
+	case errors.Is(err, docker.ErrNotFound), errors.Is(err, docker.ErrNotOurs):
+		return seenGone, 0
+	case err != nil:
+		return seenNoAnswer, 0
+	case !ct.Running:
+		return seenStopped, 0
 	}
-	s.hubPort, s.hubVerified = 0, time.Time{}
-	if forget {
-		s.hubContainer = ""
+	if p := ct.LoopbackPort(docker.InspectorHubPort); p != 0 {
+		return seenRunning, p
 	}
+	return seenStopped, 0
+}
+
+// observeHub records what check c learned about the recorded hub; at is
+// when Docker answered. It is the only place that records a Docker check.
+// A result is discarded when the recorded hub is another container or
+// anything about it changed since c started (hubSeq). Positive evidence
+// that the hub is gone or wrong drops the port (seenGone also forgets the
+// container); no answer leaves the port unverified (dropped until a later
+// check confirms it) and is no evidence about the hub; a confirmation
+// keeps or restores the port Docker reports, except for a hub that does
+// not answer (hubSick), and is valid for hubCheckInterval from at. It
+// reports whether the result was recorded.
+func (s *Service) observeHub(c hubCheck, seen hubSeen, port int, at time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c.id == "" || s.hubContainer != c.id || s.hubSeq != c.seq {
+		return false
+	}
+	if seen == seenRunning && s.hubSick != c.id {
+		if s.hubPort != port {
+			s.hubPort = port
+			s.hubSeq++
+		}
+		if at.After(s.hubVerified) {
+			s.hubVerified = at
+		}
+		return true
+	}
+	if s.hubPort != 0 || !s.hubVerified.IsZero() || seen == seenGone {
+		s.hubPort, s.hubVerified = 0, time.Time{}
+		if seen == seenGone {
+			s.hubContainer = ""
+		}
+		s.hubSeq++
+	}
+	return true
+}
+
+// recentLocked reports whether Docker confirmed the recorded hub's port
+// within hubCheckInterval of now. s.mu is held.
+func (s *Service) recentLocked(now time.Time) bool {
+	age := now.Sub(s.hubVerified)
+	return s.hubPort != 0 && s.hubContainer != "" && !s.hubVerified.IsZero() && age >= 0 && age < hubCheckInterval
 }
 
 // confirmedRecently reports whether Docker confirmed v's container and port
@@ -422,15 +515,14 @@ func (s *Service) confirmedRecently(v hubView) bool {
 	now := s.cfg.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	age := now.Sub(s.hubVerified)
-	return v.port != 0 && v.container != "" && s.hubContainer == v.container && s.hubPort == v.port &&
-		!s.hubVerified.IsZero() && age >= 0 && age < hubCheckInterval
+	return v.port != 0 && v.container != "" && s.hubContainer == v.container && s.hubPort == v.port && s.recentLocked(now)
 }
 
-// freshHub reports whether a hub session or the hub's agent token may go to
-// v's port: Docker confirmed v's container and port within
-// hubCheckInterval. An older confirmation is renewed first; concurrent
-// callers share one Docker call.
+// freshHub reports whether a hub session, the hub's agent token or a relayed
+// request may go to v's port now: Docker confirmed v's container and port
+// within hubCheckInterval. Every send that carries a secret asks it right
+// before. An older confirmation is renewed first; concurrent callers share
+// one Docker call, which is skipped when a confirmation arrived meanwhile.
 func (s *Service) freshHub(ctx context.Context, v hubView) bool {
 	if s.confirmedRecently(v) {
 		return true
@@ -450,6 +542,7 @@ func (s *Service) hubUnreachable(ctx context.Context, port int, err error) error
 	s.mu.Lock()
 	if port != 0 && s.hubPort == port {
 		s.hubPort, s.hubVerified = 0, time.Time{}
+		s.hubSeq++
 		dropped = true
 	}
 	s.mu.Unlock()
@@ -465,39 +558,26 @@ func (s *Service) hubUnreachable(ctx context.Context, port int, err error) error
 
 // verifyHub confirms through Docker, every time, that container id runs and
 // publishes the hub port on exactly port (a hub login sends the password
-// only after it). What Docker reports otherwise, and a Docker error, drops
-// the recorded port at once.
+// only after it). What Docker answers is recorded (observeHub). The Docker
+// call has its own time budget and does not end when the caller leaves.
 func (s *Service) verifyHub(ctx context.Context, id string, port int) error {
 	if s.inspectHub == nil {
 		return docker.ErrUnavailable
 	}
-	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	c := s.startCheck(id)
+	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hubDockerTimeout)
 	defer cancel()
 	ct, err := s.inspectHub(qctx, id)
-	if err != nil {
-		if ctx.Err() == nil {
-			s.dropHub(id, errors.Is(err, docker.ErrNotFound) || errors.Is(err, docker.ErrNotOurs))
-		}
+	seen, got := seenOf(ct, err)
+	s.observeHub(c, seen, got, s.cfg.Now())
+	switch {
+	case err != nil:
 		return err
-	}
-	if !ct.Running {
-		s.dropHub(id, false)
+	case seen != seenRunning:
 		return errors.New("inspector: the hub container does not run")
-	}
-	if ct.LoopbackPort(docker.InspectorHubPort) != port {
-		s.mu.Lock()
-		if s.hubContainer == id && s.hubPort == port {
-			s.hubPort, s.hubVerified = 0, time.Time{}
-		}
-		s.mu.Unlock()
-		s.kickRefresh()
+	case got != port:
 		return errors.New("inspector: the hub container does not publish the recorded port")
 	}
-	s.mu.Lock()
-	if s.hubContainer == id && s.hubPort == port && s.hubSick != id {
-		s.hubVerified = s.cfg.Now()
-	}
-	s.mu.Unlock()
 	return nil
 }
 
@@ -644,14 +724,21 @@ func (s *Service) Status(ctx context.Context) (apitypes.Inspector, error) {
 			out.AgentAddress = u.Host
 		}
 	}
-	if s.cfg.Docker == nil {
+	if s.listHubs == nil {
 		out.State = apitypes.InspectorStateUnknown
 		return out, nil
 	}
-	hubs, err := s.cfg.Docker.InspectorHubs(ctx)
+	// The listing counts as a check of the recorded hub: what it shows is
+	// recorded like any other Docker answer, a confirmation included.
+	c := s.startCheck(hubID)
+	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hubDockerTimeout)
+	hubs, err := s.listHubs(qctx)
+	cancel()
+	at := s.cfg.Now()
 	if err != nil {
-		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-			return apitypes.Inspector{}, err
+		s.observeHub(c, seenNoAnswer, 0, at)
+		if ctx.Err() != nil {
+			return apitypes.Inspector{}, ctx.Err()
 		}
 		if !errors.Is(err, docker.ErrUnavailable) {
 			s.logger.Warn("docker query failed; reporting the Inspector as unknown", "err", err)
@@ -674,28 +761,21 @@ func (s *Service) Status(ctx context.Context) (apitypes.Inspector, error) {
 		}
 	}
 	recorded := rec != nil && rec.Running && hub.ID == hubID
-	switch {
-	case hubID == "":
-	case rec == nil:
-		// The recorded hub container is gone: never use its port again.
-		s.dropHub(hubID, true)
-		hubPort = 0
-	case !recorded:
-		// It stopped, or another hub container is the current one.
-		s.dropHub(hubID, false)
-		hubPort = 0
-	case rec.LoopbackPort(docker.InspectorHubPort) != hubPort:
-		// Docker restarted the hub on another port, or the port was
-		// dropped after an error: stop using it and check it again.
-		if hubPort != 0 {
-			s.mu.Lock()
-			if s.hubContainer == hubID && s.hubPort == hubPort {
-				s.hubPort, s.hubVerified = 0, time.Time{}
-			}
-			s.mu.Unlock()
+	if hubID != "" {
+		switch {
+		case rec == nil:
+			// The recorded hub container is gone: never use its port again.
+			s.observeHub(c, seenGone, 0, at)
+		case !recorded:
+			// It stopped, or another hub container is the current one.
+			s.observeHub(c, seenStopped, 0, at)
+		default:
+			seen, port := seenOf(*rec, nil)
+			s.observeHub(c, seen, port, at)
 		}
-		s.refreshHub(ctx, hubCheckInterval)
-		hubPort = s.hubNow().port
+		now := s.hubNow()
+		recorded = recorded && now.container == hubID
+		hubPort = now.port
 	}
 	switch {
 	case recorded && ln != nil && hubPort != 0:
@@ -794,11 +874,14 @@ func (s *Service) hubTargets(ctx context.Context) ([]hubTarget, bool) {
 		if done {
 			return
 		}
-		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), targetsTimeout)
-		defer cancel()
+		// The Docker checks have their own budget; each request to the
+		// hub gets targetsTimeout from when it is sent.
+		base := context.WithoutCancel(ctx)
 		fetch := func() ([]hubTarget, error) {
 			if sid == "" {
-				n, err := s.hubLogin(tctx, v)
+				lctx, cancel := context.WithTimeout(base, 15*time.Second)
+				n, err := s.hubLoginFor(lctx, v, targetsTimeout)
+				cancel()
 				if err != nil {
 					return nil, err
 				}
@@ -807,9 +890,11 @@ func (s *Service) hubTargets(ctx context.Context) ([]hubTarget, bool) {
 				s.statusSID = n
 				s.statusMu.Unlock()
 			}
-			if !s.freshHub(tctx, v) {
+			if !s.freshHub(base, v) {
 				return nil, errHubUnverified
 			}
+			tctx, cancel := context.WithTimeout(base, targetsTimeout)
+			defer cancel()
 			list, err := s.hub.targets(tctx, v.port, sid)
 			if isTransport(err) {
 				_ = s.hubUnreachable(tctx, v.port, err)
@@ -1064,6 +1149,7 @@ func (s *Service) stopServing(msg string) {
 	s.mu.Lock()
 	s.hubContainer, s.hubPort, s.hubVerified = "", 0, time.Time{}
 	s.hubFailures = 0
+	s.hubSeq++
 	s.detail = msg
 	s.admitting = false
 	s.gen++
@@ -1165,7 +1251,7 @@ func (s *Service) enable(ctx context.Context, w io.Writer, want applyRequest) er
 		return err
 	}
 	hash := hubHash(img.ID, s.cfg.MemoryMB, sec.Generation)
-	id, port, err := s.ensureHub(ctx, w, img, hash, sec)
+	id, port, seenAt, err := s.ensureHub(ctx, w, img, hash, sec)
 	if err != nil {
 		return err
 	}
@@ -1196,8 +1282,10 @@ func (s *Service) enable(ctx context.Context, w io.Writer, want applyRequest) er
 		s.mu.Unlock()
 		return errTurnedOff
 	}
-	s.hubContainer, s.hubPort, s.hubVerified = id, port, s.cfg.Now()
+	// The confirmation is as old as Docker's answer, not this step.
+	s.hubContainer, s.hubPort, s.hubVerified = id, port, seenAt
 	s.hubSick, s.hubFailures = "", 0
+	s.hubSeq++
 	s.admitting = true
 	s.detail = ""
 	s.mu.Unlock()
@@ -1241,6 +1329,7 @@ func (s *Service) ensureSecrets(ctx context.Context, w io.Writer, rotate bool) (
 	s.sec = fresh
 	s.gen++
 	s.hubContainer, s.hubPort, s.hubVerified = "", 0, time.Time{}
+	s.hubSeq++
 	s.mu.Unlock()
 	if rotate {
 		// The tokens changed: agents must reconnect with new ones (after a
@@ -1312,12 +1401,12 @@ func hubEnv(sec *hubSecrets) map[string]string {
 }
 
 // ensureHub keeps a running hub that matches hash or replaces it, and
-// waits until it answers ready. It returns the container id and its
-// loopback port.
-func (s *Service) ensureHub(ctx context.Context, w io.Writer, img docker.Image, hash string, sec *hubSecrets) (string, int, error) {
+// waits until it answers ready. It returns the container id, its loopback
+// port and when Docker last confirmed that port.
+func (s *Service) ensureHub(ctx context.Context, w io.Writer, img docker.Image, hash string, sec *hubSecrets) (string, int, time.Time, error) {
 	hubs, err := s.cfg.Docker.InspectorHubs(ctx)
 	if err != nil {
-		return "", 0, s.failDocker("list the Inspector hub container", err)
+		return "", 0, time.Time{}, s.failDocker("list the Inspector hub container", err)
 	}
 	s.mu.Lock()
 	sick := s.hubSick
@@ -1331,72 +1420,92 @@ func (s *Service) ensureHub(ctx context.Context, w io.Writer, img docker.Image, 
 			continue
 		}
 		if err := s.cfg.Docker.RemoveInspectorHub(ctx, h.ID); err != nil {
-			return "", 0, s.failDocker("remove the Inspector hub container", err)
+			return "", 0, time.Time{}, s.failDocker("remove the Inspector hub container", err)
 		}
 		fmt.Fprintf(w, "removed the Inspector hub container %s (it did not match the settings, was not running or did not answer)\n", shortID(h.ID))
 	}
 	if keep != nil {
 		fmt.Fprintf(w, "the Inspector hub container %s is running with the current settings\n", shortID(keep.ID))
-		port, err := s.waitHubReady(ctx, w, keep.ID, sec)
-		var se *jobs.SafeError
-		if err != nil && errors.As(err, &se) && ctx.Err() == nil {
-			// It runs but does not answer: the next apply replaces it.
+		port, at, err := s.waitHubReady(ctx, w, keep.ID, sec)
+		var nr notReadyError
+		if errors.As(err, &nr) && ctx.Err() == nil {
+			// It runs but does not answer: the next apply replaces it. A
+			// Docker failure says nothing about the hub and leaves it.
 			s.mu.Lock()
 			s.hubSick = keep.ID
+			s.hubSeq++
 			s.mu.Unlock()
 		}
-		return keep.ID, port, err
+		return keep.ID, port, at, err
 	}
 	s.setHub("", 0)
 	spec := docker.HubSpec{Image: img.ID, ImageVolumes: img.Volumes, Env: hubEnv(sec), MemoryMB: s.cfg.MemoryMB, ConfigHash: hash}
 	id, err := s.cfg.Docker.CreateInspectorHub(ctx, spec)
 	if err != nil {
-		return "", 0, s.failDocker("create the Inspector hub container", err)
+		return "", 0, time.Time{}, s.failDocker("create the Inspector hub container", err)
 	}
 	if err := s.cfg.Docker.StartInspectorHub(ctx, id); err != nil {
-		return "", 0, s.failDocker("start the Inspector hub container", err)
+		return "", 0, time.Time{}, s.failDocker("start the Inspector hub container", err)
 	}
 	fmt.Fprintf(w, "started the Inspector hub container %s, waiting up to %s for it to be ready\n", shortID(id), s.cfg.ReadyTimeout)
-	port, err := s.waitHubReady(ctx, w, id, sec)
-	return id, port, err
+	port, at, err := s.waitHubReady(ctx, w, id, sec)
+	return id, port, at, err
 }
 
-// waitHubReady polls the container and the hub's /ready.
-func (s *Service) waitHubReady(ctx context.Context, w io.Writer, id string, sec *hubSecrets) (int, error) {
+// notReadyError marks a failure of the hub itself in waitHubReady: it
+// exited, or Docker reported it running and it did not answer ready in
+// time. A Docker failure is not one.
+type notReadyError struct{ err error }
+
+func (e notReadyError) Error() string { return e.err.Error() }
+func (e notReadyError) Unwrap() error { return e.err }
+
+// waitHubReady polls the container and the hub's /ready. It returns the
+// port and when Docker answered that the container publishes it. When
+// Docker fails or does not answer in time the job fails with the Docker
+// message (no notReadyError).
+func (s *Service) waitHubReady(ctx context.Context, w io.Writer, id string, sec *hubSecrets) (int, time.Time, error) {
 	wctx, cancel := context.WithTimeout(ctx, s.cfg.ReadyTimeout)
 	defer cancel()
 	t := time.NewTicker(250 * time.Millisecond)
 	defer t.Stop()
 	for {
-		ct, err := s.cfg.Docker.InspectorHub(wctx, id)
-		if wctx.Err() != nil {
-			break
-		}
+		ct, err := s.inspectHub(wctx, id)
+		at := s.cfg.Now()
 		if err != nil {
-			return 0, s.failDocker("inspect the Inspector hub container", err)
+			if ctx.Err() != nil {
+				return 0, time.Time{}, ctx.Err()
+			}
+			if wctx.Err() != nil {
+				err = context.DeadlineExceeded
+			}
+			return 0, time.Time{}, s.failDocker("inspect the Inspector hub container", err)
 		}
 		if !ct.Running && ct.State != "restarting" && ct.State != "created" {
 			fmt.Fprintf(w, "the Inspector hub container is %s (exit code %d); last output:\n", ct.State, ct.ExitCode)
 			s.writeExcerpt(ctx, w, id, sec)
-			return 0, jobs.Fail(fmt.Sprintf("the Inspector hub exited during start (exit code %d); see the job log", ct.ExitCode), nil)
+			return 0, time.Time{}, notReadyError{jobs.Fail(fmt.Sprintf("the Inspector hub exited during start (exit code %d); see the job log", ct.ExitCode), nil)}
 		}
 		if port := ct.LoopbackPort(docker.InspectorHubPort); ct.Running && port != 0 {
 			if err := s.hub.ready(wctx, port); err == nil {
 				fmt.Fprintln(w, "the Inspector hub is ready")
-				return port, nil
+				return port, at, nil
 			}
 		}
 		select {
 		case <-wctx.Done():
 		case <-t.C:
 		}
+		if wctx.Err() != nil {
+			break
+		}
 	}
 	if ctx.Err() != nil {
-		return 0, ctx.Err()
+		return 0, time.Time{}, ctx.Err()
 	}
 	fmt.Fprintln(w, "the Inspector hub did not become ready in time; last output:")
 	s.writeExcerpt(ctx, w, id, sec)
-	return 0, jobs.Fail(fmt.Sprintf("the Inspector hub did not become ready within %s; see the job log", s.cfg.ReadyTimeout), nil)
+	return 0, time.Time{}, notReadyError{jobs.Fail(fmt.Sprintf("the Inspector hub did not become ready within %s; see the job log", s.cfg.ReadyTimeout), nil)}
 }
 
 // writeExcerpt copies the hub's last lines to the job log: secrets
@@ -1418,6 +1527,7 @@ func (s *Service) writeExcerpt(ctx context.Context, w io.Writer, id string, sec 
 func (s *Service) setHub(id string, port int) {
 	s.mu.Lock()
 	s.hubContainer, s.hubPort, s.hubVerified = id, port, time.Time{}
+	s.hubSeq++
 	s.mu.Unlock()
 }
 
@@ -1515,45 +1625,30 @@ func (s *Service) sweepSessions(ctx context.Context) {
 }
 
 // refreshHub re-reads the recorded hub container through Docker (it can
-// assign a new port when it restarts the container). The port stays only
-// while that container runs and publishes it; a container that is gone or
-// not the hub any more is forgotten, and a Docker error drops the port. The
-// port of a hub that does not answer (hubSick) is not restored from
-// Docker's metadata. Concurrent refreshes share one Docker call; none runs
-// within minAge of the last one.
+// assign a new port when it restarts the container) and records the answer
+// (observeHub). Concurrent refreshes share one Docker call; none runs
+// within minAge of the last one, or while the recorded port was confirmed
+// within hubCheckInterval (checked inside the shared call, so a caller
+// that arrives just after a confirmation does not ask again). A caller
+// whose context is done does nothing.
 func (s *Service) refreshHub(ctx context.Context, minAge time.Duration) {
+	if ctx.Err() != nil {
+		return
+	}
 	s.hubFlight.do(ctx, s.cfg.Now, minAge, func() {
-		s.mu.Lock()
-		id := s.hubContainer
-		s.mu.Unlock()
-		if id == "" || s.inspectHub == nil {
-			return
-		}
-		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancel()
-		ct, err := s.inspectHub(qctx, id)
-		port := 0
-		if err == nil && ct.Running {
-			port = ct.LoopbackPort(docker.InspectorHubPort)
-		}
 		now := s.cfg.Now()
 		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.hubContainer != id {
+		id, recent := s.hubContainer, s.recentLocked(now)
+		c := hubCheck{id: id, seq: s.hubSeq}
+		s.mu.Unlock()
+		if id == "" || recent || s.inspectHub == nil {
 			return
 		}
-		if errors.Is(err, docker.ErrNotFound) || errors.Is(err, docker.ErrNotOurs) {
-			s.hubContainer = ""
-		}
-		if s.hubSick == id {
-			port = 0
-		}
-		s.hubPort = port
-		if port != 0 {
-			s.hubVerified = now
-		} else {
-			s.hubVerified = time.Time{}
-		}
+		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hubDockerTimeout)
+		defer cancel()
+		ct, err := s.inspectHub(qctx, id)
+		seen, port := seenOf(ct, err)
+		s.observeHub(c, seen, port, s.cfg.Now())
 	})
 }
 
@@ -1562,10 +1657,14 @@ func (s *Service) refreshHub(ctx context.Context, minAge time.Duration) {
 // a readiness answer other than 200) the hub counts as not answering: its
 // port is dropped and not restored from Docker's metadata alone, the state
 // is "stopped" with sickDetail and the repair is due (it replaces the
-// container).
+// container). A result counts only while the container, its port and the
+// apply that published them are the ones the check started with (hubSeq).
 func (s *Service) checkHub(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	s.mu.Lock()
-	id, port, enabled := s.hubContainer, s.hubPort, s.enabled
+	id, port, enabled, seq := s.hubContainer, s.hubPort, s.enabled, s.hubSeq
 	s.mu.Unlock()
 	if !enabled || id == "" || port == 0 {
 		return
@@ -1576,9 +1675,12 @@ func (s *Service) checkHub(ctx context.Context) {
 	if err != nil && ctx.Err() != nil {
 		return // the sweep ended, not the hub
 	}
+	if s.hooks.afterReadyCheck != nil {
+		s.hooks.afterReadyCheck()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.hubContainer != id {
+	if s.hubContainer != id || s.hubPort != port || s.hubSeq != seq {
 		return
 	}
 	if err == nil {
@@ -1586,12 +1688,14 @@ func (s *Service) checkHub(ctx context.Context) {
 		return
 	}
 	s.hubFailures++
-	if isTransport(err) && s.hubPort == port {
+	if isTransport(err) {
 		s.hubPort, s.hubVerified = 0, time.Time{}
+		s.hubSeq++
 	}
 	if s.hubFailures >= hubSickAfter && s.hubSick != id {
 		s.hubSick = id
 		s.hubPort, s.hubVerified = 0, time.Time{}
+		s.hubSeq++
 		s.logger.Warn("the Inspector hub does not answer its readiness check; it is repaired", "failures", s.hubFailures, "err", err)
 	}
 }
@@ -1599,22 +1703,27 @@ func (s *Service) checkHub(ctx context.Context) {
 // needsRepair reports whether the repair job should run.
 //
 // With the Inspector on: the hub is not serving (no listener, no hub, a
-// hub that does not answer, or Docker reports it gone or stopped), at most
-// every RepairInterval after a failed attempt.
+// hub that does not answer, or Docker reports it gone, stopped or without
+// its port), at most every RepairInterval after a failed attempt. When
+// Docker does not answer (an error, a timeout, ctx done meanwhile) that is
+// recorded as no answer and starts no repair.
 //
 // With it off or unavailable: a listener or a hub is left after a turn-off
 // whose job did not run or failed (cleanupDue). That is checked on every
 // sweep without asking Docker and is not paced by failed attempts to start
 // the hub; a failed removal is retried after cleanupRetry. Otherwise a hub
 // container left behind is looked for at most every RepairInterval.
+//
+// A caller whose context is done gets false without any check.
 func (s *Service) needsRepair(ctx context.Context) bool {
-	if s.applying() {
+	if ctx.Err() != nil || s.applying() {
 		return false
 	}
 	now := s.cfg.Now()
 	s.mu.Lock()
 	enabled, ln, id, last, sick := s.enabled, s.ln, s.hubContainer, s.lastAttempt, s.hubSick
 	cleanup, lastCleanup, lastStray := s.cleanupDue, s.lastCleanup, s.lastStray
+	c := hubCheck{id: id, seq: s.hubSeq}
 	s.mu.Unlock()
 	if !enabled || !s.Available() {
 		if ln != nil || id != "" || cleanup {
@@ -1628,31 +1737,32 @@ func (s *Service) needsRepair(ctx context.Context) bool {
 	if !last.IsZero() && now.Sub(last) < RepairInterval {
 		return false
 	}
-	if ln == nil || id == "" || sick == id || s.cfg.Docker == nil {
+	if ln == nil || id == "" || sick == id || s.inspectHub == nil {
 		return true
 	}
-	ct, err := s.cfg.Docker.InspectorHub(ctx, id)
-	if errors.Is(err, docker.ErrUnavailable) || errors.Is(err, context.Canceled) {
-		return false
-	}
-	if err != nil || !ct.Running {
-		s.dropHub(id, errors.Is(err, docker.ErrNotFound) || errors.Is(err, docker.ErrNotOurs))
-		return true
-	}
-	return false
+	qctx, cancel := context.WithTimeout(ctx, hubDockerTimeout)
+	ct, err := s.inspectHub(qctx, id)
+	cancel()
+	seen, port := seenOf(ct, err)
+	recorded := s.observeHub(c, seen, port, s.cfg.Now())
+	return recorded && (seen == seenGone || seen == seenStopped)
 }
 
 // hubLeft reports whether a hub container exists while the Inspector is
-// off or unavailable. It counts as a look for RepairInterval.
+// off or unavailable. A listing that completed counts as a look for
+// RepairInterval; a failed one does not.
 func (s *Service) hubLeft(ctx context.Context) bool {
-	if s.cfg.Docker == nil {
+	if s.listHubs == nil || ctx.Err() != nil {
+		return false
+	}
+	hubs, err := s.listHubs(ctx)
+	if err != nil {
 		return false
 	}
 	s.mu.Lock()
 	s.lastStray = s.cfg.Now()
 	s.mu.Unlock()
-	hubs, err := s.cfg.Docker.InspectorHubs(ctx)
-	return err == nil && len(hubs) > 0
+	return len(hubs) > 0
 }
 
 // Run repairs the hub at start and when it stops serving, removes a hub
@@ -1668,7 +1778,7 @@ func (s *Service) Run(ctx context.Context) {
 	if enabled && s.Available() {
 		s.startRepair(ctx)
 	} else {
-		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		cctx, cancel := context.WithTimeout(ctx, s.stepTimeout)
 		if s.hubLeft(cctx) {
 			s.startRepair(ctx)
 		}
@@ -1682,19 +1792,46 @@ func (s *Service) Run(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		s.sweepSessions(cctx)
-		s.sweepAgents(cctx)
-		s.refreshHub(cctx, hubCheckInterval)
-		s.checkHub(cctx)
-		if s.needsRepair(cctx) {
-			s.startRepair(ctx)
-		}
-		cancel()
+		s.sweep(ctx)
 	}
 }
 
+// sweep is one round of Run. Each step has its own time budget
+// (stepTimeout), so a slow step never leaves a later one an expired
+// context; nothing runs once ctx is done.
+func (s *Service) sweep(ctx context.Context) {
+	step := func(fn func(context.Context)) {
+		if ctx.Err() != nil {
+			return
+		}
+		sctx, cancel := context.WithTimeout(ctx, s.stepTimeout)
+		defer cancel()
+		fn(sctx)
+	}
+	step(s.sweepSessions)
+	step(s.sweepAgents)
+	step(func(c context.Context) { s.refreshHub(c, hubCheckInterval) })
+	step(s.checkHub)
+	repair := false
+	step(func(c context.Context) { repair = s.needsRepair(c) })
+	if repair {
+		s.startRepair(ctx)
+	}
+}
+
+// startRepair starts the automatic repair. Starting it counts as an
+// attempt at once (a start of the hub while the setting is on, a removal
+// while it is off), before the job runs: a job that fails before its body
+// runs (its log cannot be created, for example) is paced like one that
+// ran. The body records the outcome when it runs.
 func (s *Service) startRepair(ctx context.Context) {
+	s.mu.Lock()
+	if s.enabled && s.Available() {
+		s.lastAttempt = s.cfg.Now()
+	} else {
+		s.lastCleanup = s.cfg.Now()
+	}
+	s.mu.Unlock()
 	job, err := s.startApply(ctx, applyRequest{auto: true}, nil)
 	if err != nil {
 		if !errors.Is(err, jobs.ErrSubjectBusy) && !errors.Is(err, jobs.ErrShuttingDown) {
