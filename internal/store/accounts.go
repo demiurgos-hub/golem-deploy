@@ -85,10 +85,26 @@ func randomTokenVersion() (int64, error) {
 }
 
 // CreateAccount inserts an account. ErrConflict means the username exists
-// (case-insensitively). It is the only way accounts are created (HTTP admin
-// create, self-registration and the local CLI all use it), so every account
-// starts with a random token_version.
+// (case-insensitively). It and CompleteSetup are the only ways accounts are
+// created (HTTP admin create, self-registration, the local CLI and the setup
+// link), so every account starts with a random token_version. Creating an
+// approved admin deletes a pending setup token in the same transaction.
 func (s *Store) CreateAccount(ctx context.Context, in NewAccount) (Account, error) {
+	var out Account
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		out, err = s.insertAccount(ctx, tx, in)
+		return err
+	})
+	if err != nil {
+		return Account{}, err
+	}
+	return out, nil
+}
+
+// insertAccount inserts an account inside tx. An approved admin makes the
+// setup token useless, so it is deleted too.
+func (s *Store) insertAccount(ctx context.Context, tx *sql.Tx, in NewAccount) (Account, error) {
 	if !in.Role.Valid() {
 		return Account{}, fmt.Errorf("create account: invalid role %q", in.Role)
 	}
@@ -96,13 +112,17 @@ func (s *Store) CreateAccount(ctx context.Context, in NewAccount) (Account, erro
 	if err != nil {
 		return Account{}, err
 	}
-	row := s.db.QueryRowContext(ctx,
+	a, err := scanAccount(tx.QueryRowContext(ctx,
 		`INSERT INTO accounts (username, password_hash, role, approved, token_version, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?) RETURNING `+accountCols,
-		in.Username, in.PasswordHash, in.Role, in.Approved, ver, formatTime(s.nowUTC()))
-	a, err := scanAccount(row)
+		in.Username, in.PasswordHash, in.Role, in.Approved, ver, formatTime(s.nowUTC())))
 	if err != nil {
 		return Account{}, mapErr("create account", err)
+	}
+	if a.IsApprovedAdmin() {
+		if err := deleteSetupToken(ctx, tx); err != nil {
+			return Account{}, mapErr("create account", err)
+		}
 	}
 	return a, nil
 }
@@ -213,6 +233,11 @@ func (s *Store) UpdateAccount(ctx context.Context, actorID, id int64, upd Accoun
 		}
 		if unapproved {
 			if _, err := tx.ExecContext(ctx, `DELETE FROM api_tokens WHERE account_id = ?`, id); err != nil {
+				return mapErr("update account", err)
+			}
+		}
+		if next.IsApprovedAdmin() && !cur.IsApprovedAdmin() {
+			if err := deleteSetupToken(ctx, tx); err != nil {
 				return mapErr("update account", err)
 			}
 		}
