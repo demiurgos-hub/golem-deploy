@@ -704,7 +704,10 @@ main() {
 				fi
 			done
 			[ -n "$listen" ] || die "no free fallback loopback port in 8000-8099; set --listen explicitly"
-			warn "Using $listen. Automatic certificates need TCP port 80 or 443 reachable from the internet."
+			warn "Using $listen, reachable from this host only. To put the panel on the network, set" \
+				"GOLEM_DEPLOY_LISTEN (and GOLEM_DEPLOY_HTTP_LISTEN) to free ports in $ENV_FILE afterwards," \
+				"or pass --listen and --http-listen on a new installation." \
+				"Automatic certificates need TCP port 80 or 443 reachable from the internet."
 		fi
 	fi
 
@@ -1205,12 +1208,6 @@ $step. Create the first admin account: open this link in your browser.
 
      $link
 
-EOF
-		if [ -s "$link_err" ]; then
-			sed 's/^/   /' "$link_err"
-			printf '\n'
-		fi
-		cat <<EOF
    To make a new link:
 
      $link_cmd
