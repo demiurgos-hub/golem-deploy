@@ -126,13 +126,13 @@ type Server struct {
 	// Password attempt limits (login, password change, token creation):
 	// failures per client IP and per submitted username, a known-good-IP
 	// exemption from the username limit, and in-flight caps.
-	loginIP       *auth.Limiter
-	loginUser     *auth.Limiter
-	registerIP    *auth.Limiter
+	loginIP    *auth.Limiter
+	loginUser  *auth.Limiter
+	registerIP *auth.Limiter
 	// setupIP counts refused setup tokens per client IP, with the
 	// per-client parameters of loginIP but its own counters, so setup and
 	// login failures never affect each other.
-	setupIP *auth.Limiter
+	setupIP       *auth.Limiter
 	knownIPs      *auth.KnownIPs
 	loginFlightIP *auth.InFlight
 	loginFlightU  *auth.InFlight
