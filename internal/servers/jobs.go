@@ -242,10 +242,10 @@ func (s *Service) launch(ctx context.Context, sv store.Server, log io.Writer, re
 		fmt.Fprintf(log, "image volumes %s get size-limited tmpfs mounts\n", strings.Join(tmpfs, ", "))
 	}
 
-	*replaced = true
 	if err := s.removeRecorded(ctx, sv, log); err != nil {
 		return s.failDocker(ctx, sv, "remove the previous container", err)
 	}
+	*replaced = true
 	isolated, err := s.docker.EnsureNetwork(ctx)
 	switch {
 	case errors.Is(err, docker.ErrNotManaged):
@@ -573,13 +573,26 @@ func (s *Service) Delete(ctx context.Context, id int64, o DeleteOptions, log io.
 			return err
 		}
 	}
-	if err := s.removeRecorded(ctx, sv, log); err != nil {
+	if err := ctx.Err(); err != nil {
+		s.putBack(ctx, paused, log)
+		return err
+	}
+	// From here on the deletion is carried through: a cancellation no
+	// longer interrupts it between the container, the volume and the row.
+	cleanupCtx := context.WithoutCancel(ctx)
+	if err := s.removeRecorded(cleanupCtx, sv, log); err != nil {
 		ferr := s.failDocker(ctx, sv, "remove the container", err)
 		s.putBack(ctx, paused, log)
 		return ferr
 	}
+	// Should a later step fail, what is left of the server must not be
+	// started by the next daemon start (with an empty volume, if the old
+	// one is already gone).
+	if err := s.store.SetServerDesiredState(cleanupCtx, id, "stopped"); err != nil {
+		s.logger.Warn("could not record a server under deletion as stopped", "job_id", jobIDFrom(ctx), "server_id", id, "err", err)
+	}
 	if sv.DataVolume != "" {
-		err := s.docker.RemoveDataVolume(ctx, sv.ID, sv.DataVolume)
+		err := s.docker.RemoveDataVolume(cleanupCtx, sv.ID, sv.DataVolume)
 		switch {
 		case errors.Is(err, docker.ErrNotManaged), errors.Is(err, docker.ErrNotOurs):
 			// The recorded name now belongs to something else: leave it.
@@ -592,7 +605,6 @@ func (s *Service) Delete(ctx context.Context, id int64, o DeleteOptions, log io.
 			fmt.Fprintf(log, "removed the data volume %s (backups of the server are kept)\n", sv.DataVolume)
 		}
 	}
-	cleanupCtx := context.WithoutCancel(ctx)
 	deleteRow := func() error { return s.store.DeleteServer(cleanupCtx, id) }
 	var deleteErr error
 	if s.cfg.Certs != nil {

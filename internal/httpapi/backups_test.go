@@ -253,7 +253,7 @@ func TestDeleteServerLastBackup(t *testing.T) {
 	errBody(t, d.call("DELETE", base+"?skip_safety_backup=1", d.devTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
 	adminTok := d.apiToken(d.admin, nil) // API tokens are capped at developer
 	errBody(t, d.call("DELETE", base+"?skip_safety_backup=true", adminTok, nil), http.StatusForbidden, apitypes.ErrorCodeForbidden)
-	for _, q := range []string{"yes", "", "TRUE", "1&skip_safety_backup=1", "0&skip_safety_backup=1"} {
+	for _, q := range []string{"yes", "", "TRUE", "1&skip_safety_backup=1", "0&skip_safety_backup=1", "%ZZ", "1;z=1", "0&skip_safety_backup=%ZZ"} {
 		errBody(t, d.call("DELETE", base+"?skip_safety_backup="+q, d.adminSs, nil), http.StatusBadRequest, apitypes.ErrorCodeBadRequest)
 	}
 	for _, q := range []string{"", "?skip_safety_backup=0", "?skip_safety_backup=false"} {

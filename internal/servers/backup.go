@@ -434,7 +434,11 @@ func (s *Service) copyFailure(ctx context.Context, sv store.Server, err error) e
 	}
 	var cmdErr *docker.CmdError
 	if errors.As(err, &cmdErr) {
-		return s.failDocker(ctx, sv, "copy the data directory", err)
+		// What docker cp prints can name files of the game, and names
+		// never go to a log. The command error is passed on by itself: a
+		// wrapping error has its text, output included, fixed already.
+		cmdErr.Detail = "(output withheld: it can name files of the game)"
+		return s.failDocker(ctx, sv, "copy the data directory", cmdErr)
 	}
 	s.logger.Warn("copying a data directory failed", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", err)
 	switch {
@@ -461,8 +465,19 @@ func (s *Service) copyFailure(ctx context.Context, sv store.Server, err error) e
 // before every retry the recorded container is inspected again and the
 // next request goes to the port that inspection reports.
 func (s *Service) snapshot(ctx context.Context, sv store.Server, log io.Writer) (bool, error) {
-	ct, err := s.container(ctx, sv)
+	sctx, cancel := context.WithTimeout(ctx, s.cfg.SnapshotDeadline)
+	defer cancel()
+	tooLong := func() error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return jobs.Fail(fmt.Sprintf("the game did not finish a snapshot within %s; try again later", s.cfg.SnapshotDeadline), nil)
+	}
+	ct, err := s.container(sctx, sv)
 	if err != nil {
+		if sctx.Err() != nil {
+			return false, tooLong()
+		}
 		return false, s.failDocker(ctx, sv, "inspect the container", err)
 	}
 	if ct == nil || !adminRunning(*ct) {
@@ -473,14 +488,6 @@ func (s *Service) snapshot(ctx context.Context, sv store.Server, log io.Writer) 
 	if terr != nil {
 		fmt.Fprintln(log, "the game's admin endpoint is not reachable; copying the saved files as they are")
 		return false, nil
-	}
-	sctx, cancel := context.WithTimeout(ctx, s.cfg.SnapshotDeadline)
-	defer cancel()
-	tooLong := func() error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return jobs.Fail(fmt.Sprintf("the game did not finish a snapshot within %s; try again later", s.cfg.SnapshotDeadline), nil)
 	}
 	fmt.Fprintln(log, "asking the game for a fresh snapshot")
 	waiting := false
@@ -811,7 +818,13 @@ func (s *Service) stopForData(ctx context.Context, sv store.Server, log io.Write
 	if err != nil {
 		return p, s.failDocker(ctx, sv, "inspect the container", err)
 	}
-	p.wasRunning = ct != nil && adminRunning(*ct)
+	// A container Docker is restarting is stopped by the stop below too, so
+	// it counts as running. A server the operator asked to be stopped is
+	// never started again, whatever its container does.
+	p.wasRunning = ct != nil && (adminRunning(*ct) || ct.State == "restarting") && sv.DesiredState == "running"
+	if err := ctx.Err(); err != nil {
+		return p, err
+	}
 	done, err := s.docker.StopServer(ctx, ref(sv), s.cfg.StopTimeout)
 	if errors.Is(err, docker.ErrNotOurs) {
 		s.logForeignRef(ref(sv))
@@ -819,6 +832,16 @@ func (s *Service) stopForData(ctx context.Context, sv store.Server, log io.Write
 	}
 	if err != nil {
 		ferr := s.failDocker(ctx, sv, "stop the container", err)
+		if p.wasRunning {
+			// Docker finishes a stop it accepted even when the command that
+			// asked for it was cancelled. Let it finish first, so the
+			// container is not found running and then stops afterwards.
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.StopTimeout+restartAllowance)
+			if _, serr := s.docker.StopServer(sctx, ref(sv), s.cfg.StopTimeout); serr != nil {
+				s.logger.Warn("could not let an interrupted stop finish", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", serr)
+			}
+			cancel()
+		}
 		s.putBack(ctx, p, log)
 		return p, ferr
 	}

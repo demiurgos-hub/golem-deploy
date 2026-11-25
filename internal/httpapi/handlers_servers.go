@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -236,7 +237,14 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 	o := servers.DeleteOptions{CreatedBy: creatorOf(r)}
-	if values, given := r.URL.Query()["skip_safety_backup"]; given {
+	// A malformed query string is refused as a whole: the parser would
+	// otherwise drop the parts it cannot read, and a dropped parameter
+	// would count as absent.
+	query, qerr := url.ParseQuery(r.URL.RawQuery)
+	if qerr != nil {
+		return badRequest("the query string is malformed")
+	}
+	if values, given := query["skip_safety_backup"]; given {
 		// Present means one of 1, true, 0 or false: an empty value or a
 		// repeated parameter is not a choice.
 		value := ""
