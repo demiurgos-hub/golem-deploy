@@ -27,6 +27,7 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/frontend"
 	"github.com/demiurgos-hub/golem-deploy/internal/daemon"
 	"github.com/demiurgos-hub/golem-deploy/internal/git"
+	"github.com/demiurgos-hub/golem-deploy/internal/inspector"
 )
 
 // version is set at build time with -ldflags "-X main.version=v1.2.3".
@@ -219,6 +220,23 @@ func cmdServe(args []string, stderr io.Writer) int {
 	backupMax := fs.Int("backup-max-mb", backupMaxDefault, "largest data directory of a server a backup accepts, in MiB (env GOLEM_DEPLOY_BACKUP_MAX_MB)")
 	buildTimeout := fs.Duration("build-timeout", buildTimeoutDefault, "time limit of one build, e.g. 30m (env GOLEM_DEPLOY_BUILD_TIMEOUT)")
 	buildRetention := fs.Int("build-retention", buildRetentionDefault, "successful builds kept per project, with their images; builds that servers use are always kept (env GOLEM_DEPLOY_BUILD_RETENTION)")
+	inspectorListen := fs.String("inspector-listen", envDefault("GOLEM_DEPLOY_INSPECTOR_LISTEN", ""),
+		"Inspector listen address for browsers and the games' Inspector agents; empty means the host of --listen with port 8444, \"off\" disables the Inspector (env GOLEM_DEPLOY_INSPECTOR_LISTEN)")
+	inspectorImage := fs.String("inspector-image", envDefault("GOLEM_DEPLOY_INSPECTOR_IMAGE", inspector.DefaultImage),
+		"image reference of the Inspector hub, downloaded anonymously when the host does not have it (env GOLEM_DEPLOY_INSPECTOR_IMAGE)")
+	inspectorMemDefault, err := envInt("GOLEM_DEPLOY_INSPECTOR_MEMORY_MB")
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if os.Getenv("GOLEM_DEPLOY_INSPECTOR_MEMORY_MB") == "" {
+		inspectorMemDefault = inspector.DefaultMemoryMB
+	}
+	inspectorMemory := fs.Int("inspector-memory-mb", inspectorMemDefault, "memory limit of the Inspector hub container in MiB (env GOLEM_DEPLOY_INSPECTOR_MEMORY_MB)")
+	inspectorPublicURL := fs.String("inspector-public-url", envDefault("GOLEM_DEPLOY_INSPECTOR_PUBLIC_URL", ""),
+		"origin browsers use for the Inspector when a reverse proxy fronts its listener, e.g. https://inspector.example.com (env GOLEM_DEPLOY_INSPECTOR_PUBLIC_URL)")
+	inspectorAgentHost := fs.String("inspector-agent-host", envDefault("GOLEM_DEPLOY_INSPECTOR_AGENT_HOST", ""),
+		"address the games' Inspector agents connect to from their containers; empty picks it from --inspector-listen (env GOLEM_DEPLOY_INSPECTOR_AGENT_HOST)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -251,9 +269,16 @@ func cmdServe(args []string, stderr io.Writer) int {
 		BuildTimeout:    *buildTimeout,
 		BuildRetention:  *buildRetention,
 		BackupMaxMB:     *backupMax,
-		Version:         buildVersion(),
-		Logger:          logger,
-		SPA:             frontend.Handler(),
+		Inspector: daemon.InspectorOptions{
+			Listen:    *inspectorListen,
+			Image:     *inspectorImage,
+			MemoryMB:  *inspectorMemory,
+			PublicURL: *inspectorPublicURL,
+			AgentHost: *inspectorAgentHost,
+		},
+		Version: buildVersion(),
+		Logger:  logger,
+		SPA:     frontend.Handler(),
 	})
 	if err != nil {
 		logger.Error("golem-deploy failed", "err", err)

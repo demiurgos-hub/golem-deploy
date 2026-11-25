@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
@@ -28,7 +29,9 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/git"
 	"github.com/demiurgos-hub/golem-deploy/internal/httpapi"
+	"github.com/demiurgos-hub/golem-deploy/internal/inspector"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
+	"github.com/demiurgos-hub/golem-deploy/internal/netpolicy"
 	"github.com/demiurgos-hub/golem-deploy/internal/ports"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
 	"github.com/demiurgos-hub/golem-deploy/internal/servers"
@@ -83,6 +86,8 @@ type Options struct {
 	// BackupMaxMB is the largest data directory a backup accepts, in MiB
 	// (--backup-max-mb; 0 means 1024).
 	BackupMaxMB int
+	// Inspector configures the Inspector (the --inspector-* flags).
+	Inspector InspectorOptions
 	// Ready, if set, is called with the bound address once serving.
 	Ready func(addr net.Addr)
 
@@ -92,6 +97,82 @@ type Options struct {
 	storeClosed   func(error)                                      // tests only
 	readyServices func(*jobs.Runner, *build.Service, *store.Store) // tests only
 	stopTimeout   time.Duration                                    // tests only
+	inspectorGOOS string                                           // tests only; "" means runtime.GOOS
+	inspectorWait time.Duration                                    // tests only; hub ready timeout
+	inspectorCost int                                              // tests only; hub password bcrypt cost
+	inspector     func(*inspector.Service)                         // tests only; called with the service
+}
+
+// InspectorOptions are the Inspector serve flags.
+type InspectorOptions struct {
+	// Listen is --inspector-listen ("" derives it from --listen, "off"
+	// makes the Inspector unavailable).
+	Listen string
+	// Image is --inspector-image ("" means inspector.DefaultImage) and
+	// MemoryMB --inspector-memory-mb (0 means inspector.DefaultMemoryMB).
+	Image    string
+	MemoryMB int
+	// PublicURL is --inspector-public-url and AgentHost
+	// --inspector-agent-host.
+	PublicURL string
+	AgentHost string
+}
+
+// inspectorSettings are the validated Inspector flags.
+type inspectorSettings struct {
+	listen, image, publicURL, agentHost string
+	memoryMB                            int
+}
+
+// inspectorConfig validates the Inspector flags. The listener port must
+// differ from the panel and HTTP listener ports and lie outside the game
+// port range.
+func inspectorConfig(o Options, rng ports.Range) (inspectorSettings, error) {
+	var out inspectorSettings
+	var err error
+	if out.listen, err = inspector.ResolveListen(o.Inspector.Listen, o.Listen); err != nil {
+		return out, err
+	}
+	out.image = o.Inspector.Image
+	if out.image == "" {
+		out.image = inspector.DefaultImage
+	}
+	if err := inspector.ValidateImage(out.image); err != nil {
+		return out, err
+	}
+	out.memoryMB = o.Inspector.MemoryMB
+	if out.memoryMB == 0 {
+		out.memoryMB = inspector.DefaultMemoryMB
+	}
+	if out.memoryMB < 32 || out.memoryMB > 1<<20 {
+		return out, errors.New("--inspector-memory-mb must be between 32 and 1048576")
+	}
+	if out.publicURL, err = inspector.ValidatePublicURL(o.Inspector.PublicURL); err != nil {
+		return out, err
+	}
+	if out.agentHost, err = inspector.ValidateAgentHost(o.Inspector.AgentHost); err != nil {
+		return out, err
+	}
+	port := inspector.ListenPort(out.listen)
+	if out.listen == "" || port == 0 {
+		return out, nil
+	}
+	portOf := func(addr string) int {
+		if _, p, err := net.SplitHostPort(addr); err == nil {
+			n, _ := strconv.Atoi(p)
+			return n
+		}
+		return 0
+	}
+	switch {
+	case port == portOf(o.Listen):
+		return out, fmt.Errorf("--inspector-listen port %d is the panel's port (--listen); choose another port or \"off\"", port)
+	case o.HTTPListen != "" && port == portOf(o.HTTPListen):
+		return out, fmt.Errorf("--inspector-listen port %d is the HTTP listener's port (--http-listen)", port)
+	case rng.Contains(port):
+		return out, fmt.Errorf("--inspector-listen port %d is inside the game server port range %s", port, rng)
+	}
+	return out, nil
 }
 
 // serverConfig validates the game server settings.
@@ -215,6 +296,10 @@ func Run(ctx context.Context, o Options) (err error) {
 		return err
 	}
 	srvCfg, err := serverConfig(o)
+	if err != nil {
+		return err
+	}
+	inspCfg, err := inspectorConfig(o, srvCfg.Ports)
 	if err != nil {
 		return err
 	}
@@ -401,6 +486,37 @@ func Run(ctx context.Context, o Options) (err error) {
 		Retention:  o.BuildRetention,
 		Logger:     logger,
 	})
+	// The panel's Host policy is shared with the Inspector listener. Panel
+	// host names derived from the game host come from the certificate
+	// coordinator, created below.
+	var automationRef atomic.Pointer[certs.Automation]
+	policy := netpolicy.New(publicHosts, trusted, func(h string) bool {
+		a := automationRef.Load()
+		return a != nil && a.IsPanelHost(h)
+	})
+	var inspTLS *tls.Config
+	if panelTLS {
+		inspTLS = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			a := automationRef.Load()
+			if a == nil {
+				return nil, errors.New("no panel TLS certificate is available yet")
+			}
+			return a.GetCertificate(hello)
+		}}
+	}
+	goos := runtime.GOOS
+	if o.inspectorGOOS != "" {
+		goos = o.inspectorGOOS
+	}
+	insp, err := inspector.New(ctx, inspector.Config{
+		Store: st, Secrets: box, Docker: dockerClient, Jobs: runner, Policy: policy, Logger: logger,
+		Image: inspCfg.image, MemoryMB: inspCfg.memoryMB, Listen: inspCfg.listen, PublicURL: inspCfg.publicURL,
+		AgentHost: inspCfg.agentHost, TLSConfig: inspTLS, GOOS: goos, ReadyTimeout: o.inspectorWait, BcryptCost: o.inspectorCost,
+	})
+	if err != nil {
+		return err
+	}
+	srvCfg.Inspector = insp
 	svc := servers.New(st, box, dockerClient, srvCfg, logger)
 	certMgr.Check(ctx, svc.GameHost)
 	ln, err := httpapi.OpenListener(o.Listen, "--listen")
@@ -434,6 +550,7 @@ func Run(ctx context.Context, o Options) (err error) {
 	if err := automation.Initialize(ctx); err != nil {
 		return fmt.Errorf("initialize certificates: %w", err)
 	}
+	automationRef.Store(automation)
 	var probe httpapi.DockerProbe = dockerClient
 	if o.docker != nil {
 		probe = o.docker
@@ -447,6 +564,7 @@ func Run(ctx context.Context, o Options) (err error) {
 		Version:        o.Version,
 		PublicHosts:    publicHosts,
 		TrustedProxies: trusted,
+		Policy:         policy,
 	}, httpapi.Deps{
 		Store:      st,
 		Sessions:   sessions,
@@ -463,6 +581,7 @@ func Run(ctx context.Context, o Options) (err error) {
 		Certs:      certMgr,
 		Automation: automation,
 		Builds:     builds,
+		Inspector:  insp,
 		SPA:        o.SPA,
 	})
 	if err != nil {
@@ -479,6 +598,9 @@ func Run(ctx context.Context, o Options) (err error) {
 	}
 	if o.readyServices != nil {
 		o.readyServices(runner, builds, st)
+	}
+	if o.inspector != nil {
+		o.inspector(insp)
 	}
 
 	// Cancel all background work with HTTP shutdown. Keep their completion
@@ -513,6 +635,13 @@ func Run(ctx context.Context, o Options) (err error) {
 			}
 		}
 	}()
+	// The Inspector repairs its hub and sweeps its sessions until
+	// shutdown, then closes its listener (the hub container keeps running).
+	inspDone := make(chan struct{})
+	go func() {
+		defer close(inspDone)
+		insp.Run(recCtx)
+	}()
 	// Certificate maintenance runs until shutdown, including mount retries.
 	certDone := make(chan struct{})
 	go func() {
@@ -531,7 +660,7 @@ func Run(ctx context.Context, o Options) (err error) {
 		}
 		deadline <- time.Now().Add(grace)
 		jobsDone := runner.Stop()
-		for _, done := range []<-chan struct{}{srv.Drained(), jobsDone, certDone, recDone, cleanupDone, scheduleDone} {
+		for _, done := range []<-chan struct{}{srv.Drained(), jobsDone, certDone, recDone, cleanupDone, scheduleDone, inspDone} {
 			<-done
 		}
 		builds.WaitWatchers()
