@@ -114,7 +114,7 @@ Create the first admin account, then start the daemon:
 | `--build-retention` | `GOLEM_DEPLOY_BUILD_RETENTION` | `5` | Successful builds kept per project with their images (1–100); builds that servers use are always kept |
 | `--backup-max-mb` | `GOLEM_DEPLOY_BACKUP_MAX_MB` | `1024` | Largest data directory of a server a backup accepts, in MiB (1–1048576) |
 | `--inspector-listen` | `GOLEM_DEPLOY_INSPECTOR_LISTEN` | host of `--listen`, port `8444` | Inspector listener for browsers and the games' Inspector agents, open while the Inspector is on; `off` disables the Inspector. Must differ from the other listeners' ports and lie outside `--port-range` ([docs/INSPECTOR.md](docs/INSPECTOR.md)) |
-| `--inspector-image` | `GOLEM_DEPLOY_INSPECTOR_IMAGE` | `ghcr.io/demiurgos-hub/golem-inspector:0.4.0-rc.1` | Inspector hub image (tag or digest), downloaded anonymously when the host does not have it |
+| `--inspector-image` | `GOLEM_DEPLOY_INSPECTOR_IMAGE` | `ghcr.io/demiurgos-hub/golem-inspector:0.4.0-rc.1` | Inspector hub image (tag or digest), downloaded with the daemon's build Docker configuration when the host does not have it |
 | `--inspector-memory-mb` | `GOLEM_DEPLOY_INSPECTOR_MEMORY_MB` | `512` | Memory limit of the Inspector hub container in MiB (32-1048576) |
 | `--inspector-public-url` | `GOLEM_DEPLOY_INSPECTOR_PUBLIC_URL` | | Origin browsers use for the Inspector when a reverse proxy fronts its listener (e.g. `https://inspector.example.com`) |
 | `--inspector-agent-host` | `GOLEM_DEPLOY_INSPECTOR_AGENT_HOST` | derived | Address the games' Inspector agents connect to from their containers |

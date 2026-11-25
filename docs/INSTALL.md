@@ -118,7 +118,7 @@ Only if the proxy runs on another machine does the panel need a non-loopback add
 
 ### Inspector
 
-The Inspector (see [INSPECTOR.md](INSPECTOR.md)) is off until an admin turns it on. It then runs one more container (`golem-deploy_inspector`, from `GOLEM_DEPLOY_INSPECTOR_IMAGE`, downloaded anonymously on first use) and opens the Inspector listener, by default on TCP port 8444 of the panel's address (`GOLEM_DEPLOY_INSPECTOR_LISTEN`; `off` disables the Inspector). Allow that one port in the host firewall and in the provider's firewall: browsers open the Inspector on it, and the game servers' Inspector agents connect to it from their containers through the Docker network's gateway, so with ufw it must be allowed (`ufw allow 8444/tcp`) even for the games.
+The Inspector (see [INSPECTOR.md](INSPECTOR.md)) is off until an admin turns it on. It then runs one more container (`golem-deploy_inspector`, from `GOLEM_DEPLOY_INSPECTOR_IMAGE`, downloaded on first use with the daemon's build Docker configuration) and opens the Inspector listener, by default on TCP port 8444 of the panel's address (`GOLEM_DEPLOY_INSPECTOR_LISTEN`; `off` disables the Inspector). Allow that one port in the host firewall and in the provider's firewall: browsers open the Inspector on it, and the game servers' Inspector agents connect to it from their containers through the Docker network's gateway, so with ufw it must be allowed (`ufw allow 8444/tcp`) even for the games.
 
 ### TLS certificates
 

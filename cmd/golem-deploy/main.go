@@ -223,7 +223,7 @@ func cmdServe(args []string, stderr io.Writer) int {
 	inspectorListen := fs.String("inspector-listen", envDefault("GOLEM_DEPLOY_INSPECTOR_LISTEN", ""),
 		"Inspector listen address for browsers and the games' Inspector agents; empty means the host of --listen with port 8444, \"off\" disables the Inspector (env GOLEM_DEPLOY_INSPECTOR_LISTEN)")
 	inspectorImage := fs.String("inspector-image", envDefault("GOLEM_DEPLOY_INSPECTOR_IMAGE", inspector.DefaultImage),
-		"image reference of the Inspector hub, downloaded anonymously when the host does not have it (env GOLEM_DEPLOY_INSPECTOR_IMAGE)")
+		"image reference of the Inspector hub, downloaded with the daemon's build Docker configuration when the host does not have it (env GOLEM_DEPLOY_INSPECTOR_IMAGE)")
 	inspectorMemDefault, err := envInt("GOLEM_DEPLOY_INSPECTOR_MEMORY_MB")
 	if err != nil {
 		fmt.Fprintln(stderr, err)

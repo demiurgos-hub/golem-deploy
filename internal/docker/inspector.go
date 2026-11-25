@@ -23,6 +23,8 @@ const (
 	InspectorHubPort = 8787
 	// inspectorHubPids bounds the hub's processes.
 	inspectorHubPids = 256
+	// inspectorHubCPUs bounds the hub's CPU time (one CPU).
+	inspectorHubCPUs = "1"
 	// inspectorStopTimeout is the hub's graceful stop timeout.
 	inspectorStopTimeout = 15 * time.Second
 	// pullTimeout bounds one image download.
@@ -32,7 +34,7 @@ const (
 // HubSpec describes the Inspector hub container. The hardening matches
 // RunSpec: no registry pull at create, read-only root filesystem, all
 // capabilities dropped, no-new-privileges, an init process, no image health
-// check, a pids and a memory limit, the non-root user 65532, size-limited
+// check, a pids, a memory and a CPU limit (one CPU), the non-root user 65532, size-limited
 // noexec tmpfs mounts on /tmp and on every volume the image declares, a
 // bounded json-file log, the managed network, no mounts, the hub port
 // published on 127.0.0.1 only, and every dev.golemengine.deploy.* label set
@@ -123,6 +125,7 @@ func (s HubSpec) Args(instance, envFilePath string) ([]string, error) {
 		"--security-opt", "no-new-privileges",
 		"--pids-limit", strconv.Itoa(inspectorHubPids),
 		"--memory", mem, "--memory-swap", mem,
+		"--cpus", inspectorHubCPUs,
 		"--log-driver", "json-file",
 		"--log-opt", "max-size=10m",
 		"--log-opt", "max-file=3",
@@ -328,9 +331,12 @@ func (c *Client) ResolveImage(ctx context.Context, ref string) (Image, error) {
 	return list[0], nil
 }
 
-// PullImage downloads ref anonymously: the CLI runs with the daemon's
-// dedicated client configuration (the one builds use), so the operator's
-// stored registry credentials and proxies are never used.
+// PullImage downloads ref with the daemon's build client configuration
+// (the one builds use), never with the operator's own client
+// configuration. That configuration holds no registry credentials unless
+// an operator added some there; the pull then uses them, which is fine
+// because the reference is the operator's own setting. Proxies in it are
+// refused.
 func (c *Client) PullImage(ctx context.Context, ref string) error {
 	if err := ValidateHubImageRef(ref); err != nil {
 		return err
