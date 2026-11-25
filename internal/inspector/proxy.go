@@ -294,9 +294,7 @@ func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if sid := sess.end(); sid != "" {
 		if v := s.hubNow(); v.port != 0 {
 			lctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			if err := s.hub.logout(lctx, v.port, sid); err != nil {
-				_ = s.hubUnreachable(lctx, v.port, err)
-			}
+			s.logoutAt(lctx, v, sid)
 			cancel()
 		}
 	}
@@ -454,7 +452,7 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 				s.logger.Warn("an Inspector page from the hub could not carry the boot script and was not served")
 				s.page(w, http.StatusBadGateway, "Inspector unavailable",
 					"The Inspector page could not be prepared. Try again in a moment from Golem Deploy.")
-			case errors.Is(err, errHubSessionLost):
+			case errors.Is(err, errHubSessionLost), errors.Is(err, errHubUnverified):
 				hubError(w, http.StatusServiceUnavailable, "hub_unavailable")
 			default:
 				s.logger.Debug("inspector proxy request failed", "err", err)
@@ -477,10 +475,13 @@ func webSocketAnswer(resp *http.Response) bool {
 		strings.EqualFold(strings.TrimSpace(resp.Header.Get("Upgrade")), "websocket") && len(resp.Header.Values("Upgrade")) == 1
 }
 
-// retryTransport logs in again, once, when the hub no longer knows the
-// session's hub session (the hub restarted), and repeats the request with
-// the new session. When that fails the request fails (503): the hub's
-// "not signed in" answer never reaches the browser.
+// retryTransport sends a request only to a hub port Docker confirmed
+// within hubCheckInterval (the session's hub cookie never goes elsewhere,
+// and neither does a browser's request for the Inspector's own pages). It
+// logs in again, once, when the hub no longer knows the session's hub
+// session (the hub restarted), and repeats the request with the new
+// session. When that fails the request fails (503): the hub's "not signed
+// in" answer never reaches the browser.
 type retryTransport struct {
 	s    *Service
 	base http.RoundTripper
@@ -488,6 +489,9 @@ type retryTransport struct {
 
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	info := proxyInfoFrom(req.Context())
+	if !t.s.freshHub(req.Context(), info.view) {
+		return nil, errHubUnverified
+	}
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
 		return nil, t.s.hubUnreachable(req.Context(), info.view.port, err)
@@ -654,17 +658,26 @@ func (s *Service) logoutHub(sid string) {
 	if sid == "" {
 		return
 	}
-	port := s.hubNow().port
-	if port == 0 {
+	v := s.hubNow()
+	if v.port == 0 {
 		return
 	}
 	s.goBG(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := s.hub.logout(ctx, port, sid); err != nil {
-			_ = s.hubUnreachable(ctx, port, err)
-		}
+		s.logoutAt(ctx, v, sid)
 	})
+}
+
+// logoutAt ends hub session sid at the hub of snapshot v, only while Docker
+// confirmed v's port within hubCheckInterval (renewed first when older).
+func (s *Service) logoutAt(ctx context.Context, v hubView, sid string) {
+	if !s.freshHub(ctx, v) {
+		return
+	}
+	if err := s.hub.logout(ctx, v.port, sid); err != nil {
+		_ = s.hubUnreachable(ctx, v.port, err)
+	}
 }
 
 // endSession ends a session: its streams close and its hub session is

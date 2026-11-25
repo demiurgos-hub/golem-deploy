@@ -154,8 +154,9 @@ type sessionEntry struct {
 // Origin). Failed tickets are limited per client address; the limiter is
 // asked before the body is read. It consumes the ticket, checks the
 // account, logs in at the hub for the new session and answers the key;
-// only its hash is kept. The session is registered only while the
-// generation (listener and secrets) the exchange started with is current.
+// only its hash is kept. The ticket is accepted only under the generation
+// (admission and secrets) it was issued under: when it is consumed, when
+// the hub snapshot is taken and when the session is registered.
 func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		reject(w, r, http.StatusMethodNotAllowed, "method_not_allowed")
@@ -187,8 +188,9 @@ func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 		hubError(w, http.StatusBadRequest, "bad_request")
 		return
 	}
+	cur := s.hubNow().gen
 	tk, ok := s.tickets.consume(req.Ticket)
-	if !ok {
+	if !ok || tk.gen != cur {
 		hubError(w, http.StatusForbidden, "link_invalid")
 		return
 	}
@@ -198,7 +200,16 @@ func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res.Refund()
+	if s.hooks.afterTicketConsumed != nil {
+		s.hooks.afterTicketConsumed()
+	}
 	v, serving := s.view()
+	if v.gen != tk.gen {
+		// The secrets were replaced or the Inspector turned off since the
+		// link was issued.
+		hubError(w, http.StatusForbidden, "link_invalid")
+		return
+	}
 	if !serving {
 		hubError(w, http.StatusServiceUnavailable, "not_running")
 		return
@@ -217,7 +228,7 @@ func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 	var key string
 	var evicted []*session
 	var createErr error
-	if !s.admit(v.gen, func() bool {
+	if !s.admit(tk.gen, func() bool {
 		key, _, evicted, createErr = s.sessions.create(acct.ID, acct.TokenVersion, sid)
 		return createErr == nil
 	}) {

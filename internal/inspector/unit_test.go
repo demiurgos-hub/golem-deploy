@@ -73,7 +73,7 @@ func TestSecretsStorage(t *testing.T) {
 func TestTickets(t *testing.T) {
 	clock := &fakeClock{t: time.Unix(1000, 0)}
 	ts := newTicketStore(clock.Now)
-	tok, exp, err := ts.issue(1, 5, "arena")
+	tok, exp, err := ts.issue(1, 5, "arena", 0)
 	if err != nil || len(tok) != 43 || !exp.Equal(clock.Now().Add(TicketTTL)) {
 		t.Fatalf("%q %v %v", tok, exp, err)
 	}
@@ -84,29 +84,29 @@ func TestTickets(t *testing.T) {
 	if _, ok := ts.consume(tok); ok {
 		t.Fatal("used twice")
 	}
-	tok, _, _ = ts.issue(1, 5, "")
+	tok, _, _ = ts.issue(1, 5, "", 0)
 	clock.Advance(TicketTTL)
 	if _, ok := ts.consume(tok); ok {
 		t.Fatal("expired ticket accepted")
 	}
 	for i := 0; i < maxTicketsPerAccount; i++ {
-		if _, _, err := ts.issue(2, 0, ""); err != nil {
+		if _, _, err := ts.issue(2, 0, "", 0); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, _, err := ts.issue(2, 0, ""); err != errTooManyTickets {
+	if _, _, err := ts.issue(2, 0, "", 0); err != errTooManyTickets {
 		t.Fatalf("per account: %v", err)
 	}
 	for i := int64(0); len(ts.m) < maxTickets; i++ {
-		if _, _, err := ts.issue(100+i/maxTicketsPerAccount, 0, ""); err != nil {
+		if _, _, err := ts.issue(100+i/maxTicketsPerAccount, 0, "", 0); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, _, err := ts.issue(99999, 0, ""); err != errTooManyTickets {
+	if _, _, err := ts.issue(99999, 0, "", 0); err != errTooManyTickets {
 		t.Fatalf("total: %v", err)
 	}
 	clock.Advance(TicketTTL)
-	if _, _, err := ts.issue(99999, 0, ""); err != nil {
+	if _, _, err := ts.issue(99999, 0, "", 0); err != nil {
 		t.Fatalf("after expiry: %v", err)
 	}
 	for _, bad := range []string{"", "short", strings.Repeat("a", 43), strings.Repeat("a", 100)} {

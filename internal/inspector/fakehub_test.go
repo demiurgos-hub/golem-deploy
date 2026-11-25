@@ -62,6 +62,8 @@ type fakeHub struct {
 	gone, stopped bool
 	publish       int
 	inspects      int
+	// inspectErr, when set, is what every inspect returns.
+	inspectErr error
 	// loginGate, when set, holds every login until it is closed.
 	loginGate chan struct{}
 	// logoutGate, when set, holds every logout until it is closed;
@@ -116,6 +118,9 @@ func (h *fakeHub) inspect(_ context.Context, id string) (docker.Container, error
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.inspects++
+	if h.inspectErr != nil {
+		return docker.Container{}, h.inspectErr
+	}
 	if h.gone || id != testHubID {
 		return docker.Container{}, docker.ErrNotFound
 	}
@@ -129,6 +134,12 @@ func (h *fakeHub) inspect(_ context.Context, id string) (docker.Container, error
 
 // restart drops every session, like a restarted hub.
 func (h *fakeHub) restart() { h.set(func(h *fakeHub) { h.sessions = map[string]bool{} }) }
+
+func (h *fakeHub) inspectCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.inspects
+}
 
 func (h *fakeHub) loginCount() int {
 	h.mu.Lock()
