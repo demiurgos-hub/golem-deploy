@@ -119,15 +119,19 @@ jobs:
 
       # sha256sum -c alone passes with missing entries: SHA256SUMS must hold
       # exactly one entry for each asset, nothing else, and match the files.
+      # They are compared as files, because a command substitution drops NUL
+      # bytes and trailing newlines.
       - name: SHA256SUMS matches the files to upload
         working-directory: dist/release
         run: |
-          want=$(sha256sum golem-deploy_linux_amd64.tar.gz golem-deploy_linux_arm64.tar.gz install.sh |
-            sed 's/^\([0-9a-f]\{64\}\) [ *]/\1  /' | LC_ALL=C sort)
-          got=$(LC_ALL=C sort SHA256SUMS)
-          if [ "$want" != "$got" ]; then
+          set -o pipefail
+          tmp=$(mktemp -d)
+          sha256sum golem-deploy_linux_amd64.tar.gz golem-deploy_linux_arm64.tar.gz install.sh |
+            sed 's/^\([0-9a-f]\{64\}\) [ *]/\1  /' | LC_ALL=C sort >"$tmp/want"
+          LC_ALL=C sort SHA256SUMS >"$tmp/got"
+          if ! cmp -s "$tmp/want" "$tmp/got"; then
             echo "::error::SHA256SUMS does not list exactly the three assets with their digests"
-            diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") || true
+            diff "$tmp/want" "$tmp/got" || true
             exit 1
           fi
           cat SHA256SUMS

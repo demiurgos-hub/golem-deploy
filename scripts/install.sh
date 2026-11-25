@@ -132,8 +132,10 @@ docker_server_version() {
 }
 
 # Docker's apt repository is configured when an enabled entry in a source
-# file apt reads points at it: "deb" lines in sources.list and *.list, and
-# deb822 stanzas in *.sources without "Enabled: no". Backups such as
+# file apt reads has a URI of Docker's repository: "deb" lines in
+# sources.list and *.list (everything after "#" is a comment), and deb822
+# stanzas in *.sources that apt does not disable ("Enabled: no", "false",
+# "0", "off" and the like, in any letter case). Backups such as
 # docker.sources.save, comments and disabled entries do not count.
 docker_repo_configured() {
 	local f
@@ -151,32 +153,49 @@ docker_repo_configured() {
 				/^[^ \t]/ { field = tolower($0); sub(/:.*/, "", field); val = $0; sub(/^[^:]*:/, "", val) }
 				/^[ \t]/ { val = $0 }
 				field == "types" && (" " val " ") ~ /[ \t]deb[ \t]/ { deb = 1 }
-				field == "uris" && val ~ /download\.docker\.com\/linux/ { uri = 1 }
-				field == "enabled" && tolower(val) ~ /^[ \t]*(no|false|off|without|disable)[ \t]*$/ { enabled = 0 }
+				field == "uris" { n = split(val, u, /[ \t]+/); for (i = 1; i <= n; i++) if (u[i] ~ /^https?:\/\/download\.docker\.com\/linux\//) uri = 1 }
+				field == "enabled" && tolower(val) ~ /^[ \t]*(no|false|0|off|without|disable)[ \t]*$/ { enabled = 0 }
 				END { flush(); exit !found }' "$f" && return 0
 			;;
 		*)
-			awk '$1 == "deb" && /download\.docker\.com\/linux/ { found = 1 } END { exit !found }' "$f" && return 0
+			# deb [options] URI suite [components]; the options may hold spaces.
+			awk '
+				{ sub(/#.*/, "") }
+				$1 != "deb" { next }
+				{
+					i = 2
+					if ($i ~ /^\[/) { while (i <= NF && $i !~ /\]$/) i++; i++ }
+					if ($i ~ /^https?:\/\/download\.docker\.com\/linux\//) found = 1
+				}
+				END { exit !found }' "$f" && return 0
 			;;
 		esac
 	done
 	return 1
 }
 
-# docker_candidates_ok PKG... checks that apt's candidate version of each
-# package comes from Docker's repository, so that a pin or another source
-# cannot swap in packages from elsewhere.
+# docker_candidates_ok PKG... checks that apt downloads the candidate
+# version of each package from Docker's repository, so that a pin, a mirror
+# or a local repository cannot swap in packages from elsewhere. Of the
+# sources that offer a version, apt uses one with the highest priority, so
+# every source with that priority must be Docker's repository for this OS.
 docker_candidates_ok() {
-	local pkg
+	local pkg policy
 	for pkg in "$@"; do
-		if ! LC_ALL=C apt-cache policy "$pkg" </dev/null 2>/dev/null | awk '
-			/^  Candidate:/ { cand = $2 }
-			/^ \*\*\* / { ver = $2; next }
-			/^     [^ ]/ { ver = $1; next }
-			/^        / && ver == cand && cand != "(none)" && /https:\/\/download\.docker\.com\/linux\// { ok = 1 }
-			END { exit !ok }'; then
-			warn "apt's candidate for $pkg does not come from https://download.docker.com:"
-			LC_ALL=C apt-cache policy "$pkg" </dev/null 2>&1 | sed -n '1,6s/^/    /p' >&2 || true
+		if ! policy=$(LC_ALL=C apt-cache policy "$pkg" </dev/null 2>/dev/null) ||
+			! printf '%s\n' "$policy" | awk -v want="https://download.docker.com/linux/$os_id" '
+				/^  Candidate:/ { cand = $2 }
+				/^ \*\*\* / { ver = $2; next }
+				/^     [^ ]/ { ver = $1; next }
+				/^        / && ver == cand && cand != "(none)" { n++; prio[n] = $1 + 0; url[n] = $2 }
+				END {
+					if (n == 0) exit 1
+					max = prio[1]
+					for (i = 2; i <= n; i++) if (prio[i] > max) max = prio[i]
+					for (i = 1; i <= n; i++) if (prio[i] == max && url[i] != want && url[i] != want "/") exit 1
+				}'; then
+			warn "apt would not download $pkg only from https://download.docker.com/linux/$os_id:"
+			printf '%s\n' "$policy" | sed -n '1,12s/^/    /p' >&2 || true
 			return 1
 		fi
 	done
@@ -186,14 +205,16 @@ docker_candidates_ok() {
 # GOLEM_DEPLOY_RELEASE_URL), with retries and a size cap. Older curl
 # versions apply --max-filesize only when the server sends a length, so the
 # cap is also enforced while writing: at most MAX_BYTES+1 bytes reach DEST,
-# and more than MAX_BYTES fails.
+# and more than MAX_BYTES fails. -q, which must come first, keeps curl from
+# reading root's ~/.curlrc, where "insecure" would turn off certificate
+# checks.
 fetch() {
 	local url=$1 dest=$2 max=$3 proto='=https' try size rc
 	case $url in file://*) proto='=file' ;; esac
 	for try in 1 2 3 4; do
 		[ "$try" -eq 1 ] || sleep 2
 		set +e
-		curl --proto "$proto" --proto-redir '=https' --tlsv1.2 -fsSL --connect-timeout 20 \
+		curl -q --proto "$proto" --proto-redir '=https' --tlsv1.2 -fsSL --connect-timeout 20 \
 			--max-filesize "$max" "$url" </dev/null | head -c "$((max + 1))" >"$dest"
 		rc=("${PIPESTATUS[@]}")
 		set -e
@@ -294,24 +315,58 @@ env_value() {
 	sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1
 }
 
+# settings_data_dir prints the data directory the settings file gives the
+# service. It fails unless the last assignment of GOLEM_DEPLOY_DATA_DIR is
+# a plain line GOLEM_DEPLOY_DATA_DIR=/path whose path the daemon accepts and
+# systemd does not rewrite: no quotes, "$", backslash, control character,
+# "," or "=", and no space at the end. uninstall.sh reads it the same way.
+settings_data_dir() {
+	local text line trimmed last=''
+	text=$(cat -- "$ENV_FILE" 2>/dev/null) || return 1
+	while IFS= read -r line; do
+		trimmed=${line#"${line%%[![:space:]]*}"}
+		case $trimmed in '#'* | ';'*) continue ;; esac
+		[[ $trimmed =~ ^GOLEM_DEPLOY_DATA_DIR[[:space:]]*= ]] && last=$line
+	done <<<"$text"
+	[[ $last =~ ^GOLEM_DEPLOY_DATA_DIR=(/.*)$ ]] || return 1
+	last=${BASH_REMATCH[1]}
+	case $last in *[\"\'\$\\,=]* | *[[:cntrl:]]* | *[[:space:]]) return 1 ;; esac
+	printf '%s' "$last"
+}
+
+# shell_quote WORD prints WORD quoted for a POSIX shell when it needs it.
+shell_quote() {
+	local q="'\\''"
+	case $1 in
+	'' | *[!A-Za-z0-9_./:=@+-]*) printf "'%s'" "${1//\'/"$q"}" ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
 # extract_archive ARCHIVE DIR unpacks exactly the expected members of a
 # release archive into DIR. Anything else (other names, directories, links,
 # devices, duplicates, oversized contents) is refused before extraction.
 extract_archive() {
-	local archive=$1 dir=$2 label=${3:-$1} names listing line total f
+	local archive=$1 dir=$2 label=${3:-$1} names listing line size total f
 	names=$(tar -tzf "$archive" 2>/dev/null) || die "$label is not a readable .tar.gz archive"
 	# shellcheck disable=SC2086 # the member names are fixed words
 	if [ "$(printf '%s\n' "$names" | LC_ALL=C sort)" != "$(printf '%s\n' $ARCHIVE_MEMBERS)" ]; then
 		die "$label does not contain exactly the files of a Golem Deploy release ($ARCHIVE_MEMBERS)"
 	fi
-	listing=$(tar -tvzf "$archive" 2>/dev/null) || die "$label is not a readable .tar.gz archive"
+	# With numeric owners every line is "MODE UID/GID SIZE DATE TIME NAME",
+	# so an owner name with spaces cannot shift the size field.
+	listing=$(tar --numeric-owner -tvzf "$archive" 2>/dev/null) || die "$label is not a readable .tar.gz archive"
+	total=0
 	while IFS= read -r line; do
 		case $line in
 		-*) ;;
 		*) die "$label contains something other than plain files: $line" ;;
 		esac
+		[[ $line =~ ^-[^\ ]{9}\ +[0-9]+/[0-9]+\ +([0-9]{1,18})\  ]] || die "$label has an unexpected listing line: $line"
+		size=$((10#${BASH_REMATCH[1]}))
+		[ "$size" -le "$ARCHIVE_MAX_BYTES" ] || die "$label unpacks to more than $ARCHIVE_MAX_BYTES bytes"
+		total=$((total + size))
 	done <<<"$listing"
-	total=$(printf '%s\n' "$listing" | awk '{ s += $3 } END { printf "%d", s }')
 	[ "$total" -le "$ARCHIVE_MAX_BYTES" ] || die "$label unpacks to more than $ARCHIVE_MAX_BYTES bytes"
 	# shellcheck disable=SC2086 # the member names are fixed words
 	tar -xzf "$archive" -C "$dir" --no-same-owner --no-same-permissions -- $ARCHIVE_MEMBERS ||
@@ -361,8 +416,16 @@ install_docker() {
 			die "could not download Docker's repository key from https://download.docker.com/linux/$os_id/gpg; nothing was changed for Docker"
 		# The keyring and the source file are written only after the key matched.
 		check_docker_key "$work/docker.asc"
-		install -d -m 0755 -o root -g root /etc/apt/keyrings
-		install -m 0644 -o root -g root "$work/docker.asc" "$DOCKER_KEYRING"
+		# An existing keyring is never overwritten.
+		if [ -e "$DOCKER_KEYRING" ] || [ -L "$DOCKER_KEYRING" ]; then
+			cmp -s -- "$work/docker.asc" "$DOCKER_KEYRING" ||
+				die "$DOCKER_KEYRING exists, but does not hold the key just downloaded from Docker. Remove it" \
+					"(no enabled apt source uses Docker's repository) and run this script again. Nothing was changed for Docker."
+			note "$DOCKER_KEYRING already holds this key"
+		else
+			install -d -m 0755 -o root -g root /etc/apt/keyrings
+			install -T -m 0644 -o root -g root "$work/docker.asc" "$DOCKER_KEYRING"
+		fi
 		cat >"$work/docker.sources" <<EOF
 # Docker's apt repository, added by the Golem Deploy installer.
 Types: deb
@@ -372,7 +435,7 @@ Components: stable
 Architectures: $arch
 Signed-By: $DOCKER_KEYRING
 EOF
-		install -m 0644 -o root -g root "$work/docker.sources" "$DOCKER_SOURCES"
+		install -T -m 0644 -o root -g root "$work/docker.sources" "$DOCKER_SOURCES"
 		note "wrote $DOCKER_KEYRING and $DOCKER_SOURCES"
 	fi
 	say "Installing Docker Engine ($DOCKER_PACKAGES)"
@@ -419,8 +482,8 @@ apply_sysctl() {
 # a value that was already higher is kept.
 $lines
 EOF
-	install -m 0644 -o root -g root "$work/sysctl.conf" "$SYSCTL_FILE.new"
-	mv -f "$SYSCTL_FILE.new" "$SYSCTL_FILE"
+	install -T -m 0644 -o root -g root "$work/sysctl.conf" "$SYSCTL_FILE.new"
+	mv -fT "$SYSCTL_FILE.new" "$SYSCTL_FILE"
 	printf '%s' "$lines" | sed 's/^/    /'
 	local f
 	if command -v sysctl >/dev/null 2>&1; then
@@ -584,6 +647,14 @@ main() {
 		release_url=${release_url%/}
 	fi
 
+	# Everything is unpacked or copied into a private directory first and
+	# installed from there.
+	work=$(mktemp -d)
+	trap 'rm -rf -- "$work"' EXIT
+
+	# The TLS files are copied once; the copies are checked and installed,
+	# so a renewal in between cannot install a mismatched pair.
+	local tls_cert_copy=$work/tls-cert.pem tls_key_copy=$work/tls-key.pem
 	if [ -n "$tls_cert" ] || [ -n "$tls_key" ]; then
 		if [ -z "$tls_cert" ] || [ -z "$tls_key" ]; then
 			die "--tls-cert and --tls-key must be given together"
@@ -592,15 +663,18 @@ main() {
 			if [ ! -f "$f" ] || [ ! -r "$f" ] || [ ! -s "$f" ]; then
 				die "$f is not a readable, non-empty file"
 			fi
-			grep -q -- '-----BEGIN ' "$f" || die "$f does not look like a PEM file"
 		done
-		grep -q -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' "$tls_key" || die "$tls_key does not contain a PEM private key"
-		grep -q -- '-----BEGIN CERTIFICATE-----' "$tls_cert" || die "$tls_cert does not contain a PEM certificate"
+		head -c 1048577 <"$tls_cert" >"$tls_cert_copy" || die "could not read $tls_cert"
+		[ "$(stat -c %s -- "$tls_cert_copy")" -le 1048576 ] || die "$tls_cert is larger than 1 MiB"
+		head -c 1048577 <"$tls_key" >"$tls_key_copy" || die "could not read $tls_key"
+		[ "$(stat -c %s -- "$tls_key_copy")" -le 1048576 ] || die "$tls_key is larger than 1 MiB"
+		grep -q -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' "$tls_key_copy" || die "$tls_key does not contain a PEM private key"
+		grep -q -- '-----BEGIN CERTIFICATE-----' "$tls_cert_copy" || die "$tls_cert does not contain a PEM certificate"
 		if command -v openssl >/dev/null 2>&1; then
 			local cert_pub key_pub
-			cert_pub=$(openssl x509 -in "$tls_cert" -noout -pubkey 2>/dev/null </dev/null) ||
+			cert_pub=$(openssl x509 -in "$tls_cert_copy" -noout -pubkey 2>/dev/null </dev/null) ||
 				die "openssl cannot read the certificate in $tls_cert"
-			key_pub=$(openssl pkey -in "$tls_key" -pubout -passin pass: 2>/dev/null </dev/null) ||
+			key_pub=$(openssl pkey -in "$tls_key_copy" -pubout -passin pass: 2>/dev/null </dev/null) ||
 				die "openssl cannot read the private key in $tls_key (encrypted keys are not supported)"
 			[ "$cert_pub" = "$key_pub" ] || die "$tls_key is not the private key of the certificate in $tls_cert"
 		fi
@@ -685,6 +759,13 @@ main() {
 	fi
 	note "systemd: $(systemctl --version | head -n 1)"
 
+	# The files this run writes must not be directories (or links to them).
+	local dest
+	for dest in "$BIN_DEST" "$BIN_DEST.new" "$UNINSTALL_DEST" "$UNINSTALL_DEST.new" "$UNIT_DEST" "$ENV_FILE" \
+		"$SYSCTL_FILE" "$SYSCTL_FILE.new" "$TLS_CERT_DEST" "$TLS_CERT_DEST.new" "$TLS_KEY_DEST" "$TLS_KEY_DEST.new"; do
+		[ ! -d "$dest" ] || die "$dest is a directory; the installer writes a file there. Remove it and run this script again."
+	done
+
 	if [ -n "$default_ports" ]; then
 		local busy='' port owner
 		for port in 443 80; do
@@ -745,6 +826,15 @@ main() {
 		docker_plan=install
 		note "Docker Engine is not installed; it will be installed from Docker's apt repository"
 		if ! docker_repo_configured; then
+			# The file this run would write is never overwritten.
+			if [ -e "$DOCKER_SOURCES" ] || [ -L "$DOCKER_SOURCES" ]; then
+				die "$DOCKER_SOURCES exists but has no enabled entry for Docker's repository" \
+					"(https://download.docker.com/linux/$os_id). Enable it (remove its \"Enabled:\" line) or remove the file," \
+					"and run this script again. Nothing was changed."
+			fi
+			if [ -e "$DOCKER_KEYRING" ] && [ ! -f "$DOCKER_KEYRING" ]; then
+				die "$DOCKER_KEYRING exists and is not a file; remove it and run this script again. Nothing was changed."
+			fi
 			docker_add_repo=yes
 			if [ "$os_id" = ubuntu ]; then
 				# shellcheck source=/dev/null
@@ -781,10 +871,6 @@ main() {
 
 	# --- the program to install ----------------------------------------------
 
-	# Everything is unpacked or copied into a private directory first and
-	# installed from there.
-	work=$(mktemp -d)
-	trap 'rm -rf -- "$work"' EXIT
 	local payload=$work/payload
 	mkdir -m 0700 "$payload"
 
@@ -828,11 +914,12 @@ main() {
 			die "$archive cannot be verified: pass --sha256 HEX, or put the release's SHA256SUMS next to it; nothing was changed"
 		fi
 		# Hash, list and extract a private copy, so the file checked is the
-		# file installed.
+		# file installed. The cap is enforced while copying: at most one byte
+		# more than allowed is written.
 		local size
-		size=$(stat -c %s -- "$archive")
+		head -c "$((ARCHIVE_MAX_BYTES + 1))" <"$archive" >"$copy" || die "could not copy $archive"
+		size=$(stat -c %s -- "$copy")
 		[ "$size" -le "$ARCHIVE_MAX_BYTES" ] || die "$archive is larger than $ARCHIVE_MAX_BYTES bytes"
-		cp -- "$archive" "$copy" || die "could not copy $archive"
 		got=$(sha256_of "$copy")
 		[ "$got" = "$want" ] || die "the SHA-256 of $archive is $got, but $want was expected; nothing was changed"
 		say "Using $archive (SHA-256 $got matches)"
@@ -988,13 +1075,13 @@ main() {
 	fi
 	# Copy next to the destination, then rename: a running service keeps the old
 	# file until it restarts, and an interrupted copy never leaves half a binary.
-	install -m 0755 -o root -g root "$payload/golem-deploy" "$BIN_DEST.new"
-	mv -f "$BIN_DEST.new" "$BIN_DEST"
+	install -T -m 0755 -o root -g root "$payload/golem-deploy" "$BIN_DEST.new"
+	mv -fT "$BIN_DEST.new" "$BIN_DEST"
 
 	say "Installing the uninstaller as $UNINSTALL_DEST"
 	install -d -m 0755 -o root -g root "$(dirname "$UNINSTALL_DEST")"
-	install -m 0755 -o root -g root "$payload/uninstall.sh" "$UNINSTALL_DEST.new"
-	mv -f "$UNINSTALL_DEST.new" "$UNINSTALL_DEST"
+	install -T -m 0755 -o root -g root "$payload/uninstall.sh" "$UNINSTALL_DEST.new"
+	mv -fT "$UNINSTALL_DEST.new" "$UNINSTALL_DEST"
 
 	# --- settings ------------------------------------------------------------
 
@@ -1003,10 +1090,10 @@ main() {
 	if [ -n "$tls_cert" ]; then
 		say "Installing the TLS certificate and key into $TLS_DIR"
 		install -d -m 0750 -o root -g "$svc_group" "$TLS_DIR"
-		install -m 0644 -o root -g root "$tls_cert" "$TLS_CERT_DEST.new"
-		install -m 0640 -o root -g "$svc_group" "$tls_key" "$TLS_KEY_DEST.new"
-		mv -f "$TLS_CERT_DEST.new" "$TLS_CERT_DEST"
-		mv -f "$TLS_KEY_DEST.new" "$TLS_KEY_DEST"
+		install -T -m 0644 -o root -g root "$tls_cert_copy" "$TLS_CERT_DEST.new"
+		install -T -m 0640 -o root -g "$svc_group" "$tls_key_copy" "$TLS_KEY_DEST.new"
+		mv -fT "$TLS_CERT_DEST.new" "$TLS_CERT_DEST"
+		mv -fT "$TLS_KEY_DEST.new" "$TLS_KEY_DEST"
 	fi
 
 	detected_addr=''
@@ -1064,64 +1151,69 @@ $tls_lines
 EOF
 		chown root:"$svc_group" "$tmp_env"
 		chmod 0640 "$tmp_env"
-		mv "$tmp_env" "$ENV_FILE"
+		mv -T "$tmp_env" "$ENV_FILE"
 		env_written=yes
 	fi
 
 	# --- systemd unit --------------------------------------------------------
 
 	say "Installing $UNIT_DEST"
-	install -m 0644 -o root -g root "$payload/golem-deploy.service" "$UNIT_DEST"
+	install -T -m 0644 -o root -g root "$payload/golem-deploy.service" "$UNIT_DEST"
 	systemctl daemon-reload
 	systemctl enable "$SERVICE" >/dev/null 2>&1 || die "systemctl enable $SERVICE failed"
 
 	say "Restarting $SERVICE"
-	local restart_at state started='' invocation
+	local restart_at state='' substate='' started='' restarted=yes invocation
 	restart_at=$(date +%s)
 	# Clear the unit's start limit (5 starts in 5 minutes), which repeated
 	# runs of this script would otherwise hit.
 	systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
-	systemctl restart "$SERVICE" || true
+	systemctl restart "$SERVICE" || restarted=''
 
 	# Wait until this run of the service logs that it is listening, or fails.
-	for _ in $(seq "$START_TIMEOUT"); do
-		state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
-		# Restart=on-failure turns a crash into "activating (auto-restart)".
-		[ "$(systemctl show -p SubState --value "$SERVICE")" != auto-restart ] || break
-		if [ "$state" = active ]; then
-			invocation=$(systemctl show -p InvocationID --value "$SERVICE")
-			if [ -n "$invocation" ] &&
-				journalctl --no-pager -q -o cat "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null | grep 'golem-deploy listening' >/dev/null; then
-				started=yes
+	# A failing systemctl must not end the script before the failure handling.
+	if [ -n "$restarted" ]; then
+		for _ in $(seq "$START_TIMEOUT"); do
+			state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
+			substate=$(systemctl show -p SubState --value "$SERVICE" 2>/dev/null || true)
+			# Restart=on-failure turns a crash into "activating (auto-restart)".
+			[ "$substate" != auto-restart ] || break
+			if [ "$state" = active ]; then
+				invocation=$(systemctl show -p InvocationID --value "$SERVICE" 2>/dev/null || true)
+				if [ -n "$invocation" ] &&
+					journalctl --no-pager -q -o cat "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null | grep 'golem-deploy listening' >/dev/null; then
+					started=yes
+					break
+				fi
+			elif [ "$state" != activating ] && [ "$state" != reloading ]; then
 				break
 			fi
-		elif [ "$state" != activating ] && [ "$state" != reloading ]; then
-			break
-		fi
-		sleep 1
-	done
-	if [ -z "$started" ]; then
-		state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
-		if [ "$state" = active ]; then
-			warn "$SERVICE is active but did not log \"golem-deploy listening\" within ${START_TIMEOUT}s; check: journalctl -u $SERVICE"
-		else
-			printf '\n' >&2
-			systemctl status --no-pager --lines=0 "$SERVICE" >&2 || true
-			printf '\nLog since the restart:\n' >&2
-			journalctl --no-pager -u "$SERVICE" --since "@$restart_at" -n 40 >&2 || true
-			local substate
-			substate=$(systemctl show -p SubState --value "$SERVICE" 2>/dev/null || true)
-			if [ -n "$env_written" ]; then
-				# Otherwise the next run would keep a settings file the daemon refuses.
-				systemctl stop "$SERVICE" >/dev/null 2>&1 || true
-				mv -f "$ENV_FILE" "$ENV_FILE.failed"
+			sleep 1
+		done
+	fi
+	state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
+	if [ -n "$started" ]; then
+		say "$SERVICE is running"
+	elif [ -n "$restarted" ] && [ "$state" = active ]; then
+		warn "$SERVICE is active but did not log \"golem-deploy listening\" within ${START_TIMEOUT}s," \
+			"so no setup link is made; check: systemctl status $SERVICE; journalctl -u $SERVICE"
+	else
+		printf '\n' >&2
+		systemctl status --no-pager --lines=0 "$SERVICE" >&2 || true
+		printf '\nLog since the restart:\n' >&2
+		journalctl --no-pager -u "$SERVICE" --since "@$restart_at" -n 40 >&2 || true
+		substate=$(systemctl show -p SubState --value "$SERVICE" 2>/dev/null || true)
+		if [ -n "$env_written" ]; then
+			# Otherwise the next run would keep a settings file the daemon refuses.
+			systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+			if mv -fT "$ENV_FILE" "$ENV_FILE.failed"; then
 				warn "the settings file this run wrote was moved to $ENV_FILE.failed;" \
 					"the next run writes a new one from its options"
+			else
+				warn "could not move $ENV_FILE to $ENV_FILE.failed; remove it before the next run"
 			fi
-			die "$SERVICE did not start (state: ${state:-unknown}/${substate:-unknown}); see the log above and docs/INSTALL.md (Troubleshooting)"
 		fi
-	else
-		say "$SERVICE is running"
+		die "$SERVICE did not start (state: ${state:-unknown}/${substate:-unknown}); see the log above and docs/INSTALL.md (Troubleshooting)"
 	fi
 
 	# --- next steps ----------------------------------------------------------
@@ -1148,13 +1240,21 @@ EOF
 		fingerprint=$(panel_fingerprint)
 	fi
 
-	# The data directory the service uses.
-	local eff_data
-	eff_data=$(env_value GOLEM_DEPLOY_DATA_DIR)
-	case $eff_data in
-	/*) [[ $eff_data =~ ^[A-Za-z0-9._/-]+$ ]] || eff_data=$DATA_DIR ;;
-	*) eff_data=$DATA_DIR ;;
-	esac
+	# The data directory the service uses, and why no setup link is made, if
+	# none is. Without a usable data directory there is no fallback: another
+	# directory could hold another database, or none yet.
+	local eff_data='' eff_data_q='<data directory>' link_skip=''
+	if eff_data=$(settings_data_dir); then
+		eff_data_q=$(shell_quote "$eff_data")
+	else
+		eff_data=''
+	fi
+	if [ -z "$started" ]; then
+		link_skip="$SERVICE did not log that it is listening"
+	elif [ -z "$eff_data" ]; then
+		link_skip="$ENV_FILE does not set GOLEM_DEPLOY_DATA_DIR to a plain absolute path"
+		link_skip+=" (one line GOLEM_DEPLOY_DATA_DIR=/path without quotes), so the data directory the service uses is unclear"
+	fi
 
 	# The setup link is a secret: it is held in a variable and printed, never
 	# written to a file or logged. Shell tracing (bash -x) stays off while
@@ -1166,7 +1266,9 @@ EOF
 		;;
 	esac
 	local link='' link_rc=0 link_err=$work/setup-link.err
-	if [ -n "$origin" ]; then
+	if [ -n "$link_skip" ]; then
+		link_rc=1
+	elif [ -n "$origin" ]; then
 		set +e
 		link=$(cd / && runuser -u "$SVC_USER" -- "$BIN_DEST" admin setup-link \
 			--data-dir "$eff_data" --origin "$origin" --ttl 1h 2>"$link_err" </dev/null)
@@ -1200,8 +1302,18 @@ $step. The panel listens on $eff_listen and is reachable from this host only.
 EOF
 		step=$((step + 1))
 	fi
-	local link_cmd="sudo runuser -u $SVC_USER -- $BIN_DEST admin setup-link --data-dir $eff_data --origin ${origin:-<panel address>}"
-	if [ "$link_rc" -eq 0 ]; then
+	local link_cmd="sudo runuser -u $SVC_USER -- $BIN_DEST admin setup-link --data-dir $eff_data_q --origin ${origin:-<panel address>}"
+	if [ -n "$link_skip" ]; then
+		printf '%s. No setup link for the first admin account was made: %s.\n' "$step" "$link_skip"
+		if [ -z "$started" ]; then
+			printf '   Check the service with: systemctl status %s; journalctl -u %s\n' "$SERVICE" "$SERVICE"
+			printf '   Once it runs, make a link (it works once and for one hour) with:\n'
+		else
+			printf '   Make a link (it works once and for one hour) with the data directory\n'
+			printf '   the service uses:\n'
+		fi
+		printf '\n     %s\n\n' "$link_cmd"
+	elif [ "$link_rc" -eq 0 ]; then
 		cat <<EOF
 $step. Create the first admin account: open this link in your browser.
    It works once and for one hour.
@@ -1224,7 +1336,7 @@ $step. Create the first admin account, unless you already have one. It prompts f
    the password twice (add --password-stdin to pipe it instead). Run it as
    $SVC_USER so the files it creates stay readable by the service:
 
-     sudo runuser -u $SVC_USER -- $BIN_DEST admin create --data-dir $eff_data --username admin
+     sudo runuser -u $SVC_USER -- $BIN_DEST admin create --data-dir $eff_data_q --username admin
 
    Then open the panel at ${origin:-https://<this host>:${eff_listen##*:}}/
 
