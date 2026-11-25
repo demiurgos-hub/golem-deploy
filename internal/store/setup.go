@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -92,22 +93,30 @@ type queryRower interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// noSetupToken stands in for the stored token and its expiry while none is
+// pending, so that every refused token takes the same steps: both queries,
+// the time parse and the constant-time comparison of 64 bytes. No setup
+// token hashes to it (a hash is 64 hex characters).
+var noSetupToken = struct{ hash, expires string }{
+	hash:    strings.Repeat("x", 64),
+	expires: formatTime(time.Unix(0, 0)),
+}
+
 // setupTokenValid checks hash against the stored token in constant time.
+// Every refusal (an admin exists, no token, wrong token, expired) does the
+// same work.
 func (s *Store) setupTokenValid(ctx context.Context, q queryRower, hash string) (bool, error) {
-	var n int
-	err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE role = 'admin' AND approved = 1`).Scan(&n)
+	var admins int
+	err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE role = 'admin' AND approved = 1`).Scan(&admins)
 	if err != nil {
 		return false, mapErr("check setup token", err)
 	}
-	if n > 0 {
-		return false, nil
-	}
+	pending := true
 	var stored, expires string
 	err = q.QueryRowContext(ctx, `SELECT token_hash, expires_at FROM setup_token WHERE id = 1`).Scan(&stored, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
+		pending, stored, expires = false, noSetupToken.hash, noSetupToken.expires
+	} else if err != nil {
 		return false, mapErr("check setup token", err)
 	}
 	exp, err := parseTime(expires)
@@ -115,7 +124,7 @@ func (s *Store) setupTokenValid(ctx context.Context, q queryRower, hash string) 
 		return false, err
 	}
 	match := subtle.ConstantTimeCompare([]byte(stored), []byte(hash)) == 1
-	return match && s.nowUTC().Before(exp), nil
+	return pending && admins == 0 && match && s.nowUTC().Before(exp), nil
 }
 
 func deleteSetupToken(ctx context.Context, tx *sql.Tx) error {

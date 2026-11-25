@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -195,5 +196,26 @@ func TestCompleteSetupChecksForAdmins(t *testing.T) {
 	}
 	if _, err := s.CompleteSetup(ctx, "a", setupAdmin("root")); !errors.Is(err, ErrSetupInvalid) {
 		t.Fatalf("with an admin: %v", err)
+	}
+}
+
+func TestSetupTokenRefusedWithoutAPendingToken(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	// The stand-in values are never accepted, not even when sent as the
+	// hash.
+	for _, h := range []string{noSetupToken.hash, "", strings.Repeat("0", 64)} {
+		if ok, err := s.CheckSetupToken(ctx, h); err != nil || ok {
+			t.Fatalf("no token, hash %q: %v %v", h, ok, err)
+		}
+		if _, err := s.CompleteSetup(ctx, h, setupAdmin("root")); !errors.Is(err, ErrSetupInvalid) {
+			t.Fatalf("complete without a token: %v", err)
+		}
+	}
+	if _, err := parseTime(noSetupToken.expires); err != nil {
+		t.Fatal(err)
+	}
+	if len(noSetupToken.hash) != 64 {
+		t.Fatal("the stand-in hash must have the length of a real one")
 	}
 }
