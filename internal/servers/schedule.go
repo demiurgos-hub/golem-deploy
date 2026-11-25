@@ -81,18 +81,18 @@ func (s *Service) ScheduleBackups(ctx context.Context, start JobStarter) ([]int6
 // scheduledBackup takes a scheduled backup and applies the server's
 // retention afterwards. It first checks again, now that it holds the
 // server's job slot, that the backup is still due; when it is not, it
-// says why and succeeds. A failure delays the next attempt.
+// says why and succeeds. A failure, also one of that check, delays the
+// next attempt; a cancellation does not.
 func (s *Service) scheduledBackup(ctx context.Context, id int64, log io.Writer) error {
 	fmt.Fprintln(log, "scheduled backup")
 	why, err := s.stillDue(ctx, id)
-	if err != nil {
-		return err
-	}
 	if why != "" {
 		fmt.Fprintln(log, why)
 		return nil
 	}
-	err = s.Backup(ctx, id, BackupOptions{Kind: store.BackupScheduled}, log)
+	if err == nil {
+		err = s.Backup(ctx, id, BackupOptions{Kind: store.BackupScheduled}, log)
+	}
 	var at *time.Time
 	switch {
 	case err != nil && ctx.Err() != nil:
@@ -112,8 +112,9 @@ func (s *Service) scheduledBackup(ctx context.Context, id int64, log io.Writer) 
 }
 
 // stillDue returns why a scheduled backup of server id is no longer due
-// ("" when it is): the schedule was turned off, the server no longer runs,
-// or a backup newer than the interval exists.
+// ("" when it is): the schedule was turned off, a scheduled backup failed
+// within ScheduleRetryDelay (recorded after the tick read the server), the
+// server no longer runs, or a backup newer than the interval exists.
 func (s *Service) stillDue(ctx context.Context, id int64) (string, error) {
 	sv, err := s.load(ctx, id)
 	if err != nil {
@@ -121,6 +122,10 @@ func (s *Service) stillDue(ctx context.Context, id int64) (string, error) {
 	}
 	if sv.BackupIntervalHours <= 0 {
 		return "the backup schedule was turned off meanwhile; nothing to do", nil
+	}
+	if sv.BackupFailedAt != nil && s.cfg.Now().Sub(*sv.BackupFailedAt) < ScheduleRetryDelay {
+		return fmt.Sprintf("a scheduled backup failed at %s; the next attempt waits %s after a failure, so nothing to do",
+			sv.BackupFailedAt.UTC().Format(time.RFC3339), ScheduleRetryDelay), nil
 	}
 	ct, err := s.container(ctx, sv)
 	if err != nil {

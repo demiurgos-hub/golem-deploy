@@ -457,9 +457,9 @@ func (s *Service) copyFailure(ctx context.Context, sv store.Server, err error) e
 // reports whether one was written; a stopped server, a game without the
 // snapshot hook or an admin endpoint that does not answer give false. Any
 // other answer fails the backup. The whole request, retries included, is
-// bounded by SnapshotDeadline; before every retry the recorded container
-// is inspected again and the next request goes to the port that
-// inspection reports.
+// bounded by SnapshotDeadline, and so are the inspections between retries:
+// before every retry the recorded container is inspected again and the
+// next request goes to the port that inspection reports.
 func (s *Service) snapshot(ctx context.Context, sv store.Server, log io.Writer) (bool, error) {
 	ct, err := s.container(ctx, sv)
 	if err != nil {
@@ -507,7 +507,10 @@ func (s *Service) snapshot(ctx context.Context, sv store.Server, log io.Writer) 
 				return false, tooLong()
 			case <-time.After(s.cfg.SnapshotRetry):
 			}
-			if ct, err = s.container(ctx, sv); err != nil {
+			if ct, err = s.container(sctx, sv); err != nil {
+				if sctx.Err() != nil {
+					return false, tooLong()
+				}
 				return false, s.failDocker(ctx, sv, "inspect the container", err)
 			}
 			if ct == nil || !adminRunning(*ct) {
