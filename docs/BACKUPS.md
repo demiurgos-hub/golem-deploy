@@ -105,3 +105,8 @@ When both are known and differ (`Server.data.schema_mismatch`), a start or resta
 ## Backing up the daemon itself
 
 Backups live in the data directory. Copy `<data-dir>/backups/` together with `golem-deploy.db` and `keys/` when you back up the daemon (see [INSTALL.md](INSTALL.md#upgrade)). The data volumes themselves stay in Docker; a backup of the host should include Docker's volumes or rely on the archives above.
+
+## See also
+
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md#backups-and-restore): backup and restore errors and their fixes.
+- [SECURITY.md](SECURITY.md#backups): why archives are treated as untrusted.

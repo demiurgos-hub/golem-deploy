@@ -7,7 +7,7 @@ Windows with Docker Desktop is supported for development only. On Windows, Golem
 ## Requirements
 
 - Ubuntu or Debian with systemd as the init system, on amd64 or arm64, and root access. To have Docker installed by the script, use a release that [Docker supports](https://docs.docker.com/engine/install/ubuntu/#os-requirements) (for example Ubuntu 22.04 or 24.04, Debian 12).
-- `curl`, which cloud images include. The installer installs the rest with apt: `git`, `git-lfs`, `openssh-client` (for SSH repository URLs) and `ca-certificates`, and Docker Engine with the buildx plugin when Docker is missing.
+- `curl`, which cloud images include. The installer installs the rest with apt: `git`, `git-lfs`, `openssh-client` (for SSH repository URLs) and `ca-certificates`, and, when Docker is missing, `gpg` (to check Docker's key) and Docker Engine with the buildx plugin.
 - Network access to GitHub and, when Docker is installed, to `download.docker.com`. Builds later need Docker Hub, gcr.io, the Go module proxy and npm. For hosts without network access, see [Offline installs](#offline-installs).
 - A dedicated host is best: the service user is root-equivalent through Docker (see [Security](#security)).
 
@@ -31,7 +31,7 @@ Where the program comes from:
 |--------|---------|
 | (none) | Download the release the script belongs to; for `install.sh` from `releases/latest`, that is the latest release. A script from a source checkout downloads the latest release |
 | `--version TAG` | Download release `TAG`, for example `v0.1.0` |
-| `--archive FILE` | Install from a downloaded release archive ([offline](#offline-installs)) |
+| `--archive FILE` | Install from a downloaded release archive ([offline](#offline-installs)); it needs `--sha256` or a `SHA256SUMS` next to it |
 | `--sha256 HEX` | The expected SHA-256 of the archive, checked instead of the release's `SHA256SUMS` ([verifying downloads](#verifying-downloads)) |
 | `--binary FILE` | Install a binary you built, from a source checkout ([building from source](#building-from-source)) |
 
@@ -79,13 +79,13 @@ When the service has started, the installer runs `golem-deploy admin setup-link`
      https://deploy.example.com/setup#t=...
 ```
 
-The link is a secret: anyone who opens it first becomes admin. The installer only prints it; it never writes it to a file or to the journal. To make a new one (for example when it expired):
+The link is a secret: whoever opens it first can choose the first admin's username and password and submit them. Opening it alone creates nothing. The installer only prints it; it never writes it to a file or to the journal, and it turns shell tracing off while it holds the link, so `bash -x` does not show it either. To make a new one (for example when it expired):
 
 ```sh
 sudo runuser -u golem-deploy -- /usr/local/bin/golem-deploy admin setup-link --data-dir /var/lib/golem-deploy --origin https://deploy.example.com
 ```
 
-The address in the link is built from the settings file: `https` unless the panel listens on loopback or with plain HTTP, the first public host (or the detected address), and the port unless it is the default one. When the panel listens on loopback, the link starts with `http://localhost:<port>` and the installer first prints the SSH tunnel to open:
+The installer uses the data directory the settings file names (`GOLEM_DEPLOY_DATA_DIR`, when it is an absolute path) for this command and the ones it prints. The address in the link is built from the settings file: `https` unless the panel listens on loopback or with plain HTTP, the first public host (or the detected address), and the port unless it is the default one. When the panel listens on loopback, the link starts with `http://localhost:<port>` and the installer first prints the SSH tunnel to open:
 
 ```sh
 ssh -N -L 8000:127.0.0.1:8000 <user>@<host>
@@ -103,7 +103,16 @@ It prompts for the password twice; `--password-stdin` reads it from the first li
 
 ## What the installer does
 
-It stops at the first failed check, before changing anything: the options, root, Ubuntu or Debian (`/etc/os-release`), amd64 or arm64, systemd running, the state of Docker (below), then the download, its checksum and its contents, and finally that the binary runs (`golem-deploy version`) and, for a download of a given version, reports that version. Then it:
+It first runs these checks and stops at the first one that fails, before changing anything: the options (including, when `openssl` is installed, that `--tls-cert` and `--tls-key` belong together), root, Ubuntu or Debian (`/etc/os-release`, and the release's code name when Docker's repository is to be added), amd64 or arm64, systemd running, the state of Docker (below), then the download, its checksum and its contents, and finally that the binary runs (`golem-deploy version`) and, for a download of a given version, reports that version.
+
+Some failures can only show up after changes began. They stop the installer with an error, and running it again after fixing the cause continues from there:
+
+- **Installing packages** (`apt-get update` or `apt-get install` fails): packages apt installed so far stay installed. apt runs with `--no-remove`, so it never removes a package.
+- **Docker's repository key** has the wrong fingerprint, or cannot be downloaded: `git`, `git-lfs`, `openssh-client`, `ca-certificates` and `gpg` may already be installed; Docker's keyring and source file are not written.
+- **Docker's packages** do not come from `download.docker.com` (another source or an apt pin wins), or installing them fails: the keyring and `/etc/apt/sources.list.d/docker.sources` stay and are used by the next run; no Docker package is installed in the first case.
+- **The service does not start:** the user, the data directory, the binary, the uninstaller, the unit and the UDP buffer settings are in place, and the unit is enabled. When this run wrote the settings file, it is moved to `/etc/golem-deploy/golem-deploy.env.failed` (same owner and mode) and the service is stopped, so that the next run writes a new one from its options; the installer says so. An existing settings file is kept as it is.
+
+Then it:
 
 | Creates or changes | Details |
 |--------------------|---------|
@@ -120,7 +129,7 @@ It stops at the first failed check, before changing anything: the options, root,
 | `/etc/systemd/system/golem-deploy.service` | The unit from [`deploy/golem-deploy.service`](../deploy/golem-deploy.service), enabled and (re)started |
 | `/var/cache/golem-deploy` | Created by systemd for Docker client state used by operations outside the build pipeline (`DOCKER_CONFIG`) |
 
-Downloads use HTTPS only (TLS 1.2 or newer, no redirect to plain HTTP) with retries. The archive is checked against `SHA256SUMS` before it is opened, and only its four expected files are extracted, as plain files, into a private temporary directory: anything else in the archive (other names, links, directories) stops the installation. The installer sets file modes itself and ignores those in the archive.
+Downloads use HTTPS only (TLS 1.2 or newer, no redirect to plain HTTP) with retries and a size cap (256 MiB for the archive, 1 MiB for `SHA256SUMS` and Docker's key) that holds also when the server sends no length. The archive is checked against `SHA256SUMS` before it is opened, and only its four expected files are extracted, as plain files, into a private temporary directory: anything else in the archive (other names, links, directories) stops the installation. The installer sets file modes itself and ignores those in the archive.
 
 After restarting the service it waits up to 30 seconds for the daemon to log `golem-deploy listening`; if the service fails instead, it prints `systemctl status` and the log of that start and exits with an error.
 
@@ -129,7 +138,7 @@ It never changes firewall rules. When ufw is active, it prints the `ufw allow` c
 ### Docker
 
 - **Docker works:** the installed Docker is kept as it is, whatever its version or source. Builds need the buildx plugin: when `docker buildx version` fails, the installer installs `docker-buildx-plugin` if Docker's apt repository is configured, and stops otherwise.
-- **Docker is missing:** the installer follows [Docker's instructions for Ubuntu](https://docs.docker.com/engine/install/ubuntu/) and [Debian](https://docs.docker.com/engine/install/debian/): it downloads Docker's repository key to `/etc/apt/keyrings/docker.asc`, writes `/etc/apt/sources.list.d/docker.sources` with `Signed-By:` that key, installs `docker-ce docker-ce-cli containerd.io docker-buildx-plugin`, then enables and starts Docker and waits until it answers. When `gpg` is installed, it first checks that the key has Docker's fingerprint `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88` and stops on a mismatch. When the repository is already configured, it is used as it is.
+- **Docker is missing:** the installer follows [Docker's instructions for Ubuntu](https://docs.docker.com/engine/install/ubuntu/) and [Debian](https://docs.docker.com/engine/install/debian/): it downloads Docker's repository key, checks that it has Docker's fingerprint `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88` (installing the distribution's `gpg` package first when `gpg` is missing) and stops on a mismatch. Only then does it write the key to `/etc/apt/keyrings/docker.asc` and `/etc/apt/sources.list.d/docker.sources` with `Signed-By:` that key. After `apt-get update` it checks with `apt-cache policy` that apt would install `docker-ce docker-ce-cli containerd.io docker-buildx-plugin` from `download.docker.com` and stops if another source or a pin wins, then installs them with `--no-remove`, enables and starts Docker and waits until it answers. When the repository is already configured, it is used as it is. Only enabled entries count: `deb` lines in `/etc/apt/sources.list` and `*.list` files, and stanzas without `Enabled: no` in `*.sources` files. Comments and backups such as `docker.sources.save` do not.
 - **Docker's packages are installed but Docker is stopped:** it is enabled and started.
 - **Conflicting packages:** when distribution packages that conflict with Docker's are installed (`docker.io`, `docker-compose`, `docker-compose-v2`, `docker-doc`, `docker-buildx`, `podman-docker`, `containerd`, `runc`) and Docker does not work, the installer stops and prints the `apt-get remove` command. It never removes packages itself.
 - Docker from a snap and rootless Docker are not supported.
@@ -157,7 +166,7 @@ The unit grants only `CAP_NET_BIND_SERVICE`, which lets the daemon bind ports be
 sudo systemctl restart golem-deploy
 ```
 
-The installer never overwrites this file. When it already exists, `--public-host`, `--listen` and `--port-range` are ignored with a warning.
+The installer never overwrites this file. When it already exists, `--public-host`, `--listen` and `--port-range` are ignored with a warning. The one exception is a file the same run wrote: when the service then does not start (for example because the daemon refuses an option), the file is moved to `golem-deploy.env.failed`, so that running the installer again with corrected options writes a new one.
 
 To run the panel behind a TLS-terminating reverse proxy on the same host, keep it on loopback and add the proxy and host name, for example:
 
@@ -174,7 +183,7 @@ Only if the proxy runs on another machine does the panel need a non-loopback add
 The installer does not change firewall rules. Allow in your provider's firewall (security groups) and in the host firewall:
 
 - the panel's TCP port (443, and 80 for automatic certificates, on a default installation); a loopback panel needs none;
-- the game servers' port range over **UDP and TCP**. Docker publishes these ports itself and bypasses ufw and firewalld; see [SERVERS.md](SERVERS.md#firewall);
+- the game servers' port range over **UDP and TCP**. Docker publishes these ports itself and bypasses ufw and firewalld; see [SERVERS.md](SERVERS.md#firewall), and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#players-cannot-connect) when players cannot connect;
 - TCP 8444 when you turn the Inspector on (below).
 
 ### Inspector
@@ -213,13 +222,26 @@ sudo golem-deploy-uninstall --purge
 
 Before it changes anything it prints what it will delete (counts of Docker objects, the directories and the user) and asks you to type `purge`. Without a terminal it refuses unless `--yes` is given. It then also removes:
 
-- this installation's Docker containers, volumes (the game servers' saved worlds), images and the `golem-deploy` network, found only by the label `dev.golemengine.deploy.managed=true`. When `sqlite3` is installed, the uninstaller reads the installation's instance id from the database and only removes objects with that instance label; otherwise it removes every object with the managed label and says so. Containers that someone else started from Golem Deploy's images are left alone, and an image such a container uses cannot be removed (the uninstaller reports it);
+- this installation's Docker containers, volumes (the game servers' saved worlds), images and the `golem-deploy` network: only objects with the label `dev.golemengine.deploy.managed=true` **and** this installation's instance id in `dev.golemengine.deploy.instance` (see below). Of the containers, only those the daemon created count: they also carry one of its own label keys (`server-id`, `inspector-hub` or `helper`), which build images never have. Containers that someone else started from Golem Deploy's images are left alone;
+- of the images, only the tags in Golem Deploy's own namespace (`golem-deploy/...`), removed with `--no-prune` and never with `-f`, and the image itself once no tag is left. An image that still has another tag (yours, or an image you built `FROM` one of Golem Deploy's, which inherits its labels) or that another container uses is left, and the uninstaller lists it;
 - `/var/lib/golem-deploy`: the database, the encryption keys (stored credentials cannot be recovered without `keys/secrets.key`), every project checkout and the backups;
 - `/etc/golem-deploy` and the user and group `golem-deploy`.
 
+**The instance id.** Docker objects are deleted only when the uninstaller knows this installation's instance id, so that a purge never reaches another installation's objects, or those of an older database. It takes the id from `--instance ID` (32 hexadecimal characters), otherwise from the installed binary (`golem-deploy admin instance-id`, run as the service user), otherwise from the database with `sqlite3` when that is installed. When the id is unknown and Docker holds objects with the managed label, it stops before changing anything and lists the instance ids it found, with how many containers, volumes, images and networks carry each:
+
+```sh
+sudo golem-deploy-uninstall --purge --instance 0123456789abcdef0123456789abcdef
+```
+
+When Docker holds no managed objects at all, the purge goes on without a Docker step.
+
+**What it refuses.** It refuses to start when Docker is installed but not reachable, and when anything is mounted at or below a directory it would delete (it reads `/proc/self/mountinfo`, so bind mounts count too) and names the mount points. Directories are deleted without crossing into other file systems. Where it expects a file (the unit, the binary, the uninstaller, the sysctl file) and finds a directory, it leaves it and warns.
+
+**When something fails.** The uninstaller stops the service and checks that it stopped before it lists Docker's objects, and stops with an error if it did not. When a listing fails or a Docker object cannot be deleted (for example a network another container is still attached to), it stops: the data directory, the settings, the user, the binary and the uninstaller are kept, the service stays stopped (`systemctl start golem-deploy` starts it again), and it prints the exact command to run again after fixing the cause, with `--instance`.
+
 The Inspector hub image carries no Golem Deploy label and is left; remove it with `docker image rm` and the configured `GOLEM_DEPLOY_INSPECTOR_IMAGE`. Docker itself, Docker's apt repository and every apt package stay installed, and no prune command is run.
 
-The uninstaller removes itself. To purge after a plain uninstall, run `uninstall.sh` from a release archive: `sudo bash uninstall.sh --purge`. It copes with a half-installed or partly removed installation.
+The uninstaller removes itself. To purge after a plain uninstall, run `uninstall.sh` from a release archive: `sudo bash uninstall.sh --purge`. The binary is gone by then, so pass `--instance` unless `sqlite3` can read the database; a plain uninstall prints the id when it knows it. It copes with a half-installed or partly removed installation.
 
 ## Offline installs
 
@@ -229,7 +251,7 @@ Download the archive for the host's architecture and `SHA256SUMS` from the [rele
 sudo bash install.sh --archive ./golem-deploy_linux_amd64.tar.gz
 ```
 
-The archive is checked against a `SHA256SUMS` next to it, or against `--sha256 HEX`; without either the installer warns that it is not verified. Docker must already be installed, or the host must reach Docker's apt repository.
+The archive is checked against a `SHA256SUMS` next to it, or against `--sha256 HEX`; without either the installer refuses it. It copies the archive into a private temporary directory first and checks, lists and unpacks only that copy, so the file it checked is the file it installs. Docker must already be installed, or the host must reach Docker's apt repository.
 
 Each archive holds exactly `golem-deploy` (the binary with the web client), `golem-deploy.service`, `uninstall.sh` and `LICENSE`.
 
@@ -270,7 +292,7 @@ Without the web client build the binary works, but the panel only shows a "web c
 
 ## Security
 
-The security model is described in [SECURITY.md](SECURITY.md). For the installation:
+The security model is described in [SECURITY.md](SECURITY.md); how to report a vulnerability is in the repository's [SECURITY.md](../SECURITY.md). For the installation:
 
 - **The `docker` group is root-equivalent.** The service user must be in it to drive Docker, and any member of the group can start a privileged container that mounts the host's file system. Treat the `golem-deploy` account, and the panel's admin accounts, as root on this host. Do not add people to the `docker` group, and keep the host dedicated.
 - **Managed TLS on network listeners.** A non-loopback listener without TLS files serves HTTPS with a generated certificate until ACME is configured. Keep the panel on loopback if you reach it through an SSH tunnel or a reverse proxy on the same host.
@@ -287,6 +309,9 @@ Installation and service problems are below. For builds, game servers and connec
 - **The download or the checksum fails:** nothing was changed. Check that the host reaches `github.com` and GitHub's download hosts (`*.githubusercontent.com`) over HTTPS, and that the version exists. A checksum mismatch means the file is not the one the release lists; download it again and do not work around the check.
 - **`packages that conflict with Docker's are installed`:** remove the listed packages with the printed `apt-get remove` command (images, containers and volumes in `/var/lib/docker` are kept) and run the installer again, or install Docker yourself and run it again.
 - **Installing Docker fails:** the release may not be one Docker publishes packages for. Install Docker Engine following Docker's instructions, then run the installer again. After a failure at this step, `/etc/apt/keyrings/docker.asc` and `/etc/apt/sources.list.d/docker.sources` may already exist; the next run uses them.
+- **`the downloaded Docker repository key does not have the fingerprint Docker documents`:** something between the host and `download.docker.com` changed the key. Nothing was written for Docker's repository. Do not work around the check.
+- **`apt's candidate for docker-ce does not come from https://download.docker.com`:** another apt source offers a newer `docker-ce`, or an apt pin (`/etc/apt/preferences.d/`) prefers another origin. The installer prints the start of `apt-cache policy`; fix the source or the pin and run it again.
+- **The first start fails and the settings file was moved to `golem-deploy.env.failed`:** the daemon refused a setting (the log shows which, for example a port range with no usable port). Run the installer again with corrected options; it writes a new settings file. Delete the `.failed` file when you no longer need it.
 - **`the Docker buildx plugin is missing`:** install `docker-buildx-plugin` (Docker's packages) or the distribution's `docker-buildx` package (with `docker.io`).
 - **The service does not start, `bind: address already in use`:** another process holds the listen port. Find it with `ss -ltnp 'sport = :8000'`, then stop it or change `GOLEM_DEPLOY_LISTEN` and restart. A game port range that contains the listen port is refused at startup.
 - **A listener port is busy or forbidden.** Free it in the other service or update the corresponding listener in the environment file. For a manually configured daemon on Linux, binding low ports may require `CAP_NET_BIND_SERVICE`.

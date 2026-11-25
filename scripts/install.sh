@@ -65,7 +65,8 @@ GitHub and checks it against the release's SHA256SUMS.
 Where the program comes from (default: download ${RELEASE_VERSION:-the latest release}):
   --version TAG         download release TAG (for example v0.1.0)
   --archive FILE        install from a downloaded release archive (offline);
-                        checked against --sha256 or a SHA256SUMS next to it
+                        checked against --sha256 or a SHA256SUMS next to it,
+                        and refused without either
   --sha256 HEX          expected SHA-256 of the archive
   --binary FILE         install a built binary from a source checkout (the
                         unit and the uninstaller come from the checkout)
@@ -127,19 +128,83 @@ docker_server_version() {
 	docker version --format '{{.Server.Version}}' 2>/dev/null
 }
 
-# Docker's apt repository is configured when any apt source points at it.
+# Docker's apt repository is configured when an enabled entry in a source
+# file apt reads points at it: "deb" lines in sources.list and *.list, and
+# deb822 stanzas in *.sources without "Enabled: no". Backups such as
+# docker.sources.save, comments and disabled entries do not count.
 docker_repo_configured() {
-	grep -rsE '^[^#]*download\.docker\.com/linux' /etc/apt/sources.list /etc/apt/sources.list.d/ >/dev/null
+	local f
+	for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+		[ -f "$f" ] || continue
+		# apt ignores files with other characters in their names.
+		[[ ${f##*/} =~ ^[A-Za-z0-9_.-]+$ ]] || continue
+		case $f in
+		*.sources)
+			awk '
+				function flush() { if (deb && uri && enabled) found = 1; deb = 0; uri = 0; enabled = 1 }
+				BEGIN { enabled = 1 }
+				/^#/ { next }
+				/^[ \t]*$/ { flush(); field = ""; next }
+				/^[^ \t]/ { field = tolower($0); sub(/:.*/, "", field); val = $0; sub(/^[^:]*:/, "", val) }
+				/^[ \t]/ { val = $0 }
+				field == "types" && (" " val " ") ~ /[ \t]deb[ \t]/ { deb = 1 }
+				field == "uris" && val ~ /download\.docker\.com\/linux/ { uri = 1 }
+				field == "enabled" && tolower(val) ~ /^[ \t]*(no|false|off|without|disable)[ \t]*$/ { enabled = 0 }
+				END { flush(); exit !found }' "$f" && return 0
+			;;
+		*)
+			awk '$1 == "deb" && /download\.docker\.com\/linux/ { found = 1 } END { exit !found }' "$f" && return 0
+			;;
+		esac
+	done
+	return 1
+}
+
+# docker_candidates_ok PKG... checks that apt's candidate version of each
+# package comes from Docker's repository, so that a pin or another source
+# cannot swap in packages from elsewhere.
+docker_candidates_ok() {
+	local pkg
+	for pkg in "$@"; do
+		if ! LC_ALL=C apt-cache policy "$pkg" </dev/null 2>/dev/null | awk '
+			/^  Candidate:/ { cand = $2 }
+			/^ \*\*\* / { ver = $2; next }
+			/^     [^ ]/ { ver = $1; next }
+			/^        / && ver == cand && cand != "(none)" && /https:\/\/download\.docker\.com\/linux\// { ok = 1 }
+			END { exit !ok }'; then
+			warn "apt's candidate for $pkg does not come from https://download.docker.com:"
+			LC_ALL=C apt-cache policy "$pkg" </dev/null 2>&1 | sed -n '1,6s/^/    /p' >&2 || true
+			return 1
+		fi
+	done
 }
 
 # fetch URL DEST MAX_BYTES downloads over HTTPS only (file:// for a local
-# GOLEM_DEPLOY_RELEASE_URL), with retries and a size cap.
+# GOLEM_DEPLOY_RELEASE_URL), with retries and a size cap. Older curl
+# versions apply --max-filesize only when the server sends a length, so the
+# cap is also enforced while writing: at most MAX_BYTES+1 bytes reach DEST,
+# and more than MAX_BYTES fails.
 fetch() {
-	local proto='=https'
-	case $1 in file://*) proto='=file' ;; esac
-	curl --proto "$proto" --proto-redir '=https' --tlsv1.2 -fsSL \
-		--retry 3 --retry-delay 2 --retry-connrefused --connect-timeout 20 \
-		--max-filesize "$3" -o "$2" "$1"
+	local url=$1 dest=$2 max=$3 proto='=https' try size rc
+	case $url in file://*) proto='=file' ;; esac
+	for try in 1 2 3 4; do
+		[ "$try" -eq 1 ] || sleep 2
+		set +e
+		curl --proto "$proto" --proto-redir '=https' --tlsv1.2 -fsSL --connect-timeout 20 \
+			--max-filesize "$max" "$url" </dev/null | head -c "$((max + 1))" >"$dest"
+		rc=("${PIPESTATUS[@]}")
+		set -e
+		size=$(stat -c %s -- "$dest" 2>/dev/null || printf 0)
+		# 63: the length the server announced is over the cap.
+		if [ "$size" -gt "$max" ] || [ "${rc[0]}" -eq 63 ]; then
+			warn "$url is larger than $max bytes"
+			return 1
+		fi
+		if [ "${rc[0]}" -eq 0 ] && [ "${rc[1]}" -eq 0 ]; then
+			return 0
+		fi
+	done
+	return 1
 }
 
 sha256_of() {
@@ -230,34 +295,34 @@ env_value() {
 # release archive into DIR. Anything else (other names, directories, links,
 # devices, duplicates, oversized contents) is refused before extraction.
 extract_archive() {
-	local archive=$1 dir=$2 names listing line total f
-	names=$(tar -tzf "$archive" 2>/dev/null) || die "$archive is not a readable .tar.gz archive"
+	local archive=$1 dir=$2 label=${3:-$1} names listing line total f
+	names=$(tar -tzf "$archive" 2>/dev/null) || die "$label is not a readable .tar.gz archive"
 	# shellcheck disable=SC2086 # the member names are fixed words
 	if [ "$(printf '%s\n' "$names" | LC_ALL=C sort)" != "$(printf '%s\n' $ARCHIVE_MEMBERS)" ]; then
-		die "$archive does not contain exactly the files of a Golem Deploy release ($ARCHIVE_MEMBERS)"
+		die "$label does not contain exactly the files of a Golem Deploy release ($ARCHIVE_MEMBERS)"
 	fi
-	listing=$(tar -tvzf "$archive" 2>/dev/null) || die "$archive is not a readable .tar.gz archive"
+	listing=$(tar -tvzf "$archive" 2>/dev/null) || die "$label is not a readable .tar.gz archive"
 	while IFS= read -r line; do
 		case $line in
 		-*) ;;
-		*) die "$archive contains something other than plain files: $line" ;;
+		*) die "$label contains something other than plain files: $line" ;;
 		esac
 	done <<<"$listing"
 	total=$(printf '%s\n' "$listing" | awk '{ s += $3 } END { printf "%d", s }')
-	[ "$total" -le "$ARCHIVE_MAX_BYTES" ] || die "$archive unpacks to more than $ARCHIVE_MAX_BYTES bytes"
+	[ "$total" -le "$ARCHIVE_MAX_BYTES" ] || die "$label unpacks to more than $ARCHIVE_MAX_BYTES bytes"
 	# shellcheck disable=SC2086 # the member names are fixed words
 	tar -xzf "$archive" -C "$dir" --no-same-owner --no-same-permissions -- $ARCHIVE_MEMBERS ||
-		die "could not extract $archive"
+		die "could not extract $label"
 	for f in $ARCHIVE_MEMBERS; do
 		if [ ! -f "$dir/$f" ] || [ -L "$dir/$f" ]; then
-			die "$archive did not unpack $f as a plain file"
+			die "$label did not unpack $f as a plain file"
 		fi
 	done
 }
 
 # check_docker_key FILE stops unless FILE holds exactly one OpenPGP key with
-# Docker's documented fingerprint. It needs gpg; apt itself only uses the
-# key to check signatures.
+# Docker's documented fingerprint. It needs gpg, which the packages step
+# installs when it is missing.
 check_docker_key() {
 	local file=$1 home fprs
 	home=$(mktemp -d "$work/gnupg.XXXXXX")
@@ -284,34 +349,22 @@ wait_for_docker() {
 }
 
 install_docker() {
-	local suite
 	export DEBIAN_FRONTEND=noninteractive
-	if docker_repo_configured; then
+	if [ -z "$docker_add_repo" ]; then
 		say "Docker's apt repository is already configured"
 	else
 		say "Adding Docker's apt repository"
 		fetch "https://download.docker.com/linux/$os_id/gpg" "$work/docker.asc" 1048576 ||
-			die "could not download Docker's repository key from https://download.docker.com/linux/$os_id/gpg"
-		if command -v gpg >/dev/null 2>&1; then
-			check_docker_key "$work/docker.asc"
-		else
-			note "gpg is not installed, so the key's fingerprint is not checked (apt checks the packages against the key)"
-		fi
-		if [ "$os_id" = ubuntu ]; then
-			# shellcheck source=/dev/null
-			suite=$(. /etc/os-release && printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")
-		else
-			# shellcheck source=/dev/null
-			suite=$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")
-		fi
-		[[ $suite =~ ^[a-z]+$ ]] || die "cannot tell this release's code name from /etc/os-release; install Docker Engine by hand: $docker_hint_url"
+			die "could not download Docker's repository key from https://download.docker.com/linux/$os_id/gpg; nothing was changed for Docker"
+		# The keyring and the source file are written only after the key matched.
+		check_docker_key "$work/docker.asc"
 		install -d -m 0755 -o root -g root /etc/apt/keyrings
 		install -m 0644 -o root -g root "$work/docker.asc" "$DOCKER_KEYRING"
 		cat >"$work/docker.sources" <<EOF
 # Docker's apt repository, added by the Golem Deploy installer.
 Types: deb
 URIs: https://download.docker.com/linux/$os_id
-Suites: $suite
+Suites: $docker_suite
 Components: stable
 Architectures: $arch
 Signed-By: $DOCKER_KEYRING
@@ -322,7 +375,11 @@ EOF
 	say "Installing Docker Engine ($DOCKER_PACKAGES)"
 	apt-get update -q </dev/null || die "apt-get update failed; see the output above"
 	# shellcheck disable=SC2086 # fixed package names
-	apt-get install -y -q $DOCKER_PACKAGES </dev/null || die "installing Docker Engine failed; see the output above"
+	docker_candidates_ok $DOCKER_PACKAGES ||
+		die "apt would not install Docker Engine from Docker's repository (another source or a pin wins); no Docker package was installed"
+	# --no-remove: apt stops rather than remove packages to make room.
+	# shellcheck disable=SC2086 # fixed package names
+	apt-get install -y -q --no-remove $DOCKER_PACKAGES </dev/null || die "installing Docker Engine failed; see the output above"
 }
 
 start_docker() {
@@ -336,7 +393,9 @@ install_buildx() {
 	say "Installing the Docker buildx plugin (docker-buildx-plugin)"
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get update -q </dev/null || die "apt-get update failed; see the output above"
-	apt-get install -y -q docker-buildx-plugin </dev/null || die "installing docker-buildx-plugin failed; see the output above"
+	docker_candidates_ok docker-buildx-plugin ||
+		die "apt would not install docker-buildx-plugin from Docker's repository (another source or a pin wins)"
+	apt-get install -y -q --no-remove docker-buildx-plugin </dev/null || die "installing docker-buildx-plugin failed; see the output above"
 	docker buildx version >/dev/null 2>&1 || die "docker buildx still does not work after installing docker-buildx-plugin"
 }
 
@@ -533,6 +592,14 @@ main() {
 		done
 		grep -q -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' "$tls_key" || die "$tls_key does not contain a PEM private key"
 		grep -q -- '-----BEGIN CERTIFICATE-----' "$tls_cert" || die "$tls_cert does not contain a PEM certificate"
+		if command -v openssl >/dev/null 2>&1; then
+			local cert_pub key_pub
+			cert_pub=$(openssl x509 -in "$tls_cert" -noout -pubkey 2>/dev/null </dev/null) ||
+				die "openssl cannot read the certificate in $tls_cert"
+			key_pub=$(openssl pkey -in "$tls_key" -pubout -passin pass: 2>/dev/null </dev/null) ||
+				die "openssl cannot read the private key in $tls_key (encrypted keys are not supported)"
+			[ "$cert_pub" = "$key_pub" ] || die "$tls_key is not the private key of the certificate in $tls_cert"
+		fi
 	fi
 
 	if [ -z "$listen" ]; then
@@ -621,7 +688,7 @@ main() {
 	docker_hint_url=https://docs.docker.com/engine/install/$os_id/
 	local docker_hint="install Docker Engine following $docker_hint_url and run this script again"
 	local docker_plan='' buildx_plan='' docker_path conflicts=() pkg
-	docker_version=''
+	docker_version='' docker_add_repo='' docker_suite=''
 	for pkg in $DOCKER_CONFLICTS; do
 		if pkg_installed "$pkg"; then conflicts+=("$pkg"); fi
 	done
@@ -650,6 +717,18 @@ main() {
 		[ "${#conflicts[@]}" -eq 0 ] || die "$conflict_msg"
 		docker_plan=install
 		note "Docker Engine is not installed; it will be installed from Docker's apt repository"
+		if ! docker_repo_configured; then
+			docker_add_repo=yes
+			if [ "$os_id" = ubuntu ]; then
+				# shellcheck source=/dev/null
+				docker_suite=$(. /etc/os-release && printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")
+			else
+				# shellcheck source=/dev/null
+				docker_suite=$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")
+			fi
+			[[ $docker_suite =~ ^[a-z]+$ ]] ||
+				die "cannot tell this release's code name from /etc/os-release; $docker_hint"
+		fi
 	fi
 	if [ -z "$docker_plan" ]; then
 		case $(docker info --format '{{join .SecurityOptions " "}}' 2>/dev/null || true) in
@@ -710,23 +789,27 @@ main() {
 		;;
 	archive)
 		[ -f "$archive" ] || die "$archive is not a file"
-		local sums got want=''
+		local sums got want='' copy=$work/release.tar.gz name
+		name=$(basename -- "$archive")
 		sums=$(dirname -- "$archive")/SHA256SUMS
-		got=$(sha256_of "$archive")
 		if [ -n "$sha256" ]; then
 			want=$sha256
 		elif [ -f "$sums" ]; then
-			want=$(awk -v n="$(basename -- "$archive")" 'NF == 2 && ($2 == n || $2 == "*" n) { print tolower($1) }' "$sums")
-			[[ $want =~ ^[0-9a-f]{64}$ ]] || die "$sums has no single entry for $(basename -- "$archive"); pass --sha256"
-		fi
-		if [ -n "$want" ]; then
-			[ "$got" = "$want" ] || die "the SHA-256 of $archive is $got, but $want was expected; nothing was changed"
-			say "Using $archive (SHA-256 $got matches)"
+			want=$(awk -v n="$name" 'NF == 2 && ($2 == n || $2 == "*" n) { print tolower($1) }' "$sums")
+			[[ $want =~ ^[0-9a-f]{64}$ ]] || die "$sums has no single entry for $name; pass --sha256; nothing was changed"
 		else
-			warn "$archive is not verified: no --sha256 given and no SHA256SUMS next to it (SHA-256 $got)"
-			say "Using $archive"
+			die "$archive cannot be verified: pass --sha256 HEX, or put the release's SHA256SUMS next to it; nothing was changed"
 		fi
-		extract_archive "$archive" "$payload"
+		# Hash, list and extract a private copy, so the file checked is the
+		# file installed.
+		local size
+		size=$(stat -c %s -- "$archive")
+		[ "$size" -le "$ARCHIVE_MAX_BYTES" ] || die "$archive is larger than $ARCHIVE_MAX_BYTES bytes"
+		cp -- "$archive" "$copy" || die "could not copy $archive"
+		got=$(sha256_of "$copy")
+		[ "$got" = "$want" ] || die "the SHA-256 of $archive is $got, but $want was expected; nothing was changed"
+		say "Using $archive (SHA-256 $got matches)"
+		extract_archive "$copy" "$payload" "$archive"
 		;;
 	binary)
 		local src=${BASH_SOURCE[0]:-} script_dir
@@ -772,11 +855,16 @@ main() {
 	if [ "$docker_plan" = install ] && ! command -v curl >/dev/null 2>&1; then
 		missing+=(curl)
 	fi
+	# gpg checks the fingerprint of Docker's repository key.
+	if [ -n "$docker_add_repo" ] && ! command -v gpg >/dev/null 2>&1; then
+		missing+=(gpg)
+	fi
 	if [ "${#missing[@]}" -gt 0 ]; then
 		say "Installing ${missing[*]} with apt"
 		export DEBIAN_FRONTEND=noninteractive
 		apt-get update -q </dev/null || die "apt-get update failed; see the output above"
-		apt-get install -y -q --no-install-recommends "${missing[@]}" </dev/null || die "apt-get install failed; see the output above"
+		apt-get install -y -q --no-install-recommends --no-remove "${missing[@]}" </dev/null ||
+			die "apt-get install failed; see the output above"
 	else
 		say "git, git-lfs, openssh-client and ca-certificates are installed"
 	fi
@@ -895,7 +983,7 @@ main() {
 	fi
 
 	detected_addr=''
-	local detected_public=''
+	local detected_public='' env_written=''
 	if [ -e "$ENV_FILE" ]; then
 		say "Keeping the existing settings file $ENV_FILE"
 		if [ "${#config_opts[@]}" -gt 0 ]; then
@@ -950,6 +1038,7 @@ EOF
 		chown root:"$svc_group" "$tmp_env"
 		chmod 0640 "$tmp_env"
 		mv "$tmp_env" "$ENV_FILE"
+		env_written=yes
 	fi
 
 	# --- systemd unit --------------------------------------------------------
@@ -993,7 +1082,16 @@ EOF
 			systemctl status --no-pager --lines=0 "$SERVICE" >&2 || true
 			printf '\nLog since the restart:\n' >&2
 			journalctl --no-pager -u "$SERVICE" --since "@$restart_at" -n 40 >&2 || true
-			die "$SERVICE did not start (state: ${state:-unknown}/$(systemctl show -p SubState --value "$SERVICE")); see the log above and docs/INSTALL.md (Troubleshooting)"
+			local substate
+			substate=$(systemctl show -p SubState --value "$SERVICE" 2>/dev/null || true)
+			if [ -n "$env_written" ]; then
+				# Otherwise the next run would keep a settings file the daemon refuses.
+				systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+				mv -f "$ENV_FILE" "$ENV_FILE.failed"
+				warn "the settings file this run wrote was moved to $ENV_FILE.failed;" \
+					"the next run writes a new one from its options"
+			fi
+			die "$SERVICE did not start (state: ${state:-unknown}/${substate:-unknown}); see the log above and docs/INSTALL.md (Troubleshooting)"
 		fi
 	else
 		say "$SERVICE is running"
@@ -1023,18 +1121,33 @@ EOF
 		fingerprint=$(panel_fingerprint)
 	fi
 
+	# The data directory the service uses.
+	local eff_data
+	eff_data=$(env_value GOLEM_DEPLOY_DATA_DIR)
+	case $eff_data in
+	/*) [[ $eff_data =~ ^[A-Za-z0-9._/-]+$ ]] || eff_data=$DATA_DIR ;;
+	*) eff_data=$DATA_DIR ;;
+	esac
+
 	# The setup link is a secret: it is held in a variable and printed, never
-	# written to a file or logged.
+	# written to a file or logged. Shell tracing (bash -x) stays off while
+	# the link is around.
+	local xtrace=''
+	case $- in *x*)
+		xtrace=yes
+		set +x
+		;;
+	esac
 	local link='' link_rc=0 link_err=$work/setup-link.err
 	if [ -n "$origin" ]; then
 		set +e
 		link=$(cd / && runuser -u "$SVC_USER" -- "$BIN_DEST" admin setup-link \
-			--data-dir "$DATA_DIR" --origin "$origin" --ttl 1h 2>"$link_err" </dev/null)
+			--data-dir "$eff_data" --origin "$origin" --ttl 1h 2>"$link_err" </dev/null)
 		link_rc=$?
 		set -e
 		if [ "$link_rc" -eq 0 ]; then
 			local token=${link#"$origin/setup#t="}
-			if [ "$token" = "$link" ] || [[ ! $token =~ ^[A-Za-z0-9._~-]+$ ]]; then
+			if [ "$token" = "$link" ] || [[ ! $token =~ ^[A-Za-z0-9_-]{43}$ ]]; then
 				warn "golem-deploy admin setup-link printed something other than a setup link; it is not shown"
 				link='' link_rc=1
 			fi
@@ -1060,7 +1173,7 @@ $step. The panel listens on $eff_listen and is reachable from this host only.
 EOF
 		step=$((step + 1))
 	fi
-	local link_cmd="sudo runuser -u $SVC_USER -- $BIN_DEST admin setup-link --data-dir $DATA_DIR --origin ${origin:-<panel address>}"
+	local link_cmd="sudo runuser -u $SVC_USER -- $BIN_DEST admin setup-link --data-dir $eff_data --origin ${origin:-<panel address>}"
 	if [ "$link_rc" -eq 0 ]; then
 		cat <<EOF
 $step. Create the first admin account: open this link in your browser.
@@ -1090,7 +1203,7 @@ $step. Create the first admin account, unless you already have one. It prompts f
    the password twice (add --password-stdin to pipe it instead). Run it as
    $SVC_USER so the files it creates stay readable by the service:
 
-     sudo runuser -u $SVC_USER -- $BIN_DEST admin create --data-dir $DATA_DIR --username admin
+     sudo runuser -u $SVC_USER -- $BIN_DEST admin create --data-dir $eff_data --username admin
 
    Then open the panel at ${origin:-https://<this host>:${eff_listen##*:}}/
 
@@ -1136,7 +1249,8 @@ EOF
 $step. Allow the panel's TCP port(s) $panel_ports in your provider's firewall. This
    script does not change firewall rules.
 EOF
-		if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n 1 | grep -x 'Status: active' >/dev/null; then
+		# grep reads all of ufw's output, so ufw never gets SIGPIPE.
+		if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null </dev/null | grep -x 'Status: active' >/dev/null; then
 			printf '   ufw is active on this host; allow them with:\n\n'
 			for port in $panel_ports; do printf '     ufw allow %s/tcp\n' "$port"; done
 			if [ "$eff_inspector" != off ]; then
@@ -1160,6 +1274,8 @@ EOF
 	if [ -n "$detected_public" ]; then
 		printf 'The panel and the games use the detected address %s.\n' "$detected_addr"
 	fi
+	link=''
+	[ -z "$xtrace" ] || set -x
 }
 
 # Grouped so that a download cut off in this line is a syntax error.

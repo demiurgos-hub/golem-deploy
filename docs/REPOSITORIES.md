@@ -58,3 +58,8 @@ The LFS server is always derived from the project's URL, never from the reposito
 ## Troubleshooting
 
 The job's detail gives the reason (authentication failed, repository not found, branch does not exist, host key verification failed, remote unreachable, timeout); the job log (`GET /api/v1/jobs/{id}/log`) has the git output. A project in status `error` is repaired by pulling it, which re-clones when there is no checkout. A build requires an idle checkout with a Git HEAD that matches the recorded commit. Use `pull: true` to update the checkout and build in one job.
+
+## See also
+
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md#before-the-build-starts): messages about the checkout when a build starts.
+- [SECURITY.md](SECURITY.md#game-repositories): why repositories are untrusted and what the daemon reads from them.

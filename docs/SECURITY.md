@@ -172,7 +172,7 @@ A backup is an archive of a game's data directory, and everything in it was writ
 - The daemon stores only regular files and directories, with owners reset and modes masked; links, pipes, devices and unsafe names are left out and only counted, never named.
 - It interprets nothing in the archive except the header of the top-level `world.snapshot`, to record the schema fingerprint.
 - Archives are size-capped (`--backup-max-mb`, default 1024 MiB, and 100000 entries) and need 1 GiB of free disk space to remain.
-- There is no upload: a restore uses only archives the daemon made itself, and checks their size and SHA-256 first. A restore, reset or deletion first takes a safety backup.
+- There is no upload: a restore uses only archives the daemon made itself, and checks their size and SHA-256 first. A restore, reset or deletion first takes a safety backup, unless an admin asks to skip it (`skip_safety_backup`).
 - A downloaded archive holds whatever the game wrote. Treat it as untrusted on your own computer, and check its SHA-256 if it travels.
 
 ## Restarting or stopping the panel

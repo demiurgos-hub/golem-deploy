@@ -117,6 +117,39 @@ jobs:
           name: release
           path: dist
 
+      # sha256sum -c alone passes with missing entries: SHA256SUMS must hold
+      # exactly one entry for each asset, nothing else, and match the files.
+      - name: SHA256SUMS matches the files to upload
+        working-directory: dist/release
+        run: |
+          want=$(sha256sum golem-deploy_linux_amd64.tar.gz golem-deploy_linux_arm64.tar.gz install.sh |
+            sed 's/^\([0-9a-f]\{64\}\) [ *]/\1  /' | LC_ALL=C sort)
+          got=$(LC_ALL=C sort SHA256SUMS)
+          if [ "$want" != "$got" ]; then
+            echo "::error::SHA256SUMS does not list exactly the three assets with their digests"
+            diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") || true
+            exit 1
+          fi
+          cat SHA256SUMS
+
+      # The tag must still name the commit this run built and attested.
+      - name: The tag still points at the built commit
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          refs=$(git ls-remote "$REPO_URL" "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          # An annotated tag lists the tag object and then the commit (^{}).
+          commit=$(printf '%s\n' "$refs" | awk -v t="refs/tags/$TAG^{}" '$2 == t { print $1 }')
+          if [ -z "$commit" ]; then
+            commit=$(printf '%s\n' "$refs" | awk -v t="refs/tags/$TAG" '$2 == t { print $1 }')
+          fi
+          if [ "$commit" != "$SHA" ]; then
+            echo "::error::tag $TAG points at ${commit:-nothing} on the remote, but this run built $SHA"
+            exit 1
+          fi
+
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -124,7 +157,6 @@ jobs:
           TAG: ${{ github.ref_name }}
           PRERELEASE: ${{ needs.tag.outputs.prerelease }}
         run: |
-          (cd dist/release && sha256sum -c SHA256SUMS)
           flags=()
           if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
           gh release create "$TAG" --verify-tag --title "$TAG" --notes-file dist/notes.md "${flags[@]}" \

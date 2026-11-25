@@ -18,6 +18,10 @@ curl -fsSL https://github.com/demiurgos-hub/golem-deploy/releases/latest/downloa
 
 `releases/latest` points at the newest release that is not a prerelease. A release candidate is installed with `--version vX.Y.Z-rc.N` or its own `install.sh`.
 
+## Protect the release tags
+
+A pushed `v*` tag publishes a release, and the release workflow checks that the tag did not move while it ran. To keep anyone with plain write access from creating, moving or deleting release tags, add a tag ruleset once: in the repository's **Settings → Rules → Rulesets**, create a tag ruleset that targets `refs/tags/v*`, restricts creations, updates and deletions, and lets only the maintainers who release bypass it.
+
 ## Steps
 
 1. **Check `main`.** CI passes on the commit you want to release. With Docker available, also run the opt-in Docker tests (see `AGENTS.md`).
@@ -46,7 +50,7 @@ curl -fsSL https://github.com/demiurgos-hub/golem-deploy/releases/latest/downloa
 1. **Tag:** checks that the tag looks like `vX.Y.Z` or `vX.Y.Z-rc.N` and that `CHANGELOG.md` has notes for it.
 2. **Checks:** runs the CI workflow (`ci.yml`): frontend lint, tests and build, shellcheck on every script, generated types, hidden characters, `go vet`, staticcheck, govulncheck and `go test -race`.
 3. **Build:** runs `scripts/release.sh` without dependency caches, takes the notes with `scripts/release-notes.sh`, and creates the build provenance attestation for the archives and `install.sh`.
-4. **Publish:** checks `SHA256SUMS` and creates the GitHub release with `gh release create`, marked as a prerelease when the tag has a `-` part.
+4. **Publish:** checks that `SHA256SUMS` holds exactly one entry for each of the three assets and nothing else, with the digests of the files about to be uploaded; checks with `git ls-remote` that the tag on the remote still points at the commit the run built, and stops if it moved; then creates the GitHub release with `gh release create`, marked as a prerelease when the tag has a `-` part.
 
 Each job only gets the permissions it needs: reading the repository, plus the attestation permissions for the build and writing releases for the publish job.
 

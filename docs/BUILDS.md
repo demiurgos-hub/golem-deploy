@@ -102,3 +102,9 @@ What this does **not** protect against:
 - Base images (`golang`, `node`, `distroless`) are pulled by tag from their registries at build time; use public base images by default. An operator can deliberately add credentials in `<data-dir>/docker-build/` for registries that builds may access. See [INSTALL.md](INSTALL.md).
 - Docker's layer cache is content-addressed and shared across projects (generated builds use project-specific cache mounts); identical inputs produce identical layers, which is not a confidentiality issue but means build cache sizes are host-wide. Prune it with `docker builder prune` when needed.
 - The built image runs the game's code: the server hardening in [SERVERS.md](SERVERS.md) is what contains it at run time.
+
+## See also
+
+- [GAME_INTEGRATION.md](GAME_INTEGRATION.md): making a game repository buildable, step by step.
+- [SECURITY.md](SECURITY.md#builds): builds in the installation's security model.
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md#builds-fail): build error messages and their fixes.

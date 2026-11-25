@@ -105,7 +105,7 @@ The build's detail names the problem, and the build log has the output. Build a 
 | `the project checkout is not idle; pull it first (or build with pull)` | Another project job is running, or the last one failed. Pull the project. |
 | `the checkout HEAD could not be verified against the recorded commit; pull the project first` | The checkout is incomplete or changed. Pull the project. |
 | `another job is already running for this project` | Wait for the clone, pull or branch job to finish. |
-| `too many builds are queued (at most 4); wait for one to finish` | One build runs at a time and at most 4 wait. |
+| `too many builds are queued (at most 4); wait for one to finish` | One build runs at a time, and at most 4 builds may be queued or running in total. |
 
 ### The preflight
 
