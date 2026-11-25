@@ -12,6 +12,7 @@ func (s *Server) routes() []route {
 		{method: "POST", path: "/auth/register", access: AccessPublic, handler: s.handleRegister},
 		{method: "POST", path: "/auth/logout", access: AccessSession, handler: s.handleLogout},
 		{method: "POST", path: "/auth/refresh", access: AccessSession, handler: s.handleRefresh},
+		{method: "POST", path: "/setup", access: AccessPublic, handler: s.handleSetup},
 
 		// System.
 		{method: "GET", path: "/status", access: AccessDeveloper, handler: s.handleStatus},

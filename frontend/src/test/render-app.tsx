@@ -28,7 +28,7 @@ export function renderApp({
   const { transport, calls } = fakeTransport({
     "GET /account": () => jsonResponse(200, currentAccount(me)),
     "GET /status": () => jsonResponse(200, STATUS),
-    "GET /auth/options": () => jsonResponse(200, { registration_enabled: false }),
+    "GET /auth/options": () => jsonResponse(200, { registration_enabled: false, setup_required: false }),
     // Pages list builds on the side (first-run guide, project page); tests that care override these.
     "GET /builds": () => jsonResponse(200, { items: [] }),
     "GET /projects/{id}/builds": () => jsonResponse(200, { items: [] }),

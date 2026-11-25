@@ -305,7 +305,7 @@ func TestStatusAndSettings(t *testing.T) {
 	}
 	// The public auth options follow the setting and reveal nothing else.
 	opts := h.do("GET", "/api/v1/auth/options", "", nil)
-	if opts.Code != http.StatusOK || strings.TrimSpace(opts.Body.String()) != `{"registration_enabled":false}` {
+	if opts.Code != http.StatusOK || strings.TrimSpace(opts.Body.String()) != `{"registration_enabled":false,"setup_required":false}` {
 		t.Fatalf("auth options %d %s", opts.Code, opts.Body.String())
 	}
 	if s := decode[apitypes.Settings](t, h.do("PATCH", "/api/v1/settings", tok, `{"registration_enabled":true}`)); !s.RegistrationEnabled {

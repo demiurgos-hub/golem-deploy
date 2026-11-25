@@ -2,9 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/demiurgos-hub/golem-deploy/internal/auth"
+	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
+	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
 func runCLI(t *testing.T, stdin string, args ...string) (int, string, string) {
@@ -126,5 +133,110 @@ func TestBuildFlags(t *testing.T) {
 	}
 	if code, _, stderr := runCLI(t, "", "serve", "--listen", "127.0.0.1:0", "--build-retention", "-1", "--data-dir", t.TempDir()); code != 1 || !strings.Contains(stderr, "--build-retention") {
 		t.Fatalf("bad retention: %d %q", code, stderr)
+	}
+}
+
+var setupLinkRE = regexp.MustCompile(`^(.*)/setup#t=([A-Za-z0-9_-]{43})\n$`)
+
+// setupLink runs admin setup-link and returns the origin part and the token.
+func setupLink(t *testing.T, args ...string) (string, string, string) {
+	t.Helper()
+	code, out, stderr := runCLI(t, "", append([]string{"admin", "setup-link"}, args...)...)
+	if code != 0 {
+		t.Fatalf("setup-link %q: %d %q", args, code, stderr)
+	}
+	m := setupLinkRE.FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("setup-link output %q", out)
+	}
+	if strings.Contains(stderr, m[2]) {
+		t.Fatal("the token went to standard error")
+	}
+	return m[1], m[2], stderr
+}
+
+func TestAdminSetupLink(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	origin, tok1, stderr := setupLink(t, "--data-dir", dir)
+	if origin != "" || !strings.Contains(stderr, "works once") || !strings.Contains(stderr, "expires at") {
+		t.Fatalf("origin %q, stderr %q", origin, stderr)
+	}
+	for in, want := range map[string]string{
+		"https://deploy.example.com":      "https://deploy.example.com",
+		"http://192.0.2.7:8000":           "http://192.0.2.7:8000",
+		"HTTPS://deploy.example.com:8443": "https://deploy.example.com:8443",
+		"https://[2001:db8::1]:443":       "https://[2001:db8::1]:443",
+	} {
+		if got, _, _ := setupLink(t, "--data-dir", dir, "--origin", in); got != want {
+			t.Errorf("origin %q: got %q, want %q", in, got, want)
+		}
+	}
+	_, tok2, _ := setupLink(t, "--data-dir", dir, "--ttl", "24h")
+	if tok1 == tok2 {
+		t.Fatal("tokens repeat")
+	}
+
+	// Only the newest token is valid and only its hash is stored.
+	ctx := context.Background()
+	layout, err := datadir.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(ctx, layout.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if ok, _ := st.CheckSetupToken(ctx, auth.HashSetupToken(tok1)); ok {
+		t.Fatal("a replaced token is still valid")
+	}
+	if ok, _ := st.CheckSetupToken(ctx, auth.HashSetupToken(tok2)); !ok {
+		t.Fatal("the newest token is not valid")
+	}
+	for _, name := range []string{layout.DB(), layout.DB() + "-wal"} {
+		db, err := os.ReadFile(name)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if bytes.Contains(db, []byte(tok2)) {
+			t.Fatalf("the token is stored in %s", filepath.Base(name))
+		}
+	}
+}
+
+func TestAdminSetupLinkRejectsBadFlags(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	for _, origin := range []string{
+		"deploy.example.com", "ftp://deploy.example.com", "https://", "https://deploy.example.com/",
+		"https://deploy.example.com/panel", "https://deploy.example.com?x=1", "https://deploy.example.com?",
+		"https://deploy.example.com#x", "https://deploy.example.com#", "https://user@deploy.example.com",
+		"https://deploy.example.com:0", "https://deploy.example.com:70000", "https://deploy.example.com:",
+		"https://a b", "mailto:x@example.com",
+	} {
+		if code, out, stderr := runCLI(t, "", "admin", "setup-link", "--data-dir", dir, "--origin", origin); code != 2 || out != "" || !strings.Contains(stderr, "--origin") {
+			t.Errorf("origin %q: %d %q %q", origin, code, out, stderr)
+		}
+	}
+	for _, ttl := range []string{"59s", "24h1m", "-1h", "0", "soon"} {
+		if code, out, _ := runCLI(t, "", "admin", "setup-link", "--data-dir", dir, "--ttl", ttl); code != 2 || out != "" {
+			t.Errorf("ttl %q: %d %q", ttl, code, out)
+		}
+	}
+	setupLink(t, "--data-dir", dir, "--ttl", "1m")
+	if code, _, _ := runCLI(t, "", "admin", "setup-link", "--data-dir", dir, "extra"); code != 2 {
+		t.Errorf("positional argument: %d", code)
+	}
+}
+
+func TestAdminSetupLinkRefusesWithAnAdmin(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	setupLink(t, "--data-dir", dir)
+	if code, _, stderr := runCLI(t, "a-very-good-password\n", "admin", "create", "--username", "root", "--password-stdin", "--data-dir", dir); code != 0 {
+		t.Fatalf("create: %d %q", code, stderr)
+	}
+	code, out, stderr := runCLI(t, "", "admin", "setup-link", "--data-dir", dir)
+	if code != 3 || out != "" || !strings.Contains(stderr, "admin account already exists") ||
+		!strings.Contains(stderr, "admin create") || !strings.Contains(stderr, "admin reset-password") {
+		t.Fatalf("with an admin: %d %q %q", code, out, stderr)
 	}
 }

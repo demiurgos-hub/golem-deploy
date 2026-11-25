@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
@@ -16,11 +17,21 @@ var ErrUsernameExists = errors.New("an account with that username already exists
 // ErrNoSuchAccount is returned by ResetPassword for an unknown username.
 var ErrNoSuchAccount = errors.New("no account with that username")
 
+// ErrAdminExists is returned by CreateSetupLink when an approved admin
+// account exists.
+var ErrAdminExists = errors.New("an admin account already exists")
+
+// Setup link lifetimes accepted by CreateSetupLink.
+const (
+	MinSetupLinkTTL = time.Minute
+	MaxSetupLinkTTL = 24 * time.Hour
+)
+
 // openForAdmin opens the store for the admin CLI. It never takes the
-// serve lock (the commands work while the daemon runs). create may
-// initialise a new or empty data directory (so the first admin can be
-// created before the first serve); other commands require an initialised
-// one.
+// serve lock (the commands work while the daemon runs). create and
+// setup-link may initialise a new or empty data directory (so the first
+// admin can be created before the first serve); other commands require an
+// initialised one.
 func openForAdmin(ctx context.Context, dataDir string, initialise bool) (*store.Store, error) {
 	open := datadir.Open
 	if initialise {
@@ -106,4 +117,31 @@ func resetPassword(ctx context.Context, dataDir, username, password string, cost
 		return 0, fmt.Errorf("set password: %w", err)
 	}
 	return revoked, nil
+}
+
+// CreateSetupLink creates a new one-time setup token that is valid for ttl
+// and replaces any previous one. The token lets a browser create the first
+// admin account (POST /api/v1/setup). Only its hash is stored. It refuses
+// with ErrAdminExists when an approved admin account exists.
+func CreateSetupLink(ctx context.Context, dataDir string, ttl time.Duration) (token string, expiresAt time.Time, err error) {
+	if ttl < MinSetupLinkTTL || ttl > MaxSetupLinkTTL {
+		return "", time.Time{}, fmt.Errorf("the link lifetime must be between %v and %v", MinSetupLinkTTL, MaxSetupLinkTTL)
+	}
+	token, hash, err := auth.NewSetupToken()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	st, err := openForAdmin(ctx, dataDir, true)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	defer st.Close()
+	expiresAt = time.Now().Add(ttl).UTC().Truncate(time.Millisecond)
+	if err := st.SetSetupToken(ctx, hash, expiresAt); err != nil {
+		if errors.Is(err, store.ErrAdminExists) {
+			return "", time.Time{}, ErrAdminExists
+		}
+		return "", time.Time{}, fmt.Errorf("store setup token: %w", err)
+	}
+	return token, expiresAt, nil
 }

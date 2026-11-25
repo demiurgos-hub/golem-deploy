@@ -3,6 +3,7 @@
 //	golem-deploy serve [flags]
 //	golem-deploy admin create --username <u> [--password-stdin] [--data-dir <dir>]
 //	golem-deploy admin reset-password --username <u> [--password-stdin] [--data-dir <dir>]
+//	golem-deploy admin setup-link [--data-dir <dir>] [--origin <origin>] [--ttl <duration>]
 //	golem-deploy version
 package main
 
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -49,6 +51,8 @@ const usage = `Usage:
   golem-deploy admin reset-password --username <u>
                                              set a new password (ends the account's sessions
                                              and deletes its API tokens)
+  golem-deploy admin setup-link              print a one-time link that creates the first
+                                             admin account in a browser
   golem-deploy version                       print the version
 
 Run "golem-deploy <command> -h" for the flags of a command.
@@ -293,6 +297,9 @@ func cmdAdmin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	sub := args[0]
+	if sub == "setup-link" {
+		return cmdSetupLink(args[1:], stdout, stderr)
+	}
 	if sub != "create" && sub != "reset-password" {
 		fmt.Fprintf(stderr, "unknown admin command %q\n\n%s", sub, usage)
 		return 2
@@ -334,6 +341,88 @@ func cmdAdmin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "password updated for %q; all of its sessions have been ended and %d API token(s) deleted\n", strings.ToLower(strings.TrimSpace(*username)), revoked)
 	}
 	return 0
+}
+
+// exitAdminExists is the exit code of admin setup-link when an admin account
+// already exists (the installer relies on it).
+const exitAdminExists = 3
+
+// cmdSetupLink prints a one-time setup link as the only line on stdout.
+// Notes for people go to stderr.
+func cmdSetupLink(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("admin setup-link", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dataDir := dataDirFlag(fs)
+	origin := fs.String("origin", "", "panel origin to put before the link's path, e.g. https://deploy.example.com:8443")
+	ttl := fs.Duration("ttl", time.Hour, "how long the link stays valid, from 1m to 24h")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "admin setup-link: unexpected arguments %q\n", fs.Args())
+		return 2
+	}
+	prefix := ""
+	if *origin != "" {
+		o, err := parseOrigin(*origin)
+		if err != nil {
+			fmt.Fprintf(stderr, "admin setup-link: --origin: %v\n", err)
+			return 2
+		}
+		prefix = o
+	}
+	if *ttl < daemon.MinSetupLinkTTL || *ttl > daemon.MaxSetupLinkTTL {
+		fmt.Fprintf(stderr, "admin setup-link: --ttl must be between %v and %v\n", daemon.MinSetupLinkTTL, daemon.MaxSetupLinkTTL)
+		return 2
+	}
+	token, expires, err := daemon.CreateSetupLink(context.Background(), *dataDir, *ttl)
+	if errors.Is(err, daemon.ErrAdminExists) {
+		fmt.Fprintln(stderr, `error: an admin account already exists, so no setup link is needed. Use "golem-deploy admin create" to add an admin or "golem-deploy admin reset-password" to set a new password.`)
+		return exitAdminExists
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "%s/setup#t=%s\n", prefix, token)
+	fmt.Fprintf(stderr, "Open the link in a browser to create the first admin account. It works once and expires at %s. Making a new link ends this one.\n", expires.Format(time.RFC3339))
+	return 0
+}
+
+// parseOrigin accepts "http" or "https", a host and an optional port, and
+// nothing else. It returns the origin as scheme://host[:port].
+func parseOrigin(v string) (string, error) {
+	u, err := url.Parse(v)
+	if err != nil {
+		return "", errors.New("not a valid URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", errors.New("the scheme must be http or https")
+	}
+	if u.Opaque != "" || u.Host == "" || u.Hostname() == "" {
+		return "", errors.New("a host is required, e.g. https://deploy.example.com")
+	}
+	if u.User != nil {
+		return "", errors.New("user information is not allowed")
+	}
+	if u.Path != "" || u.RawPath != "" {
+		return "", errors.New("a path is not allowed, not even /")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return "", errors.New("a query is not allowed")
+	}
+	if u.Fragment != "" || strings.Contains(v, "#") {
+		return "", errors.New("a fragment is not allowed")
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return "", errors.New("the port must be a number from 1 to 65535")
+		}
+	} else if strings.HasSuffix(u.Host, ":") {
+		return "", errors.New("the port must be a number from 1 to 65535")
+	}
+	return u.Scheme + "://" + u.Host, nil
 }
 
 // splitList splits a comma-separated flag value, dropping empty entries.

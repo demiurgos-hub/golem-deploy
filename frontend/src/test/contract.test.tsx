@@ -13,7 +13,7 @@ const server: Server = serverFixture({ restart_required: true });
 
 describe("login page and /auth/options", () => {
   it("offers registration only when it is enabled", async () => {
-    const view = renderApp({ path: "/login", routes: { "GET /auth/options": () => jsonResponse(200, { registration_enabled: true }) } });
+    const view = renderApp({ path: "/login", routes: { "GET /auth/options": () => jsonResponse(200, { registration_enabled: true, setup_required: false }) } });
     expect(await screen.findByRole("link", { name: "Request one" })).toBeInTheDocument();
     view.unmount();
 

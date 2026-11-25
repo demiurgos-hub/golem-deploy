@@ -23,14 +23,84 @@ func (s *Server) sessionResponse(acct store.Account, loginAt time.Time) (apitype
 	}, nil
 }
 
-// handleAuthOptions tells the login page whether self-registration is open.
-// It is public and reveals nothing else.
+// handleAuthOptions tells the login page whether self-registration is open
+// and whether the first admin account still has to be created. It is public
+// and reveals nothing else.
 func (s *Server) handleAuthOptions(w http.ResponseWriter, r *http.Request) error {
 	settings, err := s.store.GetSettings(r.Context())
 	if err != nil {
 		return internal(err)
 	}
-	writeJSON(w, http.StatusOK, apitypes.AuthOptions{RegistrationEnabled: settings.RegistrationEnabled})
+	setup, err := s.store.SetupRequired(r.Context())
+	if err != nil {
+		return internal(err)
+	}
+	writeJSON(w, http.StatusOK, apitypes.AuthOptions{RegistrationEnabled: settings.RegistrationEnabled, SetupRequired: setup})
+	return nil
+}
+
+// errSetupLinkInvalid is the one answer for every refused setup token.
+var errSetupLinkInvalid = newError(http.StatusForbidden, apitypes.ErrorCodeSetupLinkInvalid, "this setup link is missing, expired or already used")
+
+// handleSetup creates the first admin account with the one-time setup token
+// (golem-deploy admin setup-link) and signs it in. The token is decided
+// first, counted against the client-IP login limit: a refused token stays
+// counted and never reaches the password hashing. Validation errors are
+// reported only for a valid token and do not use it up. The store checks
+// the token again, and that no admin exists, in the transaction that
+// creates the account.
+func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) error {
+	var req apitypes.SetupRequest
+	if err := decodeJSON(r, &req); err != nil {
+		return err
+	}
+	ctx := r.Context()
+	ip := clientIP(r)
+	res, wait, ok := s.loginIP.Reserve(ip)
+	if !ok {
+		return rateLimited(wait)
+	}
+	hash := auth.HashSetupToken(req.Token)
+	if req.Token == "" {
+		return errSetupLinkInvalid
+	}
+	valid, err := s.store.CheckSetupToken(ctx, hash)
+	if err != nil {
+		res.Refund()
+		return internal(err)
+	}
+	if !valid {
+		return errSetupLinkInvalid
+	}
+	// The token is good: from here on nothing counts as a failed attempt.
+	res.Refund()
+	username, err := auth.NormalizeUsername(req.Username)
+	if err != nil {
+		return invalidField("username", err.Error())
+	}
+	if err := auth.ValidatePassword(req.Password); err != nil {
+		return invalidField("password", err.Error())
+	}
+	pwHash, err := s.hashPassword(ctx, req.Password)
+	if err != nil {
+		return err
+	}
+	acct, err := s.store.CompleteSetup(ctx, hash, store.NewAccount{Username: username, PasswordHash: pwHash, Role: store.RoleAdmin, Approved: true})
+	switch {
+	case errors.Is(err, store.ErrSetupInvalid):
+		// Another request used the token or an admin appeared meanwhile.
+		return errSetupLinkInvalid
+	case errors.Is(err, store.ErrConflict):
+		return conflict(apitypes.ErrorCodeUsernameTaken, "username is already taken")
+	case err != nil:
+		return internal(err)
+	}
+	s.logger.Info("first admin account created with the setup link", "request_id", requestIDFrom(ctx), "account_id", acct.ID, "username", acct.Username, "client", ip)
+	resp, err := s.sessionResponse(acct, s.now())
+	if err != nil {
+		return internal(err)
+	}
+	writeJSON(w, http.StatusCreated, resp)
 	return nil
 }
 
