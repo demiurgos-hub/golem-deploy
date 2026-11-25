@@ -29,12 +29,15 @@ export function ServerActions({
   onJob,
   size = "sm",
   busy = false,
+  only,
 }: {
   server: Server;
   onJob: (job: Job) => void;
   size?: "sm" | "md";
   /** A job is already active for this server. */
   busy?: boolean;
+  /** Only the restart button (where a section says that a change needs a restart). */
+  only?: "restart";
 }) {
   const api = useApi();
   const toast = useToast();
@@ -69,6 +72,7 @@ export function ServerActions({
     </Button>
   );
 
+  if (only === "restart") return server.state !== "missing" ? button("restart", <RotateCw />) : null;
   return (
     <>
       {active || server.desired_state === "running"

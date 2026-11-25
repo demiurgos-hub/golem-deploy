@@ -32,15 +32,18 @@ export function Section({
   actions,
   children,
   className,
+  id,
 }: {
   title: string;
   description?: ReactNode;
   actions?: ReactNode;
   children: ReactNode;
   className?: string;
+  /** An anchor other pages can link to (/admin/settings#inspector). */
+  id?: string;
 }) {
   return (
-    <section className={cn("rounded-lg border border-border bg-card", className)} aria-label={title}>
+    <section id={id} className={cn("scroll-mt-20 rounded-lg border border-border bg-card", className)} aria-label={title}>
       <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-4 py-3">
         <div className="min-w-0">
           <h2 className="text-sm font-semibold">{title}</h2>

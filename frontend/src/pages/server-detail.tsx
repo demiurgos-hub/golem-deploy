@@ -20,6 +20,7 @@ import {
 import { buildName } from "@/components/builds";
 import { CertificateDetails } from "@/components/certificate";
 import { EnvEditor } from "@/components/env-editor";
+import { ServerInspectorSection } from "@/components/inspector";
 import { InlineJob, JobsPanel, useShownJob } from "@/components/jobs";
 import { OriginsEditor, hasOriginErrors, noOriginErrors, originErrorsFrom, validateOrigins, type OriginErrors } from "@/components/origins-editor";
 import { ServerActions } from "@/components/server-actions";
@@ -205,7 +206,7 @@ function ServerDetail({ id }: { id: number }) {
         {s.restart_required && (
           <Notice tone="warning" title="Restart required">
             The running container was created from an older definition: the build, port, environment, allowed origins, the game
-            host, the certificate mode or the daemon&apos;s run settings changed since it started. Changes never restart a server on
+            host, the certificate mode, the Inspector settings or the daemon&apos;s run settings changed since it started. Changes never restart a server on
             their own: restart it to apply them (connected players are disconnected).
           </Notice>
         )}
@@ -335,6 +336,7 @@ function ServerDetail({ id }: { id: number }) {
           onPickBackup={() => setDialog("pick-backup")}
           onReset={() => setDialog("reset")}
         />
+        <ServerInspectorSection server={s} busy={activeJob !== null} onJob={shown.show} />
         <div className="grid gap-6 lg:grid-cols-2">
           <OriginsSection server={s} />
           <CertificateSection server={s} />

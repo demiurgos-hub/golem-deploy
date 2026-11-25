@@ -8,6 +8,7 @@ import { qk } from "@/api/query-keys";
 import type { CertificateMode, GameCertificate, Job, UpdateGameCertificateRequest } from "@/api/types.gen";
 import { CertificateDetails } from "@/components/certificate";
 import { ACMESettings, AutomaticCertificateCheck, PanelCertificateSettings, SharedCertificateWarning } from "@/components/certificate-settings";
+import { InspectorSettingsSection } from "@/components/inspector";
 import { InlineJob } from "@/components/jobs";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,6 +29,7 @@ export function AdminSettingsPage() {
         <CertificatesSection acme={acme} />
         <PanelCertificateSettings acme={acme} />
         <ACMESettings query={acme} />
+        <InspectorSettingsSection />
         <RegistrationSection />
       </div>
     </>
