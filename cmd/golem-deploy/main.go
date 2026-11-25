@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -390,7 +391,10 @@ func cmdSetupLink(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "%s/setup#t=%s\n", prefix, token)
+	if _, err := fmt.Fprintf(stdout, "%s/setup#t=%s\n", prefix, token); err != nil {
+		fmt.Fprintln(stderr, "error: could not write the link to standard output")
+		return 1
+	}
 	fmt.Fprintf(stderr, "Open the link in a browser to create the first admin account. It works once and expires at %s. Making a new link ends this one.\n", expires.Format(time.RFC3339))
 	return 0
 }
@@ -438,6 +442,9 @@ func parseOrigin(v string) (string, error) {
 	if u.User != nil {
 		return "", errors.New("user information is not allowed")
 	}
+	if err := checkOriginHost(u); err != nil {
+		return "", err
+	}
 	if u.Path != "" || u.RawPath != "" {
 		return "", errors.New("a path is not allowed, not even /")
 	}
@@ -456,6 +463,44 @@ func parseOrigin(v string) (string, error) {
 		return "", errors.New("the port must be a number from 1 to 65535")
 	}
 	return u.Scheme + "://" + u.Host, nil
+}
+
+// checkOriginHost accepts a host a browser can open: a DNS name, localhost,
+// an IPv4 address or an IPv6 address in brackets without a zone.
+func checkOriginHost(u *url.URL) error {
+	h := u.Hostname()
+	if strings.Contains(h, "%") {
+		return errors.New("an IPv6 zone (%) is not allowed; browsers cannot open it")
+	}
+	if strings.HasPrefix(u.Host, "[") {
+		if a, err := netip.ParseAddr(h); err != nil || !a.Is6() {
+			return errors.New("the host in brackets must be an IPv6 address")
+		}
+		return nil
+	}
+	if a, err := netip.ParseAddr(h); err == nil && a.Is4() {
+		return nil
+	}
+	errHost := errors.New("the host must be a DNS name, localhost, an IPv4 address or an IPv6 address in brackets")
+	name := strings.TrimSuffix(h, ".")
+	if name == "" || len(name) > 253 {
+		return errHost
+	}
+	labels := strings.Split(name, ".")
+	for _, l := range labels {
+		if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' || strings.IndexFunc(l, func(r rune) bool {
+			return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_')
+		}) >= 0 {
+			return errHost
+		}
+	}
+	// Browsers read a host whose last label is a number as an IPv4
+	// address, and it was not a valid one.
+	last := strings.ToLower(labels[len(labels)-1])
+	if strings.Trim(last, "0123456789") == "" || strings.HasPrefix(last, "0x") && strings.Trim(last[2:], "0123456789abcdef") == "" {
+		return errHost
+	}
+	return nil
 }
 
 // splitList splits a comma-separated flag value, dropping empty entries.

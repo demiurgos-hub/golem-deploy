@@ -170,6 +170,11 @@ func TestAdminSetupLink(t *testing.T) {
 		"http://192.0.2.7:8000":           "http://192.0.2.7:8000",
 		"HTTPS://deploy.example.com:8443": "https://deploy.example.com:8443",
 		"https://[2001:db8::1]:443":       "https://[2001:db8::1]:443",
+		"http://localhost:8000":           "http://localhost:8000",
+		"https://deploy.example.com.":     "https://deploy.example.com.",
+		"https://my_host.example.com":     "https://my_host.example.com",
+		"https://Deploy.Example.com":      "https://Deploy.Example.com",
+		"https://123.example.com":         "https://123.example.com",
 	} {
 		if got, _, _ := setupLink(t, "--data-dir", dir, "--origin", in); got != want {
 			t.Errorf("origin %q: got %q, want %q", in, got, want)
@@ -216,6 +221,10 @@ func TestAdminSetupLinkRejectsBadFlags(t *testing.T) {
 		"https://deploy.example.com#x", "https://deploy.example.com#", "https://user@deploy.example.com",
 		"https://deploy.example.com:0", "https://deploy.example.com:70000", "https://deploy.example.com:",
 		"https://a b", "mailto:x@example.com",
+		"https://[fe80::1%25eth0]", "https://[fe80::1%25eth0]:8443", "https://[192.0.2.1]", "https://[deploy.example.com]",
+		"https://-deploy.example.com", "https://deploy-.example.com", "https://deploy..example.com",
+		"https://1.2.3", "https://1.2.3.256", "https://01.2.3.4", "https://deploy.0x1f", "https://deploy.123",
+		"https://d%C3%A9ploy.example.com", "https://deploy!.example.com", "https://*.example.com", "https://" + strings.Repeat("a", 64) + ".example.com",
 	} {
 		if code, out, stderr := runCLI(t, "", "admin", "setup-link", "--data-dir", dir, "--origin", origin); code != 2 || out != "" || !strings.Contains(stderr, "--origin") {
 			t.Errorf("origin %q: %d %q %q", origin, code, out, stderr)
@@ -390,5 +399,9 @@ func TestAdminWriteFailures(t *testing.T) {
 	var errOut bytes.Buffer
 	if code := run([]string{"admin", "instance-id", "--data-dir", dir}, strings.NewReader(""), failingWriter{}, &errOut); code != 1 || !strings.Contains(errOut.String(), "standard output") {
 		t.Fatalf("instance-id: %d %q", code, errOut.String())
+	}
+	errOut.Reset()
+	if code := run([]string{"admin", "setup-link", "--data-dir", dir}, strings.NewReader(""), failingWriter{}, &errOut); code != 1 || !strings.Contains(errOut.String(), "standard output") || strings.Contains(errOut.String(), "works once") {
+		t.Fatalf("setup-link: %d %q", code, errOut.String())
 	}
 }
