@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { Link, useNavigate, useRouter, useSearch } from "@tanstack/react-router";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { Moon, Sun } from "lucide-react";
 import { useServices, useSession } from "@/app/services";
 import { describeError, isApiError, readyAgain, withWait } from "@/api/errors";
@@ -10,8 +10,9 @@ import { useTheme } from "@/hooks/use-theme";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { Checkbox, Field, Input } from "@/components/ui/input";
-import { ErrorText, Notice } from "@/components/ui/states";
+import { ErrorText, LoadingState, Notice } from "@/components/ui/states";
 import { normalizeUsername, validatePassword, validateUsername } from "@/lib/validators";
+import { clearSetupToken, heldSetupToken } from "@/lib/setup-token";
 import { safeRedirectPath } from "@/lib/url";
 
 function AuthLayout({ title, children }: { title: string; children: ReactNode }) {
@@ -327,23 +328,18 @@ export function RegisterPage() {
   );
 }
 
-/** The setup token in a "#t=<token>" fragment, or null. */
-export function setupTokenFromHash(hash: string): string | null {
-  const params = new URLSearchParams(hash.startsWith("#") ? hash.slice(1) : hash);
-  return params.get("t") || null;
-}
-
 /**
  * Creates the first admin account with the one-time setup link
- * (golem-deploy admin setup-link prints "<origin>/setup#t=<token>"). The
- * token is read once from the fragment, kept only in this component's state
- * and removed from the address bar straight away.
+ * (golem-deploy admin setup-link prints "<origin>/setup#t=<token>"). main.tsx
+ * has already moved the token from the address bar into the holder in
+ * lib/setup-token.ts; the page takes it from there and clears it once the
+ * token is used up or refused.
  */
 export function SetupPage() {
   const { api, session, queryClient } = useServices();
-  const router = useRouter();
   const navigate = useNavigate();
-  const [token, setToken] = useState<string | null>(() => setupTokenFromHash(router.state.location.hash));
+  const options = useAuthOptions();
+  const [token, setToken] = useState<string | null>(heldSetupToken);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -353,13 +349,11 @@ export function SetupPage() {
   const [pending, setPending] = useState(false);
   const [wait, startWait] = useCountdown();
 
+  // Once an admin exists, no setup link works any more.
+  const setupDone = options.data?.setup_required === false;
   useEffect(() => {
-    // The router's history replaces the entry (history.replaceState in a
-    // browser), so the token leaves the address bar and the browser's
-    // history at once.
-    const loc = router.state.location;
-    if (loc.hash) router.history.replace(loc.pathname + loc.searchStr);
-  }, [router]);
+    if (setupDone) clearSetupToken();
+  }, [setupDone]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -374,6 +368,7 @@ export function SetupPage() {
     setPending(true);
     try {
       const res = await api.auth.setup({ token, username: normalizeUsername(username), password });
+      clearSetupToken();
       queryClient.clear();
       const me: CurrentAccount = { ...res.account, auth: "session", api_token: null };
       queryClient.setQueryData(qk.account, me);
@@ -383,6 +378,7 @@ export function SetupPage() {
       setPending(false);
       if (waitsForRetry(err) && isApiError(err) && err.retryAfter) startWait(err.retryAfter);
       if (isApiError(err) && err.code === "setup_link_invalid") {
+        clearSetupToken();
         setToken(null);
       } else if (isApiError(err) && err.code === "username_taken") {
         setErrors({ username: "This username is taken. Choose another." });
@@ -392,6 +388,33 @@ export function SetupPage() {
         setFormError(err);
       }
     }
+  }
+
+  if (setupDone) {
+    return (
+      <AuthLayout title="Set up Golem Deploy">
+        <div className="flex flex-col gap-4 text-sm">
+          <p>This setup link is missing, expired or already used. A setup link works once and only until it expires.</p>
+          <p>
+            This installation already has an admin account, so no setup link is needed.{" "}
+            <Link to="/login" className="font-medium underline underline-offset-4">
+              Sign in
+            </Link>{" "}
+            instead.
+          </p>
+        </div>
+      </AuthLayout>
+    );
+  }
+
+  // Wait for the options rather than show a form or advice that may not
+  // apply. If they cannot be read, go on: the daemon decides the token.
+  if (options.isPending) {
+    return (
+      <AuthLayout title="Set up Golem Deploy">
+        <LoadingState />
+      </AuthLayout>
+    );
   }
 
   if (!token) {

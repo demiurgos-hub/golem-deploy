@@ -44,8 +44,9 @@ var errSetupLinkInvalid = newError(http.StatusForbidden, apitypes.ErrorCodeSetup
 
 // handleSetup creates the first admin account with the one-time setup token
 // (golem-deploy admin setup-link) and signs it in. The token is decided
-// first, counted against the client-IP login limit: a refused token stays
-// counted and never reaches the password hashing. Validation errors are
+// first, counted per client IP on the setup limiter (the login limiter's
+// parameters, its own counters): a refused token stays counted and never
+// reaches the password hashing. Validation errors are
 // reported only for a valid token and do not use it up. The store checks
 // the token again, and that no admin exists, in the transaction that
 // creates the account.
@@ -56,7 +57,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) error {
 	}
 	ctx := r.Context()
 	ip := clientIP(r)
-	res, wait, ok := s.loginIP.Reserve(ip)
+	res, wait, ok := s.setupIP.Reserve(ip)
 	if !ok {
 		return rateLimited(wait)
 	}

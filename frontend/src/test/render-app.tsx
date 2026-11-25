@@ -6,6 +6,7 @@ import { createServices } from "@/app/services";
 import type { Account, Status } from "@/api/types.gen";
 import { account, currentAccount, fakeJwt, fakeTransport, jsonResponse, type Handler } from "@/test/fake-api";
 import { inspectorOff } from "@/test/fixtures";
+import { captureSetupToken, clearSetupToken } from "@/lib/setup-token";
 
 export const STATUS: Status = {
   version: "v0.0.0-test",
@@ -40,6 +41,9 @@ export function renderApp({
   const services = createServices({ transport, local: localStorage, session: sessionStorage, channel: null, document: null });
   if (signedInAs) services.session.start(fakeJwt(Math.floor(Date.now() / 1000) + 12 * 3600), false);
   const history = createMemoryHistory({ initialEntries: [path] });
+  // What main.tsx does with the browser's address before the router starts.
+  clearSetupToken();
+  captureSetupToken(history.location, (url) => history.replace(url));
   const user = userEvent.setup();
   const view = render(<AppRoot services={services} history={history} />);
   return { ...view, services, calls, history, user };

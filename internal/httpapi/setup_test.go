@@ -100,7 +100,7 @@ func TestSetupRefusals(t *testing.T) {
 		}
 		bodies = append(bodies, strip(rr))
 		errBody(t, rr, http.StatusForbidden, apitypes.ErrorCodeSetupLinkInvalid)
-		h.srv.loginIP.Reset(clientIPForTests)
+		h.srv.setupIP.Reset(clientIPForTests)
 	}
 	check("missing", setup(h, "", "root"))
 	check("wrong", setup(h, tok+"x", "root"))
@@ -137,7 +137,7 @@ func TestSetupValidationKeepsTheToken(t *testing.T) {
 	if e.Field != "password" {
 		t.Fatalf("field %q", e.Field)
 	}
-	if n := h.srv.loginIP.Count(clientIPForTests); n != 0 {
+	if n := h.srv.setupIP.Count(clientIPForTests); n != 0 {
 		t.Fatalf("validation errors with a valid token were counted: %d", n)
 	}
 	if rr := setup(h, tok, "root"); rr.Code != http.StatusCreated {
@@ -157,16 +157,52 @@ func TestSetupRateLimit(t *testing.T) {
 	if rr.Header().Get("Retry-After") == "" {
 		t.Fatal("no Retry-After")
 	}
-	// Setup failures and login failures share the per-client limit.
-	if r := login(h, "nobody", testPassword); r.code != http.StatusTooManyRequests {
+	// Setup failures do not count against login.
+	if n := h.srv.loginIP.Count(clientIPForTests); n != 0 {
+		t.Fatalf("setup failures counted against login: %d", n)
+	}
+	if r := login(h, "nobody", testPassword); r.code != http.StatusUnauthorized {
 		t.Fatalf("login after setup failures: %d", r.code)
 	}
 	h.clock.Add(loginWindow)
 	if rr := setup(h, tok, "root"); rr.Code != http.StatusCreated {
 		t.Fatalf("setup after the window: %d %s", rr.Code, rr.Body.String())
 	}
-	if n := h.srv.loginIP.Count(clientIPForTests); n != 0 {
+	if n := h.srv.setupIP.Count(clientIPForTests); n != 0 {
 		t.Fatalf("a successful setup was counted: %d", n)
+	}
+}
+
+// Login failures do not count against setup, and setup keeps its own
+// counter after the first admin exists.
+func TestSetupAndLoginLimitsAreSeparate(t *testing.T) {
+	h := newHarness(t)
+	tok := h.setupToken(time.Hour)
+	for i := 0; i < loginFailuresPerWindow; i++ {
+		if r := login(h, "nobody", testPassword); r.code != http.StatusUnauthorized {
+			t.Fatalf("login %d: %d", i, r.code)
+		}
+	}
+	if r := login(h, "nobody", testPassword); r.code != http.StatusTooManyRequests {
+		t.Fatalf("login over the limit: %d", r.code)
+	}
+	if n := h.srv.setupIP.Count(clientIPForTests); n != 0 {
+		t.Fatalf("login failures counted against setup: %d", n)
+	}
+	if rr := setup(h, tok, "root"); rr.Code != http.StatusCreated {
+		t.Fatalf("setup while login is limited: %d %s", rr.Code, rr.Body.String())
+	}
+
+	// Old links after setup use up only the setup counter.
+	h.clock.Add(loginWindow)
+	for i := 0; i < loginFailuresPerWindow+1; i++ {
+		setup(h, tok, "other")
+	}
+	if n := h.srv.loginIP.Count(clientIPForTests); n != 0 {
+		t.Fatalf("setup requests after setup counted against login: %d", n)
+	}
+	if r := login(h, "root", testPassword); r.code != http.StatusOK {
+		t.Fatalf("login after old setup links: %d", r.code)
 	}
 }
 

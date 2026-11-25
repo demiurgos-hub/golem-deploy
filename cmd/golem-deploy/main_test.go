@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
@@ -166,6 +170,11 @@ func TestAdminSetupLink(t *testing.T) {
 		"http://192.0.2.7:8000":           "http://192.0.2.7:8000",
 		"HTTPS://deploy.example.com:8443": "https://deploy.example.com:8443",
 		"https://[2001:db8::1]:443":       "https://[2001:db8::1]:443",
+		"http://localhost:8000":           "http://localhost:8000",
+		"https://deploy.example.com.":     "https://deploy.example.com.",
+		"https://my_host.example.com":     "https://my_host.example.com",
+		"https://Deploy.Example.com":      "https://Deploy.Example.com",
+		"https://123.example.com":         "https://123.example.com",
 	} {
 		if got, _, _ := setupLink(t, "--data-dir", dir, "--origin", in); got != want {
 			t.Errorf("origin %q: got %q, want %q", in, got, want)
@@ -212,6 +221,10 @@ func TestAdminSetupLinkRejectsBadFlags(t *testing.T) {
 		"https://deploy.example.com#x", "https://deploy.example.com#", "https://user@deploy.example.com",
 		"https://deploy.example.com:0", "https://deploy.example.com:70000", "https://deploy.example.com:",
 		"https://a b", "mailto:x@example.com",
+		"https://[fe80::1%25eth0]", "https://[fe80::1%25eth0]:8443", "https://[192.0.2.1]", "https://[deploy.example.com]",
+		"https://-deploy.example.com", "https://deploy-.example.com", "https://deploy..example.com",
+		"https://1.2.3", "https://1.2.3.256", "https://01.2.3.4", "https://deploy.0x1f", "https://deploy.123",
+		"https://d%C3%A9ploy.example.com", "https://deploy!.example.com", "https://*.example.com", "https://" + strings.Repeat("a", 64) + ".example.com",
 	} {
 		if code, out, stderr := runCLI(t, "", "admin", "setup-link", "--data-dir", dir, "--origin", origin); code != 2 || out != "" || !strings.Contains(stderr, "--origin") {
 			t.Errorf("origin %q: %d %q %q", origin, code, out, stderr)
@@ -238,5 +251,157 @@ func TestAdminSetupLinkRefusesWithAnAdmin(t *testing.T) {
 	if code != 3 || out != "" || !strings.Contains(stderr, "admin account already exists") ||
 		!strings.Contains(stderr, "admin create") || !strings.Contains(stderr, "admin reset-password") {
 		t.Fatalf("with an admin: %d %q %q", code, out, stderr)
+	}
+}
+
+// treeState records every file and directory below dir with its size, time
+// and content hash.
+func treeState(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	err := filepath.Walk(dir, func(p string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, p)
+		if fi.IsDir() {
+			out[rel] = "dir"
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		out[rel] = fmt.Sprintf("%s %d %x", fi.ModTime().Format(time.RFC3339Nano), fi.Size(), sha256.Sum256(b))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+var instanceIDRE = regexp.MustCompile(`^[0-9a-f]{32}\n$`)
+
+func TestAdminInstanceID(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "data")
+	layout, err := datadir.Prepare(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(ctx, layout.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Before the first serve there is no id, and none is made.
+	code, out, stderr := runCLI(t, "", "admin", "instance-id", "--data-dir", dir)
+	if code != 1 || out != "" || !strings.Contains(stderr, "no instance id yet") {
+		t.Fatalf("without an id: %d %q %q", code, out, stderr)
+	}
+	if v, ok, err := st.GetSetting(ctx, store.SettingInstanceID); err != nil || ok {
+		t.Fatalf("an instance id was created: %q %v", v, err)
+	}
+	want, err := st.InstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// While the daemon has the database open.
+	code, out, stderr = runCLI(t, "", "admin", "instance-id", "--data-dir", dir)
+	if code != 0 || !instanceIDRE.MatchString(out) || out != want+"\n" || stderr != "" {
+		t.Fatalf("instance-id: %d %q %q, want %q", code, out, stderr, want)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// With the daemon stopped: the same id, and nothing created or changed.
+	before := treeState(t, dir)
+	code, out, _ = runCLI(t, "", "admin", "instance-id", "--data-dir", dir)
+	if code != 0 || out != want+"\n" {
+		t.Fatalf("instance-id after close: %d %q", code, out)
+	}
+	after := treeState(t, dir)
+	if fmt.Sprint(before) != fmt.Sprint(after) {
+		t.Fatalf("the data directory changed:\nbefore %v\nafter  %v", before, after)
+	}
+}
+
+func TestAdminInstanceIDRefuses(t *testing.T) {
+	root := t.TempDir()
+
+	// A missing directory is not created.
+	missing := filepath.Join(root, "missing")
+	if code, out, stderr := runCLI(t, "", "admin", "instance-id", "--data-dir", missing); code != 1 || out != "" || !strings.Contains(stderr, "does not exist") {
+		t.Fatalf("missing: %d %q %q", code, out, stderr)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("the data directory was created: %v", err)
+	}
+
+	// A directory that Golem Deploy did not initialise stays as it is.
+	other := filepath.Join(root, "other")
+	if err := os.Mkdir(other, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, stderr := runCLI(t, "", "admin", "instance-id", "--data-dir", other); code != 1 || out != "" || !strings.Contains(stderr, "not an initialised") {
+		t.Fatalf("uninitialised: %d %q %q", code, out, stderr)
+	}
+	if entries, err := os.ReadDir(other); err != nil || len(entries) != 0 {
+		t.Fatalf("the directory changed: %v %v", entries, err)
+	}
+
+	// An initialised directory whose database was never opened.
+	fresh := filepath.Join(root, "fresh")
+	if _, err := datadir.Prepare(fresh); err != nil {
+		t.Fatal(err)
+	}
+	before := treeState(t, fresh)
+	if code, out, stderr := runCLI(t, "", "admin", "instance-id", "--data-dir", fresh); code != 1 || out != "" || !strings.Contains(stderr, "no instance id yet") {
+		t.Fatalf("fresh: %d %q %q", code, out, stderr)
+	}
+	if fmt.Sprint(before) != fmt.Sprint(treeState(t, fresh)) {
+		t.Fatal("the data directory changed")
+	}
+
+	// Usage errors.
+	if code, _, _ := runCLI(t, "", "admin", "instance-id", "--data-dir", fresh, "extra"); code != 2 {
+		t.Fatalf("positional argument: %d", code)
+	}
+	if code, _, _ := runCLI(t, "", "admin", "instance-id", "--bogus"); code != 2 {
+		t.Fatalf("unknown flag: %d", code)
+	}
+}
+
+// failingWriter fails every write, like a closed pipe or /dev/full.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+func TestAdminWriteFailures(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "data")
+	layout, err := datadir.Prepare(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(ctx, layout.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.InstanceID(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var errOut bytes.Buffer
+	if code := run([]string{"admin", "instance-id", "--data-dir", dir}, strings.NewReader(""), failingWriter{}, &errOut); code != 1 || !strings.Contains(errOut.String(), "standard output") {
+		t.Fatalf("instance-id: %d %q", code, errOut.String())
+	}
+	errOut.Reset()
+	if code := run([]string{"admin", "setup-link", "--data-dir", dir}, strings.NewReader(""), failingWriter{}, &errOut); code != 1 || !strings.Contains(errOut.String(), "standard output") || strings.Contains(errOut.String(), "works once") {
+		t.Fatalf("setup-link: %d %q", code, errOut.String())
 	}
 }
