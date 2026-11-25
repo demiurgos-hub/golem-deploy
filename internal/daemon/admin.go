@@ -145,3 +145,26 @@ func CreateSetupLink(ctx context.Context, dataDir string, ttl time.Duration) (to
 	}
 	return token, expiresAt, nil
 }
+
+// ErrNoInstanceID is returned by InstanceID when the data directory has no
+// instance id yet.
+var ErrNoInstanceID = errors.New("the data directory has no instance id yet; golem-deploy serve creates it when it first starts")
+
+// InstanceID returns the instance id of the installation in dataDir, the
+// value of the instance label on its Docker objects. It creates, migrates
+// and changes nothing (the database is opened read-only) and works while
+// the daemon runs.
+func InstanceID(ctx context.Context, dataDir string) (string, error) {
+	layout, err := datadir.Open(dataDir)
+	if err != nil {
+		return "", err
+	}
+	id, err := store.ReadInstanceID(ctx, layout.DB())
+	if errors.Is(err, store.ErrNoInstanceID) {
+		return "", ErrNoInstanceID
+	}
+	if err != nil {
+		return "", fmt.Errorf("read the instance id: %w", err)
+	}
+	return id, nil
+}

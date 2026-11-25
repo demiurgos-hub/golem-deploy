@@ -4,6 +4,7 @@
 //	golem-deploy admin create --username <u> [--password-stdin] [--data-dir <dir>]
 //	golem-deploy admin reset-password --username <u> [--password-stdin] [--data-dir <dir>]
 //	golem-deploy admin setup-link [--data-dir <dir>] [--origin <origin>] [--ttl <duration>]
+//	golem-deploy admin instance-id [--data-dir <dir>]
 //	golem-deploy version
 package main
 
@@ -53,6 +54,8 @@ const usage = `Usage:
                                              and deletes its API tokens)
   golem-deploy admin setup-link              print a one-time link that creates the first
                                              admin account in a browser
+  golem-deploy admin instance-id             print the instance id this installation labels its
+                                             Docker objects with
   golem-deploy version                       print the version
 
 Run "golem-deploy <command> -h" for the flags of a command.
@@ -297,8 +300,11 @@ func cmdAdmin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	sub := args[0]
-	if sub == "setup-link" {
+	switch sub {
+	case "setup-link":
 		return cmdSetupLink(args[1:], stdout, stderr)
+	case "instance-id":
+		return cmdInstanceID(args[1:], stdout, stderr)
 	}
 	if sub != "create" && sub != "reset-password" {
 		fmt.Fprintf(stderr, "unknown admin command %q\n\n%s", sub, usage)
@@ -386,6 +392,33 @@ func cmdSetupLink(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "%s/setup#t=%s\n", prefix, token)
 	fmt.Fprintf(stderr, "Open the link in a browser to create the first admin account. It works once and expires at %s. Making a new link ends this one.\n", expires.Format(time.RFC3339))
+	return 0
+}
+
+// cmdInstanceID prints the installation's instance id (the value of the
+// dev.golemengine.deploy.instance label on its Docker objects) as the only
+// line on stdout. The uninstaller uses it to remove only this
+// installation's Docker objects. It changes nothing in the data directory.
+func cmdInstanceID(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("admin instance-id", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dataDir := dataDirFlag(fs)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "admin instance-id: unexpected arguments %q\n", fs.Args())
+		return 2
+	}
+	id, err := daemon.InstanceID(context.Background(), *dataDir)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if _, err := fmt.Fprintln(stdout, id); err != nil {
+		fmt.Fprintln(stderr, "error: could not write the instance id to standard output")
+		return 1
+	}
 	return 0
 }
 
