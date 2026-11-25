@@ -132,8 +132,10 @@ docker_server_version() {
 }
 
 # Docker's apt repository is configured when an enabled entry in a source
-# file apt reads points at it: "deb" lines in sources.list and *.list, and
-# deb822 stanzas in *.sources without "Enabled: no". Backups such as
+# file apt reads has a URI of Docker's repository: "deb" lines in
+# sources.list and *.list (everything after "#" is a comment), and deb822
+# stanzas in *.sources that apt does not disable ("Enabled: no", "false",
+# "0", "off" and the like, in any letter case). Backups such as
 # docker.sources.save, comments and disabled entries do not count.
 docker_repo_configured() {
 	local f
@@ -151,32 +153,49 @@ docker_repo_configured() {
 				/^[^ \t]/ { field = tolower($0); sub(/:.*/, "", field); val = $0; sub(/^[^:]*:/, "", val) }
 				/^[ \t]/ { val = $0 }
 				field == "types" && (" " val " ") ~ /[ \t]deb[ \t]/ { deb = 1 }
-				field == "uris" && val ~ /download\.docker\.com\/linux/ { uri = 1 }
-				field == "enabled" && tolower(val) ~ /^[ \t]*(no|false|off|without|disable)[ \t]*$/ { enabled = 0 }
+				field == "uris" { n = split(val, u, /[ \t]+/); for (i = 1; i <= n; i++) if (u[i] ~ /^https?:\/\/download\.docker\.com\/linux\//) uri = 1 }
+				field == "enabled" && tolower(val) ~ /^[ \t]*(no|false|0|off|without|disable)[ \t]*$/ { enabled = 0 }
 				END { flush(); exit !found }' "$f" && return 0
 			;;
 		*)
-			awk '$1 == "deb" && /download\.docker\.com\/linux/ { found = 1 } END { exit !found }' "$f" && return 0
+			# deb [options] URI suite [components]; the options may hold spaces.
+			awk '
+				{ sub(/#.*/, "") }
+				$1 != "deb" { next }
+				{
+					i = 2
+					if ($i ~ /^\[/) { while (i <= NF && $i !~ /\]$/) i++; i++ }
+					if ($i ~ /^https?:\/\/download\.docker\.com\/linux\//) found = 1
+				}
+				END { exit !found }' "$f" && return 0
 			;;
 		esac
 	done
 	return 1
 }
 
-# docker_candidates_ok PKG... checks that apt's candidate version of each
-# package comes from Docker's repository, so that a pin or another source
-# cannot swap in packages from elsewhere.
+# docker_candidates_ok PKG... checks that apt downloads the candidate
+# version of each package from Docker's repository, so that a pin, a mirror
+# or a local repository cannot swap in packages from elsewhere. Of the
+# sources that offer a version, apt uses one with the highest priority, so
+# every source with that priority must be Docker's repository for this OS.
 docker_candidates_ok() {
-	local pkg
+	local pkg policy
 	for pkg in "$@"; do
-		if ! LC_ALL=C apt-cache policy "$pkg" </dev/null 2>/dev/null | awk '
-			/^  Candidate:/ { cand = $2 }
-			/^ \*\*\* / { ver = $2; next }
-			/^     [^ ]/ { ver = $1; next }
-			/^        / && ver == cand && cand != "(none)" && /https:\/\/download\.docker\.com\/linux\// { ok = 1 }
-			END { exit !ok }'; then
-			warn "apt's candidate for $pkg does not come from https://download.docker.com:"
-			LC_ALL=C apt-cache policy "$pkg" </dev/null 2>&1 | sed -n '1,6s/^/    /p' >&2 || true
+		if ! policy=$(LC_ALL=C apt-cache policy "$pkg" </dev/null 2>/dev/null) ||
+			! printf '%s\n' "$policy" | awk -v want="https://download.docker.com/linux/$os_id" '
+				/^  Candidate:/ { cand = $2 }
+				/^ \*\*\* / { ver = $2; next }
+				/^     [^ ]/ { ver = $1; next }
+				/^        / && ver == cand && cand != "(none)" { n++; prio[n] = $1 + 0; url[n] = $2 }
+				END {
+					if (n == 0) exit 1
+					max = prio[1]
+					for (i = 2; i <= n; i++) if (prio[i] > max) max = prio[i]
+					for (i = 1; i <= n; i++) if (prio[i] == max && url[i] != want && url[i] != want "/") exit 1
+				}'; then
+			warn "apt would not download $pkg only from https://download.docker.com/linux/$os_id:"
+			printf '%s\n' "$policy" | sed -n '1,12s/^/    /p' >&2 || true
 			return 1
 		fi
 	done
@@ -361,8 +380,16 @@ install_docker() {
 			die "could not download Docker's repository key from https://download.docker.com/linux/$os_id/gpg; nothing was changed for Docker"
 		# The keyring and the source file are written only after the key matched.
 		check_docker_key "$work/docker.asc"
-		install -d -m 0755 -o root -g root /etc/apt/keyrings
-		install -m 0644 -o root -g root "$work/docker.asc" "$DOCKER_KEYRING"
+		# An existing keyring is never overwritten.
+		if [ -e "$DOCKER_KEYRING" ] || [ -L "$DOCKER_KEYRING" ]; then
+			cmp -s -- "$work/docker.asc" "$DOCKER_KEYRING" ||
+				die "$DOCKER_KEYRING exists, but does not hold the key just downloaded from Docker. Remove it" \
+					"(no enabled apt source uses Docker's repository) and run this script again. Nothing was changed for Docker."
+			note "$DOCKER_KEYRING already holds this key"
+		else
+			install -d -m 0755 -o root -g root /etc/apt/keyrings
+			install -T -m 0644 -o root -g root "$work/docker.asc" "$DOCKER_KEYRING"
+		fi
 		cat >"$work/docker.sources" <<EOF
 # Docker's apt repository, added by the Golem Deploy installer.
 Types: deb
@@ -372,7 +399,7 @@ Components: stable
 Architectures: $arch
 Signed-By: $DOCKER_KEYRING
 EOF
-		install -m 0644 -o root -g root "$work/docker.sources" "$DOCKER_SOURCES"
+		install -T -m 0644 -o root -g root "$work/docker.sources" "$DOCKER_SOURCES"
 		note "wrote $DOCKER_KEYRING and $DOCKER_SOURCES"
 	fi
 	say "Installing Docker Engine ($DOCKER_PACKAGES)"
@@ -745,6 +772,15 @@ main() {
 		docker_plan=install
 		note "Docker Engine is not installed; it will be installed from Docker's apt repository"
 		if ! docker_repo_configured; then
+			# The file this run would write is never overwritten.
+			if [ -e "$DOCKER_SOURCES" ] || [ -L "$DOCKER_SOURCES" ]; then
+				die "$DOCKER_SOURCES exists but has no enabled entry for Docker's repository" \
+					"(https://download.docker.com/linux/$os_id). Enable it (remove its \"Enabled:\" line) or remove the file," \
+					"and run this script again. Nothing was changed."
+			fi
+			if [ -e "$DOCKER_KEYRING" ] && [ ! -f "$DOCKER_KEYRING" ]; then
+				die "$DOCKER_KEYRING exists and is not a file; remove it and run this script again. Nothing was changed."
+			fi
 			docker_add_repo=yes
 			if [ "$os_id" = ubuntu ]; then
 				# shellcheck source=/dev/null
