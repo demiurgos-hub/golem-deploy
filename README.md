@@ -28,6 +28,7 @@ The HTTP contract is documented in [docs/API.md](docs/API.md).
 
 ## Documentation
 
+- [docs/QUICKSTART.md](docs/QUICKSTART.md): from a fresh server to a running game.
 - [docs/INSTALL.md](docs/INSTALL.md): installing, upgrading and uninstalling on a Linux host.
 - [docs/GAME_INTEGRATION.md](docs/GAME_INTEGRATION.md): making a game deployable.
 - [docs/REPOSITORIES.md](docs/REPOSITORIES.md): Git repositories, credentials and SSH host keys.
