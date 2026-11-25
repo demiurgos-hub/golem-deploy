@@ -145,3 +145,43 @@ func TestReadInstanceIDWithoutID(t *testing.T) {
 		t.Fatalf("junk: %v, want an error", err)
 	}
 }
+
+// A database copied or restored with its -wal file but without the -shm
+// file is read from private copies: nothing appears next to it.
+func TestReadInstanceIDWALWithoutSHM(t *testing.T) {
+	ctx := context.Background()
+	src := filepath.Join(t.TempDir(), "src.db")
+	s, err := Open(ctx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := s.InstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Copy while the store is open, so the id is still in the -wal file.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "golem-deploy.db")
+	for _, suffix := range []string{"", "-wal"} {
+		b, err := os.ReadFile(src + suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path+suffix, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(path + "-wal"); err != nil || fi.Size() == 0 {
+		t.Fatalf("the copied -wal file is missing or empty: %v", err)
+	}
+
+	before := dirState(t, dir)
+	got, err := ReadInstanceID(ctx, path)
+	if err != nil || got != want {
+		t.Fatalf("got %q, %v; want %q", got, err, want)
+	}
+	sameState(t, before, dirState(t, dir))
+}

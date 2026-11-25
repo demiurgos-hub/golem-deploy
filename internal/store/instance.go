@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/url"
 	"os"
@@ -34,18 +35,36 @@ func ReadInstanceID(ctx context.Context, path string) (string, error) {
 	if !fi.Mode().IsRegular() {
 		return "", errors.New("the database is not a regular file")
 	}
-	// While the daemon runs, or after it stopped without closing the
-	// database, newer pages can be in the -wal file: open read-only with
-	// the usual locking, which uses the daemon's -wal and -shm files. Without
-	// a -wal file the database file holds everything; open it as immutable
-	// so that SQLite creates no -wal or -shm file. The instance id never
-	// changes once written, so a daemon that starts meanwhile does not
-	// change the answer.
-	query := "mode=ro&immutable=1"
+	// Without a -wal file the database file holds everything; open it as
+	// immutable so that SQLite creates no -wal or -shm file. While the
+	// daemon runs, or after it stopped without closing the database, newer
+	// pages can be in the -wal file: open read-only with the usual locking,
+	// which uses the daemon's -wal and -shm files. A -wal file without a
+	// -shm file (a restored or copied database) would make SQLite create
+	// the -shm file, so then private copies of both are read instead. The
+	// instance id never changes once written, so a daemon that starts
+	// meanwhile does not change the answer.
+	dsn := readOnlyDSN(abs, "mode=ro&immutable=1")
 	if _, err := os.Lstat(abs + "-wal"); err == nil {
-		query = "mode=ro&_busy_timeout=5000"
+		if _, err := os.Lstat(abs + "-shm"); err == nil {
+			dsn = readOnlyDSN(abs, "mode=ro&_busy_timeout=5000")
+		} else {
+			tmp, err := os.MkdirTemp("", "golem-deploy-instance-id-")
+			if err != nil {
+				return "", fmt.Errorf("create temporary directory: %w", err)
+			}
+			defer os.RemoveAll(tmp)
+			copyPath := filepath.Join(tmp, "copy.db")
+			if err := copyFile(abs, copyPath); err != nil {
+				return "", err
+			}
+			if err := copyFile(abs+"-wal", copyPath+"-wal"); err != nil {
+				return "", err
+			}
+			dsn = readOnlyDSN(copyPath, "mode=ro")
+		}
 	}
-	db, err := sql.Open("sqlite", readOnlyDSN(abs, query))
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return "", fmt.Errorf("open database: %w", err)
 	}
@@ -86,4 +105,32 @@ func readOnlyDSN(abs, query string) string {
 	}
 	u := url.URL{Scheme: "file", Path: p, RawQuery: query}
 	return u.String()
+}
+
+// copyFile copies the regular file src to a new file dst (mode 0600).
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", filepath.Base(src), err)
+	}
+	defer in.Close()
+	fi, err := in.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", filepath.Base(src), err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", filepath.Base(src))
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create copy of %s: %w", filepath.Base(src), err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return fmt.Errorf("copy %s: %w", filepath.Base(src), err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("copy %s: %w", filepath.Base(src), err)
+	}
+	return nil
 }
