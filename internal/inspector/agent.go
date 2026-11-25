@@ -113,6 +113,13 @@ func (s *Service) networkAddrs(ctx context.Context, refresh bool) (docker.Networ
 	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	addrs, err := s.cfg.Docker.ManagedNetworkAddresses(qctx)
+	if err != nil && !errors.Is(err, docker.ErrNotFound) && s.netErr == nil && len(s.netAddrs.Gateways)+len(s.netAddrs.Subnets) > 0 {
+		// Docker did not answer: keep the last known addresses (the agent
+		// address and restart_required must not flicker) and ask again
+		// soon.
+		s.netAt = now.Add(-networkCacheTTL + 5*time.Second)
+		return s.netAddrs, nil
+	}
 	s.netAddrs, s.netErr, s.netAt = addrs, err, now
 	if err != nil {
 		// Retry sooner after a failure.

@@ -97,10 +97,6 @@ type Options struct {
 	storeClosed   func(error)                                      // tests only
 	readyServices func(*jobs.Runner, *build.Service, *store.Store) // tests only
 	stopTimeout   time.Duration                                    // tests only
-	inspectorGOOS string                                           // tests only; "" means runtime.GOOS
-	inspectorWait time.Duration                                    // tests only; hub ready timeout
-	inspectorCost int                                              // tests only; hub password bcrypt cost
-	inspector     func(*inspector.Service)                         // tests only; called with the service
 }
 
 // InspectorOptions are the Inspector serve flags.
@@ -504,14 +500,10 @@ func Run(ctx context.Context, o Options) (err error) {
 			return a.GetCertificate(hello)
 		}}
 	}
-	goos := runtime.GOOS
-	if o.inspectorGOOS != "" {
-		goos = o.inspectorGOOS
-	}
 	insp, err := inspector.New(ctx, inspector.Config{
 		Store: st, Secrets: box, Docker: dockerClient, Jobs: runner, Policy: policy, Logger: logger,
 		Image: inspCfg.image, MemoryMB: inspCfg.memoryMB, Listen: inspCfg.listen, PublicURL: inspCfg.publicURL,
-		AgentHost: inspCfg.agentHost, TLSConfig: inspTLS, GOOS: goos, ReadyTimeout: o.inspectorWait, BcryptCost: o.inspectorCost,
+		AgentHost: inspCfg.agentHost, TLSConfig: inspTLS, GOOS: runtime.GOOS,
 	})
 	if err != nil {
 		return err
@@ -598,9 +590,6 @@ func Run(ctx context.Context, o Options) (err error) {
 	}
 	if o.readyServices != nil {
 		o.readyServices(runner, builds, st)
-	}
-	if o.inspector != nil {
-		o.inspector(insp)
 	}
 
 	// Cancel all background work with HTTP shutdown. Keep their completion

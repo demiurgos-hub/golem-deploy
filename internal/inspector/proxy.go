@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/netpolicy"
+	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
 // Browser side of the Inspector listener.
@@ -200,17 +201,14 @@ func (s *Service) sessionFor(r *http.Request) *session {
 		return nil
 	}
 	acct, err := s.cfg.Store.GetAccount(r.Context(), sess.accountID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil // the database did not answer: refuse this request only
+	}
 	if err != nil || !acct.Approved || acct.TokenVersion != sess.tokenVersion {
-		if err == nil || !isTransient(r.Context(), err) {
-			s.endSession(sess)
-		}
+		s.endSession(sess)
 		return nil
 	}
 	return sess
-}
-
-func isTransient(ctx context.Context, err error) bool {
-	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // unauthenticated answers a request without a valid session: a static page
