@@ -1,7 +1,7 @@
-import { useQuery, type QueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useApi } from "@/app/services";
 import { qk } from "@/api/query-keys";
-import type { Build, Job, Project, Server, SubjectType } from "@/api/types.gen";
+import type { Build, Job, JobList, Project, Server, SubjectType } from "@/api/types.gen";
 
 export function isJobActive(job: Pick<Job, "status"> | undefined): boolean {
   return job?.status === "queued" || job?.status === "running";
@@ -50,6 +50,10 @@ export function invalidateJobSubject(queryClient: QueryClient, job: Job) {
     void queryClient.invalidateQueries({ queryKey: qk.backups.all });
   } else if (job.subject_type === "certificate") {
     void queryClient.invalidateQueries({ queryKey: qk.certificates.all });
+    void queryClient.invalidateQueries({ queryKey: qk.servers.all });
+  } else if (job.subject_type === "inspector") {
+    // The Inspector's state, and the servers' restart_required and inspector_active.
+    void queryClient.invalidateQueries({ queryKey: qk.inspector });
     void queryClient.invalidateQueries({ queryKey: qk.servers.all });
   }
 }
@@ -106,7 +110,7 @@ export function useJob(id: number, initial?: Job) {
   });
 }
 
-export function useSubjectJobs(type: SubjectType, id: number, limit = 20) {
+export function useSubjectJobs(type: SubjectType, id: number | string, limit = 20) {
   const api = useApi();
   return useQuery({
     queryKey: [...qk.jobs.forSubject(type, id), limit],
@@ -277,5 +281,39 @@ export function useBackups(serverId: number | null = null) {
     queryKey: qk.backups.list(serverId),
     queryFn: ({ signal }) => api.backups.list(serverId === null ? {} : { server_id: serverId }, signal),
     refetchInterval: POLL_IDLE_MS,
+  });
+}
+
+/**
+ * Whether a mounted query knows of an active inspector.apply job (the
+ * Settings section lists the Inspector's jobs and follows the one it
+ * started). Only observed queries count, so a list left in the cache by a
+ * page that is gone does not keep the polling fast.
+ */
+function inspectorApplyActive(queryClient: QueryClient): boolean {
+  return queryClient
+    .getQueryCache()
+    .findAll({ queryKey: qk.jobs.all })
+    .some((q) => {
+      if (q.getObserversCount() === 0) return false;
+      const data = q.state.data as JobList | Job | undefined;
+      if (!data) return false;
+      const items = "items" in data ? data.items : [data];
+      return items.some((j) => j.kind === "inspector.apply" && isJobActive(j));
+    });
+}
+
+/**
+ * The installation's Inspector (any signed-in identity). It changes through
+ * other admins and on its own (the hub stops, servers connect), so it is
+ * polled while visible: fast while an inspector.apply job runs.
+ */
+export function useInspector() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useQuery({
+    queryKey: qk.inspector,
+    queryFn: ({ signal }) => api.inspector.get(signal),
+    refetchInterval: () => listPollInterval(inspectorApplyActive(queryClient)),
   });
 }

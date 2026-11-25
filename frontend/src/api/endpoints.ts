@@ -19,12 +19,15 @@ import type {
   CreateBackupRequest,
   CreateBuildRequest,
   CreateBuildResponse,
+  CreateInspectorSessionRequest,
   CreateProjectRequest,
   CreateProjectResponse,
   CreateServerRequest,
   CurrentAccount,
   GameCertificate,
   ImageList,
+  Inspector,
+  InspectorSession,
   Job,
   JobList,
   LoginRequest,
@@ -51,6 +54,7 @@ import type {
   UpdateAccountRequest,
   UpdateGameCertificateRequest,
   UpdateGameCertificateResponse,
+  UpdateInspectorRequest,
   UpdatePanelCertificateRequest,
   UpdatePanelCertificateResponse,
   UpdateProjectRequest,
@@ -146,6 +150,14 @@ export function createEndpoints(c: ApiClient) {
       acme: (signal?: AbortSignal) => c.request<ACME>("GET", "/certificates/acme", { signal }),
       updateACME: (body: UpdateACMERequest) => c.request<ACME>("PUT", "/certificates/acme", { body }),
       renew: () => c.request<Job>("POST", "/certificates/acme/renew"),
+    },
+    inspector: {
+      get: (signal?: AbortSignal) => c.request<Inspector>("GET", "/inspector", { signal }),
+      /** Admin. 202 restricted inspector.apply job; 409 job_in_progress while one runs, 409 conflict when not available. */
+      update: (body: UpdateInspectorRequest) => c.request<Job>("PATCH", "/inspector", { body }),
+      /** Login sessions only (API tokens get 403 session_required). A one-time entry link, valid for 60 seconds. */
+      createSession: (body: CreateInspectorSessionRequest) =>
+        c.request<InspectorSession>("POST", "/inspector/sessions", { body }),
     },
     servers: {
       list: (signal?: AbortSignal) => c.request<ServerList>("GET", "/servers", { signal }),
