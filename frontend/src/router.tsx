@@ -53,8 +53,8 @@ const registerRoute = createRoute({
   component: lazyRouteComponent(() => import("@/pages/auth"), "RegisterPage"),
 });
 
-// The first admin's setup page. A signed-in visitor goes to the home page
-// (the redirect also drops the link's fragment from the address bar).
+// The first admin's setup page. main.tsx has already moved the link's token
+// out of the address bar. A signed-in visitor goes to the home page.
 const setupRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/setup",
