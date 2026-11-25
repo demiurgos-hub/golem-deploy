@@ -1225,7 +1225,7 @@ func (s *Service) openListener() error {
 	if s.ln != nil {
 		return nil
 	}
-	ln, err := openListener(s.cfg.Listen, s.cfg.TLSConfig, s.browserHandler(), s.agentHandler(), s.sniffTimeout, s.maxConns, s.logger)
+	ln, err := openListener(s.cfg.Listen, s.cfg.TLSConfig, s.browserHandler(), s.agentHandler(), s.sniffTimeout, s.reqTimeout, s.maxConns, s.logger)
 	if err != nil {
 		s.logger.Warn("could not open the Inspector listener", "addr", s.cfg.Listen, "err", err)
 		return jobs.Fail(bindError(s.cfg.Listen, err), nil)

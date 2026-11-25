@@ -333,8 +333,14 @@ func (s *Service) newAgentProxy() *httputil.ReverseProxy {
 			pr.Out.Header.Del("Origin")
 			pr.Out.Header.Set("Authorization", "Bearer "+info.token)
 		},
-		Transport:      &agentTransport{s: s, base: newHubTransport()},
-		ModifyResponse: func(resp *http.Response) error { resp.Header.Del("Set-Cookie"); return nil },
+		Transport: &agentTransport{s: s, base: newHubTransport()},
+		ModifyResponse: func(resp *http.Response) error {
+			resp.Header.Del("Set-Cookie")
+			if resp.StatusCode == http.StatusSwitchingProtocols && !webSocketAnswer(resp) {
+				return errBadUpgrade
+			}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if r.Context().Err() == nil {
 				s.logger.Debug("inspector agent relay failed", "err", err)

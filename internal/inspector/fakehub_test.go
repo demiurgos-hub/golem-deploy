@@ -74,6 +74,11 @@ type fakeHub struct {
 	agentFlood bool
 	// sessionPad pads the /auth/session answer with that many spaces.
 	sessionPad int
+	// badUpgrade makes /ws/client and /ws/agent switch to h2c instead of
+	// a WebSocket.
+	badUpgrade bool
+	// readyStatus, when set, is the status of /ready.
+	readyStatus int
 }
 
 func newFakeHub(t *testing.T) *fakeHub {
@@ -167,7 +172,13 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 	originOK := r.Header.Get("Origin") == HubOrigin
 	switch r.URL.Path {
 	case "/ready":
-		writeHubJSON(w, 200, map[string]bool{"ready": true})
+		h.mu.Lock()
+		status := h.readyStatus
+		h.mu.Unlock()
+		if status == 0 {
+			status = 200
+		}
+		writeHubJSON(w, status, map[string]bool{"ready": status == 200})
 	case "/auth/login":
 		if !originOK {
 			writeHubJSON(w, 403, map[string]string{"error": "origin_not_allowed"})
@@ -313,10 +324,18 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 const fakeDoc = `<!doctype html><html lang="en"><head><meta charset="UTF-8"><title>Golem Inspector</title>` +
 	`<script type="module" src="/assets/index.js"></script></head><body>inspector ui</body></html>`
 
-// echo completes a WebSocket upgrade and echoes raw bytes until EOF.
+// echo completes a WebSocket upgrade and echoes raw bytes until EOF. With
+// badUpgrade it switches to h2c instead.
 func (h *fakeHub) echo(w http.ResponseWriter, r *http.Request) {
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		writeHubJSON(w, 400, map[string]string{"error": "upgrade_required"})
+		return
+	}
+	h.mu.Lock()
+	bad := h.badUpgrade
+	h.mu.Unlock()
+	if bad {
+		h.switchH2C(w)
 		return
 	}
 	conn, brw, err := http.NewResponseController(w).Hijack()
@@ -343,6 +362,24 @@ func (h *fakeHub) echo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// switchH2C answers a WebSocket upgrade with a switch to h2c and keeps the
+// connection until the other side closes it.
+func (h *fakeHub) switchH2C(w http.ResponseWriter) {
+	conn, brw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return
+	}
+	h.openStreams.Add(1)
+	defer func() {
+		h.openStreams.Add(-1)
+		_ = conn.Close()
+		h.streamClosed <- struct{}{}
+	}()
+	_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n")
+	_ = brw.Flush()
+	_, _ = io.Copy(io.Discard, brw)
 }
 
 // flood completes a WebSocket upgrade and writes until the connection

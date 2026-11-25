@@ -228,16 +228,20 @@ func bindError(addr string, err error) string {
 	return "the Inspector listener could not be opened on port " + port
 }
 
-func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
-	// No ReadTimeout or WriteTimeout: relayed WebSocket streams live long.
-	// Handlers set read and write deadlines at the start of every request
-	// and clear them only when a WebSocket is relayed.
+// newHTTPServer returns a server whose read and write timeouts (reqTimeout)
+// cover everything Go does on a connection, also what it answers before
+// any handler runs (a 417 for an unsupported Expect, which then reads the
+// announced body). A relayed WebSocket clears the deadlines when it takes
+// over the connection (proxyWriter.Hijack).
+func newHTTPServer(h http.Handler, logger *slog.Logger, reqTimeout time.Duration) *http.Server {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
 	return &http.Server{
 		Handler:                      h,
-		ReadHeaderTimeout:            readHeaderTimeout,
+		ReadTimeout:                  reqTimeout,
+		WriteTimeout:                 reqTimeout,
+		ReadHeaderTimeout:            min(readHeaderTimeout, reqTimeout),
 		IdleTimeout:                  idleTimeout,
 		MaxHeaderBytes:               maxHeaderBytes,
 		DisableGeneralOptionsHandler: true,
@@ -249,7 +253,7 @@ func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
 // (and plaintext connections agent) handling on the same port; without
 // it, one plaintext server serves both. Every handler runs under the
 // listener's tracker.
-func openListener(addr string, tlsConfig *tls.Config, browser, agentOnly http.Handler, sniffTimeout time.Duration, conns int, logger *slog.Logger) (*listener, error) {
+func openListener(addr string, tlsConfig *tls.Config, browser, agentOnly http.Handler, sniffTimeout, reqTimeout time.Duration, conns int, logger *slog.Logger) (*listener, error) {
 	raw, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -258,16 +262,16 @@ func openListener(addr string, tlsConfig *tls.Config, browser, agentOnly http.Ha
 	l := &listener{addr: raw.Addr(), limit: ln, tr: newTracker()}
 	browser, agentOnly = l.tr.wrap(browser), l.tr.wrap(agentOnly)
 	if tlsConfig == nil {
-		srv := newHTTPServer(browser, logger)
+		srv := newHTTPServer(browser, logger, reqTimeout)
 		l.servers = []*http.Server{srv}
 		l.closers = []func() error{ln.Close}
 		l.wg.Go(func() { _ = srv.Serve(ln) })
 		return l, nil
 	}
 	sn := newSniffer(ln, sniffTimeout)
-	tlsSrv := newHTTPServer(browser, logger)
+	tlsSrv := newHTTPServer(browser, logger, reqTimeout)
 	tlsSrv.TLSConfig = tlsConfig
-	plainSrv := newHTTPServer(agentOnly, logger)
+	plainSrv := newHTTPServer(agentOnly, logger, reqTimeout)
 	l.servers = []*http.Server{tlsSrv, plainSrv}
 	l.closers = []func() error{sn.close}
 	l.wg.Go(func() { _ = tlsSrv.Serve(tls.NewListener(sn.tls, tlsConfig)) })

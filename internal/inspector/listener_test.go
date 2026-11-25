@@ -132,7 +132,7 @@ func TestBindError(t *testing.T) {
 	}
 	defer ln.Close()
 	addr := ln.Addr().String()
-	_, err = openListener(addr, nil, http.NotFoundHandler(), http.NotFoundHandler(), time.Second, maxConns, nil)
+	_, err = openListener(addr, nil, http.NotFoundHandler(), http.NotFoundHandler(), time.Second, time.Minute, maxConns, nil)
 	if err == nil {
 		t.Fatal("bound a busy port")
 	}

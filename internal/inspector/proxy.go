@@ -260,10 +260,16 @@ func (s *Service) originOK(r *http.Request) bool {
 }
 
 // handleLogout ends the daemon session at once, then forwards the
-// sign-out to the hub. Only POST is accepted (405 otherwise).
+// sign-out to the hub. Only POST without a body is accepted (405 for other
+// methods, 400 for a body): nothing happens before what the client sent
+// was read.
 func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		reject(w, r, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if hasBody(r) {
+		reject(w, r, http.StatusBadRequest, "bad_request")
 		return
 	}
 	if !s.knownKey(r) {
@@ -364,6 +370,11 @@ func (s *Service) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	// The answer is never written after the session expired: the write
+	// deadline is the earlier of the request timeout and the expiry (a
+	// relayed WebSocket clears it and ends with the session instead).
+	left := sess.expires.Sub(s.cfg.Now())
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(min(s.reqTimeout, left)))
 	if !upgrade {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.reqTimeout)
@@ -414,6 +425,9 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 			resp.Header.Del("Set-Cookie")
 			resp.Header.Del(SessionHeader)
 			if resp.StatusCode == http.StatusSwitchingProtocols {
+				if !webSocketAnswer(resp) {
+					return errBadUpgrade
+				}
 				// Browsers fail a connection that offered subprotocols
 				// and got none back.
 				resp.Header.Del("Sec-WebSocket-Protocol")
@@ -449,6 +463,18 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 		},
 		ErrorLog: s.proxyLog,
 	}
+}
+
+// errBadUpgrade: the hub switched protocols for something that is not the
+// WebSocket upgrade the request asked for. Returning it from
+// ModifyResponse closes the hub's connection.
+var errBadUpgrade = errors.New("inspector: the hub switched to a protocol that was not asked for")
+
+// webSocketAnswer reports whether a 101 from the hub answers a WebSocket
+// upgrade of the request with a WebSocket upgrade.
+func webSocketAnswer(resp *http.Response) bool {
+	return resp.Request != nil && isWebSocket(resp.Request) && headerHasToken(resp.Header, "Connection", "upgrade") &&
+		strings.EqualFold(strings.TrimSpace(resp.Header.Get("Upgrade")), "websocket") && len(resp.Header.Values("Upgrade")) == 1
 }
 
 // retryTransport logs in again, once, when the hub no longer knows the
