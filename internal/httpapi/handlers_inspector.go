@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/inspector"
@@ -72,8 +73,13 @@ func (s *Server) handleUpdateInspector(w http.ResponseWriter, r *http.Request) e
 	if err != nil {
 		return inspectorError(err)
 	}
+	// Enabled is optional: log what was asked, not the pointer.
+	enabled := "unchanged"
+	if req.Enabled != nil {
+		enabled = strconv.FormatBool(*req.Enabled)
+	}
 	s.logger.Info("inspector apply requested", "request_id", requestIDFrom(r.Context()), "account_id", identityFrom(r).Account.ID,
-		"enabled", req.Enabled, "pull_image", req.PullImage, "rotate_secrets", req.RotateSecrets, "job_id", job.ID)
+		"enabled", enabled, "pull_image", req.PullImage, "rotate_secrets", req.RotateSecrets, "job_id", job.ID)
 	writeJSON(w, http.StatusAccepted, toAPIJob(job))
 	return nil
 }
