@@ -442,6 +442,91 @@ describe("opening the Inspector", () => {
     await waitFor(() => expect(tab.location.replace).toHaveBeenCalledWith("https://inspector.example.com/_golem-deploy/enter#t=abc"));
   });
 
+  it("never gives the link to a tab whose opener cannot be cleared: it closes the tab and offers the link in a dialog", async () => {
+    const tab = fakeTab();
+    Object.defineProperty(tab, "opener", {
+      get: () => ({}),
+      set: () => {
+        throw new Error("not allowed");
+      },
+    });
+    vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: { ...connected(), "POST /inspector/sessions": () => jsonResponse(201, session()) },
+    });
+    await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    expect(tab.close).toHaveBeenCalled();
+    expect(tab.location.replace).not.toHaveBeenCalled();
+    expect(within(dialog).getByRole("link", { name: /Open the Inspector/ })).toHaveAttribute("href", `${ADDRESS}/_golem-deploy/enter#t=abc`);
+  });
+
+  it("offers the link in a dialog when the tab was closed before the link arrived", async () => {
+    const tab = fakeTab();
+    vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    let answer!: (r: Response) => void;
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: { ...connected(), "POST /inspector/sessions": () => new Promise<Response>((r) => (answer = r)) },
+    });
+    await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
+    await waitFor(() => expect(answer).toBeDefined());
+    tab.closed = true;
+    answer(jsonResponse(201, session()));
+    const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    expect(dialog).toHaveAccessibleDescription("The Inspector could not be opened in a new tab: the browser blocked the tab, or the tab was closed.");
+    expect(tab.location.replace).not.toHaveBeenCalled();
+  });
+
+  it("does not offer a link that has already expired, and asks for a new one", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    let n = 0;
+    const { user, calls } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: {
+        ...connected(),
+        "POST /inspector/sessions": () => jsonResponse(201, session(n++ === 0 ? { expires_at: new Date(Date.now() - 1000).toISOString() } : {})),
+      },
+    });
+    await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    expect(within(dialog).getByText("The link has expired. Ask for a new one.")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("link")).toBeNull();
+    await user.click(within(dialog).getByRole("button", { name: "Get a new link" }));
+    await waitFor(() => expect(calls.filter((c) => c.method === "POST" && c.path === "/inspector/sessions")).toHaveLength(2));
+    expect(await screen.findByRole("link", { name: /Open the Inspector/ })).toBeInTheDocument();
+  });
+
+  it("hides the link once it has expired, also when the timer was late", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: { ...connected(), "POST /inspector/sessions": () => jsonResponse(201, session()) },
+    });
+    await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    const link = within(dialog).getByRole("link", { name: /Open the Inspector/ });
+    // After React's handler: was the click let through to open the link?
+    const opened = vi.fn();
+    const after = (e: Event) => {
+      if (!e.defaultPrevented) opened();
+      e.preventDefault();
+    };
+    document.addEventListener("click", after);
+    const start = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => start + 61_000);
+    await user.click(link);
+    expect(await within(dialog).findByText("The link has expired. Ask for a new one.")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("link")).toBeNull();
+    expect(opened).not.toHaveBeenCalled();
+    document.removeEventListener("click", after);
+  });
+
   it("closes the tab again and says why when the request fails", async () => {
     const tab = fakeTab();
     vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
@@ -465,6 +550,7 @@ describe("opening the Inspector", () => {
     });
     await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
     const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    expect(dialog).toHaveAccessibleDescription(/the browser blocked the tab, or the tab was closed/);
     expect(within(dialog).getByText("Use this link instead. It works once, within a minute.")).toBeInTheDocument();
     const link = within(dialog).getByRole("link", { name: /Open the Inspector/ });
     expect(link).toHaveAttribute("href", `${ADDRESS}/_golem-deploy/enter#t=abc`);

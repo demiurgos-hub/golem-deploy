@@ -23,16 +23,37 @@ import { inspectorAddress, inspectorEntryUrl, serverInspectorState } from "@/lib
 export const INSPECTOR_SWITCH_HINT =
   "Takes effect at the next start or restart. It needs the Inspector of this installation, which an administrator turns on in Settings.";
 
-/** The longest a link is offered after the browser blocked the new tab: it works once, for 60 seconds. */
+/** How long a link works after the daemon issued it (once). */
 const LINK_LIFETIME_MS = 60_000;
+
+/**
+ * Cuts the blank tab off from this page (window.opener). False when the
+ * browser does not let it: such a tab is never given the link.
+ */
+function cutOff(tab: Window): boolean {
+  try {
+    tab.opener = null;
+    if (tab.opener !== null) return false;
+  } catch {
+    return false;
+  }
+  try {
+    tab.document.title = "Opening the Inspector";
+    tab.document.body.textContent = "Opening the Inspector...";
+  } catch {
+    // Only the text of the waiting tab; it is navigated all the same.
+  }
+  return true;
+}
 
 /**
  * Opens the Inspector in a new tab with a one-time link from POST
  * /inspector/sessions. Browsers block tabs opened after an await, so the
  * tab is opened during the click and navigated when the link arrives; it
  * cannot reach this page through window.opener. A failed request closes it
- * again. When no tab could be opened, the link is offered in a dialog for
- * the minute it works. The link lives only in this component's state.
+ * again. When there is no usable tab (blocked, closed by the user, or its
+ * opener could not be cleared), the link is offered in a dialog until it
+ * expires. The link lives only in this component's state.
  */
 export function OpenInspectorButton({
   serverId,
@@ -48,31 +69,32 @@ export function OpenInspectorButton({
   const api = useApi();
   const toast = useToast();
   const [pending, setPending] = useState(false);
-  const [fallback, setFallback] = useState<{ url: string; ms: number } | null>(null);
+  // The link and when it stops working (ms since the epoch, this browser's clock).
+  const [fallback, setFallback] = useState<{ url: string; deadline: number } | null>(null);
   const [expired, setExpired] = useState(false);
 
   useEffect(() => {
     if (!fallback) return;
-    const t = setTimeout(() => setExpired(true), fallback.ms);
+    const t = setTimeout(() => setExpired(true), Math.max(0, fallback.deadline - Date.now()));
     return () => clearTimeout(t);
   }, [fallback]);
 
   function open() {
     if (pending) return;
+    const asked = Date.now();
     let tab: Window | null = null;
     try {
       tab = window.open("about:blank", "_blank");
     } catch {
       tab = null;
     }
-    if (tab) {
+    if (tab && !cutOff(tab)) {
       try {
-        tab.opener = null;
-        tab.document.title = "Opening the Inspector";
-        tab.document.body.textContent = "Opening the Inspector...";
+        tab.close();
       } catch {
-        // The blank tab is ours; if the browser refuses these, it is navigated all the same.
+        // Nothing more to do: the link goes to the dialog, never to that tab.
       }
+      tab = null;
     }
     setPending(true);
     api.inspector
@@ -86,9 +108,12 @@ export function OpenInspectorButton({
           tab.location.replace(url);
           return;
         }
-        const left = Date.parse(session.expires_at) - Date.now();
-        setExpired(false);
-        setFallback({ url, ms: left > 0 && left <= LINK_LIFETIME_MS ? left : LINK_LIFETIME_MS });
+        // The daemon issued the link after this request was sent, so it works at least until a minute after that;
+        // expires_at can only make it earlier (it comes from the daemon's clock).
+        const expires = Date.parse(session.expires_at);
+        const deadline = Math.min(asked + LINK_LIFETIME_MS, Number.isFinite(expires) ? expires : Infinity);
+        setExpired(deadline <= Date.now());
+        setFallback({ url, deadline });
       })
       .catch((err: unknown) => {
         tab?.close();
@@ -108,10 +133,21 @@ export function OpenInspectorButton({
         open={fallback !== null}
         onOpenChange={(o) => !o && setFallback(null)}
         title="Open the Inspector"
-        description="Your browser did not let this page open a new tab."
+        description="The Inspector could not be opened in a new tab: the browser blocked the tab, or the tab was closed."
       >
         {expired ? (
-          <p className="text-sm">The link has expired. Close this and open the Inspector again.</p>
+          <div className="flex flex-col items-start gap-3 text-sm">
+            <p>The link has expired. Ask for a new one.</p>
+            <Button
+              size="sm"
+              onClick={() => {
+                setFallback(null);
+                open();
+              }}
+            >
+              Get a new link
+            </Button>
+          </div>
         ) : (
           <div className="flex flex-col items-start gap-3 text-sm">
             <p>Use this link instead. It works once, within a minute.</p>
@@ -119,7 +155,15 @@ export function OpenInspectorButton({
               href={fallback?.url}
               target="_blank"
               rel="noopener noreferrer"
-              onClick={() => setFallback(null)}
+              onClick={(e) => {
+                // A timer can fire late in a background tab: check again when the link is used.
+                if (!fallback || Date.now() >= fallback.deadline) {
+                  e.preventDefault();
+                  setExpired(true);
+                  return;
+                }
+                setFallback(null);
+              }}
               className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
             >
               Open the Inspector
