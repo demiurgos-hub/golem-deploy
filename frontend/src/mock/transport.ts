@@ -1009,7 +1009,7 @@ export function createMockTransport(real: Transport): Transport {
       public_url: "",
       expires_at: new Date(Date.now() + 60_000).toISOString(),
     };
-    return json(st, 200, session);
+    return json(st, 201, session);
   }
 
   function jobLogStream(job: Job, follow: boolean, onEnd: () => void): ReadableStream<Uint8Array> {

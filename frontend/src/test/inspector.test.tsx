@@ -436,7 +436,7 @@ describe("opening the Inspector", () => {
     const { user } = renderApp({
       path: "/servers/3",
       signedInAs: developer,
-      routes: { ...connected(), "POST /inspector/sessions": () => jsonResponse(200, session({ public_url: "https://inspector.example.com" })) },
+      routes: { ...connected(), "POST /inspector/sessions": () => jsonResponse(201, session({ public_url: "https://inspector.example.com" })) },
     });
     await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
     await waitFor(() => expect(tab.location.replace).toHaveBeenCalledWith("https://inspector.example.com/_golem-deploy/enter#t=abc"));
@@ -461,7 +461,7 @@ describe("opening the Inspector", () => {
     const { user } = renderApp({
       path: "/servers/3",
       signedInAs: developer,
-      routes: { ...connected(), "POST /inspector/sessions": () => jsonResponse(200, session()) },
+      routes: { ...connected(), "POST /inspector/sessions": () => jsonResponse(201, session()) },
     });
     await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
     const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
@@ -485,7 +485,7 @@ describe("opening the Inspector", () => {
         "GET /servers": () => jsonResponse(200, { items: [serverFixture()] }),
         "GET /projects": () => jsonResponse(200, { items: [projectFixture()] }),
         "GET /inspector": () => jsonResponse(200, inspectorFixture()),
-        "POST /inspector/sessions": () => jsonResponse(200, session()),
+        "POST /inspector/sessions": () => jsonResponse(201, session()),
       },
     });
     await user.click(await screen.findByRole("button", { name: /Open Inspector/ }));
