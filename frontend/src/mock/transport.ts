@@ -958,12 +958,20 @@ export function createMockTransport(real: Transport): Transport {
     st.inspectorTokens.delete(s.id);
   }
 
-  /** The games connected to the hub now: running servers started with the Inspector and its current secrets. */
+  /**
+   * The games connected to the hub now: running servers started with the Inspector and its current secrets whose switch is still on (the
+   * daemon closes the relay of a server whose switch was turned off and refuses it afterwards).
+   */
   function hubConnected(): Server[] {
     const ins = st.inspector;
     if (ins.state !== "running") return [];
     return st.servers.filter(
-      (s) => s.inspector_active && s.state === "running" && st.inspectorTokens.get(s.id) === ins.secrets && !NO_INSPECTOR_SUPPORT.has(s.name),
+      (s) =>
+        s.inspector &&
+        s.inspector_active &&
+        s.state === "running" &&
+        st.inspectorTokens.get(s.id) === ins.secrets &&
+        !NO_INSPECTOR_SUPPORT.has(s.name),
     );
   }
 
@@ -1012,9 +1020,9 @@ export function createMockTransport(real: Transport): Transport {
       ...base,
       state: ins.state,
       detail: ins.state === "stopped" ? ins.detail : "",
-      // The image the hub container was created from: none before the hub exists.
+      // The image the hub container was created from and when it started: whenever the container runs, whatever the state.
       image_id: ins.imageId,
-      started_at: running ? ins.startedAt : null,
+      started_at: ins.startedAt,
       agent_address: INSPECTOR_AGENT_ADDRESS,
       targets,
       other_targets: other,
@@ -1033,6 +1041,8 @@ export function createMockTransport(real: Transport): Transport {
     }
     if (activeJobFor(st, "inspector", "hub")) return fail(st, 409, "job_in_progress", "another Inspector job is already running");
     ins.enabled = on;
+    // Off takes effect at once, like the daemon's: unused links end before the job runs.
+    if (!on) st.inspectorLinks.clear();
     // The setting counts at once: servers with the switch on now differ from (or match again) what their container was started with.
     for (const s of st.servers) syncRestartRequired(s);
     if (on && ins.state !== "running") {
@@ -1059,7 +1069,11 @@ export function createMockTransport(real: Transport): Transport {
         return;
       }
       if (download) ins.imagePresent = true;
-      if (req.rotate_secrets) ins.secrets++;
+      if (req.rotate_secrets) {
+        ins.secrets++;
+        // Links issued under the old secrets end with them.
+        st.inspectorLinks.clear();
+      }
       Object.assign(ins, { state: "running", detail: "", startedAt: iso(), imageId: INSPECTOR_IMAGE_ID });
       // New secrets: containers started with the old ones cannot connect any more.
       for (const s of st.servers) syncRestartRequired(s);
@@ -1078,7 +1092,8 @@ export function createMockTransport(real: Transport): Transport {
       if (!s) return fail(st, 404, "not_found", "server not found");
       if (!s.inspector) return fail(st, 400, "validation_failed", "the server's Inspector setting is off; turn it on and restart the server", "server_id");
     }
-    if (st.inspector.state !== "running") return fail(st, 409, "conflict", "the Inspector is not running");
+    // Refused as soon as the setting is off, also while the job that turns it off runs.
+    if (!st.inspector.enabled || st.inspector.state !== "running") return fail(st, 409, "conflict", "the Inspector is not running");
     const now = Date.now();
     const links = (st.inspectorLinks.get(me.id) ?? []).filter((exp) => exp > now);
     st.inspectorLinks.set(me.id, links);

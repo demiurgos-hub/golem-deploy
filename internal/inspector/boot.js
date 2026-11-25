@@ -46,17 +46,29 @@
   var NativeURL = w.URL;
   var NativeRequest = typeof w.Request === 'function' ? w.Request : null;
 
-  // resolve returns u as an absolute URL, resolved the way the browser
-  // resolves fetch and WebSocket URLs (against the document's base URL, so
-  // a <base> element counts). u is turned into a string once.
-  function resolve(u) {
+  // resolve returns the string text as an absolute URL, resolved the way
+  // the browser resolves fetch and WebSocket URLs (against the document's
+  // base URL, so a <base> element counts), or null.
+  function resolve(text) {
     var doc = w.document;
     var base = doc && typeof doc.baseURI === 'string' && doc.baseURI !== '' ? doc.baseURI : loc.href;
     try {
-      return new NativeURL(String(u), base);
+      return new NativeURL(text, base);
     } catch (e) {
       return null;
     }
+  }
+
+  // wsHref is the WebSocket form of an http or https URL.
+  function wsHref(u) {
+    var href = u.href;
+    if (u.protocol === 'http:') {
+      return 'ws:' + href.slice(5);
+    }
+    if (u.protocol === 'https:') {
+      return 'wss:' + href.slice(6);
+    }
+    return href;
   }
 
   // sameOrigin reports whether u (http, https, ws or wss) is this page's
@@ -75,29 +87,34 @@
   }
 
   // The URL or the Request that is checked is exactly what reaches the
-  // native fetch and WebSocket: never the page's original value again.
+  // native fetch and WebSocket, for every origin: the page's value is
+  // turned into a string once and never passed on again.
   var origFetch = w.fetch;
   if (typeof origFetch === 'function') {
     w.fetch = function (input, init) {
       var req = null;
-      var target;
+      var text;
       if (NativeRequest !== null && input instanceof NativeRequest) {
         // A copy made by the native constructor: its URL is the one the
         // browser uses, whatever the page's object reports.
         try {
           req = new NativeRequest(input);
         } catch (e) {
-          return origFetch.apply(w, arguments);
+          // The native fetch fails the same way for this Request.
+          return Promise.reject(e);
         }
-        target = resolve(req.url);
+        text = req.url;
       } else {
-        target = resolve(input);
-      }
-      if (!sameOrigin(target)) {
-        if (req === null) {
-          return origFetch.apply(w, arguments);
+        try {
+          text = String(input);
+        } catch (e) {
+          return Promise.reject(e);
         }
-        return init === undefined ? origFetch.call(w, req) : origFetch.call(w, req, init);
+      }
+      var target = resolve(text);
+      if (!sameOrigin(target)) {
+        var plain = req !== null ? req : target !== null ? target.href : text;
+        return init === undefined ? origFetch.call(w, plain) : origFetch.call(w, plain, init);
       }
       var opts = {};
       var k;
@@ -126,9 +143,11 @@
   var OrigWebSocket = w.WebSocket;
   if (typeof OrigWebSocket === 'function') {
     var Wrapped = function WebSocket(url, protocols) {
-      var target = resolve(url);
+      var text = String(url);
+      var target = resolve(text);
+      var href = target !== null ? wsHref(target) : text;
       if (!sameOrigin(target)) {
-        return arguments.length > 1 ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
+        return arguments.length > 1 ? new OrigWebSocket(href, protocols) : new OrigWebSocket(href);
       }
       var list = [];
       if (typeof protocols === 'string') {
@@ -137,12 +156,6 @@
         list = Array.prototype.slice.call(protocols);
       }
       list.push(MARKER, KEY_PROTOCOL + key);
-      var href = target.href;
-      if (target.protocol === 'http:') {
-        href = 'ws:' + href.slice(5);
-      } else if (target.protocol === 'https:') {
-        href = 'wss:' + href.slice(6);
-      }
       return new OrigWebSocket(href, list);
     };
     Wrapped.prototype = OrigWebSocket.prototype;

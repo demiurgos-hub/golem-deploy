@@ -260,10 +260,16 @@ func (s *Service) originOK(r *http.Request) bool {
 }
 
 // handleLogout ends the daemon session at once, then forwards the
-// sign-out to the hub. Only POST is accepted (405 otherwise).
+// sign-out to the hub. Only POST without a body is accepted (405 for other
+// methods, 400 for a body): nothing happens before what the client sent
+// was read.
 func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		reject(w, r, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if hasBody(r) {
+		reject(w, r, http.StatusBadRequest, "bad_request")
 		return
 	}
 	if !s.knownKey(r) {
@@ -288,9 +294,7 @@ func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if sid := sess.end(); sid != "" {
 		if v := s.hubNow(); v.port != 0 {
 			lctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			if err := s.hub.logout(lctx, v.port, sid); err != nil {
-				_ = s.hubUnreachable(lctx, v.port, err)
-			}
+			s.logoutAt(lctx, v, sid)
 			cancel()
 		}
 	}
@@ -364,6 +368,11 @@ func (s *Service) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	// The answer is never written after the session expired: the write
+	// deadline is the earlier of the request timeout and the expiry (a
+	// relayed WebSocket clears it and ends with the session instead).
+	left := sess.expires.Sub(s.cfg.Now())
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(min(s.reqTimeout, left)))
 	if !upgrade {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.reqTimeout)
@@ -414,6 +423,9 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 			resp.Header.Del("Set-Cookie")
 			resp.Header.Del(SessionHeader)
 			if resp.StatusCode == http.StatusSwitchingProtocols {
+				if !webSocketAnswer(resp) {
+					return errBadUpgrade
+				}
 				// Browsers fail a connection that offered subprotocols
 				// and got none back.
 				resp.Header.Del("Sec-WebSocket-Protocol")
@@ -440,7 +452,7 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 				s.logger.Warn("an Inspector page from the hub could not carry the boot script and was not served")
 				s.page(w, http.StatusBadGateway, "Inspector unavailable",
 					"The Inspector page could not be prepared. Try again in a moment from Golem Deploy.")
-			case errors.Is(err, errHubSessionLost):
+			case errors.Is(err, errHubSessionLost), errors.Is(err, errHubUnverified):
 				hubError(w, http.StatusServiceUnavailable, "hub_unavailable")
 			default:
 				s.logger.Debug("inspector proxy request failed", "err", err)
@@ -451,10 +463,25 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 	}
 }
 
-// retryTransport logs in again, once, when the hub no longer knows the
-// session's hub session (the hub restarted), and repeats the request with
-// the new session. When that fails the request fails (503): the hub's
-// "not signed in" answer never reaches the browser.
+// errBadUpgrade: the hub switched protocols for something that is not the
+// WebSocket upgrade the request asked for. Returning it from
+// ModifyResponse closes the hub's connection.
+var errBadUpgrade = errors.New("inspector: the hub switched to a protocol that was not asked for")
+
+// webSocketAnswer reports whether a 101 from the hub answers a WebSocket
+// upgrade of the request with a WebSocket upgrade.
+func webSocketAnswer(resp *http.Response) bool {
+	return resp.Request != nil && isWebSocket(resp.Request) && headerHasToken(resp.Header, "Connection", "upgrade") &&
+		strings.EqualFold(strings.TrimSpace(resp.Header.Get("Upgrade")), "websocket") && len(resp.Header.Values("Upgrade")) == 1
+}
+
+// retryTransport sends a request only to a hub port Docker confirmed
+// within hubCheckInterval (the session's hub cookie never goes elsewhere,
+// and neither does a browser's request for the Inspector's own pages). It
+// logs in again, once, when the hub no longer knows the session's hub
+// session (the hub restarted), and repeats the request with the new
+// session. When that fails the request fails (503): the hub's "not signed
+// in" answer never reaches the browser.
 type retryTransport struct {
 	s    *Service
 	base http.RoundTripper
@@ -462,6 +489,9 @@ type retryTransport struct {
 
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	info := proxyInfoFrom(req.Context())
+	if !t.s.freshHub(req.Context(), info.view) {
+		return nil, errHubUnverified
+	}
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
 		return nil, t.s.hubUnreachable(req.Context(), info.view.port, err)
@@ -628,17 +658,26 @@ func (s *Service) logoutHub(sid string) {
 	if sid == "" {
 		return
 	}
-	port := s.hubNow().port
-	if port == 0 {
+	v := s.hubNow()
+	if v.port == 0 {
 		return
 	}
 	s.goBG(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := s.hub.logout(ctx, port, sid); err != nil {
-			_ = s.hubUnreachable(ctx, port, err)
-		}
+		s.logoutAt(ctx, v, sid)
 	})
+}
+
+// logoutAt ends hub session sid at the hub of snapshot v, only while Docker
+// confirmed v's port within hubCheckInterval (renewed first when older).
+func (s *Service) logoutAt(ctx context.Context, v hubView, sid string) {
+	if !s.freshHub(ctx, v) {
+		return
+	}
+	if err := s.hub.logout(ctx, v.port, sid); err != nil {
+		_ = s.hubUnreachable(ctx, v.port, err)
+	}
 }
 
 // endSession ends a session: its streams close and its hub session is

@@ -154,8 +154,9 @@ type sessionEntry struct {
 // Origin). Failed tickets are limited per client address; the limiter is
 // asked before the body is read. It consumes the ticket, checks the
 // account, logs in at the hub for the new session and answers the key;
-// only its hash is kept. The session is registered only while the
-// generation (listener and secrets) the exchange started with is current.
+// only its hash is kept. The ticket is accepted only under the generation
+// (admission and secrets) it was issued under: when it is consumed, when
+// the hub snapshot is taken and when the session is registered.
 func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		reject(w, r, http.StatusMethodNotAllowed, "method_not_allowed")
@@ -187,8 +188,9 @@ func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 		hubError(w, http.StatusBadRequest, "bad_request")
 		return
 	}
+	cur := s.hubNow().gen
 	tk, ok := s.tickets.consume(req.Ticket)
-	if !ok {
+	if !ok || tk.gen != cur {
 		hubError(w, http.StatusForbidden, "link_invalid")
 		return
 	}
@@ -198,7 +200,16 @@ func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res.Refund()
+	if s.hooks.afterTicketConsumed != nil {
+		s.hooks.afterTicketConsumed()
+	}
 	v, serving := s.view()
+	if v.gen != tk.gen {
+		// The secrets were replaced or the Inspector turned off since the
+		// link was issued.
+		hubError(w, http.StatusForbidden, "link_invalid")
+		return
+	}
 	if !serving {
 		hubError(w, http.StatusServiceUnavailable, "not_running")
 		return
@@ -217,7 +228,7 @@ func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 	var key string
 	var evicted []*session
 	var createErr error
-	if !s.admit(v.gen, func() bool {
+	if !s.admit(tk.gen, func() bool {
 		key, _, evicted, createErr = s.sessions.create(acct.ID, acct.TokenVersion, sid)
 		return createErr == nil
 	}) {
@@ -314,59 +325,46 @@ func injectBoot(resp *http.Response) error {
 }
 
 // headEnd returns the index just after the opening <head> tag of a
-// document whose leading content is, in this order: optional whitespace
-// and comments, an optional doctype (more whitespace and comments around
-// it), an optional <html ...> tag (more whitespace and comments) and then
-// the <head ...> tag. Tag names are ASCII case-insensitive and quoted
-// attribute values may contain ">". Any other document returns -1: the
-// boot script is never placed inside a comment or after other content.
+// document whose leading content is exactly, in this order: an optional
+// UTF-8 byte order mark, optional whitespace, at most one doctype, optional
+// whitespace, an optional <html ...> tag, optional whitespace and then the
+// <head ...> tag. Comments are not accepted anywhere before it: browsers
+// end some malformed comments earlier than "-->", so markup they execute
+// could come before the boot script. Tag names are ASCII case-insensitive,
+// and tags end where a browser ends them (tagEnd). Any other document
+// returns -1.
 func headEnd(doc []byte) int {
 	i := 0
 	if bytes.HasPrefix(doc, []byte("\xef\xbb\xbf")) {
 		i = 3 // UTF-8 byte order mark
 	}
-	skip := func() bool {
-		for {
-			for i < len(doc) && isHTMLSpace(doc[i]) {
-				i++
-			}
-			if !bytes.HasPrefix(doc[i:], []byte("<!--")) {
-				return true
-			}
-			end := bytes.Index(doc[i+4:], []byte("-->"))
-			if end < 0 {
-				return false
-			}
-			i += 4 + end + 3
+	space := func() {
+		for i < len(doc) && isHTMLSpace(doc[i]) {
+			i++
 		}
 	}
-	if !skip() {
-		return -1
-	}
+	space()
 	if i+9 <= len(doc) && doc[i] == '<' && doc[i+1] == '!' && asciiLowerIs(doc[i+2:i+9], "doctype") {
+		// A doctype ends at its first ">", also inside quotes.
 		end := bytes.IndexByte(doc[i:], '>')
 		if end < 0 {
 			return -1
 		}
 		i += end + 1
-		if !skip() {
-			return -1
-		}
+		space()
 	}
 	if isTag(doc[i:], "html") {
-		end := tagEnd(doc[i:])
+		end := tagEnd(doc[i:], len("html"))
 		if end < 0 {
 			return -1
 		}
 		i += end
-		if !skip() {
-			return -1
-		}
+		space()
 	}
 	if !isTag(doc[i:], "head") {
 		return -1
 	}
-	end := tagEnd(doc[i:])
+	end := tagEnd(doc[i:], len("head"))
 	if end < 0 {
 		return -1
 	}
@@ -388,22 +386,99 @@ func isTag(b []byte, name string) bool {
 	return isHTMLSpace(c) || c == '/' || c == '>'
 }
 
-// tagEnd returns the index just after the ">" that closes the tag at the
-// start of b, skipping ">" inside quoted attribute values; -1 when the tag
-// does not close.
-func tagEnd(b []byte) int {
-	var quote byte
-	for i := 1; i < len(b); i++ {
+// tagEnd returns the index just after the ">" that ends the start tag at
+// the start of b (whose name is nameLen bytes long), following the HTML
+// tokenizer: a quote starts a quoted value only right after "=" (and
+// whitespace), where a ">" inside it does not end the tag; anywhere else a
+// quote is an ordinary character and the next ">" ends the tag. -1 when the
+// tag does not end.
+func tagEnd(b []byte, nameLen int) int {
+	const (
+		beforeName = iota
+		name
+		afterName
+		beforeValue
+		unquoted
+		afterQuoted
+		selfClosing
+	)
+	state := beforeName
+	for i := 1 + nameLen; i < len(b); i++ {
 		c := b[i]
-		switch {
-		case quote != 0:
-			if c == quote {
-				quote = 0
+		switch state {
+		case beforeName:
+			switch {
+			case isHTMLSpace(c):
+			case c == '/':
+				state = selfClosing
+			case c == '>':
+				return i + 1
+			default:
+				state = name // also "=": it starts a name here
 			}
-		case c == '"' || c == '\'':
-			quote = c
-		case c == '>':
-			return i + 1
+		case name:
+			switch {
+			case isHTMLSpace(c):
+				state = afterName
+			case c == '/':
+				state = selfClosing
+			case c == '=':
+				state = beforeValue
+			case c == '>':
+				return i + 1
+			}
+		case afterName:
+			switch {
+			case isHTMLSpace(c):
+			case c == '/':
+				state = selfClosing
+			case c == '=':
+				state = beforeValue
+			case c == '>':
+				return i + 1
+			default:
+				state = name
+			}
+		case beforeValue:
+			switch {
+			case isHTMLSpace(c):
+			case c == '"' || c == '\'':
+				end := bytes.IndexByte(b[i+1:], c)
+				if end < 0 {
+					return -1
+				}
+				i += 1 + end
+				state = afterQuoted
+			case c == '>':
+				return i + 1
+			default:
+				state = unquoted
+			}
+		case unquoted:
+			switch {
+			case isHTMLSpace(c):
+				state = beforeName
+			case c == '>':
+				return i + 1
+			}
+		case afterQuoted:
+			switch {
+			case isHTMLSpace(c):
+				state = beforeName
+			case c == '/':
+				state = selfClosing
+			case c == '>':
+				return i + 1
+			default:
+				state = name // a missing space: a new attribute name
+			}
+		case selfClosing:
+			if c == '>' {
+				return i + 1
+			}
+			// Anything else is read again as the start of an attribute.
+			i--
+			state = beforeName
 		}
 	}
 	return -1

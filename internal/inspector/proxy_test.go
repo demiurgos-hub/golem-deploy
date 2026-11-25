@@ -486,7 +486,7 @@ func TestBootInjection(t *testing.T) {
 	}{
 		{"attributes and case", "text/html", "<!DOCTYPE html><HTML><HEAD lang=en><title>x</title></HEAD></HTML>",
 			"<!DOCTYPE html><HTML><HEAD lang=en>" + bootTag + "<title>x</title></HEAD></HTML>"},
-		{"header before head", "text/html;charset=utf-8", "<!-- <header> --><head\n>x", "<!-- <header> --><head\n>" + bootTag + "x"},
+		{"newline in the head tag", "text/html;charset=utf-8", "<html>\n<head\n>x", "<html>\n<head\n>" + bootTag + "x"},
 		{"not HTML", "text/javascript", "document.write('<head>')", "document.write('<head>')"},
 	}
 	for _, c := range cases {
@@ -515,6 +515,7 @@ func TestBootInjection(t *testing.T) {
 	// Fail closed.
 	failures := map[string]http.HandlerFunc{
 		"no head":    doc("text/html", "<html><header>secret</header><body>hubcontent</body></html>"),
+		"comment":    doc("text/html", "<!-- hubcontent --><head></head>"),
 		"too large":  doc("text/html", "<html><head></head>"+strings.Repeat("x", maxDocument)),
 		"compressed": doc("text/html", "<html><head></head></html>", "Content-Encoding", "gzip"),
 		"partial": func(w http.ResponseWriter, _ *http.Request) {

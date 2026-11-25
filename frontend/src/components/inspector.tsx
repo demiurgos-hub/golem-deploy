@@ -46,14 +46,25 @@ function cutOff(tab: Window): boolean {
   return true;
 }
 
+/** Why the dialog is shown: no usable tab, or the link expired before it could be used in the tab. */
+type OfferReason = "no-tab" | "late";
+
+const OFFER_DESCRIPTIONS: Record<OfferReason, string> = {
+  "no-tab": "The Inspector could not be opened in a new tab: the browser blocked the tab, or the tab was closed.",
+  late: "The answer came after the link had expired, so the new tab was closed.",
+};
+
 /**
  * Opens the Inspector in a new tab with a one-time link from POST
  * /inspector/sessions. Browsers block tabs opened after an await, so the
- * tab is opened during the click and navigated when the link arrives; it
- * cannot reach this page through window.opener. A failed request closes it
- * again. When there is no usable tab (blocked, closed by the user, or its
- * opener could not be cleared), the link is offered in a dialog until it
- * expires. The link lives only in this component's state.
+ * tab is opened during the click and navigated when the link arrives, if
+ * it has not expired by then; it cannot reach this page through
+ * window.opener. A failed request or an expired link closes it again. When
+ * there is no usable tab (blocked, closed by the user, or its opener could
+ * not be cleared), a dialog offers a button that opens the link in a new
+ * tab until it expires (checked again on every click). The link is never
+ * put in the page; it lives only in this component's state and is dropped
+ * when it expires.
  */
 export function OpenInspectorButton({
   serverId,
@@ -69,15 +80,25 @@ export function OpenInspectorButton({
   const api = useApi();
   const toast = useToast();
   const [pending, setPending] = useState(false);
-  // The link and when it stops working (ms since the epoch, this browser's clock).
-  const [fallback, setFallback] = useState<{ url: string; deadline: number } | null>(null);
-  const [expired, setExpired] = useState(false);
+  // The dialog: the link (null once it expired) and when it stops working (ms since the epoch, this browser's clock).
+  const [offer, setOffer] = useState<{ url: string | null; deadline: number; reason: OfferReason } | null>(null);
+  const expired = offer !== null && offer.url === null;
 
   useEffect(() => {
-    if (!fallback) return;
-    const t = setTimeout(() => setExpired(true), Math.max(0, fallback.deadline - Date.now()));
+    if (!offer || offer.url === null) return;
+    const t = setTimeout(() => setOffer((o) => o && { ...o, url: null }), Math.max(0, offer.deadline - Date.now()));
     return () => clearTimeout(t);
-  }, [fallback]);
+  }, [offer]);
+
+  function openOffered() {
+    // A timer can fire late in a background tab: check again when the button is used.
+    if (!offer || offer.url === null || Date.now() >= offer.deadline) {
+      setOffer((o) => o && { ...o, url: null });
+      return;
+    }
+    window.open(offer.url, "_blank", "noopener,noreferrer");
+    setOffer(null);
+  }
 
   function open() {
     if (pending) return;
@@ -104,16 +125,22 @@ export function OpenInspectorButton({
         if (url === null) {
           throw new ApiError({ status: 200, code: "invalid_response", message: "The daemon sent an Inspector link this page cannot use." });
         }
-        if (tab && !tab.closed) {
-          tab.location.replace(url);
-          return;
-        }
         // The daemon issued the link after this request was sent, so it works at least until a minute after that;
         // expires_at can only make it earlier (it comes from the daemon's clock).
         const expires = Date.parse(session.expires_at);
         const deadline = Math.min(asked + LINK_LIFETIME_MS, Number.isFinite(expires) ? expires : Infinity);
-        setExpired(deadline <= Date.now());
-        setFallback({ url, deadline });
+        const live = Date.now() < deadline;
+        if (tab && !tab.closed) {
+          if (live) {
+            tab.location.replace(url);
+            return;
+          }
+          // A slow answer: never send the tab to a link that no longer works.
+          tab.close();
+          setOffer({ url: null, deadline, reason: "late" });
+          return;
+        }
+        setOffer({ url: live ? url : null, deadline, reason: "no-tab" });
       })
       .catch((err: unknown) => {
         tab?.close();
@@ -130,10 +157,10 @@ export function OpenInspectorButton({
         <span className="sr-only"> (opens in a new tab)</span>
       </Button>
       <Dialog
-        open={fallback !== null}
-        onOpenChange={(o) => !o && setFallback(null)}
+        open={offer !== null}
+        onOpenChange={(o) => !o && setOffer(null)}
         title="Open the Inspector"
-        description="The Inspector could not be opened in a new tab: the browser blocked the tab, or the tab was closed."
+        description={OFFER_DESCRIPTIONS[offer?.reason ?? "no-tab"]}
       >
         {expired ? (
           <div className="flex flex-col items-start gap-3 text-sm">
@@ -141,7 +168,7 @@ export function OpenInspectorButton({
             <Button
               size="sm"
               onClick={() => {
-                setFallback(null);
+                setOffer(null);
                 open();
               }}
             >
@@ -150,26 +177,12 @@ export function OpenInspectorButton({
           </div>
         ) : (
           <div className="flex flex-col items-start gap-3 text-sm">
-            <p>Use this link instead. It works once, within a minute.</p>
-            <a
-              href={fallback?.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              onClick={(e) => {
-                // A timer can fire late in a background tab: check again when the link is used.
-                if (!fallback || Date.now() >= fallback.deadline) {
-                  e.preventDefault();
-                  setExpired(true);
-                  return;
-                }
-                setFallback(null);
-              }}
-              className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-            >
+            <p>Open it from here instead. The link works once, within a minute.</p>
+            <Button size="sm" onClick={openOffered}>
               Open the Inspector
-              <ExternalLink aria-hidden className="size-4" />
+              <ExternalLink aria-hidden />
               <span className="sr-only">(opens in a new tab)</span>
-            </a>
+            </Button>
           </div>
         )}
       </Dialog>
@@ -541,7 +554,7 @@ function ServerInspectorStatus({ server, busy, onJob }: { server: Server; busy: 
     case "leaving":
       return row(
         <Badge tone="warning">Restart required</Badge>,
-        "The switch is off, but the running game server was started with it on. It stays connected to the Inspector until its next restart.",
+        "The switch is off, so the Inspector no longer shows this server. The running game server was started with it on and keeps trying to connect until its next restart.",
         restart,
       );
     case "installation-off":

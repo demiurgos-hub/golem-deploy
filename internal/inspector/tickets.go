@@ -23,11 +23,13 @@ const (
 var errTooManyTickets = errors.New("inspector: too many open entry links; wait a minute")
 
 // ticket is a one-time entry into the Inspector for an account. Only its
-// SHA-256 is kept.
+// SHA-256 is kept. gen is the admission generation it was issued under;
+// it is accepted only under that generation.
 type ticket struct {
 	accountID    int64
 	tokenVersion int64
 	target       string
+	gen          uint64
 	expires      time.Time
 }
 
@@ -51,8 +53,9 @@ func (t *ticketStore) sweepLocked(now time.Time) {
 	}
 }
 
-// issue returns a new ticket (43 URL-safe characters) and its expiry.
-func (t *ticketStore) issue(accountID, tokenVersion int64, target string) (string, time.Time, error) {
+// issue returns a new ticket (43 URL-safe characters) of generation gen and
+// its expiry.
+func (t *ticketStore) issue(accountID, tokenVersion int64, target string, gen uint64) (string, time.Time, error) {
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", time.Time{}, err
@@ -72,7 +75,7 @@ func (t *ticketStore) issue(accountID, tokenVersion int64, target string) (strin
 	}
 	tok := base64.RawURLEncoding.EncodeToString(raw[:])
 	exp := now.Add(TicketTTL)
-	t.m[sha256.Sum256([]byte(tok))] = ticket{accountID: accountID, tokenVersion: tokenVersion, target: target, expires: exp}
+	t.m[sha256.Sum256([]byte(tok))] = ticket{accountID: accountID, tokenVersion: tokenVersion, target: target, gen: gen, expires: exp}
 	return tok, exp, nil
 }
 

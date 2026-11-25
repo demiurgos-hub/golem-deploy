@@ -223,7 +223,9 @@ func (c *hubClient) targets(ctx context.Context, port int, sid string) ([]hubTar
 // until its Retry-After, after a 401 (the hub does not know the daemon's
 // password) for good. A hold belongs to one hub generation (the hub
 // container and the secrets' generation); it ends only when that
-// generation changes, and a later answer never shortens it.
+// generation changes, and a later answer never shortens it. It lives in
+// memory, so the hold applies within one run of the daemon: after a
+// restart the daemon tries to log in once more.
 type loginGuard struct {
 	mu    sync.Mutex
 	key   string

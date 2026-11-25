@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -35,6 +36,34 @@ func TestAdmissionGenerations(t *testing.T) {
 		}
 		if n := e.s.sessions.count(); n != 0 {
 			t.Fatalf("%d sessions after the rotation", n)
+		}
+	})
+	t.Run("ticket consumed, then the secrets replaced", func(t *testing.T) {
+		// The secrets are replaced after the ticket was consumed and the hub
+		// is serving again (with the new secrets) before the session would
+		// be registered: the ticket belongs to the old generation.
+		e := newTestEnv(t, nil)
+		ses, err := e.s.CreateSession(ctx, e.acct, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.s.hooks.afterTicketConsumed = func() {
+			fresh, err := e.s.ensureSecrets(ctx, io.Discard, true)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			e.hub.set(func(h *fakeHub) { h.hash = func() string { return fresh.PasswordHash } })
+			e.s.mu.Lock()
+			e.s.hubContainer, e.s.hubPort, e.s.admitting = testHubID, e.hub.port(), true
+			e.s.mu.Unlock()
+		}
+		r := e.exchange(ticketOf(t, ses.Path), nil)
+		if b := readBody(t, r); r.StatusCode != http.StatusForbidden || !strings.Contains(b, "link_invalid") {
+			t.Fatalf("%d %s", r.StatusCode, b)
+		}
+		if n := e.s.sessions.count(); n != 0 {
+			t.Fatalf("%d sessions from a link of the old secrets", n)
 		}
 	})
 	t.Run("agent and turn-off", func(t *testing.T) {
@@ -233,30 +262,88 @@ func TestLoginGuard(t *testing.T) {
 	}
 }
 
-// The hub port is used only for a verified running hub container: a
-// stopped container drops it at once, the password goes out only after
-// Docker confirmed the port, and a transport error drops the port until
-// Docker confirms it again.
+// The hub port is used only for a verified running hub container. The
+// password goes out only after a Docker check made for that login; a hub
+// session, the hub's agent token and the hub's own pages only within
+// hubCheckInterval of a Docker confirmation (renewed first when older);
+// and a Docker error, a stopped container or a transport error drops the
+// port at once.
 func TestHubPortValidity(t *testing.T) {
 	ctx := context.Background()
-	t.Run("stopped container", func(t *testing.T) {
-		e := newTestEnv(t, nil)
-		e.hub.set(func(h *fakeHub) { h.stopped = true })
-		e.s.refreshHub(ctx)
-		if p := e.s.hubNow().port; p != 0 {
-			t.Fatalf("port %d kept for a stopped hub", p)
-		}
-		if r := e.do("GET", "/", "", nil, nil); r.StatusCode != http.StatusServiceUnavailable {
-			t.Fatalf("UI while stopped: %d", r.StatusCode)
-		}
-		e.hub.set(func(h *fakeHub) { h.stopped = false })
-		e.clock.Advance(time.Minute)
-		waitFor(t, "the port to come back", func() bool {
-			e.s.view()
-			return e.s.hubNow().port != 0
+	// A substituted container: Docker no longer knows the recorded hub and
+	// another program serves the port (the fake hub stands in for it).
+	// Nothing calls refreshHub: the traffic itself must check first.
+	for name, act := range map[string]func(t *testing.T, e *testEnv, key, tok string){
+		"request": func(t *testing.T, e *testEnv, key, _ string) {
+			if r := e.do("GET", "/api/targets", key, nil, nil); r.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("request: %d", r.StatusCode)
+			}
+		},
+		"web UI": func(t *testing.T, e *testEnv, _, _ string) {
+			if r := e.do("GET", "/", "", nil, nil); r.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("web UI: %d", r.StatusCode)
+			}
+		},
+		"sign-out": func(t *testing.T, e *testEnv, key, _ string) {
+			if r := e.do("POST", "/auth/logout", key, map[string]string{"Origin": e.origin()}, nil); r.StatusCode != http.StatusOK {
+				t.Fatalf("sign-out: %d", r.StatusCode)
+			}
+		},
+		"agent": func(t *testing.T, e *testEnv, _, tok string) {
+			if _, _, code := dialWS(t, e.addr(), "/ws/agent", http.Header{"Authorization": {"Bearer " + tok}}); code == http.StatusSwitchingProtocols {
+				t.Fatal("agent relayed")
+			}
+		},
+	} {
+		t.Run("substituted container/"+name, func(t *testing.T) {
+			e := newTestEnv(t, func(c *Config) { c.AgentHost = "127.0.0.1" })
+			p := 7001
+			sv, _ := e.st.CreateServer(ctx, store.Server{Name: "arena", Port: &p, Inspector: true}, nil)
+			tok, _ := e.s.AgentToken(sv.ID)
+			key := e.enter(nil)
+			// Within the interval, traffic needs no Docker call.
+			inspects := e.hub.inspectCount()
+			for i := 0; i < 3; i++ {
+				if r := e.do("GET", "/api/targets", key, nil, nil); r.StatusCode != http.StatusOK {
+					t.Fatalf("before: %d", r.StatusCode)
+				}
+			}
+			if n := e.hub.inspectCount() - inspects; n != 0 {
+				t.Fatalf("%d Docker calls within the interval", n)
+			}
+			e.hub.set(func(h *fakeHub) { h.gone = true })
+			e.clock.Advance(hubCheckInterval)
+			before := len(e.hub.paths())
+			act(t, e, key, tok)
+			if got := e.hub.paths()[before:]; len(got) != 0 {
+				t.Fatalf("reached the port of a container Docker does not know: %v", got)
+			}
+			if v := e.s.hubNow(); v.port != 0 || v.container != "" {
+				t.Fatalf("hub kept: %+v", v)
+			}
 		})
-		if r := e.do("GET", "/", "", nil, nil); r.StatusCode != http.StatusOK {
-			t.Fatalf("UI after the hub runs again: %d", r.StatusCode)
+	}
+	t.Run("login asks Docker every time", func(t *testing.T) {
+		e := newTestEnv(t, nil)
+		e.enter(nil) // a confirmation just now
+		inspects, logins := e.hub.inspectCount(), e.hub.loginCount()
+		e.hub.set(func(h *fakeHub) { h.publish = 1 }) // Docker now publishes another port
+		if _, err := e.s.hubLogin(ctx, e.s.hubNow()); err == nil {
+			t.Fatal("logged in")
+		}
+		if e.hub.inspectCount() == inspects || e.hub.loginCount() != logins {
+			t.Fatal("the password went out on an earlier confirmation")
+		}
+	})
+	t.Run("Docker error", func(t *testing.T) {
+		e := newTestEnv(t, nil)
+		e.hub.set(func(h *fakeHub) { h.inspectErr = docker.ErrUnavailable })
+		logins := e.hub.loginCount()
+		if _, err := e.s.hubLogin(ctx, e.s.hubNow()); err == nil || e.hub.loginCount() != logins {
+			t.Fatalf("login: %v", err)
+		}
+		if p := e.s.hubNow().port; p != 0 {
+			t.Fatalf("port %d kept after a Docker error", p)
 		}
 	})
 	t.Run("login only after Docker confirms the port", func(t *testing.T) {
@@ -269,7 +356,7 @@ func TestHubPortValidity(t *testing.T) {
 		if r := e.exchange(ticketOf(t, ses.Path), nil); r.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("exchange: %d", r.StatusCode)
 		}
-		if impostor.loginCount() != 0 {
+		if impostor.loginCount() != 0 || len(impostor.paths()) != 0 {
 			t.Fatal("the password went to another program")
 		}
 	})
@@ -281,7 +368,7 @@ func TestHubPortValidity(t *testing.T) {
 		gate := make(chan struct{})
 		e.hub.set(func(h *fakeHub) { h.publish, h.inspectGate = deadPort, gate })
 		e.s.mu.Lock()
-		e.s.hubPort = deadPort
+		e.s.hubPort, e.s.hubVerified = deadPort, e.clock.Now() // confirmed, then the hub died
 		e.s.mu.Unlock()
 		if r := e.do("GET", "/", "", nil, nil); r.StatusCode != http.StatusBadGateway {
 			t.Fatalf("UI: %d", r.StatusCode)

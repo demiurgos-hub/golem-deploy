@@ -139,6 +139,52 @@ func TestConnectionCap(t *testing.T) {
 	}
 }
 
+// Go answers an unsupported Expect itself (417) before any handler runs and
+// then reads the announced body. The server timeouts bound that too, on a
+// plaintext listener and on both sides of a TLS listener, and the
+// connection slot is freed.
+func TestExpectationFailedFreesSlot(t *testing.T) {
+	cert := selfSigned(t)
+	withTLS := func(c *Config) {
+		c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &cert, nil }}
+	}
+	for _, tc := range []struct {
+		name string
+		mut  func(*Config)
+		tls  bool
+	}{{"plaintext listener", nil, false}, {"TLS side", withTLS, true}, {"plaintext side of TLS", withTLS, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t, tc.mut, func(s *Service) { s.reqTimeout = 500 * time.Millisecond })
+			c, err := net.Dial("tcp", e.addr())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			if tc.tls {
+				c = tls.Client(c, &tls.Config{InsecureSkipVerify: true})
+			}
+			_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.WriteString(c, "POST /ws/agent HTTP/1.1\r\nHost: "+e.addr()+"\r\nExpect: something-else\r\nContent-Length: 100\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			br := bufio.NewReader(c)
+			resp, err := http.ReadResponse(br, nil)
+			if err != nil || resp.StatusCode != http.StatusExpectationFailed {
+				t.Fatalf("%v %v", resp, err)
+			}
+			start := time.Now()
+			_, err = io.Copy(io.Discard, br)
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				t.Fatal("the connection stayed open after the 417")
+			}
+			if d := time.Since(start); d > 3*time.Second {
+				t.Fatalf("closed after %s", d)
+			}
+			waitFor(t, "the connection slot", func() bool { return e.listener().limit.open() == 0 })
+		})
+	}
+}
+
 // Closing the listener also closes connections that have not sent their
 // first byte yet.
 func TestSnifferCloseClosesWaiting(t *testing.T) {
@@ -273,6 +319,65 @@ func TestSilentClientStreams(t *testing.T) {
 	})
 }
 
+// A 101 of the hub that does not answer the WebSocket upgrade with a
+// WebSocket is refused (502) and the hub's connection is closed, for
+// browsers and for agents.
+func TestUnexpectedSwitch(t *testing.T) {
+	check := func(t *testing.T, e *testEnv, path string, hdr http.Header) {
+		t.Helper()
+		e.hub.set(func(h *fakeHub) { h.badUpgrade = true })
+		if _, _, code := dialWS(t, e.addr(), path, hdr); code != http.StatusBadGateway {
+			t.Fatalf("%s: %d", path, code)
+		}
+		select {
+		case <-e.hub.streamClosed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the hub's connection was kept open")
+		}
+	}
+	t.Run("browser", func(t *testing.T) {
+		e := newTestEnv(t, nil)
+		check(t, e, "/ws/client", e.wsAuth(e.enter(nil)))
+	})
+	t.Run("agent", func(t *testing.T) {
+		e := newTestEnv(t, func(c *Config) { c.AgentHost = "127.0.0.1" })
+		p := 7001
+		sv, _ := e.st.CreateServer(context.Background(), store.Server{Name: "arena", Port: &p, Inspector: true}, nil)
+		tok, _ := e.s.AgentToken(sv.ID)
+		check(t, e, "/ws/agent", http.Header{"Authorization": {"Bearer " + tok}})
+	})
+}
+
+// A proxied answer to a client that stopped reading is never written after
+// the session expired: the handler ends at the expiry, not after the
+// request timeout. Sign-out refuses a request with a body.
+func TestWritesEndWithSession(t *testing.T) {
+	e := newTestEnv(t, nil)
+	key := e.enter(nil)
+	if r := e.do("POST", "/auth/logout", key, map[string]string{"Origin": e.origin()}, strings.NewReader("{}")); r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("sign-out with a body: %d", r.StatusCode)
+	}
+	if r := e.do("GET", "/api/targets", key, nil, nil); r.StatusCode != http.StatusOK {
+		t.Fatalf("the session ended on a refused sign-out: %d", r.StatusCode)
+	}
+	chunk := strings.Repeat("x", 64<<10)
+	e.hub.set(func(h *fakeHub) {
+		h.static = func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			for i := 0; i < 4096; i++ {
+				if _, err := io.WriteString(w, chunk); err != nil {
+					return
+				}
+			}
+		}
+	})
+	e.clock.Advance(SessionMaxAge - 700*time.Millisecond)
+	ln := e.listener()
+	rawRequest(t, e.addr(), "GET /api/big HTTP/1.1\r\nHost: "+e.addr()+"\r\nAuthorization: Bearer "+key+"\r\n\r\n") // never read
+	waitFor(t, "the request to start", func() bool { return ln.tr.running() == 1 })
+	waitFor(t, "the request to end at the expiry", func() bool { return ln.tr.running() == 0 })
+}
+
 // A request whose session ends while the hub has not answered yet gets an
 // answer (401, session ended), never an empty 200.
 func TestCancelledRequestAnswers(t *testing.T) {
@@ -346,20 +451,31 @@ func TestOriginCanonical(t *testing.T) {
 	}
 }
 
-// The boot script goes only after a <head> tag that leads the document.
+// The boot script goes only after a <head> tag that leads the document:
+// a byte order mark, whitespace, one doctype and an <html> tag may come
+// first, nothing else (no comment), and tags end where a browser ends them.
 func TestHeadEnd(t *testing.T) {
 	for doc, want := range map[string]string{
 		"<head>x": "<head>",
-		"\xef\xbb\xbf <!doctype html>\n<html><head>":                                                           "\xef\xbb\xbf <!doctype html>\n<html><head>",
-		"<!-- a --><!DOCTYPE html><!-- b --><HTML lang=\"a>b\" data-x='>'><!-- <head> --><HEAD data-y=\"<\">x": "<!-- a --><!DOCTYPE html><!-- b --><HTML lang=\"a>b\" data-x='>'><!-- <head> --><HEAD data-y=\"<\">",
+		"\xef\xbb\xbf <!doctype html>\n<html><head>":                            "\xef\xbb\xbf <!doctype html>\n<html><head>",
+		"<!DOCTYPE html>\n<HTML lang=\"a>b\" data-x='>'>\n<HEAD data-y=\"<\">x": "<!DOCTYPE html>\n<HTML lang=\"a>b\" data-x='>'>\n<HEAD data-y=\"<\">",
 		"<html>\n  <head\n>": "<html>\n  <head\n>",
+		"<!doctype html SYSTEM \"about:legacy-compat\"><html lang=en dir='ltr'/><head/>": "<!doctype html SYSTEM \"about:legacy-compat\"><html lang=en dir='ltr'/><head/>",
+		"<html a='1'b=2 =c><head>": "<html a='1'b=2 =c><head>",
 	} {
 		if at := headEnd([]byte(doc)); at < 0 || doc[:at] != want {
 			t.Errorf("%q: %d", doc, at)
 		}
 	}
 	for _, doc := range []string{"", "<p>hi</p><head>", "<html><body><head>", "<!-- <head> -->", "<!-- open <head>", "<header>",
-		"<html><title>x</title><head>", "x<head>", "<!doctype html><!doctype html><head>", "<html lang=\"x><head>", "<head lang=\"x>"} {
+		"<html><title>x</title><head>", "x<head>", "<!doctype html><!doctype html><head>", "<html lang=\"x><head>", "<head lang=\"x>",
+		// Comments, also ones a browser ends before "-->".
+		"<!-- a --><head>", "<!doctype html><!-- x --><head>", "<html><!-- x --><head>", "<!--><script>x()</script>--><head>",
+		"<!---><script>x()</script>--><head>",
+		// A quote inside an unquoted value or an attribute name is no quote
+		// for a browser: the tag ends at the first ">".
+		"<html a=b\"><script>x()</script>\"><head>", "<html / =\"x><script>x()</script>\"><head>",
+		"<html a\"b><script>x()</script>\"><head>"} {
 		if at := headEnd([]byte(doc)); at >= 0 {
 			t.Errorf("%q accepted at %d", doc, at)
 		}

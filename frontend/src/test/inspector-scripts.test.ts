@@ -119,10 +119,15 @@ describe("boot.js", () => {
     const { w, fetch } = boot(KEY);
     const f = w.fetch as unknown as typeof globalThis.fetch;
     const init = { headers: { "x-a": "1" } };
-    for (const url of ["https://other.example/api", "https://insp.example:8445/api", "http://insp.example:8444/api", "//other.example/x"]) {
+    for (const [url, resolved] of [
+      ["https://other.example/api", "https://other.example/api"],
+      ["https://insp.example:8445/api", "https://insp.example:8445/api"],
+      ["http://insp.example:8444/api", "http://insp.example:8444/api"],
+      ["//other.example/x", "https://other.example/x"],
+    ]) {
       fetch.mockClear();
       await f(url, init);
-      expect(fetch.mock.calls[0]).toEqual([url, init]);
+      expect(fetch.mock.calls[0]).toEqual([resolved, init]);
     }
     fetch.mockClear();
     const req = new Request("https://other.example/api");
@@ -138,8 +143,8 @@ describe("boot.js", () => {
     // Inspector's origin, so they get no key.
     const based = boot(KEY, undefined, "https://other.example/app/");
     await (based.w.fetch as unknown as typeof globalThis.fetch)("/api/targets", { headers: { "x-a": "1" } });
-    expect(based.fetch.mock.calls[0]).toEqual(["/api/targets", { headers: { "x-a": "1" } }]);
-    expect(new based.ws("/ws/client").args).toEqual(["/ws/client"]);
+    expect(based.fetch.mock.calls[0]).toEqual(["https://other.example/api/targets", { headers: { "x-a": "1" } }]);
+    expect(new based.ws("/ws/client").args).toEqual(["wss://other.example/ws/client"]);
 
     // A value whose string form changes: the first form is checked and
     // sent, the second is never seen by the native calls.
@@ -151,6 +156,18 @@ describe("boot.js", () => {
     expect(sentHeaders(fetch, 0).get("authorization")).toBe(`Bearer ${KEY}`);
     n = 0;
     expect(new WS(shifty).args[0]).toBe("wss://insp.example:8444/api/targets");
+
+    // The same for another origin: the native calls get the URL that was
+    // checked, never the page's object, which would now name this origin.
+    let m = 0;
+    const away = { toString: () => (m++ === 0 ? "https://other.example/a" : "/api/targets") };
+    fetch.mockClear();
+    await (w.fetch as unknown as typeof globalThis.fetch)(away as unknown as string);
+    expect(fetch.mock.calls[0]).toEqual(["https://other.example/a"]);
+    m = 0;
+    expect(new WS(away).args).toEqual(["wss://other.example/a"]);
+    m = 0;
+    expect(new WS(away, ["p"]).args).toEqual(["wss://other.example/a", ["p"]]);
 
     // A Request whose url getter lies: the native copy's URL counts.
     class Lying extends Request {

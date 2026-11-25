@@ -122,6 +122,8 @@ func headerHasToken(h http.Header, name, token string) bool {
 // networkAddrs returns the managed network's addresses, cached; refresh
 // forces a new query when the cache is older than networkCacheTTL/6.
 // Concurrent refreshes share one Docker call; no lock is held during it.
+// The answer of a query that started before the cache was dropped or
+// forgotten is discarded.
 func (s *Service) networkAddrs(ctx context.Context, refresh bool) (docker.NetworkAddresses, error) {
 	cached := func() (bool, docker.NetworkAddresses, error) {
 		s.netMu.Lock()
@@ -133,16 +135,22 @@ func (s *Service) networkAddrs(ctx context.Context, refresh bool) (docker.Networ
 	if ok, addrs, err := cached(); ok {
 		return addrs, err
 	}
-	if s.cfg.Docker == nil {
+	if s.netQuery == nil {
 		return docker.NetworkAddresses{}, docker.ErrUnavailable
 	}
 	s.netFlight.do(ctx, s.cfg.Now, 0, func() {
+		s.netMu.Lock()
+		gen := s.netGen
+		s.netMu.Unlock()
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
-		addrs, err := s.cfg.Docker.ManagedNetworkAddresses(qctx)
+		addrs, err := s.netQuery(qctx)
 		now := s.cfg.Now()
 		s.netMu.Lock()
 		defer s.netMu.Unlock()
+		if s.netGen != gen {
+			return // dropped or forgotten meanwhile: this answer is older
+		}
 		transient := err != nil && !errors.Is(err, docker.ErrNotFound) && !errors.Is(err, docker.ErrNotManaged) && !errors.Is(err, docker.ErrNotOurs)
 		if transient && s.netErr == nil && len(s.netAddrs.Gateways)+len(s.netAddrs.Subnets) > 0 {
 			// Docker did not answer: keep the last known addresses (the
@@ -163,9 +171,23 @@ func (s *Service) networkAddrs(ctx context.Context, refresh bool) (docker.Networ
 	return s.netAddrs, s.netErr
 }
 
+// forgetNetwork makes the next use of the managed network's addresses ask
+// Docker again.
 func (s *Service) forgetNetwork() {
 	s.netMu.Lock()
 	s.netAt = time.Time{}
+	s.netGen++
+	s.netMu.Unlock()
+}
+
+// dropNetwork forgets the managed network's addresses at once: Docker
+// reported the network as not managed or not ours (err). Docker is asked
+// again after a short while.
+func (s *Service) dropNetwork(err error) {
+	s.netMu.Lock()
+	s.netAddrs, s.netErr = docker.NetworkAddresses{}, err
+	s.netAt = s.cfg.Now().Add(-networkCacheTTL + 5*time.Second)
+	s.netGen++
 	s.netMu.Unlock()
 }
 
@@ -280,7 +302,7 @@ func (s *Service) handleAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	ctx = context.WithValue(ctx, agentKey{}, agentInfo{port: v.port, token: v.sec.AgentToken})
+	ctx = context.WithValue(ctx, agentKey{}, agentInfo{view: v})
 	s.agentProxy.ServeHTTP(newProxyWriter(w, ctx), r.WithContext(ctx))
 }
 
@@ -288,8 +310,7 @@ type agentKey struct{}
 
 // agentInfo is the hub snapshot one relay uses.
 type agentInfo struct {
-	port  int
-	token string
+	view hubView
 }
 
 func (s *Service) logAgentRefusal(reason string, id int64, r *http.Request) {
@@ -325,16 +346,22 @@ func (s *Service) newAgentProxy() *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			info, _ := pr.In.Context().Value(agentKey{}).(agentInfo)
-			pr.SetURL(&url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(info.port)})
+			pr.SetURL(&url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(info.view.port)})
 			pr.Out.Host = hubHost
 			for _, h := range strippedHeaders {
 				pr.Out.Header.Del(h)
 			}
 			pr.Out.Header.Del("Origin")
-			pr.Out.Header.Set("Authorization", "Bearer "+info.token)
+			pr.Out.Header.Set("Authorization", "Bearer "+info.view.sec.AgentToken)
 		},
-		Transport:      &agentTransport{s: s, base: newHubTransport()},
-		ModifyResponse: func(resp *http.Response) error { resp.Header.Del("Set-Cookie"); return nil },
+		Transport: &agentTransport{s: s, base: newHubTransport()},
+		ModifyResponse: func(resp *http.Response) error {
+			resp.Header.Del("Set-Cookie")
+			if resp.StatusCode == http.StatusSwitchingProtocols && !webSocketAnswer(resp) {
+				return errBadUpgrade
+			}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if r.Context().Err() == nil {
 				s.logger.Debug("inspector agent relay failed", "err", err)
@@ -345,17 +372,22 @@ func (s *Service) newAgentProxy() *httputil.ReverseProxy {
 	}
 }
 
-// agentTransport marks the hub port as unverified on a transport error.
+// agentTransport sends the hub's agent token only to a hub port Docker
+// confirmed within hubCheckInterval, and drops the port on a transport
+// error.
 type agentTransport struct {
 	s    *Service
 	base http.RoundTripper
 }
 
 func (t *agentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	info, _ := req.Context().Value(agentKey{}).(agentInfo)
+	if !t.s.freshHub(req.Context(), info.view) {
+		return nil, errHubUnverified
+	}
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
-		info, _ := req.Context().Value(agentKey{}).(agentInfo)
-		return nil, t.s.hubUnreachable(req.Context(), info.port, err)
+		return nil, t.s.hubUnreachable(req.Context(), info.view.port, err)
 	}
 	return resp, nil
 }

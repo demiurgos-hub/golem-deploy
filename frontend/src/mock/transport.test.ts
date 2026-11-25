@@ -395,6 +395,38 @@ describe("mock transport: the Inspector", () => {
     expect((await call(t, "POST", "/inspector/sessions", {})).status).toBe(201);
   });
 
+  it("refuses links as soon as the setting is off and forgets unused links on a turn-off or new secrets, like the daemon", async () => {
+    const t = createMockTransport(real);
+    const patch = async (body: object) => expect((await finished(t, (await call(t, "PATCH", "/inspector", body)).body.id)).status).toBe("success");
+    const fill = async () => {
+      for (let i = 0; i < 8; i++) expect((await call(t, "POST", "/inspector/sessions", {})).status).toBe(201);
+      expect((await call(t, "POST", "/inspector/sessions", {})).status).toBe(429);
+    };
+    const off = await call(t, "PATCH", "/inspector", { enabled: false });
+    // The job has not finished: the daemon refuses already.
+    expect((await call(t, "GET", `/jobs/${off.body.id}`)).body.status).not.toBe("success");
+    expect(await call(t, "POST", "/inspector/sessions", {})).toMatchObject({ status: 409, body: { error: { code: "conflict" } } });
+    expect((await finished(t, off.body.id)).status).toBe("success");
+    await patch({ enabled: true });
+    await fill();
+    await patch({ enabled: false });
+    await patch({ enabled: true });
+    await fill();
+    await patch({ rotate_secrets: true });
+    expect((await call(t, "POST", "/inspector/sessions", {})).status).toBe(201);
+  }, 60_000);
+
+  it("drops a running server from the Inspector when its switch is turned off, like the daemon", async () => {
+    const t = createMockTransport(real);
+    expect((await call(t, "GET", "/inspector")).body.targets).toEqual([expect.objectContaining({ server_id: 11, connected: true })]);
+    expect((await call(t, "PATCH", "/servers/11", { inspector: false })).body).toMatchObject({ inspector: false, inspector_active: true });
+    // The game keeps trying until its next restart, but nothing is relayed: the hub lists it as gone for a while, under no server.
+    expect((await call(t, "GET", "/inspector")).body).toMatchObject({ targets: [], other_targets: 1 });
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now + 31_000);
+    expect((await call(t, "GET", "/inspector")).body).toMatchObject({ targets: [], other_targets: 0 });
+  });
+
   it("turns the Inspector off and on with a restricted job and marks the servers that need a restart", async () => {
     const t = createMockTransport(real);
     expect(await call(t, "PATCH", "/inspector", { enabled: false, pull_image: true })).toMatchObject({ status: 400, body: { error: { field: "pull_image" } } });
