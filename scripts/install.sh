@@ -323,14 +323,20 @@ extract_archive() {
 	if [ "$(printf '%s\n' "$names" | LC_ALL=C sort)" != "$(printf '%s\n' $ARCHIVE_MEMBERS)" ]; then
 		die "$label does not contain exactly the files of a Golem Deploy release ($ARCHIVE_MEMBERS)"
 	fi
-	listing=$(tar -tvzf "$archive" 2>/dev/null) || die "$label is not a readable .tar.gz archive"
+	# With numeric owners every line is "MODE UID/GID SIZE DATE TIME NAME",
+	# so an owner name with spaces cannot shift the size field.
+	listing=$(tar --numeric-owner -tvzf "$archive" 2>/dev/null) || die "$label is not a readable .tar.gz archive"
+	total=0
 	while IFS= read -r line; do
 		case $line in
 		-*) ;;
 		*) die "$label contains something other than plain files: $line" ;;
 		esac
+		[[ $line =~ ^-[^\ ]{9}\ +[0-9]+/[0-9]+\ +([0-9]{1,18})\  ]] || die "$label has an unexpected listing line: $line"
+		size=$((10#${BASH_REMATCH[1]}))
+		[ "$size" -le "$ARCHIVE_MAX_BYTES" ] || die "$label unpacks to more than $ARCHIVE_MAX_BYTES bytes"
+		total=$((total + size))
 	done <<<"$listing"
-	total=$(printf '%s\n' "$listing" | awk '{ s += $3 } END { printf "%d", s }')
 	[ "$total" -le "$ARCHIVE_MAX_BYTES" ] || die "$label unpacks to more than $ARCHIVE_MAX_BYTES bytes"
 	# shellcheck disable=SC2086 # the member names are fixed words
 	tar -xzf "$archive" -C "$dir" --no-same-owner --no-same-permissions -- $ARCHIVE_MEMBERS ||
@@ -611,6 +617,14 @@ main() {
 		release_url=${release_url%/}
 	fi
 
+	# Everything is unpacked or copied into a private directory first and
+	# installed from there.
+	work=$(mktemp -d)
+	trap 'rm -rf -- "$work"' EXIT
+
+	# The TLS files are copied once; the copies are checked and installed,
+	# so a renewal in between cannot install a mismatched pair.
+	local tls_cert_copy=$work/tls-cert.pem tls_key_copy=$work/tls-key.pem
 	if [ -n "$tls_cert" ] || [ -n "$tls_key" ]; then
 		if [ -z "$tls_cert" ] || [ -z "$tls_key" ]; then
 			die "--tls-cert and --tls-key must be given together"
@@ -619,15 +633,18 @@ main() {
 			if [ ! -f "$f" ] || [ ! -r "$f" ] || [ ! -s "$f" ]; then
 				die "$f is not a readable, non-empty file"
 			fi
-			grep -q -- '-----BEGIN ' "$f" || die "$f does not look like a PEM file"
 		done
-		grep -q -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' "$tls_key" || die "$tls_key does not contain a PEM private key"
-		grep -q -- '-----BEGIN CERTIFICATE-----' "$tls_cert" || die "$tls_cert does not contain a PEM certificate"
+		head -c 1048577 <"$tls_cert" >"$tls_cert_copy" || die "could not read $tls_cert"
+		[ "$(stat -c %s -- "$tls_cert_copy")" -le 1048576 ] || die "$tls_cert is larger than 1 MiB"
+		head -c 1048577 <"$tls_key" >"$tls_key_copy" || die "could not read $tls_key"
+		[ "$(stat -c %s -- "$tls_key_copy")" -le 1048576 ] || die "$tls_key is larger than 1 MiB"
+		grep -q -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' "$tls_key_copy" || die "$tls_key does not contain a PEM private key"
+		grep -q -- '-----BEGIN CERTIFICATE-----' "$tls_cert_copy" || die "$tls_cert does not contain a PEM certificate"
 		if command -v openssl >/dev/null 2>&1; then
 			local cert_pub key_pub
-			cert_pub=$(openssl x509 -in "$tls_cert" -noout -pubkey 2>/dev/null </dev/null) ||
+			cert_pub=$(openssl x509 -in "$tls_cert_copy" -noout -pubkey 2>/dev/null </dev/null) ||
 				die "openssl cannot read the certificate in $tls_cert"
-			key_pub=$(openssl pkey -in "$tls_key" -pubout -passin pass: 2>/dev/null </dev/null) ||
+			key_pub=$(openssl pkey -in "$tls_key_copy" -pubout -passin pass: 2>/dev/null </dev/null) ||
 				die "openssl cannot read the private key in $tls_key (encrypted keys are not supported)"
 			[ "$cert_pub" = "$key_pub" ] || die "$tls_key is not the private key of the certificate in $tls_cert"
 		fi
@@ -817,10 +834,6 @@ main() {
 
 	# --- the program to install ----------------------------------------------
 
-	# Everything is unpacked or copied into a private directory first and
-	# installed from there.
-	work=$(mktemp -d)
-	trap 'rm -rf -- "$work"' EXIT
 	local payload=$work/payload
 	mkdir -m 0700 "$payload"
 
@@ -864,11 +877,12 @@ main() {
 			die "$archive cannot be verified: pass --sha256 HEX, or put the release's SHA256SUMS next to it; nothing was changed"
 		fi
 		# Hash, list and extract a private copy, so the file checked is the
-		# file installed.
+		# file installed. The cap is enforced while copying: at most one byte
+		# more than allowed is written.
 		local size
-		size=$(stat -c %s -- "$archive")
+		head -c "$((ARCHIVE_MAX_BYTES + 1))" <"$archive" >"$copy" || die "could not copy $archive"
+		size=$(stat -c %s -- "$copy")
 		[ "$size" -le "$ARCHIVE_MAX_BYTES" ] || die "$archive is larger than $ARCHIVE_MAX_BYTES bytes"
-		cp -- "$archive" "$copy" || die "could not copy $archive"
 		got=$(sha256_of "$copy")
 		[ "$got" = "$want" ] || die "the SHA-256 of $archive is $got, but $want was expected; nothing was changed"
 		say "Using $archive (SHA-256 $got matches)"
@@ -1039,10 +1053,10 @@ main() {
 	if [ -n "$tls_cert" ]; then
 		say "Installing the TLS certificate and key into $TLS_DIR"
 		install -d -m 0750 -o root -g "$svc_group" "$TLS_DIR"
-		install -m 0644 -o root -g root "$tls_cert" "$TLS_CERT_DEST.new"
-		install -m 0640 -o root -g "$svc_group" "$tls_key" "$TLS_KEY_DEST.new"
-		mv -f "$TLS_CERT_DEST.new" "$TLS_CERT_DEST"
-		mv -f "$TLS_KEY_DEST.new" "$TLS_KEY_DEST"
+		install -T -m 0644 -o root -g root "$tls_cert_copy" "$TLS_CERT_DEST.new"
+		install -T -m 0640 -o root -g "$svc_group" "$tls_key_copy" "$TLS_KEY_DEST.new"
+		mv -fT "$TLS_CERT_DEST.new" "$TLS_CERT_DEST"
+		mv -fT "$TLS_KEY_DEST.new" "$TLS_KEY_DEST"
 	fi
 
 	detected_addr=''
