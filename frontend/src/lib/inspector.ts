@@ -39,7 +39,7 @@ export function inspectorEntryUrl(session: InspectorSession, loc: PageLocation =
 export type ServerInspectorState =
   /** The switch is off and the server is not connected. */
   | { kind: "off" }
-  /** The switch is off, but the running container was started with it on: it stays connected until its next restart. */
+  /** The switch is off, but the running container was started with it on: the daemon no longer relays it, and the game keeps trying to connect until its next restart. */
   | { kind: "leaving" }
   | { kind: "installation-off" }
   | { kind: "installation-down"; state: Inspector["state"]; detail: string }

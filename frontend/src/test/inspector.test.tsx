@@ -416,7 +416,7 @@ describe("server page: the Inspector", () => {
     expect(within(section).queryByText(/not running/)).toBeNull();
   });
 
-  it("says that a running server stays connected until its next restart after its switch was turned off", async () => {
+  it("says that the Inspector no longer shows a running server whose switch was turned off, which keeps trying until its next restart", async () => {
     renderApp({
       path: "/servers/3",
       signedInAs: developer,
@@ -425,7 +425,9 @@ describe("server page: the Inspector", () => {
     const section = await serverSection();
     expect(within(section).getByRole("switch", { name: "Connect this server to the Inspector" })).not.toBeChecked();
     expect(
-      await within(section).findByText("The switch is off, but the running game server was started with it on. It stays connected to the Inspector until its next restart."),
+      await within(section).findByText(
+        "The switch is off, so the Inspector no longer shows this server. The running game server was started with it on and keeps trying to connect until its next restart.",
+      ),
     ).toBeInTheDocument();
     expect(within(section).getByRole("button", { name: "Restart echo" })).toBeInTheDocument();
   });
@@ -525,7 +527,29 @@ describe("opening the Inspector", () => {
     const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
     expect(tab.close).toHaveBeenCalled();
     expect(tab.location.replace).not.toHaveBeenCalled();
-    expect(within(dialog).getByRole("link", { name: /Open the Inspector/ })).toHaveAttribute("href", `${ADDRESS}/_golem-deploy/enter#t=abc`);
+    expect(within(dialog).getByRole("button", { name: /Open the Inspector/ })).toBeInTheDocument();
+  });
+
+  it("closes the waiting tab and offers a new link when the answer arrives after the link expired", async () => {
+    const tab = fakeTab();
+    vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    let answer!: (r: Response) => void;
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: { ...connected(), "POST /inspector/sessions": () => new Promise<Response>((r) => (answer = r)) },
+    });
+    await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
+    await waitFor(() => expect(answer).toBeDefined());
+    const start = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => start + 61_000);
+    answer(jsonResponse(201, session({ expires_at: new Date(start + 60_000).toISOString() })));
+    const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    expect(dialog).toHaveAccessibleDescription("The answer came after the link had expired, so the new tab was closed.");
+    expect(within(dialog).getByText("The link has expired. Ask for a new one.")).toBeInTheDocument();
+    expect(tab.close).toHaveBeenCalled();
+    expect(tab.location.replace).not.toHaveBeenCalled();
+    expect(document.body.innerHTML).not.toContain("#t=abc");
   });
 
   it("offers the link in a dialog when the tab was closed before the link arrived", async () => {
@@ -560,14 +584,14 @@ describe("opening the Inspector", () => {
     await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
     const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
     expect(within(dialog).getByText("The link has expired. Ask for a new one.")).toBeInTheDocument();
-    expect(within(dialog).queryByRole("link")).toBeNull();
+    expect(within(dialog).queryByRole("button", { name: /Open the Inspector/ })).toBeNull();
     await user.click(within(dialog).getByRole("button", { name: "Get a new link" }));
     await waitFor(() => expect(calls.filter((c) => c.method === "POST" && c.path === "/inspector/sessions")).toHaveLength(2));
-    expect(await screen.findByRole("link", { name: /Open the Inspector/ })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /Open the Inspector/ })).toBeInTheDocument();
   });
 
-  it("hides the link once it has expired, also when the timer was late", async () => {
-    vi.spyOn(window, "open").mockReturnValue(null);
+  it("checks the deadline again when the button is used, also when the timer was late", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
     const { user } = renderApp({
       path: "/servers/3",
       signedInAs: developer,
@@ -575,21 +599,14 @@ describe("opening the Inspector", () => {
     });
     await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
     const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
-    const link = within(dialog).getByRole("link", { name: /Open the Inspector/ });
-    // After React's handler: was the click let through to open the link?
-    const opened = vi.fn();
-    const after = (e: Event) => {
-      if (!e.defaultPrevented) opened();
-      e.preventDefault();
-    };
-    document.addEventListener("click", after);
+    const button = within(dialog).getByRole("button", { name: /Open the Inspector/ });
+    open.mockClear();
     const start = Date.now();
     vi.spyOn(Date, "now").mockImplementation(() => start + 61_000);
-    await user.click(link);
+    await user.click(button);
     expect(await within(dialog).findByText("The link has expired. Ask for a new one.")).toBeInTheDocument();
-    expect(within(dialog).queryByRole("link")).toBeNull();
-    expect(opened).not.toHaveBeenCalled();
-    document.removeEventListener("click", after);
+    expect(within(dialog).queryByRole("button", { name: /Open the Inspector/ })).toBeNull();
+    expect(open).not.toHaveBeenCalled();
   });
 
   it("closes the tab again and says why when the request fails", async () => {
@@ -606,8 +623,8 @@ describe("opening the Inspector", () => {
     expect(tab.location.replace).not.toHaveBeenCalled();
   });
 
-  it("offers the link to click when the browser blocked the new tab", async () => {
-    vi.spyOn(window, "open").mockReturnValue(null);
+  it("offers a button that opens the link in a new tab when the browser blocked the tab, with no link element", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
     const { user } = renderApp({
       path: "/servers/3",
       signedInAs: developer,
@@ -616,13 +633,13 @@ describe("opening the Inspector", () => {
     await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
     const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
     expect(dialog).toHaveAccessibleDescription(/the browser blocked the tab, or the tab was closed/);
-    expect(within(dialog).getByText("Use this link instead. It works once, within a minute.")).toBeInTheDocument();
-    const link = within(dialog).getByRole("link", { name: /Open the Inspector/ });
-    expect(link).toHaveAttribute("href", `${ADDRESS}/_golem-deploy/enter#t=abc`);
-    expect(link).toHaveAttribute("target", "_blank");
-    expect(link).toHaveAttribute("rel", "noopener noreferrer");
-    link.addEventListener("click", (e) => e.preventDefault());
-    await user.click(link);
+    expect(within(dialog).getByText("Open it from here instead. The link works once, within a minute.")).toBeInTheDocument();
+    // Nothing to middle-click, modify-click or copy: the link is not in the page.
+    expect(within(dialog).queryByRole("link")).toBeNull();
+    expect(document.body.innerHTML).not.toContain("#t=abc");
+    open.mockClear();
+    await user.click(within(dialog).getByRole("button", { name: /Open the Inspector/ }));
+    expect(open).toHaveBeenCalledWith(`${ADDRESS}/_golem-deploy/enter#t=abc`, "_blank", "noopener,noreferrer");
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Open the Inspector" })).toBeNull());
   });
 
