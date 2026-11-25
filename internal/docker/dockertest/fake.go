@@ -107,10 +107,13 @@ type Volume struct {
 	Files  []File
 }
 
-// Network is a fake network.
+// Network is a fake network. Subnet and Gateway are its IPAM
+// configuration ("172.30.0.0/16" and "172.30.0.1" unless set).
 type Network struct {
 	Labels  map[string]string
 	Options map[string]string
+	Subnet  string
+	Gateway string
 }
 
 // Fake is the fake docker CLI. The zero value is not usable; call New.
@@ -135,6 +138,58 @@ type Fake struct {
 	// copiedIn records the tar headers of every "docker cp -" into a
 	// container.
 	copiedIn [][]File
+	// registry holds the images "docker pull" can download, by reference;
+	// pullHook, when set, can fail or block a pull.
+	registry map[string]Image
+	pullHook func(ref string) error
+}
+
+// AddRegistryImage makes "docker pull ref" add img (tagged ref) to the
+// host, replacing the tag on any older image.
+func (f *Fake) AddRegistryImage(ref string, img Image) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if img.Labels == nil {
+		img.Labels = map[string]string{}
+	}
+	f.registry[ref] = img
+}
+
+// SetPullHook installs fn, called with the reference of every pull before
+// it runs; a returned error fails the pull (printed as the CLI would).
+func (f *Fake) SetPullHook(fn func(ref string) error) {
+	f.mu.Lock()
+	f.pullHook = fn
+	f.mu.Unlock()
+}
+
+func (f *Fake) pull(a []string, stdout io.Writer) *failure {
+	ref := firstOr(positional(a))
+	f.mu.Lock()
+	hook := f.pullHook
+	f.mu.Unlock()
+	if hook != nil {
+		if err := hook(ref); err != nil {
+			return fail(1, "Error response from daemon: %v", err)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	img, ok := f.registry[ref]
+	if !ok {
+		return fail(1, "Error response from daemon: manifest for %s not found: manifest unknown", ref)
+	}
+	for _, other := range f.images {
+		other.Tags = slices.DeleteFunc(other.Tags, func(t string) bool { return t == ref })
+	}
+	img.Tags = append(slices.Clone(img.Tags), ref)
+	if existing := f.images[img.ID]; existing != nil {
+		existing.Tags = append(existing.Tags, ref)
+	} else {
+		f.images[img.ID] = &img
+	}
+	fmt.Fprintln(stdout, img.ID)
+	return nil
 }
 
 // BuildCall is a "docker build" the fake received.
@@ -191,7 +246,8 @@ func New() *Fake {
 		volumes:    map[string]*Volume{},
 		networks: map[string]*Network{"bridge": {Labels: map[string]string{}, Options: map[string]string{}},
 			"none": {Labels: map[string]string{}, Options: map[string]string{}}},
-		clock: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		clock:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		registry: map[string]Image{},
 	}
 }
 
@@ -550,6 +606,8 @@ func (f *Fake) Run(ctx context.Context, _ string, cmd docker.Cmd) error {
 		ferr = f.volumeInspect(positional(a), stdout)
 	case has(a, "volume", "rm"):
 		ferr = f.volumeRm(positional(a))
+	case has(a, "pull"):
+		ferr = f.pull(a, stdout)
 	case has(a, "network", "inspect"):
 		ferr = f.networkInspect(positional(a), stdout)
 	case has(a, "network", "create"):
@@ -1154,7 +1212,12 @@ func (f *Fake) networkInspect(names []string, w io.Writer) *failure {
 		fmt.Fprintln(w, "[]")
 		return fail(1, "Error response from daemon: network %s not found", name)
 	}
-	writeArray(w, []map[string]any{{"Name": name, "Labels": n.Labels, "Options": n.Options, "Containers": f.attached(name)}})
+	subnet, gateway := n.Subnet, n.Gateway
+	if subnet == "" {
+		subnet, gateway = "172.30.0.0/16", "172.30.0.1"
+	}
+	writeArray(w, []map[string]any{{"Name": name, "Labels": n.Labels, "Options": n.Options, "Containers": f.attached(name),
+		"IPAM": map[string]any{"Config": []map[string]string{{"Subnet": subnet, "Gateway": gateway}}}}})
 	return nil
 }
 

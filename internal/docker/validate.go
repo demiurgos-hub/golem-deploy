@@ -25,7 +25,14 @@ const (
 	// pipeline: the id of the builds row and the Golem Engine version.
 	LabelBuildID       = "dev.golemengine.deploy.build-id"
 	LabelEngineVersion = "dev.golemengine.deploy.engine-version"
-	ManagedValue       = "true"
+	// LabelInspector is "true" on a server container created with the
+	// Inspector agent variables and empty otherwise. LabelInspectorHub is
+	// "true" only on this installation's Inspector hub container. Every
+	// create sets both explicitly, so neither can be inherited from an
+	// image.
+	LabelInspector    = "dev.golemengine.deploy.inspector"
+	LabelInspectorHub = "dev.golemengine.deploy.inspector-hub"
+	ManagedValue      = "true"
 )
 
 // Naming and fixed runtime parameters.

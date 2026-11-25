@@ -107,3 +107,10 @@ func LoadOrCreate(path string) (*Box, error) {
 	}
 	return New(key)
 }
+
+// InspectorSecretsPurpose is the purpose for the settings row holding the
+// Inspector hub's secrets (its password, its agent token and the key of the
+// per-server agent tokens).
+func InspectorSecretsPurpose() string {
+	return "settings.inspector_secrets"
+}

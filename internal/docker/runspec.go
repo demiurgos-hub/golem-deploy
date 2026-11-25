@@ -97,6 +97,9 @@ type RunSpec struct {
 	ConfigHash string
 	// LaunchID is the daemon-generated identity of a pending create.
 	LaunchID string
+	// Inspector records that DaemonEnv points the game's Inspector agent at
+	// the daemon (the LabelInspector label).
+	Inspector bool
 	// ReadOnlyBinds are extra read-only bind mounts.
 	ReadOnlyBinds []BindMount
 	// DataVolume is an optional named volume mounted read-write.
@@ -305,6 +308,8 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 		"--label", LabelConfigHash + "=" + s.ConfigHash,
 		"--label", LabelLaunchID + "=" + s.LaunchID,
 		"--label", LabelHelper + "=",
+		"--label", LabelInspector + "=" + boolLabel(s.Inspector),
+		"--label", LabelInspectorHub + "=",
 		"--restart", "no",
 		"--init",
 		"--no-healthcheck",
@@ -379,6 +384,14 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 	}
 	args = append(args, "--", s.Image)
 	return args, nil
+}
+
+// boolLabel renders a boolean label: "true" or empty.
+func boolLabel(v bool) string {
+	if v {
+		return ManagedValue
+	}
+	return ""
 }
 
 // EnvKeys returns the variable names of an env map, sorted.
