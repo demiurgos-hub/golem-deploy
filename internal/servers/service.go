@@ -114,6 +114,30 @@ type Config struct {
 	SnapshotDeadline time.Duration
 	// Now is the clock of the backup schedule (default time.Now).
 	Now func() time.Time
+	// Inspector supplies the Inspector agent settings for servers whose
+	// Inspector switch is on; nil means the Inspector is never injected.
+	Inspector Inspector
+}
+
+// Inspector is what the service needs from the installation's Inspector
+// (internal/inspector).
+type Inspector interface {
+	// Agent returns where the games' Inspector agents connect and the
+	// generation of the per-server token key. ok is false when nothing is
+	// injected: the Inspector is off or unavailable, or containers cannot
+	// reach its listener.
+	Agent(ctx context.Context) (agent InspectorAgent, ok bool)
+	// AgentToken returns the agent token of server id (a secret).
+	AgentToken(id int64) (string, error)
+}
+
+// InspectorAgent is the non-secret part of the Inspector agent settings.
+type InspectorAgent struct {
+	// HubURL is the agent endpoint ("ws://host:port/ws/agent").
+	HubURL string
+	// Generation changes whenever the agent tokens change; it is part of
+	// the config hash instead of the tokens.
+	Generation int64
 }
 
 // DefaultBackupMaxBytes is the default of Config.BackupMaxBytes
@@ -214,7 +238,16 @@ func (s *Service) params(ctx context.Context) (runtimeParams, error) {
 	if s.cfg.Certs != nil {
 		p.groupAdd = s.cfg.Certs.GroupAdd()
 	}
+	s.inspectorParams(ctx, &p)
 	return p, nil
+}
+
+// inspectorParams fills in the Inspector agent settings.
+func (s *Service) inspectorParams(ctx context.Context, p *runtimeParams) {
+	if s.cfg.Inspector == nil {
+		return
+	}
+	p.inspector, p.inspectorOK = s.cfg.Inspector.Agent(ctx)
 }
 
 func ref(sv store.Server) docker.ServerRef {
@@ -292,7 +325,7 @@ func (s *Service) openAdminToken(sv store.Server) (string, error) {
 	return string(pt), nil
 }
 
-func (s *Service) runSpec(sv store.Server, b store.Build, env map[string]string, img docker.Image, p runtimeParams, token string) docker.RunSpec {
+func (s *Service) runSpec(sv store.Server, b store.Build, env map[string]string, img docker.Image, p runtimeParams, token string, insp map[string]string) docker.RunSpec {
 	spec := docker.RunSpec{
 		ServerID:      sv.ID,
 		ServerName:    sv.Name,
@@ -312,6 +345,12 @@ func (s *Service) runSpec(sv store.Server, b store.Build, env map[string]string,
 		ConfigHash:    s.configHash(sv, &b, p),
 		GroupAdd:      p.groupAdd,
 		AdminPort:     AdminContainerPort,
+	}
+	if len(insp) > 0 {
+		for k, v := range insp {
+			spec.DaemonEnv[k] = v
+		}
+		spec.Inspector = true
 	}
 	if sv.DataVolume != "" {
 		spec.DataVolume = &docker.VolumeMount{Name: sv.DataVolume, Target: build.DataDir}
@@ -398,6 +437,7 @@ func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p r
 		},
 		SnapshotIntervalSeconds: sv.SnapshotIntervalSeconds,
 		BackupSchedule:          apitypes.BackupSchedule{IntervalHours: sv.BackupIntervalHours, Keep: sv.BackupKeep},
+		Inspector:               sv.Inspector,
 		CreatedAt:               sv.CreatedAt.UTC(),
 		UpdatedAt:               sv.UpdatedAt.UTC(),
 	}
@@ -419,6 +459,7 @@ func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p r
 	case ct != nil:
 		out.State = mapState(ct.State)
 		out.ContainerID = ct.ID
+		out.InspectorActive = ct.Labels[docker.LabelInspector] == docker.ManagedValue
 		if !ct.StartedAt.IsZero() {
 			t := ct.StartedAt
 			out.StartedAt = &t
@@ -480,6 +521,9 @@ func (s *Service) containers(rows []store.Server, cts []docker.Container) map[in
 		}
 		if _, helper := s.knownHelpers.Load(ct.Labels[docker.LabelHelper]); helper && docker.IsHelper(ct) {
 			continue // a recorded helper container
+		}
+		if s.docker.IsInspectorHub(ct) {
+			continue // the Inspector hub (internal/inspector)
 		}
 		s.logForeign(ct)
 	}
@@ -721,7 +765,7 @@ func (s *Service) Create(ctx context.Context, req apitypes.CreateServerRequest) 
 	defer s.writeMu.Unlock()
 	seal := func(id int64) ([]byte, error) { return s.sealEnv(id, req.Env) }
 	row := store.Server{Name: req.Name, BuildID: &b.ID, AllowedOrigins: origins, DesiredState: string(desired),
-		SnapshotIntervalSeconds: snapshot, BackupIntervalHours: interval, BackupKeep: keep}
+		SnapshotIntervalSeconds: snapshot, BackupIntervalHours: interval, BackupKeep: keep, Inspector: req.Inspector != nil && *req.Inspector}
 	for attempt := 0; ; attempt++ {
 		port := 0
 		if req.Port != nil {
@@ -791,7 +835,7 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 		if err != nil {
 			return apitypes.Server{}, err
 		}
-		u := store.ServerUpdate{SetOrigins: req.AllowedOrigins != nil, AllowedOrigins: origins}
+		u := store.ServerUpdate{SetOrigins: req.AllowedOrigins != nil, AllowedOrigins: origins, Inspector: req.Inspector}
 		if req.SnapshotIntervalSeconds != nil || req.BackupSchedule != nil {
 			snapshot, interval, keep, err := dataSettings("", req.SnapshotIntervalSeconds, req.BackupSchedule,
 				sv.SnapshotIntervalSeconds, sv.BackupIntervalHours, sv.BackupKeep)
@@ -878,7 +922,8 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 	}
 	s.logger.Info("server updated", "server_id", id, "build_changed", req.BuildID != nil, "port_changed", req.Port != nil,
 		"origins_changed", req.AllowedOrigins != nil, "env_set", len(req.EnvSet), "env_unset", len(req.EnvUnset),
-		"snapshot_interval_changed", req.SnapshotIntervalSeconds != nil, "backup_schedule_changed", req.BackupSchedule != nil)
+		"snapshot_interval_changed", req.SnapshotIntervalSeconds != nil, "backup_schedule_changed", req.BackupSchedule != nil,
+		"inspector_changed", req.Inspector != nil)
 	ct, derr := s.container(ctx, updated)
 	if derr != nil {
 		// The update is stored; a cancelled caller only loses the view.
