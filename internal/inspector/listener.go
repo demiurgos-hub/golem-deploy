@@ -171,7 +171,7 @@ func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
 // openListener binds addr. With tlsConfig, TLS connections get browser
 // (and plaintext connections agent) handling on the same port; without
 // it, one plaintext server serves both.
-func openListener(addr string, tlsConfig *tls.Config, browser, agentOnly http.Handler, logger *slog.Logger) (*listener, error) {
+func openListener(addr string, tlsConfig *tls.Config, browser, agentOnly http.Handler, sniffTimeout time.Duration, logger *slog.Logger) (*listener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -184,7 +184,7 @@ func openListener(addr string, tlsConfig *tls.Config, browser, agentOnly http.Ha
 		l.wg.Go(func() { _ = srv.Serve(ln) })
 		return l, nil
 	}
-	sn := newSniffer(ln, firstByteTimeout)
+	sn := newSniffer(ln, sniffTimeout)
 	tlsSrv := newHTTPServer(browser, logger)
 	tlsSrv.TLSConfig = tlsConfig
 	plainSrv := newHTTPServer(agentOnly, logger)

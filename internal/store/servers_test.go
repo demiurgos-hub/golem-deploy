@@ -61,3 +61,56 @@ func TestSetServerDesiredState(t *testing.T) {
 		t.Fatal("invalid state accepted")
 	}
 }
+
+// The Inspector switch defaults to off, is set at create and changed only
+// by an update that names it; the database refuses other values.
+func TestServerInspectorSwitch(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	p1, p2 := 7001, 7002
+	plain, err := s.CreateServer(ctx, Server{Name: "plain", Port: &p1}, nil)
+	if err != nil || plain.Inspector {
+		t.Fatalf("%+v %v", plain, err)
+	}
+	on, err := s.CreateServer(ctx, Server{Name: "on", Port: &p2, Inspector: true}, nil)
+	if err != nil || !on.Inspector {
+		t.Fatalf("%+v %v", on, err)
+	}
+	yes, no := true, false
+	if got, err := s.UpdateServer(ctx, plain.ID, ServerUpdate{Inspector: &yes}); err != nil || !got.Inspector {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if got, err := s.UpdateServer(ctx, plain.ID, ServerUpdate{SetOrigins: true}); err != nil || !got.Inspector {
+		t.Fatalf("an update without the switch changed it: %+v %v", got, err)
+	}
+	if got, err := s.UpdateServer(ctx, on.ID, ServerUpdate{Inspector: &no}); err != nil || got.Inspector {
+		t.Fatalf("%+v %v", got, err)
+	}
+	batch, err := s.CreateServers(ctx, []Server{{Name: "imported", Inspector: true}}, nil)
+	if err != nil || !batch[0].Inspector {
+		t.Fatalf("%+v %v", batch, err)
+	}
+	if _, err := s.db.ExecContext(ctx, "UPDATE servers SET inspector = 2 WHERE id = ?", on.ID); err == nil {
+		t.Fatal("inspector = 2 accepted")
+	}
+}
+
+// The Inspector settings are plain rows of the settings table.
+func TestInspectorSettings(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, ok, err := s.GetSetting(ctx, SettingInspectorEnabled); err != nil || ok {
+		t.Fatalf("%v %v", ok, err)
+	}
+	for _, k := range []string{SettingInspectorEnabled, SettingInspectorSecrets} {
+		if err := s.SetSetting(ctx, k, "v1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetSetting(ctx, k, "v2"); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok, err := s.GetSetting(ctx, k); err != nil || !ok || v != "v2" {
+			t.Fatalf("%s: %q %v %v", k, v, ok, err)
+		}
+	}
+}

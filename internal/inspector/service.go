@@ -134,6 +134,8 @@ type Service struct {
 	guard      loginGuard
 	agentLog   sampled
 	bg         sync.WaitGroup
+	// sniffTimeout bounds the wait for a connection's first byte.
+	sniffTimeout time.Duration
 
 	// mu guards the fields below.
 	mu           sync.Mutex
@@ -195,6 +197,8 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		agents:     newAgentRegistry(),
 		entryLimit: auth.NewLimiter(entryFailuresPerWindow, entryWindow, 50000, cfg.Now),
 		agentLog:   sampled{every: time.Minute, now: cfg.Now},
+
+		sniffTimeout: firstByteTimeout,
 	}
 	s.proxy = s.newBrowserProxy()
 	s.agentProxy = s.newAgentProxy()
@@ -880,7 +884,7 @@ func (s *Service) openListener() error {
 	if s.ln != nil {
 		return nil
 	}
-	ln, err := openListener(s.cfg.Listen, s.cfg.TLSConfig, s.browserHandler(), s.agentHandler(), s.logger)
+	ln, err := openListener(s.cfg.Listen, s.cfg.TLSConfig, s.browserHandler(), s.agentHandler(), s.sniffTimeout, s.logger)
 	if err != nil {
 		s.logger.Warn("could not open the Inspector listener", "addr", s.cfg.Listen, "err", err)
 		return jobs.Fail(bindError(s.cfg.Listen, err), nil)

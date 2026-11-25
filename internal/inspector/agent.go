@@ -249,6 +249,7 @@ func (s *Service) newAgentProxy() *httputil.ReverseProxy {
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if r.Context().Err() == nil {
 				s.logger.Debug("inspector agent relay failed", "err", err)
+				s.refreshHub(context.WithoutCancel(r.Context()))
 				hubError(w, http.StatusBadGateway, "hub_unavailable")
 			}
 		},
