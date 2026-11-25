@@ -100,3 +100,8 @@ The secrets are stored encrypted in the database and never returned, logged or p
 - **The session key lives in the browser tab.** Code that runs on the Inspector's own origin can read it, like the Inspector's web UI, which comes from the hub image. Game servers cannot: they are other origins, and the listener uses no cookies.
 - The agent token of a server is visible to the game (it is in its environment) and can appear in the game's log if the game prints it. It only lets that game register as an Inspector target.
 - The Inspector listener is reachable by anyone who can reach its port. Without a valid session it serves only the entry page and its script, the boot script, a short "session ended" page, the Inspector's web UI without any data, and JSON errors.
+
+## See also
+
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-inspector): when the Inspector does not start or a game does not appear.
+- [SECURITY.md](SECURITY.md#the-inspector): the Inspector in the installation's security model.

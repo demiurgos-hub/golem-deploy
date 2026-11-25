@@ -44,3 +44,8 @@ When the effective game host changes in ACME mode, the daemon obtains a certific
 Game changes stage complete pairs outside the mounts and commit the mode and generation together. Startup discards uncommitted stages and finishes committed ones. Status continues to report the committed mode while copying is pending. Each publication atomically renames the key and then the chain, then records the mount as complete. The engine checks both files every 30 seconds and keeps its previous certificate when a poll sees a transient mismatch. It loads the new pair on a later poll without restarting. A server start repairs its mount and holds it stable until the game loads its initial pair. Publication copies the other mounts while the hold is active and retries the held mount as soon as the start releases it. Startup and periodic reconciliation adopt a newer ACME pair saved just before an interrupted install. The next check installs a valid renewal the daemon saved, even if the renewal job was cancelled.
 
 Self-signed games start with `GOLEM_TLS_PINNED=1`. Custom and ACME use `GOLEM_TLS_PINNED=0` and clients validate the certificate chain normally. Switching between those pinning settings reports `restart_required` until the server restarts.
+
+## See also
+
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md#certificate-problems): certificate errors and their fixes.
+- [SECURITY.md](SECURITY.md#certificates-and-their-keys): who can read which key.
