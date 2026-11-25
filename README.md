@@ -87,7 +87,7 @@ Create the first admin account, then start the daemon:
 ./bin/golem-deploy serve
 ```
 
-`admin create --password-stdin` reads the password from the first line of standard input instead (for scripts). `admin reset-password --username <name>` sets a new password, ends all of that account's sessions and deletes all of its API tokens (use it to recover a compromised account). Both work while the daemon is running.
+`admin create --password-stdin` reads the password from the first line of standard input instead (for scripts). `admin reset-password --username <name>` sets a new password, ends all of that account's sessions and deletes all of its API tokens (use it to recover a compromised account). Instead of `admin create`, `admin setup-link [--origin https://host[:port]] [--ttl 1h]` prints a one-time link (`<origin>/setup#t=<token>`, or only the path without `--origin`) whose page creates the first admin account in the browser: you choose the username and password there. The link works once, expires after `--ttl` (1 minute to 24 hours, default 1 hour), and a new link replaces the previous one. It refuses with exit code 3 when an admin account already exists. All three commands work while the daemon is running.
 
 `serve` options (flags, with environment fallbacks):
 
