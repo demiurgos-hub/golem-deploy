@@ -197,6 +197,8 @@ const JOB_LIMIT = 5;
 /** Admin Settings: turn the installation's Inspector on and off, and see what it does. */
 export function InspectorSettingsSection() {
   const inspector = useInspector();
+  // The daemon's 409 for a change it cannot make (the Inspector is not available): kept when the page learns that and drops the controls.
+  const [refusal, setRefusal] = useState<ApiError | null>(null);
   return (
     <Section
       id="inspector"
@@ -208,18 +210,21 @@ export function InspectorSettingsSection() {
       ) : inspector.isError && !inspector.data ? (
         <ErrorState error={inspector.error} title="Could not load the Inspector" onRetry={() => void inspector.refetch()} />
       ) : !inspector.data.available ? (
-        <Notice tone="info" title="Not available on this host">
-          The daemon was started with the Inspector listener turned off (<code className="font-mono text-xs">--inspector-listen off</code>), so the
-          Inspector cannot be turned on. To use it, start the daemon with an address for the Inspector listener.
-        </Notice>
+        <div className="flex flex-col gap-3">
+          {refusal && <ErrorText error={refusal} />}
+          <Notice tone="info" title="Not available on this host">
+            The daemon was started with the Inspector listener turned off (<code className="font-mono text-xs">--inspector-listen off</code>), so
+            the Inspector cannot be turned on. To use it, start the daemon with an address for the Inspector listener.
+          </Notice>
+        </div>
       ) : (
-        <InspectorControls inspector={inspector.data} />
+        <InspectorControls inspector={inspector.data} onRefused={setRefusal} />
       )}
     </Section>
   );
 }
 
-function InspectorControls({ inspector }: { inspector: Inspector }) {
+function InspectorControls({ inspector, onRefused }: { inspector: Inspector; onRefused: (err: ApiError) => void }) {
   const api = useApi();
   const queryClient = useQueryClient();
   const jobs = useSubjectJobs("inspector", "hub", JOB_LIMIT);
@@ -236,6 +241,13 @@ function InspectorControls({ inspector }: { inspector: Inspector }) {
       }));
       void queryClient.invalidateQueries({ queryKey: qk.inspector });
       shown.show(job);
+    },
+    onError: (err) => {
+      if (err instanceof ApiError && err.code === "conflict") {
+        // The Inspector is not available (any more): show what the daemon reports now.
+        onRefused(err);
+        void queryClient.invalidateQueries({ queryKey: qk.inspector });
+      }
     },
   });
   const busy = activeJob !== null;
@@ -438,8 +450,8 @@ function InspectorDetails({ inspector }: { inspector: Inspector }) {
       />
       {inspector.other_targets > 0 && (
         <p className="text-xs text-muted-foreground">
-          The Inspector also knows {inspector.other_targets} game {inspector.other_targets === 1 ? "server that is" : "servers that are"} not a
-          server of this installation.
+          {inspector.other_targets} {inspector.other_targets === 1 ? "entry in the Inspector belongs" : "entries in the Inspector belong"} to no
+          server with the Inspector switch on, for example a server whose switch was turned off while it runs.
         </p>
       )}
       {!inspector.agents_reachable && (
@@ -490,7 +502,7 @@ export function ServerInspectorSection({ server, busy, onJob }: { server: Server
           </p>
         </div>
         {save.isError && <ErrorText error={save.error} />}
-        {server.inspector && <ServerInspectorStatus server={server} busy={busy} onJob={onJob} />}
+        {(server.inspector || server.inspector_active) && <ServerInspectorStatus server={server} busy={busy} onJob={onJob} />}
       </div>
     </Section>
   );
@@ -522,9 +534,16 @@ function ServerInspectorStatus({ server, busy, onJob }: { server: Server; busy: 
       {action && <div className="flex flex-wrap items-center gap-2">{action}</div>}
     </div>
   );
+  const restart = <ServerActions server={server} busy={busy} onJob={onJob} only="restart" />;
   switch (st.kind) {
     case "off":
       return null;
+    case "leaving":
+      return row(
+        <Badge tone="warning">Restart required</Badge>,
+        "The switch is off, but the running game server was started with it on. It stays connected to the Inspector until its next restart.",
+        restart,
+      );
     case "installation-off":
       return row(
         <Badge tone="warning">Not connected</Badge>,
@@ -548,17 +567,28 @@ function ServerInspectorStatus({ server, busy, onJob }: { server: Server; busy: 
           </>
         ),
       );
+    case "unreachable":
+      return row(
+        <Badge tone="warning">Not connected</Badge>,
+        "Game servers cannot reach the Inspector on this host: its listener is bound to a loopback address. An administrator has to change how the daemon is started.",
+      );
+    case "server-unknown":
+      return row(<Badge tone="warning">Unknown</Badge>, "Docker cannot be queried, so the state of this server is not known.");
     case "not-running":
       return row(<Badge>Not connected</Badge>, "The server is not running. It connects to the Inspector when it starts.");
     case "restart-needed":
       return row(
         <Badge tone="warning">Restart required</Badge>,
-        st.reason === "without"
-          ? "The running game server was started without the Inspector. It connects at the next restart."
-          : "The Inspector settings changed since the game server started. It connects at the next restart.",
-        <ServerActions server={server} busy={busy} onJob={onJob} only="restart" />,
+        "The running game server was started without the Inspector. It connects at the next restart.",
+        restart,
       );
-    case "unknown":
+    case "restart-pending":
+      return row(
+        <Badge tone="warning">Not connected</Badge>,
+        "The game server is not connected to the Inspector. It has changes that wait for a restart.",
+        restart,
+      );
+    case "targets-unknown":
       return row(<Badge tone="warning">Unknown</Badge>, "The Inspector did not answer, so it is not known whether this server is connected.");
     case "connected":
       return row(
