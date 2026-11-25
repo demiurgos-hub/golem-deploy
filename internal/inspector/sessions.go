@@ -54,19 +54,22 @@ func (s *session) hubSession() string {
 
 // track registers a proxied request so ending the session cancels it
 // (closing an open WebSocket stream). The request also ends when the
-// session expires. ok is false once the session ended or expired; the
-// check and the registration are one step under the session's lock.
-func (s *session) track(parent context.Context, now time.Time) (ctx context.Context, release func(), ok bool) {
+// session expires: expiry is that instant on the wall clock, computed once
+// from now, and is the deadline of ctx. ok is false once the session ended
+// or expired; the check and the registration are one step under the
+// session's lock.
+func (s *session) track(parent context.Context, now time.Time) (ctx context.Context, expiry time.Time, release func(), ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ended || !now.Before(s.expires) {
-		return nil, nil, false
+		return nil, time.Time{}, nil, false
 	}
-	ctx, cancel := context.WithTimeout(parent, s.expires.Sub(now))
+	expiry = time.Now().Add(s.expires.Sub(now))
+	ctx, cancel := context.WithDeadline(parent, expiry)
 	s.nextID++
 	id := s.nextID
 	s.streams[id] = cancel
-	return ctx, func() {
+	return ctx, expiry, func() {
 		cancel()
 		s.mu.Lock()
 		delete(s.streams, id)
@@ -118,10 +121,15 @@ func newSessionStore(now func() time.Time) *sessionStore {
 	return &sessionStore{now: now, m: map[[32]byte]*session{}}
 }
 
-// create adds a session and returns its key. Sessions it pushed
-// out (the account's oldest beyond the limit, the oldest overall beyond
-// the total) are returned so the caller ends them.
-func (st *sessionStore) create(accountID, tokenVersion int64, hubSID string) (string, *session, []*session, error) {
+// Every session leaves the store already ended (end runs under the store's
+// lock), so a drain never misses one that is on its way out. The methods
+// that remove sessions return their hub session ids for the caller to log
+// out.
+
+// create adds a session and returns its key. Sessions it pushed out (the
+// account's oldest beyond the limit, the oldest overall beyond the total)
+// are ended; their hub session ids are returned.
+func (st *sessionStore) create(accountID, tokenVersion int64, hubSID string) (string, *session, []string, error) {
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", nil, nil, err
@@ -132,7 +140,7 @@ func (st *sessionStore) create(accountID, tokenVersion int64, hubSID string) (st
 		expires: now.Add(SessionMaxAge), hubSID: hubSID, lastLogin: now, streams: map[uint64]context.CancelFunc{}}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	var evicted []*session
+	var evicted []string
 	var mine []*session
 	for _, o := range st.m {
 		if o.accountID == accountID {
@@ -141,8 +149,8 @@ func (st *sessionStore) create(accountID, tokenVersion int64, hubSID string) (st
 	}
 	slices.SortFunc(mine, func(a, b *session) int { return a.created.Compare(b.created) })
 	for len(mine) >= maxSessionsPerAccount {
+		evicted = append(evicted, mine[0].end())
 		delete(st.m, mine[0].key)
-		evicted = append(evicted, mine[0])
 		mine = mine[1:]
 	}
 	for len(st.m) >= maxSessions {
@@ -152,43 +160,45 @@ func (st *sessionStore) create(accountID, tokenVersion int64, hubSID string) (st
 				oldest = o
 			}
 		}
+		evicted = append(evicted, oldest.end())
 		delete(st.m, oldest.key)
-		evicted = append(evicted, oldest)
 	}
 	st.m[s.key] = s
 	return k, s, evicted, nil
 }
 
 // lookup returns the live session of a key (nil when unknown or expired;
-// an expired session is removed and returned in expired so the caller
-// ends it).
-func (st *sessionStore) lookup(k string) (s *session, expired *session) {
+// an expired session is ended and removed, and its hub session id is
+// returned in expiredSID).
+func (st *sessionStore) lookup(k string) (s *session, expiredSID string) {
 	if len(k) != 43 {
-		return nil, nil
+		return nil, ""
 	}
 	key := sha256.Sum256([]byte(k))
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	s = st.m[key]
 	if s == nil {
-		return nil, nil
+		return nil, ""
 	}
 	if !st.now().Before(s.expires) {
+		sid := s.end()
 		delete(st.m, key)
-		return nil, s
+		return nil, sid
 	}
-	return s, nil
+	return s, ""
 }
 
-// remove drops s from the store (it reports whether s was present).
-func (st *sessionStore) remove(s *session) bool {
+// remove ends s and drops it from the store; it returns the hub session id
+// to log out (empty when s had ended already).
+func (st *sessionStore) remove(s *session) string {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.m[s.key] != s {
-		return false
+	sid := s.end()
+	if st.m[s.key] == s {
+		delete(st.m, s.key)
 	}
-	delete(st.m, s.key)
-	return true
+	return sid
 }
 
 // all returns every live session.
@@ -202,13 +212,14 @@ func (st *sessionStore) all() []*session {
 	return out
 }
 
-// drain removes and returns every session.
-func (st *sessionStore) drain() []*session {
+// drain ends and removes every session and returns their hub session ids
+// (one per session, empty when it had none).
+func (st *sessionStore) drain() []string {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	out := make([]*session, 0, len(st.m))
+	out := make([]string, 0, len(st.m))
 	for _, s := range st.m {
-		out = append(out, s)
+		out = append(out, s.end())
 	}
 	st.m = map[[32]byte]*session{}
 	return out

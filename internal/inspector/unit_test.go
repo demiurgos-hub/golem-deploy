@@ -126,7 +126,7 @@ func TestSessionStore(t *testing.T) {
 	if got, _ := st.lookup(key); got != s {
 		t.Fatal("lookup")
 	}
-	ctx, release, ok := s.track(context.Background(), clock.Now())
+	ctx, _, release, ok := s.track(context.Background(), clock.Now())
 	if !ok || s.streamCount() != 1 {
 		t.Fatal("track")
 	}
@@ -137,13 +137,13 @@ func TestSessionStore(t *testing.T) {
 	if s.end() != "" {
 		t.Fatal("ended twice")
 	}
-	if _, _, ok := s.track(context.Background(), clock.Now()); ok {
+	if _, _, _, ok := s.track(context.Background(), clock.Now()); ok {
 		t.Fatal("tracked after end")
 	}
 	// Expiry.
-	key, _, _, _ = st.create(1, 7, "")
+	key, _, _, _ = st.create(1, 7, "hub-2")
 	clock.Advance(SessionMaxAge)
-	if got, expired := st.lookup(key); got != nil || expired == nil {
+	if got, expired := st.lookup(key); got != nil || expired != "hub-2" {
 		t.Fatal("expired session returned")
 	}
 	// The account's oldest session is pushed out beyond the limit.
@@ -159,7 +159,7 @@ func TestSessionStore(t *testing.T) {
 		clock.Advance(time.Second)
 	}
 	_, _, ev, _ := st.create(3, 0, "new")
-	if len(ev) != 1 || ev[0].hubSession() != "s0" {
+	if len(ev) != 1 || ev[0] != "s0" {
 		t.Fatalf("evicted %v", ev)
 	}
 	if got, _ := st.lookup(first); got != nil {

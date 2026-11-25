@@ -3,6 +3,8 @@ package inspector
 import (
 	"bufio"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"errors"
 	"net"
 	"net/http"
@@ -10,6 +12,79 @@ import (
 	"sync"
 	"time"
 )
+
+// wsHandshakeTimeout bounds a relayed WebSocket upgrade until the hub
+// answered it with a valid 101; the stream then runs without it.
+const wsHandshakeTimeout = 30 * time.Second
+
+// handshake is the deadline of one relayed WebSocket upgrade.
+type handshake struct {
+	t *time.Timer
+}
+
+// startHandshake returns ctx with a deadline of d that only done clears.
+func startHandshake(parent context.Context, d time.Duration) (context.Context, *handshake, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	return ctx, &handshake{t: time.AfterFunc(d, cancel)}, cancel
+}
+
+// done clears the deadline after a valid 101; false when it passed
+// already. A nil handshake (not an upgrade) has nothing to clear.
+func (h *handshake) done() bool {
+	return h == nil || h.t.Stop()
+}
+
+// wsGUID is the key suffix of RFC 6455.
+const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// wsAccept is the Sec-WebSocket-Accept value for a Sec-WebSocket-Key.
+func wsAccept(key string) string {
+	sum := sha1.Sum([]byte(key + wsGUID))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// cancelSet holds the cancel functions of running requests, so closing
+// admission can end them all (drain).
+type cancelSet struct {
+	mu   sync.Mutex
+	next uint64
+	m    map[uint64]context.CancelFunc
+}
+
+func newCancelSet() *cancelSet { return &cancelSet{m: map[uint64]context.CancelFunc{}} }
+
+// add returns a context that closeAll cancels and its release.
+func (c *cancelSet) add(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	c.mu.Lock()
+	c.next++
+	id := c.next
+	c.m[id] = cancel
+	c.mu.Unlock()
+	return ctx, func() {
+		cancel()
+		c.mu.Lock()
+		delete(c.m, id)
+		c.mu.Unlock()
+	}
+}
+
+// closeAll cancels every registered request.
+func (c *cancelSet) closeAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, cancel := range c.m {
+		cancel()
+		delete(c.m, id)
+	}
+}
+
+// count returns the number of registered requests.
+func (c *cancelSet) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.m)
+}
 
 // trackerKey carries the listener's tracker in a request context.
 type trackerKey struct{}

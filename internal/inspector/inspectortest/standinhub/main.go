@@ -15,7 +15,9 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -183,6 +185,12 @@ func hub() error {
 	return srv.ListenAndServe()
 }
 
+// wsAccept is the Sec-WebSocket-Accept value of RFC 6455 for key.
+func wsAccept(key string) string {
+	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
 func upgrade(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.Reader, bool) {
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		http.Error(w, "upgrade required", http.StatusBadRequest)
@@ -192,7 +200,7 @@ func upgrade(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.Reader, b
 	if err != nil {
 		return nil, nil, false
 	}
-	_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n")
+	_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + wsAccept(r.Header.Get("Sec-WebSocket-Key")) + "\r\n\r\n")
 	if err := brw.Flush(); err != nil {
 		conn.Close()
 		return nil, nil, false

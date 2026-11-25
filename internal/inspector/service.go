@@ -155,8 +155,13 @@ type Service struct {
 	inspectHub func(ctx context.Context, id string) (docker.Container, error)
 	listHubs   func(ctx context.Context) ([]docker.Container, error)
 	netQuery   func(ctx context.Context) (docker.NetworkAddresses, error)
-	// stepTimeout bounds each step of a sweep (tests lower it).
-	stepTimeout time.Duration
+	// stepTimeout bounds each step of a sweep and handshakeTimeout a
+	// relayed WebSocket upgrade until the hub's valid 101 (tests lower
+	// them).
+	stepTimeout      time.Duration
+	handshakeTimeout time.Duration
+	// pages are the running relays of the hub's own pages.
+	pages *cancelSet
 	// hooks are test hooks; all nil outside tests.
 	hooks testHooks
 	// settingMu orders writes and reads of the setting with the copy in
@@ -318,7 +323,9 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		reqTimeout:   requestTimeout,
 		maxConns:     maxConns,
 
-		stepTimeout: sweepStepTimeout,
+		stepTimeout:      sweepStepTimeout,
+		handshakeTimeout: wsHandshakeTimeout,
+		pages:            newCancelSet(),
 	}
 	if cfg.PublicURL != "" {
 		o, err := canonicalOrigin(cfg.PublicURL)
@@ -1592,16 +1599,17 @@ func (s *Service) drain() int {
 	s.tickets.clear()
 	n := s.endAllSessions()
 	s.agents.closeAll()
+	s.pages.closeAll()
 	return n
 }
 
 // endAllSessions ends every session and returns how many there were.
 func (s *Service) endAllSessions() int {
-	list := s.sessions.drain()
-	for _, sess := range list {
-		s.logoutHub(sess.end())
+	sids := s.sessions.drain()
+	for _, sid := range sids {
+		s.logoutHub(sid)
 	}
-	return len(list)
+	return len(sids)
 }
 
 // sweepSessions ends sessions whose account no longer exists, lost its

@@ -70,6 +70,8 @@ type proxyInfo struct {
 	sess    *session
 	offered bool
 	view    hubView
+	// handshake is the deadline of a WebSocket upgrade (nil otherwise).
+	handshake *handshake
 }
 
 func proxyInfoFrom(ctx context.Context) proxyInfo {
@@ -188,10 +190,8 @@ func (s *Service) knownKey(r *http.Request) bool {
 	if key == "" {
 		return false
 	}
-	sess, expired := s.sessions.lookup(key)
-	if expired != nil {
-		s.endSession(expired)
-	}
+	sess, expiredSID := s.sessions.lookup(key)
+	s.logoutHub(expiredSID)
 	return sess != nil
 }
 
@@ -204,10 +204,8 @@ func (s *Service) sessionFor(r *http.Request) (sess *session, unavailable bool) 
 	if key == "" {
 		return nil, false
 	}
-	sess, expired := s.sessions.lookup(key)
-	if expired != nil {
-		s.endSession(expired)
-	}
+	sess, expiredSID := s.sessions.lookup(key)
+	s.logoutHub(expiredSID)
 	if sess == nil {
 		return nil, false
 	}
@@ -290,8 +288,7 @@ func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logger.Info("inspector session ended by sign-out", "account_id", sess.accountID)
-	s.sessions.remove(sess)
-	if sid := sess.end(); sid != "" {
+	if sid := s.sessions.remove(sess); sid != "" {
 		if v := s.hubNow(); v.port != 0 {
 			lctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			s.logoutAt(lctx, v, sid)
@@ -316,7 +313,19 @@ func (s *Service) handleStatic(w http.ResponseWriter, r *http.Request) {
 		reject(w, r, http.StatusServiceUnavailable, "hub_unavailable")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), s.reqTimeout)
+	// The relay is registered under admission like sessions and agents:
+	// closing admission ends it.
+	var ctx context.Context
+	var release func()
+	if !s.admit(v.gen, func() bool {
+		ctx, release = s.pages.add(r.Context())
+		return true
+	}) {
+		reject(w, r, http.StatusServiceUnavailable, "hub_unavailable")
+		return
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, s.reqTimeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, proxyKey{}, proxyInfo{view: v})
 	s.proxy.ServeHTTP(newProxyWriter(w, ctx), r.WithContext(ctx))
@@ -362,24 +371,33 @@ func (s *Service) handleProxy(w http.ResponseWriter, r *http.Request) {
 		hubError(w, http.StatusServiceUnavailable, "hub_unavailable")
 		return
 	}
-	ctx, release, ok := sess.track(r.Context(), s.cfg.Now())
+	ctx, expiry, release, ok := sess.track(r.Context(), s.cfg.Now())
 	if !ok {
 		s.unauthenticated(w, r)
 		return
 	}
 	defer release()
 	// The answer is never written after the session expired: the write
-	// deadline is the earlier of the request timeout and the expiry (a
-	// relayed WebSocket clears it and ends with the session instead).
-	left := sess.expires.Sub(s.cfg.Now())
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(min(s.reqTimeout, left)))
-	if !upgrade {
+	// deadline is the earlier of the request timeout and the expiry, the
+	// same instant as the request context's (a relayed WebSocket clears it
+	// and ends with the session instead).
+	wd := time.Now().Add(s.reqTimeout)
+	if expiry.Before(wd) {
+		wd = expiry
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(wd)
+	var hs *handshake
+	if upgrade {
+		var cancel context.CancelFunc
+		ctx, hs, cancel = startHandshake(ctx, s.handshakeTimeout)
+		defer cancel()
+	} else {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.reqTimeout)
 		defer cancel()
 	}
 	_, offered := presentedKey(r)
-	ctx = context.WithValue(ctx, proxyKey{}, proxyInfo{sess: sess, offered: upgrade && offered, view: v})
+	ctx = context.WithValue(ctx, proxyKey{}, proxyInfo{sess: sess, offered: upgrade && offered, view: v, handshake: hs})
 	out := r.WithContext(ctx)
 	if body != nil {
 		out.Body = io.NopCloser(bytes.NewReader(body))
@@ -426,6 +444,9 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 				if !webSocketAnswer(resp) {
 					return errBadUpgrade
 				}
+				if !proxyInfoFrom(resp.Request.Context()).handshake.done() {
+					return errHandshakeTimeout
+				}
 				// Browsers fail a connection that offered subprotocols
 				// and got none back.
 				resp.Header.Del("Sec-WebSocket-Protocol")
@@ -468,11 +489,20 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 // ModifyResponse closes the hub's connection.
 var errBadUpgrade = errors.New("inspector: the hub switched to a protocol that was not asked for")
 
+// errHandshakeTimeout: the hub's 101 came after the handshake deadline.
+var errHandshakeTimeout = errors.New("inspector: the hub did not complete the WebSocket handshake in time")
+
 // webSocketAnswer reports whether a 101 from the hub answers a WebSocket
-// upgrade of the request with a WebSocket upgrade.
+// upgrade of the request with a WebSocket upgrade: Upgrade websocket,
+// Connection upgrade and exactly one Sec-WebSocket-Accept that matches the
+// request's Sec-WebSocket-Key.
 func webSocketAnswer(resp *http.Response) bool {
-	return resp.Request != nil && isWebSocket(resp.Request) && headerHasToken(resp.Header, "Connection", "upgrade") &&
-		strings.EqualFold(strings.TrimSpace(resp.Header.Get("Upgrade")), "websocket") && len(resp.Header.Values("Upgrade")) == 1
+	if resp.Request == nil || !isWebSocket(resp.Request) || !headerHasToken(resp.Header, "Connection", "upgrade") ||
+		!strings.EqualFold(strings.TrimSpace(resp.Header.Get("Upgrade")), "websocket") || len(resp.Header.Values("Upgrade")) != 1 {
+		return false
+	}
+	keys, accepts := resp.Request.Header.Values("Sec-WebSocket-Key"), resp.Header.Values("Sec-WebSocket-Accept")
+	return len(keys) == 1 && keys[0] != "" && len(accepts) == 1 && strings.TrimSpace(accepts[0]) == wsAccept(keys[0])
 }
 
 // retryTransport sends a request only to a hub port Docker confirmed
@@ -701,6 +731,5 @@ func (s *Service) logoutAt(ctx context.Context, v hubView, sid string) {
 // endSession ends a session: its streams close and its hub session is
 // logged out in the background.
 func (s *Service) endSession(sess *session) {
-	s.sessions.remove(sess)
-	s.logoutHub(sess.end())
+	s.logoutHub(s.sessions.remove(sess))
 }

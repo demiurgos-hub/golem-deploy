@@ -302,15 +302,19 @@ func (s *Service) handleAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	ctx = context.WithValue(ctx, agentKey{}, agentInfo{view: v})
+	ctx, hs, cancel := startHandshake(ctx, s.handshakeTimeout)
+	defer cancel()
+	ctx = context.WithValue(ctx, agentKey{}, agentInfo{view: v, handshake: hs})
 	s.agentProxy.ServeHTTP(newProxyWriter(w, ctx), r.WithContext(ctx))
 }
 
 type agentKey struct{}
 
-// agentInfo is the hub snapshot one relay uses.
+// agentInfo is the hub snapshot one relay uses and the deadline of its
+// upgrade.
 type agentInfo struct {
-	view hubView
+	view      hubView
+	handshake *handshake
 }
 
 func (s *Service) logAgentRefusal(reason string, id int64, r *http.Request) {
@@ -357,8 +361,13 @@ func (s *Service) newAgentProxy() *httputil.ReverseProxy {
 		Transport: &agentTransport{s: s, base: newHubTransport()},
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Header.Del("Set-Cookie")
-			if resp.StatusCode == http.StatusSwitchingProtocols && !webSocketAnswer(resp) {
-				return errBadUpgrade
+			if resp.StatusCode == http.StatusSwitchingProtocols {
+				if !webSocketAnswer(resp) {
+					return errBadUpgrade
+				}
+				if info, _ := resp.Request.Context().Value(agentKey{}).(agentInfo); !info.handshake.done() {
+					return errHandshakeTimeout
+				}
 			}
 			return nil
 		},
