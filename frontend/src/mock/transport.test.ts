@@ -324,3 +324,105 @@ describe("mock transport: saved data and backups", () => {
     expect((await call(t, "GET", "/backups?server_id=11")).body.items[0]).toMatchObject({ kind: "manual", note: "before the patch" });
   }, 30_000);
 });
+
+describe("mock transport: the Inspector", () => {
+  async function finished(t: Transport, id: number) {
+    let j = (await call(t, "GET", `/jobs/${id}`)).body;
+    for (let i = 0; i < 80 && (j.status === "queued" || j.status === "running"); i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      j = (await call(t, "GET", `/jobs/${id}`)).body;
+    }
+    return j;
+  }
+  /** A daemon that knows the caller through an API token. */
+  const realToken: Transport = {
+    ...real,
+    fetch: async (url) =>
+      String(url).endsWith("/account")
+        ? jsonResponse(200, { ...admin, auth: "api_token", api_token: { id: 4, name: "ci" } })
+        : new Response("unexpected", { status: 599 }),
+  };
+
+  it("lets every identity read it, admins change it and only login sessions open it", async () => {
+    const t = createMockTransport(real);
+    const view = (await call(t, "GET", "/inspector")).body;
+    expect(view).toMatchObject({ available: true, enabled: true, state: "running", port: 7700, public_url: "", agents_reachable: true, other_targets: 0 });
+    // eu-arena is connected; flood-test was started with the Inspector, but its game never connects.
+    expect(view.targets).toEqual([expect.objectContaining({ server_id: 11, connected: true })]);
+    expect((await call(t, "GET", "/servers/14")).body).toMatchObject({ inspector: true, inspector_active: true });
+
+    const dev = createMockTransport(realAs("developer"));
+    expect((await call(dev, "GET", "/inspector")).status).toBe(200);
+    expect(await call(dev, "PATCH", "/inspector", { enabled: false })).toMatchObject({ status: 403, body: { error: { code: "forbidden" } } });
+    expect((await call(dev, "POST", "/inspector/sessions", {})).status).toBe(200);
+
+    const token = createMockTransport(realToken);
+    expect((await call(token, "GET", "/inspector")).status).toBe(200);
+    expect(await call(token, "POST", "/inspector/sessions", {})).toMatchObject({ status: 403, body: { error: { code: "session_required" } } });
+
+    const session = await call(t, "POST", "/inspector/sessions", { server_id: 11 });
+    expect(session).toMatchObject({ status: 200, body: { port: 7700, public_url: "", path: expect.stringMatching(/^\/_golem-deploy\/enter\?/) } });
+    expect(Date.parse(session.body.expires_at) - Date.now()).toBeLessThanOrEqual(60_000);
+    // Every link is a new one.
+    expect((await call(t, "POST", "/inspector/sessions", { server_id: 11 })).body.path).not.toBe(session.body.path);
+    expect(await call(t, "POST", "/inspector/sessions", { server_id: 999 })).toMatchObject({ status: 404, body: { error: { code: "not_found" } } });
+    // "staging" has the Inspector switch off.
+    expect(await call(t, "POST", "/inspector/sessions", { server_id: 12 })).toMatchObject({ status: 400, body: { error: { field: "server_id" } } });
+  });
+
+  it("turns the Inspector off and on with a restricted job and marks the servers that need a restart", async () => {
+    const t = createMockTransport(real);
+    expect(await call(t, "PATCH", "/inspector", { enabled: false, pull_image: true })).toMatchObject({ status: 400, body: { error: { field: "pull_image" } } });
+    const off = await call(t, "PATCH", "/inspector", { enabled: false });
+    expect(off).toMatchObject({ status: 202, body: { kind: "inspector.apply", subject_type: "inspector", subject_id: "hub", restricted: true } });
+    expect(await call(t, "PATCH", "/inspector", {})).toMatchObject({ status: 409, body: { error: { code: "job_in_progress" } } });
+    expect((await call(t, "GET", "/jobs?subject_type=inspector&subject_id=hub")).body.items[0]).toMatchObject({ id: off.body.id });
+    expect(await finished(t, off.body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", "/inspector")).body).toMatchObject({ enabled: false, state: "off", targets: null, started_at: null, image_id: "" });
+    expect(await call(t, "POST", "/inspector/sessions", {})).toMatchObject({ status: 409, body: { error: { code: "conflict" } } });
+    expect(await call(t, "PATCH", "/inspector", { rotate_secrets: true })).toMatchObject({ status: 400, body: { error: { field: "rotate_secrets" } } });
+    // eu-arena's container was started with the Inspector.
+    expect((await call(t, "GET", "/servers/11")).body).toMatchObject({ inspector_active: true, restart_required: true });
+
+    // A server created with the switch on while the Inspector is off starts without it.
+    const created = await call(t, "POST", "/servers", { name: "probe", build_id: 3, inspector: true, desired_state: "running" });
+    expect(created).toMatchObject({ status: 201, body: { inspector: true, inspector_active: false } });
+    const start = (await call(t, "GET", `/jobs?subject_type=server&subject_id=${created.body.id}`)).body.items[0];
+    expect(await finished(t, start.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", `/servers/${created.body.id}`)).body).toMatchObject({ state: "running", inspector_active: false, restart_required: false });
+
+    const on = await call(t, "PATCH", "/inspector", { enabled: true });
+    expect((await call(t, "GET", "/inspector")).body).toMatchObject({ enabled: true, state: "stopped" });
+    expect(await finished(t, on.body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", "/inspector")).body).toMatchObject({ enabled: true, state: "running", targets: [expect.objectContaining({ server_id: 11 })] });
+    expect((await call(t, "GET", `/servers/${created.body.id}`)).body).toMatchObject({ inspector_active: false, restart_required: true });
+    const restart = await call(t, "POST", `/servers/${created.body.id}/restart`);
+    expect(await finished(t, restart.body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", `/servers/${created.body.id}`)).body).toMatchObject({ inspector_active: true, restart_required: false });
+    expect((await call(t, "GET", "/inspector")).body.targets.map((x: { server_id: number }) => x.server_id)).toContain(created.body.id);
+  }, 60_000);
+
+  it("disconnects every server when the secrets are replaced, and keeps the switch in exports and imports", async () => {
+    const t = createMockTransport(real);
+    const rotate = await call(t, "PATCH", "/inspector", { rotate_secrets: true });
+    expect(rotate.status).toBe(202);
+    expect(await finished(t, rotate.body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", "/inspector")).body).toMatchObject({ state: "running", targets: [] });
+    expect((await call(t, "GET", "/servers/11")).body).toMatchObject({ inspector_active: true, restart_required: true });
+
+    // The switch applies on the next (re)start: a running server needs a restart, a stopped one does not.
+    expect(await call(t, "PATCH", "/servers/16", { inspector: "yes" })).toMatchObject({ status: 400, body: { error: { code: "bad_request" } } });
+    expect((await call(t, "PATCH", "/servers/16", { inspector: true })).body).toMatchObject({ inspector: true, restart_required: false });
+    expect((await call(t, "PATCH", "/servers/12", { inspector: true })).body).toMatchObject({ inspector: true, restart_required: false });
+    expect((await call(t, "PATCH", "/servers/14", { inspector: false })).body).toMatchObject({ inspector: false, inspector_active: true, restart_required: true });
+
+    const exported = (await call(t, "GET", "/servers/export")).body;
+    const byName = new Map<string, Record<string, unknown>>(exported.servers.map((s: { name: string }) => [s.name, s]));
+    expect(byName.get("eu-arena")).toMatchObject({ inspector: true });
+    expect(byName.get("crashy")).not.toHaveProperty("inspector");
+    const spec = { name: "copy", project: "arena-shooter" };
+    expect(await call(t, "POST", "/servers/import", { format_version: 2, servers: [{ ...spec, inspector: 1 }] })).toMatchObject({ status: 400 });
+    const imported = await call(t, "POST", "/servers/import", { format_version: 2, servers: [{ ...spec, inspector: true }] });
+    expect(imported).toMatchObject({ status: 201, body: { created: [{ name: "copy", inspector: true, inspector_active: false }] } });
+  }, 30_000);
+});
