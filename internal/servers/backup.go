@@ -101,8 +101,8 @@ type ResetOptions struct {
 	CreatedBy        *int64
 }
 
-// restartAllowance is what a start after a cancelled restore or reset may
-// take besides StartTimeout (the Docker calls before the readiness wait).
+// restartAllowance is what putting a stopped server back may take besides
+// StartTimeout (the Docker calls before the readiness wait).
 const restartAllowance = time.Minute
 
 // ValidateNote checks a backup note: a single line of at most
@@ -604,9 +604,9 @@ func (s *Service) checkRestore(ctx context.Context, id int64, o RestoreOptions) 
 // afterwards. The server starts again through the health-gated start when
 // it is meant to run, except after a forced restore of a backup whose
 // schema the build cannot load. A failure or cancellation before the
-// switch leaves the server on its old data (and starts it again when it is
-// meant to run); after the switch the job finishes its bookkeeping and
-// succeeds.
+// switch leaves the server on its old data and puts back the container the
+// job stopped (see putBack); after the switch the job finishes its
+// bookkeeping and succeeds.
 func (s *Service) Restore(ctx context.Context, id int64, o RestoreOptions, log io.Writer) error {
 	if s.cfg.Backups == nil {
 		return jobs.Fail("backups are not configured on this daemon", ErrBackupsUnavailable)
@@ -633,34 +633,35 @@ func (s *Service) Restore(ctx context.Context, id int64, o RestoreOptions, log i
 	if bk.OmittedEntries > 0 {
 		fmt.Fprintf(log, "note: the backup left out %d entries of the data directory it was taken from\n", bk.OmittedEntries)
 	}
-	if err := s.stopKeepingDesired(ctx, sv, log); err != nil {
+	paused, err := s.stopForData(ctx, sv, log)
+	if err != nil {
 		return err
 	}
 	if err := s.safetyBackup(ctx, sv, store.BackupPreRestore, o.SkipSafetyBackup, o.CreatedBy, log); err != nil {
-		s.startAgain(ctx, id, log)
+		s.putBack(ctx, paused, log)
 		return err
 	}
 	newVol, releaseVol, err := s.newDataVolume(ctx, sv)
 	if err != nil {
-		s.startAgain(ctx, id, log)
+		s.putBack(ctx, paused, log)
 		return err
 	}
 	defer releaseVol()
 	fmt.Fprintf(log, "copying the backup into the new data volume %s\n", newVol)
 	if err := s.copyIn(ctx, sv, b, img, newVol, bk, archive); err != nil {
 		s.removeVolumeQuietly(ctx, sv, newVol)
-		s.startAgain(ctx, id, log)
+		s.putBack(ctx, paused, log)
 		return err
 	}
 	if ctx.Err() != nil {
 		fmt.Fprintln(log, "the job was cancelled before the server was switched to the restored data")
 		s.removeVolumeQuietly(ctx, sv, newVol)
-		s.startAgain(ctx, id, log)
+		s.putBack(ctx, paused, log)
 		return ctx.Err()
 	}
 	if err := s.store.SwitchServerData(context.WithoutCancel(ctx), sv.ID, sv.DataVolume, newVol, bk.SchemaFingerprint); err != nil {
 		s.removeVolumeQuietly(ctx, sv, newVol)
-		s.startAgain(ctx, id, log)
+		s.putBack(ctx, paused, log)
 		return jobs.Fail("could not switch the server to the restored data", err)
 	}
 	fmt.Fprintf(log, "the server now uses the data volume %s with the backup's data (schema %s)\n", newVol, orDash(bk.SchemaFingerprint))
@@ -785,24 +786,43 @@ func (s *Service) copyIn(ctx context.Context, sv store.Server, b store.Build, im
 	return nil
 }
 
-// stopKeepingDesired gracefully stops the server's container without
-// changing its desired state.
-func (s *Service) stopKeepingDesired(ctx context.Context, sv store.Server, log io.Writer) error {
+// stopped is what stopForData found before it stopped a server: the row
+// as it was (the recorded container's id and sealed admin token) and
+// whether that container was running, so putBack can start that same
+// container again.
+type stopped struct {
+	sv         store.Server
+	wasRunning bool
+}
+
+// stopForData gracefully stops the server's recorded container without
+// changing its desired state, after noting whether it was running. When
+// the stop itself fails or is cancelled, the container is put back (see
+// putBack) before the failure is returned.
+func (s *Service) stopForData(ctx context.Context, sv store.Server, log io.Writer) (*stopped, error) {
+	p := &stopped{sv: sv}
 	if err := s.removePending(ctx, sv, log); err != nil {
-		return s.failDocker(ctx, sv, "recover the previous create", err)
+		return p, s.failDocker(ctx, sv, "recover the previous create", err)
 	}
-	stopped, err := s.docker.StopServer(ctx, ref(sv), s.cfg.StopTimeout)
+	ct, err := s.container(ctx, sv)
+	if err != nil {
+		return p, s.failDocker(ctx, sv, "inspect the container", err)
+	}
+	p.wasRunning = ct != nil && adminRunning(*ct)
+	done, err := s.docker.StopServer(ctx, ref(sv), s.cfg.StopTimeout)
 	if errors.Is(err, docker.ErrNotOurs) {
 		s.logForeignRef(ref(sv))
-		stopped, err = false, nil
+		done, err = false, nil
 	}
 	if err != nil {
-		return s.failDocker(ctx, sv, "stop the container", err)
+		ferr := s.failDocker(ctx, sv, "stop the container", err)
+		s.putBack(ctx, p, log)
+		return p, ferr
 	}
-	if stopped {
+	if done {
 		fmt.Fprintf(log, "stopped the server (graceful, timeout %s); the game saved its snapshot\n", s.cfg.StopTimeout)
 	}
-	return nil
+	return p, nil
 }
 
 // safetyBackup backs up the server's current data before a restore or
@@ -860,29 +880,112 @@ func safetyFailure(kind string, incomplete bool, detail string, kindErr error) e
 	return jobs.Fail(msg, safetyError{kind: kindErr})
 }
 
-// startAgain starts the server again after a failed or cancelled restore,
-// reset or deletion when it is meant to run, through the normal start
-// path. After a cancellation it uses a context that is not cancelled but
-// bounded by StartTimeout (plus restartAllowance for the Docker calls
-// before the readiness wait). Its outcome only reaches the job log.
-func (s *Service) startAgain(ctx context.Context, id int64, log io.Writer) {
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), s.cfg.StartTimeout+restartAllowance)
-		defer cancel()
-	}
-	sv, err := s.load(ctx, id)
-	if err != nil || sv.DesiredState != "running" {
+// putBack undoes stopForData after a restore, reset or deletion ended
+// before it replaced or removed the data: when the recorded container was
+// running before the stop and is not running now, it starts that same
+// container again (docker start of the recorded id) and waits until its
+// game reports ready with the recorded admin token. It never creates or
+// removes a container and does not look at the assigned build, so a build
+// assigned since (which the schema guard may refuse) does not keep the
+// server down. It runs under a context that is not cancelled but bounded
+// by StartTimeout plus restartAllowance, and its outcome only reaches the
+// job log (Docker's own errors go to the daemon log).
+func (s *Service) putBack(ctx context.Context, p *stopped, log io.Writer) {
+	if p == nil || !p.wasRunning {
 		return
 	}
-	fmt.Fprintln(log, "starting the server again with its previous data")
-	if err := s.start(ctx, sv, log); err != nil {
-		msg := "see the daemon log"
-		var safe *jobs.SafeError
-		if errors.As(err, &safe) {
-			msg = safe.Msg
+	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.StartTimeout+restartAllowance)
+	defer cancel()
+	sv := p.sv
+	ct, err := s.container(bctx, sv)
+	switch {
+	case err != nil:
+		s.logger.Warn("could not inspect a stopped server container to start it again", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", err)
+		fmt.Fprintln(log, "the server was not started again: Docker could not inspect its container (details in the daemon log); start the server yourself")
+		return
+	case ct == nil:
+		fmt.Fprintln(log, "the server was not started again: its container no longer exists; start the server yourself")
+		return
+	case adminRunning(*ct):
+		fmt.Fprintf(log, "the server's container %s is still running\n", shortID(sv.ContainerID))
+	default:
+		fmt.Fprintf(log, "starting the server's container %s again with its previous data\n", shortID(sv.ContainerID))
+		if err := s.docker.StartServer(bctx, ref(sv)); err != nil {
+			s.logger.Warn("could not start a stopped server container again", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", s.redactStartError(sv, err))
+			fmt.Fprintln(log, "the server was not started again: Docker could not start its container (details in the daemon log); start the server yourself")
+			return
 		}
-		fmt.Fprintf(log, "the server did not start again: %s\n", msg)
+	}
+	if why := s.waitRecordedReady(bctx, sv); why != "" {
+		fmt.Fprintf(log, "the server's container runs again, but %s; see the server log (GET /api/v1/servers/%d/logs)\n", why, sv.ID)
+		return
+	}
+	fmt.Fprintln(log, "the server is running again with its previous data")
+}
+
+// redactStartError removes the server's environment values and admin
+// token from the Docker output a failed docker start carries (best effort,
+// like a start does) before it goes to the daemon log.
+func (s *Service) redactStartError(sv store.Server, err error) error {
+	var cmdErr *docker.CmdError
+	if !errors.As(err, &cmdErr) {
+		return err
+	}
+	values := map[string]string{}
+	if env, eerr := s.openEnv(sv); eerr == nil {
+		for k, v := range env {
+			values[k] = v
+		}
+	}
+	if token, terr := s.openAdminToken(sv); terr == nil {
+		values[EnvAdminToken] = token
+	}
+	cmdErr.Detail = docker.RedactValues(cmdErr.Detail, values)
+	return err
+}
+
+// waitRecordedReady polls the recorded container and its game's admin
+// endpoint, with the recorded admin token and the port of a fresh
+// inspection each time (the way a verified running container is checked),
+// until the game reports ready, the container stops or StartTimeout
+// passes. It returns "" when the game is ready, otherwise why not, for the
+// job log.
+func (s *Service) waitRecordedReady(ctx context.Context, sv store.Server) string {
+	token, err := s.openAdminToken(sv)
+	if err != nil {
+		return "its admin token could not be read, so whether its game is ready is unknown"
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, s.cfg.StartTimeout)
+	defer cancel()
+	t := time.NewTicker(s.cfg.ReadyPoll)
+	defer t.Stop()
+	for {
+		ct, err := s.container(probeCtx, sv)
+		switch {
+		case err != nil:
+			if probeCtx.Err() == nil {
+				s.logger.Warn("could not inspect a server container while waiting for its game", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", err)
+			}
+		case ct == nil:
+			return "its container disappeared"
+		case !adminRunning(*ct):
+			return fmt.Sprintf("its container is %s (exit code %d)", ct.State, ct.ExitCode)
+		default:
+			if port := ct.LoopbackPort(AdminContainerPort); port != 0 {
+				if client, cerr := gameadmin.New(port, token); cerr == nil {
+					r, rerr := client.Ready(probeCtx)
+					client.Close()
+					if rerr == nil && r.Ready {
+						return ""
+					}
+				}
+			}
+		}
+		select {
+		case <-probeCtx.Done():
+			return fmt.Sprintf("its game did not report ready within %s", s.cfg.StartTimeout)
+		case <-t.C:
+		}
 	}
 }
 
@@ -916,28 +1019,29 @@ func (s *Service) dropOldData(ctx context.Context, old store.Server, log io.Writ
 // without changing its desired state, takes a safety backup (kind
 // pre_reset, with the rules of safetyBackup), detaches and deletes the
 // data volume, forgets the recorded fingerprint and starts the server
-// again with an empty world when it is meant to run. Cancellation follows
-// the rules of Restore.
+// again with an empty world when it is meant to run. Failures,
+// cancellation and putting the server back follow the rules of Restore.
 func (s *Service) ResetData(ctx context.Context, id int64, o ResetOptions, log io.Writer) error {
 	sv, err := s.load(ctx, id)
 	if err != nil {
 		return jobs.Fail("server not found", err)
 	}
 	fmt.Fprintf(log, "resetting the saved data of server %q\n", sv.Name)
-	if err := s.stopKeepingDesired(ctx, sv, log); err != nil {
+	paused, err := s.stopForData(ctx, sv, log)
+	if err != nil {
 		return err
 	}
 	if err := s.safetyBackup(ctx, sv, store.BackupPreReset, o.SkipSafetyBackup, o.CreatedBy, log); err != nil {
-		s.startAgain(ctx, id, log)
+		s.putBack(ctx, paused, log)
 		return err
 	}
 	if ctx.Err() != nil {
 		fmt.Fprintln(log, "the job was cancelled before the data was detached")
-		s.startAgain(ctx, id, log)
+		s.putBack(ctx, paused, log)
 		return ctx.Err()
 	}
 	if err := s.store.SwitchServerData(context.WithoutCancel(ctx), sv.ID, sv.DataVolume, "", ""); err != nil {
-		s.startAgain(ctx, id, log)
+		s.putBack(ctx, paused, log)
 		return jobs.Fail("could not detach the data volume", err)
 	}
 	if sv.DataVolume == "" {

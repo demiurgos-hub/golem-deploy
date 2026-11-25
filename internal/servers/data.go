@@ -53,31 +53,13 @@ func schemaMismatch(data, build string) bool {
 	return data != "" && build != "" && data != build
 }
 
-// refusedError is a start that failed before it touched any container
-// (see refused). It is a job failure like any other.
-type refusedError struct{ *jobs.SafeError }
-
-func (e *refusedError) Unwrap() error { return e.SafeError }
-
-// refuse marks a job failure as a start refused before any container was
-// touched.
-func refuse(msg string) error { return &refusedError{&jobs.SafeError{Msg: msg}} }
-
-// refused reports whether a start failed before it touched any container,
-// so the recorded one is in the state the start found it in and callers
-// must leave it alone.
-func refused(err error) bool {
-	var r *refusedError
-	return errors.As(err, &r)
-}
-
 // schemaGuard is the failure of a start whose saved data has another
-// schema than the build: the game would refuse to load it. It is refused.
+// schema than the build: the game would refuse to load it.
 func schemaGuard(sv store.Server, b store.Build, dataFingerprint string) error {
-	return refuse(fmt.Sprintf("the server's saved data has schema %s but build %d has schema %s, so the game cannot load it; "+
+	return jobs.Fail(fmt.Sprintf("the server's saved data has schema %s but build %d has schema %s, so the game cannot load it; "+
 		"assign a build with the saved schema (PATCH /api/v1/servers/%d with build_id), restore a backup with schema %s "+
 		"(POST /api/v1/servers/%d/restore) or reset the data (POST /api/v1/servers/%d/data/reset)",
-		dataFingerprint, b.ID, b.SchemaFingerprint, sv.ID, b.SchemaFingerprint, sv.ID, sv.ID))
+		dataFingerprint, b.ID, b.SchemaFingerprint, sv.ID, b.SchemaFingerprint, sv.ID, sv.ID), nil)
 }
 
 // volumeState inspects the server's recorded data volume: gone is true when

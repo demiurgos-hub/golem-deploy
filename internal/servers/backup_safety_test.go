@@ -68,7 +68,7 @@ func TestRecoverLeavesGuardedContainerRunning(t *testing.T) {
 	bf.f.ResetCalls()
 	var log bytes.Buffer
 	err := bf.svc.Recover(WithJobID(ctx, 9), bf.id, &log)
-	if !strings.Contains(detail(err), "build_id") || !refused(err) {
+	if !strings.Contains(detail(err), "build_id") {
 		t.Fatalf("%v\n%s", err, log.String())
 	}
 	for _, c := range bf.f.Calls() {
@@ -93,7 +93,7 @@ func TestRecoverLeavesGuardedContainerRunning(t *testing.T) {
 	}
 	pending := bf.f.AddContainer(dockertest.Container{Name: "golem-deploy-arena", Image: bf.b.ImageID,
 		Labels: dockertest.OurLabels(docker.LabelServerID, "1", docker.LabelServer, "arena", docker.LabelLaunchID, launch)})
-	if err := bf.svc.Recover(ctx, bf.id, io.Discard); !refused(err) {
+	if err := bf.svc.Recover(ctx, bf.id, io.Discard); !strings.Contains(detail(err), "build_id") {
 		t.Fatalf("%v", err)
 	}
 	if _, ok := bf.f.Container(pending); !ok {

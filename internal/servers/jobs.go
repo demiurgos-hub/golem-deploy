@@ -131,27 +131,36 @@ func (s *Service) removeRecorded(ctx context.Context, sv store.Server, log io.Wr
 }
 
 // start is the health-gated start shared by every job that starts a
-// server. Its checks of the port, the build and the schema of the saved
-// data come first and are refusals (see refused): they fail before any
-// container, pending or recorded, is touched.
+// server (see launch).
 func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) error {
+	var replaced bool
+	return s.launch(ctx, sv, log, &replaced)
+}
+
+// launch is the health-gated start. Its checks of the port, the build and
+// the schema of the saved data come first and fail before any container,
+// pending or recorded, is touched. It sets *replaced right before it
+// removes the recorded container to put a new one in its place: every
+// failure before that point leaves the recorded container exactly as it
+// was.
+func (s *Service) launch(ctx context.Context, sv store.Server, log io.Writer, replaced *bool) error {
 	if sv.Port == nil {
-		return refuse("server has no port")
+		return jobs.Fail("server has no port", nil)
 	}
 	port := *sv.Port
 	if !s.portAllowed(port) {
-		return refuse(fmt.Sprintf("port %d is no longer allowed (outside the configured range %s, browser-unsafe or the panel's own port); "+
-			"assign a new port with PATCH /api/v1/servers/%d and start again", port, s.cfg.Ports, sv.ID))
+		return jobs.Fail(fmt.Sprintf("port %d is no longer allowed (outside the configured range %s, browser-unsafe or the panel's own port); "+
+			"assign a new port with PATCH /api/v1/servers/%d and start again", port, s.cfg.Ports, sv.ID), nil)
 	}
 	if sv.BuildID == nil {
-		return refuse(fmt.Sprintf("the server has no build; assign a successful build with PATCH /api/v1/servers/%d (build_id) and start again", sv.ID))
+		return jobs.Fail(fmt.Sprintf("the server has no build; assign a successful build with PATCH /api/v1/servers/%d (build_id) and start again", sv.ID), nil)
 	}
 	b, err := s.store.GetBuild(ctx, *sv.BuildID)
 	if err != nil {
 		return jobs.Fail("could not read the server's build", err)
 	}
 	if b.Status != store.BuildStatusSuccess || b.ImageID == "" {
-		return refuse(fmt.Sprintf("build %d is not a successful build; assign another build and start again", b.ID))
+		return jobs.Fail(fmt.Sprintf("build %d is not a successful build; assign another build and start again", b.ID), nil)
 	}
 	volumeGone, err := s.volumeState(ctx, sv)
 	if err != nil {
@@ -233,6 +242,7 @@ func (s *Service) start(ctx context.Context, sv store.Server, log io.Writer) err
 		fmt.Fprintf(log, "image volumes %s get size-limited tmpfs mounts\n", strings.Join(tmpfs, ", "))
 	}
 
+	*replaced = true
 	if err := s.removeRecorded(ctx, sv, log); err != nil {
 		return s.failDocker(ctx, sv, "remove the previous container", err)
 	}
@@ -542,32 +552,31 @@ type DeleteOptions struct {
 // saved data (kind pre_delete, with the rules of safetyBackup; skipped with
 // SkipSafetyBackup or without data), then removes the container, the data
 // volume and the row (releasing its port); its backups stay. When the last
-// backup fails, nothing is removed, the server is started again when it is
-// meant to run and the failure matches ErrSafetyBackup. Docker being
-// unreachable aborts the deletion so no container or volume is left behind
-// without a row.
+// backup fails, nothing is removed, the container the deletion stopped is
+// put back (see putBack) and the failure matches ErrSafetyBackup; the same
+// container is put back when its removal fails. Docker being unreachable
+// aborts the deletion so no container or volume is left behind without a
+// row.
 func (s *Service) Delete(ctx context.Context, id int64, o DeleteOptions, log io.Writer) error {
 	sv, err := s.load(ctx, id)
 	if err != nil {
 		return jobs.Fail("server not found", err)
 	}
 	fmt.Fprintf(log, "deleting server %q\n", sv.Name)
-	if err := s.removePending(ctx, sv, log); err != nil {
-		return s.failDocker(ctx, sv, "recover the previous create", err)
+	paused, err := s.stopForData(ctx, sv, log)
+	if err != nil {
+		return err
 	}
 	if sv.DataVolume != "" {
-		if !o.SkipSafetyBackup {
-			if err := s.stopKeepingDesired(ctx, sv, log); err != nil {
-				return err
-			}
-		}
 		if err := s.safetyBackup(ctx, sv, store.BackupPreDelete, o.SkipSafetyBackup, o.CreatedBy, log); err != nil {
-			s.startAgain(ctx, id, log)
+			s.putBack(ctx, paused, log)
 			return err
 		}
 	}
 	if err := s.removeRecorded(ctx, sv, log); err != nil {
-		return s.failDocker(ctx, sv, "remove the container", err)
+		ferr := s.failDocker(ctx, sv, "remove the container", err)
+		s.putBack(ctx, paused, log)
+		return ferr
 	}
 	if sv.DataVolume != "" {
 		err := s.docker.RemoveDataVolume(ctx, sv.ID, sv.DataVolume)
@@ -627,9 +636,11 @@ func (s *Service) Reconcile(ctx context.Context, start func(id int64) error) err
 }
 
 // Recover re-verifies a completed start and redoes an incomplete or
-// unhealthy start through the same health-gated path used by Start. A
-// start refused before it touched any container (the schema guard, for
-// one) leaves the recorded container as it is, running or not.
+// unhealthy start through the same health-gated path used by Start. Only a
+// failed start that got as far as replacing the recorded container stops
+// what is left of it; any earlier failure (the schema guard, a missing
+// image, a database or certificate problem) leaves the recorded container
+// as it is, running or not.
 func (s *Service) Recover(ctx context.Context, id int64, log io.Writer) error {
 	sv, err := s.load(ctx, id)
 	if err != nil {
@@ -652,12 +663,13 @@ func (s *Service) Recover(ctx context.Context, id int64, log io.Writer) error {
 		}
 	}
 	fmt.Fprintln(log, "recreating the container after startup verification")
-	if err := s.start(ctx, sv, log); err != nil {
+	var replaced bool
+	if err := s.launch(ctx, sv, log, &replaced); err != nil {
 		switch {
-		case refused(err):
-			// Nothing was touched: the recorded container stays as it is.
+		case !replaced:
+			// The recorded container stays exactly as the start found it.
 			if sv.ContainerID != "" {
-				fmt.Fprintln(log, "the start was refused before any container was touched; the recorded container is left as it is")
+				fmt.Fprintln(log, "the start failed before it replaced the recorded container; that container is left as it is")
 			}
 		case sv.ContainerID != "" && ctx.Err() == nil:
 			s.stopQuietly(ctx, sv)

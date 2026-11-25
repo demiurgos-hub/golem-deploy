@@ -398,7 +398,7 @@ func TestRestoreSwitchesAfterCopy(t *testing.T) {
 	if vols := bf.f.Volumes(); len(vols) != 1 || vols[0] != old {
 		t.Fatalf("volumes %v", vols)
 	}
-	if ct, _ := bf.f.Container(bf.row(t).ContainerID); ct.State != "running" || !strings.Contains(log, "starting the server again") {
+	if ct, _ := bf.f.Container(bf.row(t).ContainerID); ct.State != "running" || !strings.Contains(log, "running again with its previous data") {
 		t.Fatalf("%+v\n%s", ct, log)
 	}
 	bf.noHelpers(t)
