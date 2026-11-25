@@ -271,6 +271,45 @@ describe("mock transport: saved data and backups", () => {
     expect((await call(t, "DELETE", "/servers/14?skip_safety_backup=1")).status).toBe(204);
   }, 40_000);
 
+  async function jobLog(t: Transport, id: number) {
+    return (await t.fetch(`/api/v1/jobs/${id}/log`, { method: "GET", headers: auth })).text();
+  }
+
+  it("deletes a server only when its delete job succeeds and parses skip_safety_backup like the daemon", async () => {
+    const t = createMockTransport(real);
+    for (const q of ["", "yes", "TRUE", "1&skip_safety_backup=1", "0&skip_safety_backup=1"]) {
+      expect(await call(t, "DELETE", `/servers/15?skip_safety_backup=${q}`), q).toMatchObject({ status: 400, body: { error: { code: "bad_request" } } });
+    }
+    expect((await call(t, "GET", "/servers/15")).status).toBe(200);
+    // A cancelled delete job deletes nothing.
+    const pending = call(t, "DELETE", "/servers/15?skip_safety_backup=false");
+    let job: { id: number } | undefined;
+    for (let i = 0; i < 40 && !job; i++) {
+      await new Promise((r) => setTimeout(r, 25));
+      job = (await call(t, "GET", "/jobs?subject_type=server&subject_id=15")).body.items.find((j: { kind: string }) => j.kind === "server.delete");
+    }
+    expect((await call(t, "POST", `/jobs/${job?.id}/cancel`)).status).toBe(202);
+    expect(await pending).toMatchObject({ status: 409, body: { error: { code: "conflict" } } });
+    expect((await call(t, "GET", "/servers/15")).status).toBe(200);
+    expect((await call(t, "GET", "/backups?server_id=15")).body.items.some((b: { kind: string }) => b.kind === "pre_delete")).toBe(false);
+    expect((await call(t, "DELETE", "/servers/15?skip_safety_backup=0")).status).toBe(204);
+  }, 30_000);
+
+  it("starts the same container again when a safety backup fails", async () => {
+    const t = createMockTransport(real);
+    // "flood-test" runs, and its safety backups leave entries out.
+    const before = (await call(t, "GET", "/servers/14")).body;
+    expect(before).toMatchObject({ state: "running" });
+    const reset = await call(t, "POST", "/servers/14/data/reset", {});
+    expect(await finished(t, reset.body.id)).toMatchObject({ status: "error" });
+    expect(await jobLog(t, reset.body.id)).toContain("the server is running again with its previous data");
+    expect((await call(t, "GET", "/servers/14")).body).toMatchObject({ state: "running", container_id: before.container_id });
+    expect(await call(t, "DELETE", "/servers/14")).toMatchObject({ status: 409 });
+    const del = (await call(t, "GET", "/jobs?subject_type=server&subject_id=14")).body.items.find((j: { kind: string }) => j.kind === "server.delete");
+    expect(await jobLog(t, del.id)).toContain("the server is running again with its previous data");
+    expect((await call(t, "GET", "/servers/14")).body).toMatchObject({ state: "running", container_id: before.container_id });
+  }, 30_000);
+
   it("checks backup notes like the daemon and stores them trimmed", async () => {
     const t = createMockTransport(real);
     for (const bad of [0x09, 0x7f, 0x85, 0x2028, 0x202e, 0x2067]) {
