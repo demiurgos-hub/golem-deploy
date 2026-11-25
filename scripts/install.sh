@@ -1112,6 +1112,12 @@ EOF
    fingerprint") with the one the browser shows.
 
 EOF
+	elif [ -n "$eff_cert" ]; then
+		cat <<EOF
+   The panel uses your TLS files, which you renew yourself: after renewing,
+   run this script again with --tls-cert and --tls-key.
+
+EOF
 	fi
 	if [ "$origin_host_source" = detected ] && ! is_public_ip "$detected_addr"; then
 		cat <<EOF
