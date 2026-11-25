@@ -29,7 +29,7 @@ func (s *Service) Connectivity(ctx context.Context, id int64) (apitypes.ServerCo
 	if !dockerOK {
 		return apitypes.ServerConnectivity{}, docker.ErrUnavailable
 	}
-	p, err := s.params(ctx)
+	p, err := s.params(ctx, false)
 	if err != nil {
 		return apitypes.ServerConnectivity{}, err
 	}

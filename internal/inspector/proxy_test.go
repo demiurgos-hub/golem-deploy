@@ -443,7 +443,7 @@ func TestWithoutSession(t *testing.T) {
 	if r := e.do("POST", "/", "", map[string]string{"Origin": own}, strings.NewReader("x")); r.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("POST /: %d", r.StatusCode)
 	}
-	if _, _, code := dialWS(t, e.addr(), "/", e.wsAuth(key)); code != http.StatusNotFound {
+	if _, _, code := dialWS(t, e.addr(), "/", e.wsAuth(key)); code != http.StatusBadRequest {
 		t.Fatalf("upgrade on the static UI: %d", code)
 	}
 	e.hub.mu.Lock()
@@ -569,7 +569,8 @@ func TestReloginAfterHubRestart(t *testing.T) {
 	}
 }
 
-// A refused hub login is never retried in a loop.
+// A refused hub login is never retried in a loop, and the hub's "not
+// signed in" answer never reaches the browser: the request fails with 503.
 func TestNoLoginLoop(t *testing.T) {
 	for _, tc := range []struct {
 		status int
@@ -582,10 +583,13 @@ func TestNoLoginLoop(t *testing.T) {
 			e.hub.set(func(h *fakeHub) { h.loginStatus, h.retryAfter = tc.status, tc.retry })
 			e.clock.Advance(time.Minute)
 			for i := 0; i < 5; i++ {
-				r := e.do("GET", "/api/targets", key, nil, nil)
-				if r.StatusCode != http.StatusUnauthorized || r.Header.Get(SessionHeader) != "" {
-					// The hub's 401: the daemon session is still valid.
-					t.Fatalf("request %d: %d %v", i, r.StatusCode, r.Header)
+				for _, p := range []string{"/api/targets", "/auth/session"} {
+					r := e.do("GET", p, key, nil, nil)
+					if b := readBody(t, r); r.StatusCode != http.StatusServiceUnavailable || r.Header.Get(SessionHeader) != "" ||
+						strings.Contains(b, "authenticated") {
+						// The daemon session is still valid.
+						t.Fatalf("request %d %s: %d %v %s", i, p, r.StatusCode, r.Header, b)
+					}
 				}
 				e.clock.Advance(10 * time.Second)
 			}

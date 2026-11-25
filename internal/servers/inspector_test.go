@@ -14,23 +14,44 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
-// fakeInspector is a servers.Inspector with settable answers.
+// fakeInspector is a servers.Inspector with settable answers. It counts
+// the calls of Agent.
 type fakeInspector struct {
 	mu    sync.Mutex
 	agent InspectorAgent
 	ok    bool
+	calls int
+	// afterAgent runs at the end of Agent, with the lock released.
+	afterAgent func()
 }
 
 func (f *fakeInspector) Agent(context.Context) (InspectorAgent, bool) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.agent, f.ok
+	f.calls++
+	a, ok, after := f.agent, f.ok, f.afterAgent
+	f.mu.Unlock()
+	gen := a.Generation
+	a.Token = func(id int64) (string, error) { return fakeToken(id, gen), nil }
+	if after != nil {
+		after()
+	}
+	return a, ok
 }
 
 func (f *fakeInspector) AgentToken(id int64) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return "gdi_" + strconv.FormatInt(id, 10) + "_secret-token-" + strconv.FormatInt(f.agent.Generation, 10), nil
+	return fakeToken(id, f.agent.Generation), nil
+}
+
+func fakeToken(id, gen int64) string {
+	return "gdi_" + strconv.FormatInt(id, 10) + "_secret-token-" + strconv.FormatInt(gen, 10)
+}
+
+func (f *fakeInspector) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 func (f *fakeInspector) set(fn func(*fakeInspector)) {
@@ -191,6 +212,71 @@ func TestInspectorInjection(t *testing.T) {
 	ct, _ = fx.f.Container(row.ContainerID)
 	if ct.Labels[docker.LabelInspector] != "" || ct.Env[EnvInspectorHubURL] != "" {
 		t.Fatalf("not injected: %v", ct.Env)
+	}
+}
+
+// The token, the endpoint and the generation come from one snapshot: a
+// rotation right after the launch read them does not give the container a
+// token of another generation than its config hash.
+func TestInspectorSnapshot(t *testing.T) {
+	insp := &fakeInspector{agent: InspectorAgent{HubURL: "ws://172.30.0.1:8444/ws/agent", Generation: 1}, ok: true}
+	fx := newFixture(t, Config{Inspector: insp})
+	ctx := context.Background()
+	b := fx.build(t, 1, commitA)
+	on := true
+	sv, err := fx.svc.Create(ctx, apitypes.CreateServerRequest{Name: "arena", BuildID: b.ID, Inspector: &on})
+	if err != nil {
+		t.Fatal(err)
+	}
+	insp.set(func(f *fakeInspector) {
+		f.afterAgent = func() { insp.set(func(f *fakeInspector) { f.agent.Generation = 2; f.afterAgent = nil }) }
+	})
+	if log, err := startJob(t, fx, sv.ID); err != nil {
+		t.Fatalf("%v\n%s", err, log)
+	}
+	row, _ := fx.st.GetServer(ctx, sv.ID)
+	ct, _ := fx.f.Container(row.ContainerID)
+	if got := ct.Env[EnvInspectorToken]; got != fakeToken(sv.ID, 1) {
+		t.Fatalf("token %q is not of the generation the launch read", got)
+	}
+	// The hash is of generation 1 too, so generation 2 asks for a restart.
+	if v, _ := fx.svc.Get(ctx, sv.ID); !v.RestartRequired {
+		t.Fatalf("%+v", v)
+	}
+}
+
+// Listings ask the Inspector only when some server has the switch on.
+func TestInspectorSkippedWithoutSwitch(t *testing.T) {
+	insp := &fakeInspector{agent: InspectorAgent{HubURL: "ws://172.30.0.1:8444/ws/agent", Generation: 1}, ok: true}
+	fx := newFixture(t, Config{Inspector: insp})
+	ctx := context.Background()
+	b := fx.build(t, 1, commitA)
+	sv, err := fx.svc.Create(ctx, apitypes.CreateServerRequest{Name: "arena", BuildID: b.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := insp.callCount()
+	if _, err := fx.svc.List(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fx.svc.Get(ctx, sv.ID); err != nil {
+		t.Fatal(err)
+	}
+	if log, err := startJob(t, fx, sv.ID); err != nil {
+		t.Fatalf("%v\n%s", err, log)
+	}
+	if n := insp.callCount() - before; n != 0 {
+		t.Fatalf("the Inspector was asked %d times without a server with the switch on", n)
+	}
+	on := true
+	if _, err := fx.svc.Update(ctx, sv.ID, apitypes.UpdateServerRequest{Inspector: &on}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fx.svc.List(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if insp.callCount() == before {
+		t.Fatal("the Inspector was not asked for a server with the switch on")
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -122,22 +123,25 @@ type Config struct {
 // Inspector is what the service needs from the installation's Inspector
 // (internal/inspector).
 type Inspector interface {
-	// Agent returns where the games' Inspector agents connect and the
-	// generation of the per-server token key. ok is false when nothing is
-	// injected: the Inspector is off or unavailable, or containers cannot
-	// reach its listener.
+	// Agent returns, in one snapshot, where the games' Inspector agents
+	// connect, the generation of the per-server token key and the token
+	// function of that generation. ok is false when nothing is injected:
+	// the Inspector is off or unavailable, or containers cannot reach its
+	// listener. It follows the desired configuration, not whether the hub
+	// runs at this moment.
 	Agent(ctx context.Context) (agent InspectorAgent, ok bool)
-	// AgentToken returns the agent token of server id (a secret).
-	AgentToken(id int64) (string, error)
 }
 
-// InspectorAgent is the non-secret part of the Inspector agent settings.
+// InspectorAgent is the Inspector agent setting of one moment.
 type InspectorAgent struct {
 	// HubURL is the agent endpoint ("ws://host:port/ws/agent").
 	HubURL string
 	// Generation changes whenever the agent tokens change; it is part of
 	// the config hash instead of the tokens.
 	Generation int64
+	// Token returns the agent token (a secret) of a server under
+	// Generation.
+	Token func(serverID int64) (string, error)
 }
 
 // DefaultBackupMaxBytes is the default of Config.BackupMaxBytes
@@ -228,8 +232,10 @@ func (s *Service) GameHost(ctx context.Context) (string, error) {
 	return s.cfg.DefaultGameHost, nil
 }
 
-// params reads the installation-wide container inputs.
-func (s *Service) params(ctx context.Context) (runtimeParams, error) {
+// params reads the installation-wide container inputs. The Inspector is
+// asked only when inspector is true (some server concerned has its
+// Inspector switch on): its agent setting matters for no other server.
+func (s *Service) params(ctx context.Context, inspector bool) (runtimeParams, error) {
 	host, err := s.GameHost(ctx)
 	if err != nil {
 		return runtimeParams{}, err
@@ -238,7 +244,9 @@ func (s *Service) params(ctx context.Context) (runtimeParams, error) {
 	if s.cfg.Certs != nil {
 		p.groupAdd = s.cfg.Certs.GroupAdd()
 	}
-	s.inspectorParams(ctx, &p)
+	if inspector {
+		s.inspectorParams(ctx, &p)
+	}
 	return p, nil
 }
 
@@ -537,7 +545,7 @@ func (s *Service) List(ctx context.Context) ([]apitypes.Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	p, err := s.params(ctx)
+	p, err := s.params(ctx, slices.ContainsFunc(rows, func(sv store.Server) bool { return sv.Inspector }))
 	if err != nil {
 		return nil, err
 	}
@@ -594,7 +602,7 @@ func (s *Service) container(ctx context.Context, sv store.Server) (*docker.Conta
 
 // viewOne renders one server with its container ct (dockerOK as in view).
 func (s *Service) viewOne(ctx context.Context, sv store.Server, ct *docker.Container, dockerOK bool) (apitypes.Server, error) {
-	p, err := s.params(ctx)
+	p, err := s.params(ctx, sv.Inspector)
 	if err != nil {
 		return apitypes.Server{}, err
 	}

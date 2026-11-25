@@ -1057,14 +1057,16 @@ export interface VolumeList {
  */
 export const InspectorStateOff = "off";
 /**
- * InspectorStateRunning: the hub container runs and the Inspector
- * listener is open.
+ * InspectorStateRunning: the hub container runs, the daemon reaches it
+ * and the Inspector listener is open.
  */
 export const InspectorStateRunning = "running";
 /**
  * InspectorStateStopped: the Inspector is turned on but not serving (its
- * image could not be downloaded, the container is not running or the
- * listener could not be opened). Detail says why.
+ * image could not be downloaded, the container is not running, the last
+ * apply failed or the listener could not be opened). Detail says why.
+ * After a failed apply the state stays "stopped" until an apply (or the
+ * automatic repair) succeeds.
  */
 export const InspectorStateStopped = "stopped";
 /**
@@ -1108,7 +1110,8 @@ export interface Inspector {
   image: string;
   image_id: string;
   /**
-   * StartedAt is when the hub container started; null unless it runs.
+   * StartedAt is when the hub container started; null unless it runs. It
+   * is set whenever the container runs, also while State is "stopped".
    */
   started_at: string | null;
   /**
@@ -1172,18 +1175,21 @@ export interface InspectorTarget {
 }
 /**
  * UpdateInspectorRequest is the body of PATCH /api/v1/inspector (admin). It
- * answers 202 with a restricted "inspector.apply" job that brings the hub in
- * line with the request: with the Inspector on, it downloads the image when
- * the host does not have it, creates or replaces the hub container, waits
- * until the hub is ready and opens the listener; with it off, it closes the
- * listener and removes the container.
+ * stores the setting first (a failed write fails the request and starts
+ * nothing), then answers 202 with a restricted "inspector.apply" job that
+ * brings the hub in line with the stored setting as it is when the job
+ * runs: with the Inspector on, it downloads the image when the host does
+ * not have it (before anything else changes), creates or replaces the hub
+ * container, waits until the hub is ready and opens the listener; with it
+ * off, it closes the listener and removes the container.
  * Enabled absent leaves the setting as it is (the job then repairs or
  * refreshes a hub that is on). PullImage downloads the image again even
  * though the host has it (for a tag that moved). RotateSecrets replaces the
  * hub's secrets and the tokens of every server: open Inspector sessions end
  * and servers with the Inspector on report restart_required until they are
  * restarted. PullImage and RotateSecrets are refused with 400 when the
- * Inspector would be off.
+ * Inspector would be off. Any PATCH answers 409 conflict while the
+ * Inspector is not available (--inspector-listen off).
  */
 export interface UpdateInspectorRequest {
   enabled?: boolean;
@@ -1201,8 +1207,9 @@ export interface CreateInspectorSessionRequest {
 /**
  * InspectorSession is the response of POST /api/v1/inspector/sessions: a
  * one-time entry link into the Inspector for the calling account. The route
- * needs a login session (API tokens get 403 session_required) and answers
- * 409 conflict while the Inspector is not running.
+ * needs a login session (API tokens get 403 session_required), answers 409
+ * conflict while the Inspector is not running, and 429 rate_limited while
+ * the account holds 8 unused links or the installation 1024.
  * Opening Path on the Inspector's address signs the browser tab in there
  * and opens the Inspector itself (on the requested server, if any). The
  * Inspector's address is PublicURL when it is set, otherwise the panel's
@@ -1612,7 +1619,11 @@ export interface Server {
    * game's Inspector agent is pointed at it from the next (re)start, and
    * the server appears in the Inspector under its name. Off by default.
    * InspectorActive is true when the server's current container was
-   * started that way (false without a container).
+   * started that way (false without a container, and while Docker cannot
+   * be queried). The agent variables follow the desired configuration,
+   * not whether the hub runs at that moment: a server started while the
+   * hub is down still gets them, and its agent connects once the hub is
+   * repaired.
    */
   inspector: boolean;
   inspector_active: boolean;

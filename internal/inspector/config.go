@@ -61,38 +61,61 @@ func ListenPort(addr string) int {
 
 // ValidatePublicURL checks --inspector-public-url: an https or http origin
 // without credentials, path, query or fragment. It returns the origin in
-// the form browsers send (lower-case scheme and host, no default port, no
-// trailing slash).
+// canonical form (canonicalOrigin).
 func ValidatePublicURL(raw string) (string, error) {
 	v := strings.TrimSuffix(strings.TrimSpace(raw), "/")
 	if v == "" {
 		return "", nil
 	}
-	bad := errors.New("--inspector-public-url must be an origin such as https://inspector.example.com (no path, query or credentials)")
+	o, err := canonicalOrigin(v)
+	if err != nil {
+		return "", err
+	}
+	u, _ := url.Parse(o)
+	host := u.Hostname()
+	if _, err := netip.ParseAddr(host); err != nil {
+		if hs, err := netpolicy.NormalizePublicHosts([]string{host}); err != nil || len(hs) != 1 {
+			return "", errBadOrigin
+		}
+	}
+	return o, nil
+}
+
+var errBadOrigin = errors.New("--inspector-public-url must be an origin such as https://inspector.example.com (no path, query or credentials)")
+
+// canonicalOrigin returns an http or https origin in the form browsers
+// send it: lower-case scheme and host, an IP address in its canonical
+// spelling (IPv6 in brackets), no default port, no trailing slash. Origins
+// are compared in this form.
+func canonicalOrigin(v string) (string, error) {
 	u, err := url.Parse(v)
 	if err != nil || u.Opaque != "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery || u.Host == "" {
-		return "", bad
+		return "", errBadOrigin
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "https" && scheme != "http" {
-		return "", bad
+		return "", errBadOrigin
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return "", errBadOrigin
 	}
 	host := strings.ToLower(u.Hostname())
+	if host == "" || strings.ContainsAny(host, ` %/\@`) {
+		return "", errBadOrigin
+	}
 	if a, err := netip.ParseAddr(host); err == nil {
 		if a.Zone() != "" {
-			return "", bad
+			return "", errBadOrigin
 		}
-	} else if hs, err := netpolicy.NormalizePublicHosts([]string{host}); err != nil || len(hs) != 1 {
-		return "", bad
+		host = a.String()
+	} else if strings.Contains(host, ":") {
+		return "", errBadOrigin
 	}
 	port := u.Port()
-	if strings.HasSuffix(u.Host, ":") {
-		return "", bad
-	}
 	if port != "" {
 		n, err := strconv.Atoi(port)
 		if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
-			return "", bad
+			return "", errBadOrigin
 		}
 		if (scheme == "https" && n == 443) || (scheme == "http" && n == 80) {
 			port = ""
@@ -106,6 +129,16 @@ func ValidatePublicURL(raw string) (string, error) {
 		authority = net.JoinHostPort(host, port)
 	}
 	return scheme + "://" + authority, nil
+}
+
+// canonicalHost lowers a host name and spells an IP address canonically
+// (no brackets).
+func canonicalHost(h string) string {
+	h = strings.ToLower(strings.Trim(h, "[]"))
+	if a, err := netip.ParseAddr(h); err == nil {
+		return a.String()
+	}
+	return h
 }
 
 // PublicHost returns the host name of a validated public URL ("" for none).

@@ -19,71 +19,93 @@ import (
 
 // Agent relay limits.
 const (
-	MaxAgentsPerServer = 2
-	MaxAgents          = 256
+	// MaxAgents bounds the relayed agent connections. A server keeps one
+	// relay: a new valid connection of the same server closes the previous
+	// one.
+	MaxAgents = 256
 	// networkCacheTTL is how long the managed network's addresses are
 	// reused; a peer outside them triggers a refresh at most this often.
 	networkCacheTTL = 30 * time.Second
 )
 
-// agentRegistry bounds and tracks relayed agent connections, so turning
-// the Inspector off or rotating its secrets closes them.
+// agentRelay is one relayed agent connection.
+type agentRelay struct {
+	cancel context.CancelFunc
+}
+
+// agentRegistry tracks relayed agent connections, one per server, so
+// turning the Inspector off, rotating its secrets, turning a server's
+// switch off or deleting the server closes them.
 type agentRegistry struct {
-	mu        sync.Mutex
-	perServer map[int64]int
-	conns     map[uint64]context.CancelFunc
-	next      uint64
+	mu       sync.Mutex
+	byServer map[int64]*agentRelay
 }
 
 func newAgentRegistry() *agentRegistry {
-	return &agentRegistry{perServer: map[int64]int{}, conns: map[uint64]context.CancelFunc{}}
+	return &agentRegistry{byServer: map[int64]*agentRelay{}}
 }
 
-// acquire reserves a connection slot for server id; ctx is cancelled by
-// closeAll.
+// acquire registers the relay of server id and closes the server's
+// previous relay; ctx is cancelled by closeAll, closeIf or the next relay
+// of the same server. ok is false when MaxAgents other servers are relayed.
 func (a *agentRegistry) acquire(parent context.Context, id int64) (context.Context, func(), bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.perServer[id] >= MaxAgentsPerServer || len(a.conns) >= MaxAgents {
+	prev := a.byServer[id]
+	if prev == nil && len(a.byServer) >= MaxAgents {
 		return nil, nil, false
 	}
+	if prev != nil {
+		prev.cancel()
+	}
 	ctx, cancel := context.WithCancel(parent)
-	a.next++
-	key := a.next
-	a.conns[key] = cancel
-	a.perServer[id]++
-	var once sync.Once
+	r := &agentRelay{cancel: cancel}
+	a.byServer[id] = r
 	return ctx, func() {
-		once.Do(func() {
-			cancel()
-			a.mu.Lock()
-			defer a.mu.Unlock()
-			delete(a.conns, key)
-			if a.perServer[id]--; a.perServer[id] <= 0 {
-				delete(a.perServer, id)
-			}
-		})
+		cancel()
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.byServer[id] == r {
+			delete(a.byServer, id)
+		}
 	}, true
 }
 
 // closeAll cancels every relayed connection.
 func (a *agentRegistry) closeAll() {
+	a.closeIf(func(int64) bool { return true })
+}
+
+// closeIf cancels the relays of the servers drop reports and returns how
+// many it closed.
+func (a *agentRegistry) closeIf(drop func(id int64) bool) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for _, cancel := range a.conns {
-		cancel()
+	n := 0
+	for id, r := range a.byServer {
+		if drop(id) {
+			r.cancel()
+			delete(a.byServer, id)
+			n++
+		}
 	}
+	return n
 }
 
 func (a *agentRegistry) count() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return len(a.conns)
+	return len(a.byServer)
 }
 
 // isWebSocket reports whether r asks for a WebSocket upgrade.
 func isWebSocket(r *http.Request) bool {
 	return headerHasToken(r.Header, "Connection", "upgrade") && strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}
+
+// asksUpgrade reports whether r asks for any protocol upgrade.
+func asksUpgrade(r *http.Request) bool {
+	return len(r.Header.Values("Upgrade")) > 0 || headerHasToken(r.Header, "Connection", "upgrade")
 }
 
 func headerHasToken(h http.Header, name, token string) bool {
@@ -99,33 +121,46 @@ func headerHasToken(h http.Header, name, token string) bool {
 
 // networkAddrs returns the managed network's addresses, cached; refresh
 // forces a new query when the cache is older than networkCacheTTL/6.
+// Concurrent refreshes share one Docker call; no lock is held during it.
 func (s *Service) networkAddrs(ctx context.Context, refresh bool) (docker.NetworkAddresses, error) {
-	s.netMu.Lock()
-	defer s.netMu.Unlock()
-	now := s.cfg.Now()
-	age := now.Sub(s.netAt)
-	if !s.netAt.IsZero() && (age < networkCacheTTL && !(refresh && age > networkCacheTTL/6)) {
-		return s.netAddrs, s.netErr
+	cached := func() (bool, docker.NetworkAddresses, error) {
+		s.netMu.Lock()
+		defer s.netMu.Unlock()
+		age := s.cfg.Now().Sub(s.netAt)
+		fresh := !s.netAt.IsZero() && age < networkCacheTTL && !(refresh && age > networkCacheTTL/6)
+		return fresh, s.netAddrs, s.netErr
+	}
+	if ok, addrs, err := cached(); ok {
+		return addrs, err
 	}
 	if s.cfg.Docker == nil {
 		return docker.NetworkAddresses{}, docker.ErrUnavailable
 	}
-	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	addrs, err := s.cfg.Docker.ManagedNetworkAddresses(qctx)
-	if err != nil && !errors.Is(err, docker.ErrNotFound) && s.netErr == nil && len(s.netAddrs.Gateways)+len(s.netAddrs.Subnets) > 0 {
-		// Docker did not answer: keep the last known addresses (the agent
-		// address and restart_required must not flicker) and ask again
-		// soon.
-		s.netAt = now.Add(-networkCacheTTL + 5*time.Second)
-		return s.netAddrs, nil
-	}
-	s.netAddrs, s.netErr, s.netAt = addrs, err, now
-	if err != nil {
-		// Retry sooner after a failure.
-		s.netAt = now.Add(-networkCacheTTL + 5*time.Second)
-	}
-	return addrs, err
+	s.netFlight.do(ctx, s.cfg.Now, 0, func() {
+		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		addrs, err := s.cfg.Docker.ManagedNetworkAddresses(qctx)
+		now := s.cfg.Now()
+		s.netMu.Lock()
+		defer s.netMu.Unlock()
+		transient := err != nil && !errors.Is(err, docker.ErrNotFound) && !errors.Is(err, docker.ErrNotManaged) && !errors.Is(err, docker.ErrNotOurs)
+		if transient && s.netErr == nil && len(s.netAddrs.Gateways)+len(s.netAddrs.Subnets) > 0 {
+			// Docker did not answer: keep the last known addresses (the
+			// agent address and restart_required must not flicker) and ask
+			// again soon. A network that is not managed or not ours drops
+			// them at once.
+			s.netAt = now.Add(-networkCacheTTL + 5*time.Second)
+			return
+		}
+		s.netAddrs, s.netErr, s.netAt = addrs, err, now
+		if err != nil {
+			// Retry sooner after a failure.
+			s.netAt = now.Add(-networkCacheTTL + 5*time.Second)
+		}
+	})
+	s.netMu.Lock()
+	defer s.netMu.Unlock()
+	return s.netAddrs, s.netErr
 }
 
 func (s *Service) forgetNetwork() {
@@ -135,10 +170,14 @@ func (s *Service) forgetNetwork() {
 }
 
 // peerAllowed reports whether an agent connection from peer may be relayed:
-// a loopback address or an address inside a subnet of the managed network.
+// an address inside a subnet of the managed network, or a loopback address
+// where agents arrive from loopback: on Docker Desktop (not Linux), or on
+// Linux only when --inspector-agent-host was set explicitly (a reverse
+// proxy on the host would otherwise turn remote clients into loopback
+// peers).
 func (s *Service) peerAllowed(ctx context.Context, peer netip.Addr) bool {
 	if peer.IsLoopback() {
-		return true
+		return s.cfg.GOOS != "linux" || s.cfg.AgentHost != ""
 	}
 	for _, refresh := range []bool{false, true} {
 		addrs, err := s.networkAddrs(ctx, refresh)
@@ -153,82 +192,104 @@ func (s *Service) peerAllowed(ctx context.Context, peer netip.Addr) bool {
 	return false
 }
 
-// agentHandler serves the plaintext side of the listener: only the agent
+// agentHandler serves the plaintext side of a TLS listener: only the agent
 // endpoint.
 func (s *Service) agentHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.prepare(w, r) {
+			return
+		}
 		if r.URL.Path != "/ws/agent" {
-			hubError(w, http.StatusNotFound, "not_found")
+			reject(w, r, http.StatusNotFound, "not_found")
 			return
 		}
 		s.handleAgent(w, r)
 	})
 }
 
-// handleAgent relays a game's Inspector agent to the hub. The peer must be
-// a container on the managed network (or a loopback address), the token
+// forwardingHeaders mark a request that came through a proxy; agents
+// connect directly.
+var forwardingHeaders = []string{"Forwarded", "X-Forwarded-For", "Via"}
+
+// handleAgent relays a game's Inspector agent to the hub. The request must
+// come directly (no forwarding headers) from an allowed peer, the token
 // must be the server's own agent token, and the server must exist with its
 // Inspector switch on. The hub sees the hub's own agent token instead.
 func (s *Service) handleAgent(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet || !isWebSocket(r) {
-		hubError(w, http.StatusBadRequest, "websocket_required")
+		reject(w, r, http.StatusBadRequest, "websocket_required")
 		return
+	}
+	for _, h := range forwardingHeaders {
+		if len(r.Header.Values(h)) > 0 {
+			s.logAgentRefusal("forwarded request", 0, r)
+			reject(w, r, http.StatusForbidden, "forbidden")
+			return
+		}
 	}
 	peer, ok := netpolicy.ParsePeer(r.RemoteAddr)
 	if !ok || !s.peerAllowed(r.Context(), peer) {
-		s.logAgentRefusal("peer outside the Docker network", 0, r)
-		hubError(w, http.StatusForbidden, "forbidden")
+		s.logAgentRefusal("peer not allowed", 0, r)
+		reject(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
-	sec, port, serving := s.agentTarget()
-	if !serving || sec == nil {
-		hubError(w, http.StatusServiceUnavailable, "hub_unavailable")
+	v, serving := s.view()
+	if !serving {
+		reject(w, r, http.StatusServiceUnavailable, "hub_unavailable")
 		return
 	}
 	scheme, tok, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-	id, ok := verifyAgentToken(sec.TokenKey, strings.TrimSpace(tok))
+	id, ok := verifyAgentToken(v.sec.TokenKey, strings.TrimSpace(tok))
 	if !strings.EqualFold(scheme, "Bearer") || !ok {
 		s.logAgentRefusal("invalid token", 0, r)
-		hubError(w, http.StatusUnauthorized, "auth_failed")
+		reject(w, r, http.StatusUnauthorized, "auth_failed")
 		return
 	}
 	sv, err := s.cfg.Store.GetServer(r.Context(), id)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		s.logAgentRefusal("unknown server", id, r)
-		hubError(w, http.StatusForbidden, "forbidden")
+		reject(w, r, http.StatusForbidden, "forbidden")
 		return
 	case err != nil:
-		hubError(w, http.StatusServiceUnavailable, "unavailable")
+		reject(w, r, http.StatusServiceUnavailable, "unavailable")
 		return
 	case !sv.Inspector:
 		s.logAgentRefusal("the server's Inspector switch is off", id, r)
-		hubError(w, http.StatusForbidden, "forbidden")
+		reject(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
-	ctx, release, ok := s.agents.acquire(r.Context(), id)
-	if !ok {
-		hubError(w, http.StatusTooManyRequests, "connection_limit")
+	if s.hooks.afterAgentCheck != nil {
+		s.hooks.afterAgentCheck()
+	}
+	var ctx context.Context
+	var release func()
+	full := false
+	admitted := s.admit(v.gen, func() bool {
+		var ok bool
+		ctx, release, ok = s.agents.acquire(r.Context(), id)
+		full = !ok
+		return ok
+	})
+	switch {
+	case full:
+		reject(w, r, http.StatusTooManyRequests, "connection_limit")
+		return
+	case !admitted:
+		reject(w, r, http.StatusServiceUnavailable, "hub_unavailable")
 		return
 	}
 	defer release()
-	ctx = context.WithValue(ctx, agentKey{}, agentInfo{port: port, token: sec.AgentToken})
-	s.agentProxy.ServeHTTP(w, r.WithContext(ctx))
+	ctx = context.WithValue(ctx, agentKey{}, agentInfo{port: v.port, token: v.sec.AgentToken})
+	s.agentProxy.ServeHTTP(newProxyWriter(w, ctx), r.WithContext(ctx))
 }
 
 type agentKey struct{}
 
+// agentInfo is the hub snapshot one relay uses.
 type agentInfo struct {
 	port  int
 	token string
-}
-
-// agentTarget returns the secrets and the hub port while the Inspector
-// serves.
-func (s *Service) agentTarget() (*hubSecrets, int, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.sec, s.hubPort, s.enabled && s.ln != nil && s.hubPort != 0
 }
 
 func (s *Service) logAgentRefusal(reason string, id int64, r *http.Request) {
@@ -236,6 +297,27 @@ func (s *Service) logAgentRefusal(reason string, id int64, r *http.Request) {
 		s.logger.Warn("refused an Inspector agent connection (logged once per minute)", "reason", reason, "server_id", id,
 			"remote", netpolicy.PeerKey(r.RemoteAddr))
 	})
+}
+
+// sweepAgents closes the relays of servers that no longer exist or whose
+// Inspector switch is off.
+func (s *Service) sweepAgents(ctx context.Context) {
+	if s.agents.count() == 0 {
+		return
+	}
+	rows, err := s.cfg.Store.ListServers(ctx)
+	if err != nil {
+		return
+	}
+	on := map[int64]bool{}
+	for _, r := range rows {
+		if r.Inspector {
+			on[r.ID] = true
+		}
+	}
+	if n := s.agents.closeIf(func(id int64) bool { return !on[id] }); n > 0 {
+		s.logger.Info("closed Inspector agent relays of servers that were deleted or whose Inspector switch is off", "relays", n)
+	}
 }
 
 // newAgentProxy relays agent WebSockets to the hub's loopback port.
@@ -251,19 +333,33 @@ func (s *Service) newAgentProxy() *httputil.ReverseProxy {
 			pr.Out.Header.Del("Origin")
 			pr.Out.Header.Set("Authorization", "Bearer "+info.token)
 		},
-		Transport:      newHubTransport(),
+		Transport:      &agentTransport{s: s, base: newHubTransport()},
 		ModifyResponse: func(resp *http.Response) error { resp.Header.Del("Set-Cookie"); return nil },
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if r.Context().Err() == nil {
 				s.logger.Debug("inspector agent relay failed", "err", err)
-				s.refreshHub(context.WithoutCancel(r.Context()))
-				hubError(w, http.StatusBadGateway, "hub_unavailable")
 			}
+			hubError(w, http.StatusBadGateway, "hub_unavailable")
 		},
 		ErrorLog: s.proxyLog,
 	}
 }
 
+// agentTransport marks the hub port as unverified on a transport error.
+type agentTransport struct {
+	s    *Service
+	base http.RoundTripper
+}
+
+func (t *agentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		info, _ := req.Context().Value(agentKey{}).(agentInfo)
+		return nil, t.s.hubUnreachable(req.Context(), info.port, err)
+	}
+	return resp, nil
+}
+
 // strippedHeaders never reach the hub from browsers or agents.
 var strippedHeaders = []string{"Cookie", "Authorization", "Proxy-Authorization", "Forwarded", "X-Forwarded-For",
-	"X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwarded-Port", "X-Real-Ip"}
+	"X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwarded-Port", "X-Real-Ip", "Via"}

@@ -328,10 +328,10 @@ func (s *Service) launch(ctx context.Context, sv store.Server, log io.Writer, re
 // network exists, so the agent address can be known) and returns the
 // variables of the new container, nil when it gets none.
 func (s *Service) inspectorVars(ctx context.Context, sv store.Server, b store.Build, p *runtimeParams, log io.Writer) (map[string]string, error) {
-	s.inspectorParams(ctx, p)
 	if !sv.Inspector {
 		return nil, nil
 	}
+	s.inspectorParams(ctx, p)
 	if !inspectorActive(sv, *p) {
 		fmt.Fprintln(log, "the server's Inspector switch is on, but the Inspector is off or games cannot reach it; the agent is not configured")
 		return nil, nil
@@ -342,7 +342,12 @@ func (s *Service) inspectorVars(ctx context.Context, sv store.Server, b store.Bu
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, jobs.Fail("could not read the server's project", err)
 	}
-	token, err := s.cfg.Inspector.AgentToken(sv.ID)
+	if p.inspector.Token == nil {
+		return nil, jobs.Fail("could not prepare the Inspector agent token; see the daemon log", nil)
+	}
+	// The token comes from the same snapshot as the endpoint and the
+	// generation in the config hash.
+	token, err := p.inspector.Token(sv.ID)
 	if err != nil {
 		s.logger.Warn("could not prepare the Inspector agent token", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", err)
 		return nil, jobs.Fail("could not prepare the Inspector agent token; see the daemon log", nil)

@@ -40,7 +40,25 @@ var (
 	errHubLogin       = errors.New("inspector: the hub login failed")
 	errHubAuth        = errors.New("inspector: the hub session is not valid")
 	errHubBlocked     = errors.New("inspector: hub logins are paused after a refusal")
+	// errHubAnswer: the hub answered something the daemon does not relay
+	// (too large to check).
+	errHubAnswer = errors.New("inspector: the hub's answer cannot be relayed")
+	// errHubSessionLost: the hub lost the session's hub session and a new
+	// one could not be opened.
+	errHubSessionLost = errors.New("inspector: the hub session could not be renewed")
 )
+
+// transportError marks a failure to talk to the hub at all (dial, reset,
+// timeout). The hub port is not used again until Docker confirms it.
+type transportError struct{ err error }
+
+func (e *transportError) Error() string { return "inspector: the hub did not answer: " + e.err.Error() }
+func (e *transportError) Unwrap() error { return e.err }
+
+func isTransport(err error) bool {
+	var te *transportError
+	return errors.As(err, &te)
+}
 
 // hubClient talks to the hub's loopback port: no proxy, no redirects, no
 // compression, short timeouts.
@@ -90,7 +108,11 @@ func (c *hubClient) request(ctx context.Context, method string, port int, path s
 	if sid != "" {
 		req.AddCookie(&http.Cookie{Name: hubCookie, Value: sid})
 	}
-	return c.http.Do(req)
+	resp, err := c.http.Do(req)
+	if err != nil && ctx.Err() == nil {
+		return nil, &transportError{err}
+	}
+	return resp, err
 }
 
 // rateLimitedError carries the hub's Retry-After.
@@ -199,32 +221,48 @@ func (c *hubClient) targets(ctx context.Context, port int, sid string) ([]hubTar
 
 // loginGuard pauses hub logins after the hub refused one: after a 429
 // until its Retry-After, after a 401 (the hub does not know the daemon's
-// password) until the next apply resets it.
+// password) for good. A hold belongs to one hub generation (the hub
+// container and the secrets' generation); it ends only when that
+// generation changes, and a later answer never shortens it.
 type loginGuard struct {
 	mu    sync.Mutex
+	key   string
 	until time.Time
+	cause error
 }
 
-func (g *loginGuard) blocked(now time.Time) bool {
+// blocked reports whether logins at the hub generation key are paused, and
+// why.
+func (g *loginGuard) blocked(key string, now time.Time) (bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return now.Before(g.until)
+	if g.key != key || !now.Before(g.until) {
+		return false, nil
+	}
+	return true, g.cause
 }
 
-func (g *loginGuard) record(now time.Time, err error) {
+// record notes the outcome of a login at the hub generation key.
+func (g *loginGuard) record(key string, now time.Time, err error) {
 	var rl *rateLimitedError
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	var until time.Time
 	switch {
 	case errors.As(err, &rl):
-		g.until = now.Add(rl.retryAfter)
+		until = now.Add(rl.retryAfter)
 	case errors.Is(err, errHubCredentials):
-		g.until = now.Add(100 * 365 * 24 * time.Hour)
+		until = now.Add(100 * 365 * 24 * time.Hour)
 	}
-}
-
-func (g *loginGuard) reset() {
 	g.mu.Lock()
-	g.until = time.Time{}
-	g.mu.Unlock()
+	defer g.mu.Unlock()
+	if g.key != key {
+		g.key, g.until, g.cause = key, time.Time{}, nil
+	}
+	if until.After(g.until) {
+		g.until = until
+		if errors.Is(err, errHubCredentials) {
+			g.cause = errHubCredentials
+		} else {
+			g.cause = errHubRateLimited
+		}
+	}
 }

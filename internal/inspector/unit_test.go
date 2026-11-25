@@ -126,7 +126,7 @@ func TestSessionStore(t *testing.T) {
 	if got, _ := st.lookup(key); got != s {
 		t.Fatal("lookup")
 	}
-	ctx, release, ok := s.track(context.Background())
+	ctx, release, ok := s.track(context.Background(), clock.Now())
 	if !ok || s.streamCount() != 1 {
 		t.Fatal("track")
 	}
@@ -137,7 +137,7 @@ func TestSessionStore(t *testing.T) {
 	if s.end() != "" {
 		t.Fatal("ended twice")
 	}
-	if _, _, ok := s.track(context.Background()); ok {
+	if _, _, ok := s.track(context.Background(), clock.Now()); ok {
 		t.Fatal("tracked after end")
 	}
 	// Expiry.

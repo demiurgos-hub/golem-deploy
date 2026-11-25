@@ -21,13 +21,59 @@ const (
 	// tells TLS (0x16, a handshake record) from plaintext HTTP.
 	firstByteTimeout = 10 * time.Second
 	// maxSniffing bounds connections waiting for their first byte.
-	maxSniffing       = 512
+	maxSniffing = 512
+	// maxConns bounds the open connections of the whole listener (browsers
+	// and agents, TLS and plaintext) for their whole life, relayed
+	// WebSocket streams included.
+	maxConns          = 1024
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 120 * time.Second
 	maxHeaderBytes    = 64 << 10
 	// listenerShutdownGrace bounds the graceful close of the listener.
 	listenerShutdownGrace = 5 * time.Second
 )
+
+// limitListener accepts at most cap(sem) open connections; a connection
+// beyond that is closed at once. The slot is released when the connection
+// is closed, also after a hijack.
+type limitListener struct {
+	net.Listener
+	sem chan struct{}
+}
+
+func newLimitListener(ln net.Listener, n int) *limitListener {
+	return &limitListener{Listener: ln, sem: make(chan struct{}, n)}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.sem <- struct{}{}:
+			return &limitConn{Conn: c, sem: l.sem}, nil
+		default:
+			_ = c.Close()
+		}
+	}
+}
+
+// open returns the number of open connections.
+func (l *limitListener) open() int { return len(l.sem) }
+
+type limitConn struct {
+	net.Conn
+	sem  chan struct{}
+	once sync.Once
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { <-c.sem })
+	return err
+}
 
 // peekedConn returns the sniffed first byte before the rest.
 type peekedConn struct {
@@ -60,7 +106,8 @@ func (l *chanListener) Addr() net.Addr { return l.addr }
 // sniffer accepts on one TCP listener and routes each connection by its
 // first byte: 0x16 to the TLS side, anything else to the plaintext side.
 // Each connection waits for its first byte on its own goroutine (bounded,
-// with a deadline), so a slow client never blocks the accept loop.
+// with a deadline), so a slow client never blocks the accept loop. Closing
+// the sniffer also closes the connections still waiting.
 type sniffer struct {
 	ln        net.Listener
 	tls       *chanListener
@@ -70,10 +117,14 @@ type sniffer struct {
 	sem       chan struct{}
 	timeout   time.Duration
 	wg        sync.WaitGroup
+
+	mu      sync.Mutex
+	closed  bool
+	pending map[net.Conn]struct{}
 }
 
 func newSniffer(ln net.Listener, timeout time.Duration) *sniffer {
-	s := &sniffer{ln: ln, done: make(chan struct{}), sem: make(chan struct{}, maxSniffing), timeout: timeout}
+	s := &sniffer{ln: ln, done: make(chan struct{}), sem: make(chan struct{}, maxSniffing), timeout: timeout, pending: map[net.Conn]struct{}{}}
 	s.tls = &chanListener{ch: make(chan net.Conn), done: s.done, addr: ln.Addr(), closer: s.close}
 	s.plain = &chanListener{ch: make(chan net.Conn), done: s.done, addr: ln.Addr(), closer: s.close}
 	s.wg.Go(s.loop)
@@ -85,6 +136,12 @@ func (s *sniffer) close() error {
 	s.closeOnce.Do(func() {
 		close(s.done)
 		err = s.ln.Close()
+		s.mu.Lock()
+		s.closed = true
+		for c := range s.pending {
+			_ = c.Close()
+		}
+		s.mu.Unlock()
 	})
 	return err
 }
@@ -106,6 +163,15 @@ func (s *sniffer) loop() {
 			_ = c.Close() // too many connections still silent
 			continue
 		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			<-s.sem
+			_ = c.Close()
+			continue
+		}
+		s.pending[c] = struct{}{}
+		s.mu.Unlock()
 		s.wg.Go(func() {
 			defer func() { <-s.sem }()
 			s.route(c)
@@ -117,7 +183,11 @@ func (s *sniffer) route(c net.Conn) {
 	_ = c.SetReadDeadline(time.Now().Add(s.timeout))
 	r := bufio.NewReaderSize(c, 1024)
 	first, err := r.Peek(1)
-	if err != nil {
+	s.mu.Lock()
+	delete(s.pending, c)
+	closed := s.closed
+	s.mu.Unlock()
+	if err != nil || closed {
 		_ = c.Close()
 		return
 	}
@@ -139,6 +209,8 @@ type listener struct {
 	addr    net.Addr
 	servers []*http.Server
 	closers []func() error
+	limit   *limitListener
+	tr      *tracker
 	wg      sync.WaitGroup
 }
 
@@ -157,26 +229,34 @@ func bindError(addr string, err error) string {
 }
 
 func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
-	// No ReadTimeout or WriteTimeout: proxied WebSocket streams live long.
-	// Handlers set per-request deadlines for everything else.
+	// No ReadTimeout or WriteTimeout: relayed WebSocket streams live long.
+	// Handlers set read and write deadlines at the start of every request
+	// and clear them only when a WebSocket is relayed.
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	return &http.Server{
-		Handler:           h,
-		ReadHeaderTimeout: readHeaderTimeout,
-		IdleTimeout:       idleTimeout,
-		MaxHeaderBytes:    maxHeaderBytes,
-		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelDebug),
+		Handler:                      h,
+		ReadHeaderTimeout:            readHeaderTimeout,
+		IdleTimeout:                  idleTimeout,
+		MaxHeaderBytes:               maxHeaderBytes,
+		DisableGeneralOptionsHandler: true,
+		ErrorLog:                     slog.NewLogLogger(logger.Handler(), slog.LevelDebug),
 	}
 }
 
 // openListener binds addr. With tlsConfig, TLS connections get browser
 // (and plaintext connections agent) handling on the same port; without
-// it, one plaintext server serves both.
-func openListener(addr string, tlsConfig *tls.Config, browser, agentOnly http.Handler, sniffTimeout time.Duration, logger *slog.Logger) (*listener, error) {
-	ln, err := net.Listen("tcp", addr)
+// it, one plaintext server serves both. Every handler runs under the
+// listener's tracker.
+func openListener(addr string, tlsConfig *tls.Config, browser, agentOnly http.Handler, sniffTimeout time.Duration, conns int, logger *slog.Logger) (*listener, error) {
+	raw, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	l := &listener{addr: ln.Addr()}
+	ln := newLimitListener(raw, conns)
+	l := &listener{addr: raw.Addr(), limit: ln, tr: newTracker()}
+	browser, agentOnly = l.tr.wrap(browser), l.tr.wrap(agentOnly)
 	if tlsConfig == nil {
 		srv := newHTTPServer(browser, logger)
 		l.servers = []*http.Server{srv}
@@ -196,9 +276,9 @@ func openListener(addr string, tlsConfig *tls.Config, browser, agentOnly http.Ha
 	return l, nil
 }
 
-// close stops accepting, lets in-flight requests finish for a short grace
-// and closes the rest. Hijacked (WebSocket) connections are ended by the
-// caller by cancelling their requests.
+// close stops accepting, lets in-flight requests finish and waits for the
+// relayed streams (whose requests the caller cancelled before), all within
+// listenerShutdownGrace; what is left after it is closed.
 func (l *listener) close() {
 	ctx, cancel := context.WithTimeout(context.Background(), listenerShutdownGrace)
 	defer cancel()
@@ -214,6 +294,12 @@ func (l *listener) close() {
 		})
 	}
 	wg.Wait()
+	if !l.tr.wait(ctx) {
+		l.tr.closeAll()
+		wctx, wcancel := context.WithTimeout(context.Background(), time.Second)
+		l.tr.wait(wctx)
+		wcancel()
+	}
 	l.wg.Wait()
 }
 

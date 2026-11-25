@@ -120,7 +120,7 @@ func TestViewAndContainersIndex(t *testing.T) {
 	}
 	other := 7002
 	sv2, _ := st.CreateServer(ctx, store.Server{Name: "b", BuildID: &b.ID, Port: &other}, nil)
-	params, _ := svc.params(ctx)
+	params, _ := svc.params(ctx, true)
 	params.certMode, params.certDir = certs.ModeSelfSigned, fx.certs.ServerDir(sv.ID)
 	recorded := f.AddContainer(dockertest.Container{Name: "golem-deploy-a", Image: b.ImageID,
 		Labels: dockertest.OurLabels(docker.LabelServerID, "1", docker.LabelConfigHash, svc.configHash(sv, &b, params))})

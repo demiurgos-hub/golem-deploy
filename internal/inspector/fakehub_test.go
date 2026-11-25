@@ -23,6 +23,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/demiurgos-hub/golem-deploy/internal/docker"
 	"github.com/demiurgos-hub/golem-deploy/internal/netpolicy"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
@@ -56,6 +57,23 @@ type fakeHub struct {
 	static       http.HandlerFunc
 	openStreams  atomic.Int32
 	streamClosed chan struct{}
+	// Docker's view of the hub container (inspect): gone, stopped, or
+	// published on another port; inspects counts the queries.
+	gone, stopped bool
+	publish       int
+	inspects      int
+	// loginGate, when set, holds every login until it is closed.
+	loginGate chan struct{}
+	// logoutGate, when set, holds every logout until it is closed;
+	// logoutSeen gets a value when a logout arrives.
+	logoutGate chan struct{}
+	logoutSeen chan struct{}
+	// inspectGate, when set, holds every inspect until it is closed.
+	inspectGate chan struct{}
+	// agentFlood makes /ws/agent write without end after the upgrade.
+	agentFlood bool
+	// sessionPad pads the /auth/session answer with that many spaces.
+	sessionPad int
 }
 
 func newFakeHub(t *testing.T) *fakeHub {
@@ -76,6 +94,32 @@ func (h *fakeHub) set(fn func(*fakeHub)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	fn(h)
+}
+
+// testHubID is the hub container id of a testEnv.
+var testHubID = strings.Repeat("a", 64)
+
+// inspect stands in for Docker's view of the hub container: it runs and
+// publishes the fake hub's port, unless gone or stopped says otherwise.
+func (h *fakeHub) inspect(_ context.Context, id string) (docker.Container, error) {
+	h.mu.Lock()
+	gate := h.inspectGate
+	h.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.inspects++
+	if h.gone || id != testHubID {
+		return docker.Container{}, docker.ErrNotFound
+	}
+	port := h.port()
+	if h.publish != 0 {
+		port = h.publish
+	}
+	return docker.Container{ID: id, Running: !h.stopped, State: "running",
+		Ports: map[string][]docker.PortBinding{"8787/tcp": {{HostIP: "127.0.0.1", HostPort: port}}}}, nil
 }
 
 // restart drops every session, like a restarted hub.
@@ -135,6 +179,12 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		h.mu.Lock()
 		h.logins++
+		gate := h.loginGate
+		h.mu.Unlock()
+		if gate != nil {
+			<-gate
+		}
+		h.mu.Lock()
 		status, retry := h.loginStatus, h.retryAfter
 		hash := ""
 		if h.hash != nil {
@@ -161,6 +211,15 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: hubCookie, Value: sid, Path: "/", HttpOnly: true, Secure: true})
 		writeHubJSON(w, 200, map[string]bool{"authenticated": true})
 	case "/auth/logout":
+		h.mu.Lock()
+		gate, seen := h.logoutGate, h.logoutSeen
+		h.mu.Unlock()
+		if seen != nil {
+			seen <- struct{}{}
+		}
+		if gate != nil {
+			<-gate
+		}
 		if !originOK {
 			writeHubJSON(w, 403, map[string]string{"error": "origin_not_allowed"})
 			return
@@ -177,6 +236,14 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		writeHubJSON(w, 200, map[string]bool{"authenticated": false})
 	case "/auth/session":
 		_, ok := h.authed(r)
+		h.mu.Lock()
+		pad := h.sessionPad
+		h.mu.Unlock()
+		if pad > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"authenticated":`+strconv.FormatBool(ok)+`}`+strings.Repeat(" ", pad))
+			return
+		}
 		writeHubJSON(w, 200, map[string]bool{"authenticated": ok, "authDisabled": false})
 	case "/api/targets":
 		if _, ok := h.authed(r); !ok {
@@ -197,6 +264,12 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.echo(w, r)
+	case "/ws/flood":
+		if _, ok := h.authed(r); !ok {
+			writeHubJSON(w, 401, map[string]string{"error": "auth_required"})
+			return
+		}
+		h.flood(w)
 	case "/ws/agent":
 		want := ""
 		if h.agentToken != nil {
@@ -204,6 +277,13 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		if r.Header.Get("Authorization") != "Bearer "+want || want == "" {
 			writeHubJSON(w, 401, map[string]string{"error": "auth_failed"})
+			return
+		}
+		h.mu.Lock()
+		flood := h.agentFlood
+		h.mu.Unlock()
+		if flood {
+			h.flood(w)
 			return
 		}
 		h.echo(w, r)
@@ -260,6 +340,29 @@ func (h *fakeHub) echo(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err != nil {
+			return
+		}
+	}
+}
+
+// flood completes a WebSocket upgrade and writes until the connection
+// fails, ignoring what the client sends.
+func (h *fakeHub) flood(w http.ResponseWriter) {
+	conn, brw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return
+	}
+	h.openStreams.Add(1)
+	defer func() {
+		h.openStreams.Add(-1)
+		_ = conn.Close()
+		h.streamClosed <- struct{}{}
+	}()
+	_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n")
+	_ = brw.Flush()
+	chunk := bytes.Repeat([]byte("x"), 64<<10)
+	for {
+		if _, err := conn.Write(chunk); err != nil {
 			return
 		}
 	}
@@ -329,8 +432,9 @@ func openStore(t *testing.T) (*store.Store, *secrets.Box) {
 }
 
 // newTestEnv returns a running Service (listener open, hub known) talking
-// to a fake hub. mut adjusts the configuration before New.
-func newTestEnv(t *testing.T, mut func(*Config)) *testEnv {
+// to a fake hub. mut adjusts the configuration before New; svc adjusts the
+// Service before its listener opens.
+func newTestEnv(t *testing.T, mut func(*Config), svc ...func(*Service)) *testEnv {
 	t.Helper()
 	st, box := openStore(t)
 	clock := &fakeClock{t: time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)}
@@ -353,12 +457,19 @@ func newTestEnv(t *testing.T, mut func(*Config)) *testEnv {
 	hub.hash = func() string { return sec.PasswordHash }
 	hub.agentToken = func() string { return sec.AgentToken }
 	s.mu.Lock()
-	s.enabled, s.sec, s.hubPort, s.hubContainer = true, sec, hub.port(), strings.Repeat("a", 64)
+	s.enabled, s.sec, s.hubPort, s.hubContainer = true, sec, hub.port(), testHubID
 	s.mu.Unlock()
+	s.inspectHub = hub.inspect
 	s.sniffTimeout = 300 * time.Millisecond
+	for _, fn := range svc {
+		fn(s)
+	}
 	if err := s.openListener(); err != nil {
 		t.Fatal(err)
 	}
+	s.mu.Lock()
+	s.admitting = true
+	s.mu.Unlock()
 	acct, err := st.CreateAccount(context.Background(), store.NewAccount{Username: "dev", PasswordHash: "x", Role: store.RoleDeveloper, Approved: true})
 	if err != nil {
 		t.Fatal(err)
@@ -383,6 +494,45 @@ func newTestEnv(t *testing.T, mut func(*Config)) *testEnv {
 		}
 	})
 	return e
+}
+
+// listener returns the open listener.
+func (e *testEnv) listener() *listener {
+	e.s.mu.Lock()
+	defer e.s.mu.Unlock()
+	return e.s.ln
+}
+
+// session returns the live session of key.
+func (e *testEnv) session(key string) *session {
+	s, _ := e.s.sessions.lookup(key)
+	if s == nil {
+		e.t.Fatal("no session for the key")
+	}
+	return s
+}
+
+// waitFor polls cond until it holds or 5 seconds pass.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// requests returns the paths the fake hub received.
+func (h *fakeHub) paths() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, 0, len(h.requests))
+	for _, r := range h.requests {
+		out = append(out, r.Path)
+	}
+	return out
 }
 
 // addr is the listener's host:port.
