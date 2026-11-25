@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow runs the same checks before it builds a release.
+  workflow_call:
 
 permissions:
   contents: read
@@ -16,9 +18,9 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -29,7 +31,7 @@ jobs:
       - run: npm test
       - run: npm run build
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
           path: frontend/dist
@@ -40,23 +42,24 @@ jobs:
     name: Shell
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      # The installer runs as root on users' hosts; shellcheck is preinstalled
-      # on GitHub's Ubuntu runners.
+      # Every script in scripts/; the installer and the uninstaller run as
+      # root on users' hosts. shellcheck is preinstalled on GitHub's Ubuntu
+      # runners.
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck scripts/install.sh scripts/build.sh scripts/gen-types.sh
+          shellcheck scripts/*.sh
 
   go:
     name: Go
     needs: frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: frontend-dist
           path: frontend/dist
@@ -67,7 +70,7 @@ jobs:
         id: go-version
         run: echo "minor=$(sed -n 's/^go \([0-9]*\.[0-9]*\).*/\1/p' go.mod)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ steps.go-version.outputs.minor }}.x
           check-latest: true

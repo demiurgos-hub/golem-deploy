@@ -47,6 +47,8 @@ go build -o bin/golem-deploy ./cmd/golem-deploy
 
 `scripts/build.sh` runs the same steps (pass `-ldflags "-X main.version=v0.1.0"` to stamp a version). If you compile without building the web client, the binary still works but every web page returns a short plain-text notice explaining how to build it.
 
+`scripts/release.sh v0.1.0` builds the files of a release into `dist/release`: reproducible archives for linux/amd64 and linux/arm64, `install.sh` and `SHA256SUMS`. A built binary installs on a host with `sudo scripts/install.sh --binary ./bin/golem-deploy` from the checkout. Releases are made by pushing a tag; see [docs/RELEASING.md](docs/RELEASING.md).
+
 After changing `internal/apitypes`, regenerate the web client's types with `scripts/gen-types.sh`.
 
 Run the checks used in CI:
@@ -76,7 +78,13 @@ npm test                          # Vitest + Testing Library
 
 ## Install
 
-To run Golem Deploy as a systemd service on an Ubuntu or Debian host with Docker, build the binary and run `sudo scripts/install.sh /path/to/golem-deploy`. It creates the `golem-deploy` user, the data directory `/var/lib/golem-deploy`, the settings file `/etc/golem-deploy/golem-deploy.env` and the service; see [docs/INSTALL.md](docs/INSTALL.md) for requirements, upgrades, uninstalling and security notes.
+On an Ubuntu or Debian host with systemd (amd64 or arm64):
+
+```sh
+curl -fsSL https://github.com/demiurgos-hub/golem-deploy/releases/latest/download/install.sh | sudo bash
+```
+
+The installer downloads the latest release and checks its checksum, installs Docker Engine from Docker's apt repository when it is missing, and sets Golem Deploy up as the systemd service `golem-deploy` with its data in `/var/lib/golem-deploy` and its settings in `/etc/golem-deploy/golem-deploy.env`. It ends with a one-time link to create the first admin account. Run it again to upgrade; `sudo golem-deploy-uninstall` removes it. See [docs/INSTALL.md](docs/INSTALL.md) for the options, offline installs, verifying downloads and uninstalling, and [CHANGELOG.md](CHANGELOG.md) for what each release changed.
 
 ## Run
 

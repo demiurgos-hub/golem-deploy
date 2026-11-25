@@ -1,13 +1,15 @@
 ---
-description: Toolchain versions, linting, build script, and CI workflow
-globs: "{.github/workflows/**,scripts/**,tygo.yaml,go.mod,frontend/package.json,frontend/eslint.config.js,frontend/vite.config.ts,frontend/vitest.config.ts,.gitignore,.gitattributes}"
+description: Toolchain versions, linting, build and release scripts, CI and release workflows
+globs: "{.github/workflows/**,scripts/**,CHANGELOG.md,docs/RELEASING.md,tygo.yaml,go.mod,frontend/package.json,frontend/eslint.config.js,frontend/vite.config.ts,frontend/vitest.config.ts,.gitignore,.gitattributes}"
 alwaysApply: false
 ---
 
 # Toolchain and CI
 
 - `go.mod` sets the minimum Go version; CI derives the Go minor version from its `go` line and installs the latest patch of that minor. `ignore ./frontend/node_modules` keeps npm-shipped Go packages out of `./...`.
-- `.github/workflows/ci.yml` runs the frontend job (`npm ci`, `npm run lint`, `npm test`, `npm run build`), the shell job (`shellcheck` on every script in `scripts/`: `install.sh`, `build.sh`, `gen-types.sh`; write `CDPATH=''`, not `CDPATH=`, SC1007) and then the Go job with the built `frontend/dist` artifact: the generated-types freshness check (`scripts/gen-types.sh` + `git diff --exit-code`), the hidden-character check, `go vet`, `staticcheck`, `govulncheck`, `go test -race`. Keep local verification aligned with it.
+- `.github/workflows/ci.yml` runs the frontend job (`npm ci`, `npm run lint`, `npm test`, `npm run build`), the shell job (`shellcheck scripts/*.sh`; write `CDPATH=''`, not `CDPATH=`, SC1007) and then the Go job with the built `frontend/dist` artifact: the generated-types freshness check (`scripts/gen-types.sh` + `git diff --exit-code`), the hidden-character check, `go vet`, `staticcheck`, `govulncheck`, `go test -race`. It is also a reusable workflow (`workflow_call`) for the release. Keep local verification aligned with it.
+- `.github/workflows/release.yml` runs on a pushed `v*` tag: tag format and changelog notes, then `ci.yml`, then `scripts/release.sh` (no dependency caches) with an `actions/attest` build provenance attestation, then `gh release create` (prerelease when the tag has a `-`). Workflow permissions are `{}`; each job asks for its own. Use current major versions of actions (look them up) and keep `ci.yml` and `release.yml` on the same ones.
+- `scripts/release.sh [--skip-web] VERSION [OUTDIR]` (default `dist/release`, ignored by git) builds the release files whose names `docs/RELEASING.md` and the installer rely on: reproducible archives (GNU tar, sorted members with explicit modes, owner 0, `SOURCE_DATE_EPOCH` or commit time, `gzip -n`), `install.sh` with `RELEASE_VERSION` stamped, `SHA256SUMS` in plain `sha256sum` form. It must keep working on Linux and in Git Bash on Windows (no reliance on file modes; GNU tar reads `C:`-style paths as remote hosts, so use `/c/...` paths or `--force-local`). `scripts/release-notes.sh VERSION` prints the version's `CHANGELOG.md` section (Keep a Changelog `## [X.Y.Z] - DATE`) and fails when it is missing.
 - ESLint uses the flat config in `frontend/eslint.config.js` (`typescript-eslint`, `eslint-plugin-react-hooks`) with `--max-warnings=0`. Disable a rule only on the specific line, with a comment explaining why.
 - `frontend/package-lock.json` must stay `npm ci`-compatible; commit it with dependency changes.
 - Vite empties `frontend/dist` on build; the `keep-dist-placeholder` plugin in `vite.config.ts` restores the committed `.gitkeep`.

@@ -38,3 +38,6 @@ temp/
 *~
 .DS_Store
 Thumbs.db
+
+# Release files built by scripts/release.sh
+dist/
