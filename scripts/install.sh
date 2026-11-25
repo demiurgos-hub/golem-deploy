@@ -205,14 +205,16 @@ docker_candidates_ok() {
 # GOLEM_DEPLOY_RELEASE_URL), with retries and a size cap. Older curl
 # versions apply --max-filesize only when the server sends a length, so the
 # cap is also enforced while writing: at most MAX_BYTES+1 bytes reach DEST,
-# and more than MAX_BYTES fails.
+# and more than MAX_BYTES fails. -q, which must come first, keeps curl from
+# reading root's ~/.curlrc, where "insecure" would turn off certificate
+# checks.
 fetch() {
 	local url=$1 dest=$2 max=$3 proto='=https' try size rc
 	case $url in file://*) proto='=file' ;; esac
 	for try in 1 2 3 4; do
 		[ "$try" -eq 1 ] || sleep 2
 		set +e
-		curl --proto "$proto" --proto-redir '=https' --tlsv1.2 -fsSL --connect-timeout 20 \
+		curl -q --proto "$proto" --proto-redir '=https' --tlsv1.2 -fsSL --connect-timeout 20 \
 			--max-filesize "$max" "$url" </dev/null | head -c "$((max + 1))" >"$dest"
 		rc=("${PIPESTATUS[@]}")
 		set -e
@@ -313,11 +315,39 @@ env_value() {
 	sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1
 }
 
+# settings_data_dir prints the data directory the settings file gives the
+# service. It fails unless the last assignment of GOLEM_DEPLOY_DATA_DIR is
+# a plain line GOLEM_DEPLOY_DATA_DIR=/path whose path the daemon accepts and
+# systemd does not rewrite: no quotes, "$", backslash, control character,
+# "," or "=", and no space at the end. uninstall.sh reads it the same way.
+settings_data_dir() {
+	local text line trimmed last=''
+	text=$(cat -- "$ENV_FILE" 2>/dev/null) || return 1
+	while IFS= read -r line; do
+		trimmed=${line#"${line%%[![:space:]]*}"}
+		case $trimmed in '#'* | ';'*) continue ;; esac
+		[[ $trimmed =~ ^GOLEM_DEPLOY_DATA_DIR[[:space:]]*= ]] && last=$line
+	done <<<"$text"
+	[[ $last =~ ^GOLEM_DEPLOY_DATA_DIR=(/.*)$ ]] || return 1
+	last=${BASH_REMATCH[1]}
+	case $last in *[\"\'\$\\,=]* | *[[:cntrl:]]* | *[[:space:]]) return 1 ;; esac
+	printf '%s' "$last"
+}
+
+# shell_quote WORD prints WORD quoted for a POSIX shell when it needs it.
+shell_quote() {
+	local q="'\\''"
+	case $1 in
+	'' | *[!A-Za-z0-9_./:=@+-]*) printf "'%s'" "${1//\'/"$q"}" ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
 # extract_archive ARCHIVE DIR unpacks exactly the expected members of a
 # release archive into DIR. Anything else (other names, directories, links,
 # devices, duplicates, oversized contents) is refused before extraction.
 extract_archive() {
-	local archive=$1 dir=$2 label=${3:-$1} names listing line total f
+	local archive=$1 dir=$2 label=${3:-$1} names listing line size total f
 	names=$(tar -tzf "$archive" 2>/dev/null) || die "$label is not a readable .tar.gz archive"
 	# shellcheck disable=SC2086 # the member names are fixed words
 	if [ "$(printf '%s\n' "$names" | LC_ALL=C sort)" != "$(printf '%s\n' $ARCHIVE_MEMBERS)" ]; then
@@ -452,8 +482,8 @@ apply_sysctl() {
 # a value that was already higher is kept.
 $lines
 EOF
-	install -m 0644 -o root -g root "$work/sysctl.conf" "$SYSCTL_FILE.new"
-	mv -f "$SYSCTL_FILE.new" "$SYSCTL_FILE"
+	install -T -m 0644 -o root -g root "$work/sysctl.conf" "$SYSCTL_FILE.new"
+	mv -fT "$SYSCTL_FILE.new" "$SYSCTL_FILE"
 	printf '%s' "$lines" | sed 's/^/    /'
 	local f
 	if command -v sysctl >/dev/null 2>&1; then
@@ -728,6 +758,13 @@ main() {
 		die "systemd is not running as the init system; the installer needs systemd to run the service"
 	fi
 	note "systemd: $(systemctl --version | head -n 1)"
+
+	# The files this run writes must not be directories (or links to them).
+	local dest
+	for dest in "$BIN_DEST" "$BIN_DEST.new" "$UNINSTALL_DEST" "$UNINSTALL_DEST.new" "$UNIT_DEST" "$ENV_FILE" \
+		"$SYSCTL_FILE" "$SYSCTL_FILE.new" "$TLS_CERT_DEST" "$TLS_CERT_DEST.new" "$TLS_KEY_DEST" "$TLS_KEY_DEST.new"; do
+		[ ! -d "$dest" ] || die "$dest is a directory; the installer writes a file there. Remove it and run this script again."
+	done
 
 	if [ -n "$default_ports" ]; then
 		local busy='' port owner
@@ -1038,13 +1075,13 @@ main() {
 	fi
 	# Copy next to the destination, then rename: a running service keeps the old
 	# file until it restarts, and an interrupted copy never leaves half a binary.
-	install -m 0755 -o root -g root "$payload/golem-deploy" "$BIN_DEST.new"
-	mv -f "$BIN_DEST.new" "$BIN_DEST"
+	install -T -m 0755 -o root -g root "$payload/golem-deploy" "$BIN_DEST.new"
+	mv -fT "$BIN_DEST.new" "$BIN_DEST"
 
 	say "Installing the uninstaller as $UNINSTALL_DEST"
 	install -d -m 0755 -o root -g root "$(dirname "$UNINSTALL_DEST")"
-	install -m 0755 -o root -g root "$payload/uninstall.sh" "$UNINSTALL_DEST.new"
-	mv -f "$UNINSTALL_DEST.new" "$UNINSTALL_DEST"
+	install -T -m 0755 -o root -g root "$payload/uninstall.sh" "$UNINSTALL_DEST.new"
+	mv -fT "$UNINSTALL_DEST.new" "$UNINSTALL_DEST"
 
 	# --- settings ------------------------------------------------------------
 
@@ -1114,64 +1151,69 @@ $tls_lines
 EOF
 		chown root:"$svc_group" "$tmp_env"
 		chmod 0640 "$tmp_env"
-		mv "$tmp_env" "$ENV_FILE"
+		mv -T "$tmp_env" "$ENV_FILE"
 		env_written=yes
 	fi
 
 	# --- systemd unit --------------------------------------------------------
 
 	say "Installing $UNIT_DEST"
-	install -m 0644 -o root -g root "$payload/golem-deploy.service" "$UNIT_DEST"
+	install -T -m 0644 -o root -g root "$payload/golem-deploy.service" "$UNIT_DEST"
 	systemctl daemon-reload
 	systemctl enable "$SERVICE" >/dev/null 2>&1 || die "systemctl enable $SERVICE failed"
 
 	say "Restarting $SERVICE"
-	local restart_at state started='' invocation
+	local restart_at state='' substate='' started='' restarted=yes invocation
 	restart_at=$(date +%s)
 	# Clear the unit's start limit (5 starts in 5 minutes), which repeated
 	# runs of this script would otherwise hit.
 	systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
-	systemctl restart "$SERVICE" || true
+	systemctl restart "$SERVICE" || restarted=''
 
 	# Wait until this run of the service logs that it is listening, or fails.
-	for _ in $(seq "$START_TIMEOUT"); do
-		state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
-		# Restart=on-failure turns a crash into "activating (auto-restart)".
-		[ "$(systemctl show -p SubState --value "$SERVICE")" != auto-restart ] || break
-		if [ "$state" = active ]; then
-			invocation=$(systemctl show -p InvocationID --value "$SERVICE")
-			if [ -n "$invocation" ] &&
-				journalctl --no-pager -q -o cat "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null | grep 'golem-deploy listening' >/dev/null; then
-				started=yes
+	# A failing systemctl must not end the script before the failure handling.
+	if [ -n "$restarted" ]; then
+		for _ in $(seq "$START_TIMEOUT"); do
+			state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
+			substate=$(systemctl show -p SubState --value "$SERVICE" 2>/dev/null || true)
+			# Restart=on-failure turns a crash into "activating (auto-restart)".
+			[ "$substate" != auto-restart ] || break
+			if [ "$state" = active ]; then
+				invocation=$(systemctl show -p InvocationID --value "$SERVICE" 2>/dev/null || true)
+				if [ -n "$invocation" ] &&
+					journalctl --no-pager -q -o cat "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null | grep 'golem-deploy listening' >/dev/null; then
+					started=yes
+					break
+				fi
+			elif [ "$state" != activating ] && [ "$state" != reloading ]; then
 				break
 			fi
-		elif [ "$state" != activating ] && [ "$state" != reloading ]; then
-			break
-		fi
-		sleep 1
-	done
-	if [ -z "$started" ]; then
-		state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
-		if [ "$state" = active ]; then
-			warn "$SERVICE is active but did not log \"golem-deploy listening\" within ${START_TIMEOUT}s; check: journalctl -u $SERVICE"
-		else
-			printf '\n' >&2
-			systemctl status --no-pager --lines=0 "$SERVICE" >&2 || true
-			printf '\nLog since the restart:\n' >&2
-			journalctl --no-pager -u "$SERVICE" --since "@$restart_at" -n 40 >&2 || true
-			local substate
-			substate=$(systemctl show -p SubState --value "$SERVICE" 2>/dev/null || true)
-			if [ -n "$env_written" ]; then
-				# Otherwise the next run would keep a settings file the daemon refuses.
-				systemctl stop "$SERVICE" >/dev/null 2>&1 || true
-				mv -f "$ENV_FILE" "$ENV_FILE.failed"
+			sleep 1
+		done
+	fi
+	state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
+	if [ -n "$started" ]; then
+		say "$SERVICE is running"
+	elif [ -n "$restarted" ] && [ "$state" = active ]; then
+		warn "$SERVICE is active but did not log \"golem-deploy listening\" within ${START_TIMEOUT}s," \
+			"so no setup link is made; check: systemctl status $SERVICE; journalctl -u $SERVICE"
+	else
+		printf '\n' >&2
+		systemctl status --no-pager --lines=0 "$SERVICE" >&2 || true
+		printf '\nLog since the restart:\n' >&2
+		journalctl --no-pager -u "$SERVICE" --since "@$restart_at" -n 40 >&2 || true
+		substate=$(systemctl show -p SubState --value "$SERVICE" 2>/dev/null || true)
+		if [ -n "$env_written" ]; then
+			# Otherwise the next run would keep a settings file the daemon refuses.
+			systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+			if mv -fT "$ENV_FILE" "$ENV_FILE.failed"; then
 				warn "the settings file this run wrote was moved to $ENV_FILE.failed;" \
 					"the next run writes a new one from its options"
+			else
+				warn "could not move $ENV_FILE to $ENV_FILE.failed; remove it before the next run"
 			fi
-			die "$SERVICE did not start (state: ${state:-unknown}/${substate:-unknown}); see the log above and docs/INSTALL.md (Troubleshooting)"
 		fi
-	else
-		say "$SERVICE is running"
+		die "$SERVICE did not start (state: ${state:-unknown}/${substate:-unknown}); see the log above and docs/INSTALL.md (Troubleshooting)"
 	fi
 
 	# --- next steps ----------------------------------------------------------
@@ -1198,13 +1240,21 @@ EOF
 		fingerprint=$(panel_fingerprint)
 	fi
 
-	# The data directory the service uses.
-	local eff_data
-	eff_data=$(env_value GOLEM_DEPLOY_DATA_DIR)
-	case $eff_data in
-	/*) [[ $eff_data =~ ^[A-Za-z0-9._/-]+$ ]] || eff_data=$DATA_DIR ;;
-	*) eff_data=$DATA_DIR ;;
-	esac
+	# The data directory the service uses, and why no setup link is made, if
+	# none is. Without a usable data directory there is no fallback: another
+	# directory could hold another database, or none yet.
+	local eff_data='' eff_data_q='<data directory>' link_skip=''
+	if eff_data=$(settings_data_dir); then
+		eff_data_q=$(shell_quote "$eff_data")
+	else
+		eff_data=''
+	fi
+	if [ -z "$started" ]; then
+		link_skip="$SERVICE did not log that it is listening"
+	elif [ -z "$eff_data" ]; then
+		link_skip="$ENV_FILE does not set GOLEM_DEPLOY_DATA_DIR to a plain absolute path"
+		link_skip+=" (one line GOLEM_DEPLOY_DATA_DIR=/path without quotes), so the data directory the service uses is unclear"
+	fi
 
 	# The setup link is a secret: it is held in a variable and printed, never
 	# written to a file or logged. Shell tracing (bash -x) stays off while
@@ -1216,7 +1266,9 @@ EOF
 		;;
 	esac
 	local link='' link_rc=0 link_err=$work/setup-link.err
-	if [ -n "$origin" ]; then
+	if [ -n "$link_skip" ]; then
+		link_rc=1
+	elif [ -n "$origin" ]; then
 		set +e
 		link=$(cd / && runuser -u "$SVC_USER" -- "$BIN_DEST" admin setup-link \
 			--data-dir "$eff_data" --origin "$origin" --ttl 1h 2>"$link_err" </dev/null)
@@ -1250,8 +1302,18 @@ $step. The panel listens on $eff_listen and is reachable from this host only.
 EOF
 		step=$((step + 1))
 	fi
-	local link_cmd="sudo runuser -u $SVC_USER -- $BIN_DEST admin setup-link --data-dir $eff_data --origin ${origin:-<panel address>}"
-	if [ "$link_rc" -eq 0 ]; then
+	local link_cmd="sudo runuser -u $SVC_USER -- $BIN_DEST admin setup-link --data-dir $eff_data_q --origin ${origin:-<panel address>}"
+	if [ -n "$link_skip" ]; then
+		printf '%s. No setup link for the first admin account was made: %s.\n' "$step" "$link_skip"
+		if [ -z "$started" ]; then
+			printf '   Check the service with: systemctl status %s; journalctl -u %s\n' "$SERVICE" "$SERVICE"
+			printf '   Once it runs, make a link (it works once and for one hour) with:\n'
+		else
+			printf '   Make a link (it works once and for one hour) with the data directory\n'
+			printf '   the service uses:\n'
+		fi
+		printf '\n     %s\n\n' "$link_cmd"
+	elif [ "$link_rc" -eq 0 ]; then
 		cat <<EOF
 $step. Create the first admin account: open this link in your browser.
    It works once and for one hour.
@@ -1274,7 +1336,7 @@ $step. Create the first admin account, unless you already have one. It prompts f
    the password twice (add --password-stdin to pipe it instead). Run it as
    $SVC_USER so the files it creates stay readable by the service:
 
-     sudo runuser -u $SVC_USER -- $BIN_DEST admin create --data-dir $eff_data --username admin
+     sudo runuser -u $SVC_USER -- $BIN_DEST admin create --data-dir $eff_data_q --username admin
 
    Then open the panel at ${origin:-https://<this host>:${eff_listen##*:}}/
 
