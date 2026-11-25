@@ -847,8 +847,8 @@ func (s *Service) safetyBackup(ctx context.Context, sv store.Server, kind string
 		fmt.Fprintln(log, "no current data to back up")
 		return nil
 	case errors.As(err, &nothing):
-		return safetyFailure(kind, true, fmt.Sprintf("the data directory holds no regular files, only entries a backup cannot hold (links, pipes, devices or names "+
-			"that are not allowed; counted above: %d), so no backup was stored", nothing.omitted), nil)
+		return safetyFailure(kind, true, fmt.Sprintf("the data directory holds no regular files, only %d entries a backup cannot hold (links, pipes, devices or names "+
+			"that are not allowed), so no backup was stored", nothing.omitted), nil)
 	case err != nil && ctx.Err() != nil:
 		return ctx.Err()
 	case err != nil:
@@ -863,8 +863,8 @@ func (s *Service) safetyBackup(ctx context.Context, sv store.Server, kind string
 		}
 		return safetyFailure(kind, false, detail, kindErr)
 	case b.OmittedEntries > 0:
-		return safetyFailure(kind, true, fmt.Sprintf("the data directory holds entries a backup cannot hold (links, pipes, devices or names "+
-			"that are not allowed; counted above: %d); the incomplete backup was stored as backup %d", b.OmittedEntries, b.ID), nil)
+		return safetyFailure(kind, true, fmt.Sprintf("%d of the entries in the data directory cannot be held by a backup (links, pipes, devices or names "+
+			"that are not allowed); the incomplete backup was stored as backup %d", b.OmittedEntries, b.ID), nil)
 	}
 	return nil
 }

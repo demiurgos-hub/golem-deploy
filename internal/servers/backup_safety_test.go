@@ -155,7 +155,7 @@ func TestSafetyBackupMustBeComplete(t *testing.T) {
 	if len(pre) != 1 || pre[0].OmittedEntries != 1 || pre[0].FileCount != 1 {
 		t.Fatalf("%+v", pre)
 	}
-	if !errors.Is(err, ErrSafetyBackup) || !strings.Contains(msg, "counted above: 1") || !strings.Contains(msg, "stored as backup "+strconv.FormatInt(pre[0].ID, 10)) ||
+	if !errors.Is(err, ErrSafetyBackup) || !strings.Contains(msg, "1 of the entries in the data directory") || !strings.Contains(msg, "stored as backup "+strconv.FormatInt(pre[0].ID, 10)) ||
 		!strings.Contains(msg, "skip_safety_backup") || !strings.Contains(msg, "nothing was replaced") {
 		t.Fatalf("%v\n%s", err, log)
 	}
