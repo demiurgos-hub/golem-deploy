@@ -53,14 +53,16 @@ func (s *session) hubSession() string {
 }
 
 // track registers a proxied request so ending the session cancels it
-// (closing an open WebSocket stream). ok is false once the session ended.
-func (s *session) track(parent context.Context) (ctx context.Context, release func(), ok bool) {
+// (closing an open WebSocket stream). The request also ends when the
+// session expires. ok is false once the session ended or expired; the
+// check and the registration are one step under the session's lock.
+func (s *session) track(parent context.Context, now time.Time) (ctx context.Context, release func(), ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ended {
+	if s.ended || !now.Before(s.expires) {
 		return nil, nil, false
 	}
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithTimeout(parent, s.expires.Sub(now))
 	s.nextID++
 	id := s.nextID
 	s.streams[id] = cancel
@@ -70,6 +72,13 @@ func (s *session) track(parent context.Context) (ctx context.Context, release fu
 		delete(s.streams, id)
 		s.mu.Unlock()
 	}, true
+}
+
+// isEnded reports whether the session ended.
+func (s *session) isEnded() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ended
 }
 
 // end marks the session ended, cancels its requests and returns the hub

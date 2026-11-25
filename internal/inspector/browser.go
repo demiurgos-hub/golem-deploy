@@ -43,7 +43,7 @@ const (
 	WebSocketProtocol  = "golem-deploy.inspector"
 	WebSocketKeyPrefix = "golem-deploy.key."
 	// bootTag is inserted directly after the opening <head> tag of every
-	// HTML document from the hub.
+	// HTML document from the hub (see headEnd).
 	bootTag = `<script src="/_golem-deploy/boot.js"></script>`
 	// maxDocument bounds an HTML document read for the insertion.
 	maxDocument = 2 << 20
@@ -61,7 +61,8 @@ var (
 )
 
 // errDocument: an HTML document from the hub cannot carry the boot script
-// (no <head>, too large, compressed or partial). It is not served.
+// (no leading <head> tag, too large, compressed or partial). It is not
+// served.
 var errDocument = errors.New("inspector: the hub's page cannot carry the boot script")
 
 const pageStyle = `body{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;line-height:1.5;color:#222;background:#fff}` +
@@ -98,7 +99,7 @@ func (s *Service) page(w http.ResponseWriter, status int, title, text string) {
 // serveScript serves one of the embedded scripts.
 func serveScript(w http.ResponseWriter, r *http.Request, body string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		hubError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		reject(w, r, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
 	h := w.Header()
@@ -127,11 +128,11 @@ func (s *Service) handleOwn(w http.ResponseWriter, r *http.Request) {
 		return
 	case EnterPath, EndedPath:
 	default:
-		hubError(w, http.StatusNotFound, "not_found")
+		reject(w, r, http.StatusNotFound, "not_found")
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		hubError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		reject(w, r, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
 	if r.URL.Path == EnterPath {
@@ -150,25 +151,33 @@ type sessionEntry struct {
 
 // handleSessionEntry exchanges a ticket for a session key (POST
 // /_golem-deploy/session, JSON {"ticket": "..."}, the Inspector's own
-// Origin). It consumes the ticket, checks the account, logs in at the hub
-// for the new session and answers the key; only its hash is kept. Failed
-// tickets are limited per client address.
+// Origin). Failed tickets are limited per client address; the limiter is
+// asked before the body is read. It consumes the ticket, checks the
+// account, logs in at the hub for the new session and answers the key;
+// only its hash is kept. The session is registered only while the
+// generation (listener and secrets) the exchange started with is current.
 func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		hubError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		reject(w, r, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
 	if !s.originOK(r) {
-		hubError(w, http.StatusForbidden, "origin_not_allowed")
+		reject(w, r, http.StatusForbidden, "origin_not_allowed")
 		return
 	}
 	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
-		hubError(w, http.StatusUnsupportedMediaType, "unsupported_media_type")
+		reject(w, r, http.StatusUnsupportedMediaType, "unsupported_media_type")
+		return
+	}
+	res, wait, ok := s.entryLimit.Reserve(s.cfg.Policy.ClientIP(r))
+	if !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait/time.Second)+1))
+		reject(w, r, http.StatusTooManyRequests, "too_many_attempts")
 		return
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSessionBody))
 	if err != nil {
-		hubError(w, http.StatusRequestEntityTooLarge, "body_too_large")
+		reject(w, r, http.StatusRequestEntityTooLarge, "body_too_large")
 		return
 	}
 	var req struct {
@@ -176,12 +185,6 @@ func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 	}
 	if json.Unmarshal(raw, &req) != nil {
 		hubError(w, http.StatusBadRequest, "bad_request")
-		return
-	}
-	res, wait, ok := s.entryLimit.Reserve(s.cfg.Policy.ClientIP(r))
-	if !ok {
-		w.Header().Set("Retry-After", strconv.Itoa(int(wait/time.Second)+1))
-		hubError(w, http.StatusTooManyRequests, "too_many_attempts")
 		return
 	}
 	tk, ok := s.tickets.consume(req.Ticket)
@@ -195,22 +198,35 @@ func (s *Service) handleSessionEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res.Refund()
-	if _, _, serving := s.agentTarget(); !serving {
+	v, serving := s.view()
+	if !serving {
 		hubError(w, http.StatusServiceUnavailable, "not_running")
 		return
 	}
 	lctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	sid, err := s.hubLogin(lctx)
+	sid, err := s.hubLogin(lctx, v)
 	cancel()
 	if err != nil {
 		s.logger.Warn("could not open an Inspector session at the hub", "account_id", acct.ID, "err", err)
 		hubError(w, http.StatusServiceUnavailable, "unavailable")
 		return
 	}
-	key, _, evicted, err := s.sessions.create(acct.ID, acct.TokenVersion, sid)
-	if err != nil {
+	if s.hooks.afterEntryLogin != nil {
+		s.hooks.afterEntryLogin()
+	}
+	var key string
+	var evicted []*session
+	var createErr error
+	if !s.admit(v.gen, func() bool {
+		key, _, evicted, createErr = s.sessions.create(acct.ID, acct.TokenVersion, sid)
+		return createErr == nil
+	}) {
 		s.logoutHub(sid)
-		hubError(w, http.StatusInternalServerError, "internal")
+		if createErr != nil {
+			hubError(w, http.StatusInternalServerError, "internal")
+			return
+		}
+		hubError(w, http.StatusServiceUnavailable, "not_running")
 		return
 	}
 	for _, old := range evicted {
@@ -297,23 +313,98 @@ func injectBoot(resp *http.Response) error {
 	return nil
 }
 
-// headEnd returns the index just after the first opening <head> tag
-// (ASCII case-insensitive, with or without attributes), or -1.
+// headEnd returns the index just after the opening <head> tag of a
+// document whose leading content is, in this order: optional whitespace
+// and comments, an optional doctype (more whitespace and comments around
+// it), an optional <html ...> tag (more whitespace and comments) and then
+// the <head ...> tag. Tag names are ASCII case-insensitive and quoted
+// attribute values may contain ">". Any other document returns -1: the
+// boot script is never placed inside a comment or after other content.
 func headEnd(doc []byte) int {
-	for i := 0; i+5 < len(doc); i++ {
-		if doc[i] != '<' || !asciiLowerIs(doc[i+1:i+5], "head") {
-			continue
+	i := 0
+	if bytes.HasPrefix(doc, []byte("\xef\xbb\xbf")) {
+		i = 3 // UTF-8 byte order mark
+	}
+	skip := func() bool {
+		for {
+			for i < len(doc) && isHTMLSpace(doc[i]) {
+				i++
+			}
+			if !bytes.HasPrefix(doc[i:], []byte("<!--")) {
+				return true
+			}
+			end := bytes.Index(doc[i+4:], []byte("-->"))
+			if end < 0 {
+				return false
+			}
+			i += 4 + end + 3
 		}
-		switch doc[i+5] {
-		case '>', ' ', '\t', '\n', '\r', '\f', '/':
-		default:
-			continue // <header>, <heading>, ...
-		}
-		j := bytes.IndexByte(doc[i+5:], '>')
-		if j < 0 {
+	}
+	if !skip() {
+		return -1
+	}
+	if i+9 <= len(doc) && doc[i] == '<' && doc[i+1] == '!' && asciiLowerIs(doc[i+2:i+9], "doctype") {
+		end := bytes.IndexByte(doc[i:], '>')
+		if end < 0 {
 			return -1
 		}
-		return i + 5 + j + 1
+		i += end + 1
+		if !skip() {
+			return -1
+		}
+	}
+	if isTag(doc[i:], "html") {
+		end := tagEnd(doc[i:])
+		if end < 0 {
+			return -1
+		}
+		i += end
+		if !skip() {
+			return -1
+		}
+	}
+	if !isTag(doc[i:], "head") {
+		return -1
+	}
+	end := tagEnd(doc[i:])
+	if end < 0 {
+		return -1
+	}
+	return i + end
+}
+
+func isHTMLSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
+}
+
+// isTag reports whether b starts with the opening tag name (a "<", the
+// name, then whitespace, "/" or ">").
+func isTag(b []byte, name string) bool {
+	n := len(name)
+	if len(b) < n+2 || b[0] != '<' || !asciiLowerIs(b[1:1+n], name) {
+		return false
+	}
+	c := b[1+n]
+	return isHTMLSpace(c) || c == '/' || c == '>'
+}
+
+// tagEnd returns the index just after the ">" that closes the tag at the
+// start of b, skipping ">" inside quoted attribute values; -1 when the tag
+// does not close.
+func tagEnd(b []byte) int {
+	var quote byte
+	for i := 1; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '>':
+			return i + 1
+		}
 	}
 	return -1
 }

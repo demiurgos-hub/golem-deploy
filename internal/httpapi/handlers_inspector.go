@@ -34,6 +34,8 @@ func inspectorError(err error) error {
 		return notFound("server")
 	case errors.Is(err, inspector.ErrNotRunning):
 		return conflict(apitypes.ErrorCodeConflict, "the Inspector is not running")
+	case errors.Is(err, inspector.ErrUnavailable):
+		return conflict(apitypes.ErrorCodeConflict, "the Inspector is unavailable: the daemon runs with --inspector-listen off")
 	case errors.Is(err, inspector.ErrTooManyTickets):
 		e := newError(http.StatusTooManyRequests, apitypes.ErrorCodeRateLimited, "too many open Inspector links; use one or wait a minute")
 		e.header = http.Header{"Retry-After": {"60"}}

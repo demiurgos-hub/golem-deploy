@@ -83,8 +83,9 @@ func TestInspectorRoutes(t *testing.T) {
 		code   apitypes.ErrorCode
 	}{
 		&inspector.FieldError{Field: "pull_image", Msg: "x"}: {http.StatusBadRequest, apitypes.ErrorCodeValidationFailed},
-		jobs.ErrSubjectBusy:  {http.StatusConflict, apitypes.ErrorCodeJobInProgress},
-		jobs.ErrShuttingDown: {http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable},
+		jobs.ErrSubjectBusy:      {http.StatusConflict, apitypes.ErrorCodeJobInProgress},
+		inspector.ErrUnavailable: {http.StatusConflict, apitypes.ErrorCodeConflict},
+		jobs.ErrShuttingDown:     {http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable},
 	} {
 		stub.updateErr = err
 		e := errBody(t, h.do("PATCH", "/api/v1/inspector", admin, `{}`), want.status, want.code)

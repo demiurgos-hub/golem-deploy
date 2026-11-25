@@ -53,6 +53,7 @@ func TestHubSpecArgs(t *testing.T) {
 		"--security-opt", "no-new-privileges",
 		"--pids-limit", "256",
 		"--memory", "512m", "--memory-swap", "512m",
+		"--cpus", "1",
 		"--log-driver", "json-file",
 		"--log-opt", "max-size=10m",
 		"--log-opt", "max-file=3",

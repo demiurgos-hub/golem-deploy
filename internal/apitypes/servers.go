@@ -91,7 +91,11 @@ type Server struct {
 	// game's Inspector agent is pointed at it from the next (re)start, and
 	// the server appears in the Inspector under its name. Off by default.
 	// InspectorActive is true when the server's current container was
-	// started that way (false without a container).
+	// started that way (false without a container, and while Docker cannot
+	// be queried). The agent variables follow the desired configuration,
+	// not whether the hub runs at that moment: a server started while the
+	// hub is down still gets them, and its agent connects once the hub is
+	// repaired.
 	Inspector       bool      `json:"inspector"`
 	InspectorActive bool      `json:"inspector_active"`
 	CreatedAt       time.Time `json:"created_at"`

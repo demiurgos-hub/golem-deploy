@@ -132,7 +132,7 @@ func TestBindError(t *testing.T) {
 	}
 	defer ln.Close()
 	addr := ln.Addr().String()
-	_, err = openListener(addr, nil, http.NotFoundHandler(), http.NotFoundHandler(), time.Second, nil)
+	_, err = openListener(addr, nil, http.NotFoundHandler(), http.NotFoundHandler(), time.Second, maxConns, nil)
 	if err == nil {
 		t.Fatal("bound a busy port")
 	}
@@ -143,10 +143,12 @@ func TestBindError(t *testing.T) {
 }
 
 // The agent endpoint relays a game's agent with the hub's own token, only
-// from the Docker network or loopback, only with the server's token, only
-// for a server with the switch on, and within the connection limits.
+// from an allowed peer, only with the server's token, only for a server
+// with the switch on, and within the connection limits; a server keeps one
+// relay.
 func TestAgentRelay(t *testing.T) {
-	e := newTestEnv(t, nil)
+	// A loopback peer is allowed on Linux only with an explicit agent host.
+	e := newTestEnv(t, func(c *Config) { c.AgentHost = "127.0.0.1" })
 	ctx := context.Background()
 	p1, p2, p3 := 7001, 7002, 7003
 	arena, _ := e.st.CreateServer(ctx, store.Server{Name: "arena", Port: &p1, Inspector: true}, nil)
@@ -160,7 +162,7 @@ func TestAgentRelay(t *testing.T) {
 		return v
 	}
 	bearer := func(v string) http.Header {
-		return http.Header{"Authorization": {"Bearer " + v}, "Cookie": {"a=b"}, "X-Forwarded-For": {"6.6.6.6"}, "Origin": {"http://x"}}
+		return http.Header{"Authorization": {"Bearer " + v}, "Cookie": {"a=b"}, "X-Real-Ip": {"6.6.6.6"}, "Origin": {"http://x"}}
 	}
 	cases := map[string]struct {
 		hdr  http.Header
@@ -185,28 +187,28 @@ func TestAgentRelay(t *testing.T) {
 	echoOnce(t, a1, br1, "register")
 	got, _ := e.hub.last("/ws/agent")
 	if got.Header.Get("Authorization") != "Bearer "+e.s.sec.AgentToken || got.Header.Get("Cookie") != "" ||
-		got.Header.Get("X-Forwarded-For") != "" || got.Header.Get("Origin") != "" || got.Host != hubHost {
+		got.Header.Get("X-Real-Ip") != "" || got.Header.Get("Origin") != "" || got.Host != hubHost {
 		t.Fatalf("headers at the hub: %v %q", got.Header, got.Host)
 	}
-	a2, _, code := dialWS(t, e.addr(), "/ws/agent", bearer(tok(arena.ID)))
+	// A second connection of the same server replaces the first.
+	a2, br2, code := dialWS(t, e.addr(), "/ws/agent", bearer(tok(arena.ID)))
 	if code != http.StatusSwitchingProtocols {
 		t.Fatalf("second: %d", code)
 	}
 	defer a2.Close()
-	if _, _, code := dialWS(t, e.addr(), "/ws/agent", bearer(tok(arena.ID))); code != http.StatusTooManyRequests {
-		t.Fatalf("third for one server: %d", code)
-	}
+	waitClosed(t, a1, br1)
+	echoOnce(t, a2, br2, "still here")
 	b1, _, code := dialWS(t, e.addr(), "/ws/agent", bearer(tok(other.ID)))
 	if code != http.StatusSwitchingProtocols {
 		t.Fatalf("other server: %d", code)
 	}
 	defer b1.Close()
-	if n := e.s.agents.count(); n != 3 {
+	if n := e.s.agents.count(); n != 2 {
 		t.Fatalf("relayed %d", n)
 	}
 	// Turning the Inspector off (or rotating) closes relayed agents.
 	e.s.agents.closeAll()
-	waitClosed(t, a1, br1)
+	waitClosed(t, a2, br2)
 	if e.s.agents.count() != 0 {
 		deadline := time.Now().Add(5 * time.Second)
 		for e.s.agents.count() != 0 && time.Now().Before(deadline) {
@@ -221,18 +223,25 @@ func TestAgentRelay(t *testing.T) {
 	}
 }
 
-// Only loopback peers and peers inside the managed network's subnets may
-// use the agent endpoint.
+// Peers inside the managed network's subnets may use the agent endpoint;
+// loopback peers only off Linux (Docker Desktop) or with an explicit
+// --inspector-agent-host.
 func TestAgentPeer(t *testing.T) {
-	e := newTestEnv(t, nil)
-	e.s.netMu.Lock()
-	e.s.netAddrs = docker.NetworkAddresses{Subnets: []netip.Prefix{netip.MustParsePrefix("172.30.0.0/16")}}
-	e.s.netAt = e.clock.Now()
-	e.s.netMu.Unlock()
 	ctx := context.Background()
-	for peer, want := range map[string]bool{"127.0.0.1": true, "::1": true, "172.30.4.5": true, "172.31.0.1": false, "10.0.0.1": false, "2001:db8::1": false} {
-		if got := e.s.peerAllowed(ctx, netip.MustParseAddr(peer)); got != want {
-			t.Errorf("%s: %v", peer, got)
+	for _, tc := range []struct {
+		goos, agentHost string
+		loopback        bool
+	}{{"linux", "", false}, {"linux", "172.30.0.1", true}, {"windows", "", true}, {"darwin", "", true}} {
+		e := newTestEnv(t, func(c *Config) { c.GOOS, c.AgentHost = tc.goos, tc.agentHost })
+		e.s.netMu.Lock()
+		e.s.netAddrs = docker.NetworkAddresses{Subnets: []netip.Prefix{netip.MustParsePrefix("172.30.0.0/16")}}
+		e.s.netAt = e.clock.Now()
+		e.s.netMu.Unlock()
+		for peer, want := range map[string]bool{"127.0.0.1": tc.loopback, "::1": tc.loopback, "172.30.4.5": true, "172.31.0.1": false,
+			"10.0.0.1": false, "2001:db8::1": false} {
+			if got := e.s.peerAllowed(ctx, netip.MustParseAddr(peer)); got != want {
+				t.Errorf("%s/%q %s: %v", tc.goos, tc.agentHost, peer, got)
+			}
 		}
 	}
 }

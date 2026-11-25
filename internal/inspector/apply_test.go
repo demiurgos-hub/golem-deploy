@@ -246,13 +246,15 @@ func TestApplyImage(t *testing.T) {
 	a := newApplyEnv(t, false)
 	ctx := context.Background()
 	var log bytes.Buffer
-	err := a.s.apply(ctx, &log, applyRequest{enabled: true, auto: true})
+	if err := a.s.storeEnabled(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	err := a.s.apply(ctx, &log, applyRequest{auto: true})
 	if err == nil || len(a.f.CallsTo("pull")) != 0 || !strings.Contains(a.s.detail, "not on this host") {
 		t.Fatalf("auto repair: %v %q", err, a.s.detail)
 	}
 	st, _ := a.s.Status(ctx)
-	if st.State != apitypes.InspectorStateOff {
-		// Not enabled yet: the setting is stored by Update only.
+	if st.State != apitypes.InspectorStateStopped || !strings.Contains(st.Detail, "not on this host") {
 		t.Fatalf("%+v", st)
 	}
 	j, out := a.update(t, apitypes.UpdateInspectorRequest{Enabled: boolPtr(true)})
@@ -317,9 +319,10 @@ func TestUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var fe *FieldError
-	if _, err := s.Update(context.Background(), apitypes.UpdateInspectorRequest{Enabled: boolPtr(true)}, nil); !errors.As(err, &fe) || fe.Field != "enabled" {
-		t.Fatalf("%v", err)
+	for _, req := range []apitypes.UpdateInspectorRequest{{Enabled: boolPtr(true)}, {Enabled: boolPtr(false)}, {}} {
+		if _, err := s.Update(context.Background(), req, nil); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("%+v: %v", req, err)
+		}
 	}
 	v, err := s.Status(context.Background())
 	if err != nil || v.Available || v.Port != 0 || v.State != apitypes.InspectorStateOff {
@@ -354,7 +357,7 @@ func TestRepair(t *testing.T) {
 		t.Fatal("no repair after a restart")
 	}
 	var out bytes.Buffer
-	if err := s2.apply(ctx, &out, applyRequest{enabled: true, auto: true}); err != nil {
+	if err := s2.apply(ctx, &out, applyRequest{auto: true}); err != nil {
 		t.Fatalf("%v\n%s", err, out.String())
 	}
 	if len(a.f.CallsTo("create")) != 1 || !strings.Contains(out.String(), "running with the current settings") {

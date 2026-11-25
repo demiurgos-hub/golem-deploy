@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -23,14 +24,20 @@ const (
 	// maxProxyBody bounds request bodies relayed to the hub (they are
 	// buffered so a request can be repeated after a hub restart).
 	maxProxyBody = 64 << 10
+	// maxSessionAnswer bounds the hub's /auth/session answer, which the
+	// daemon reads to tell a lost hub session.
+	maxSessionAnswer = 4 << 10
 	// entryFailuresPerWindow bounds failed entries per client address.
 	entryFailuresPerWindow = 10
 	entryWindow            = 15 * time.Minute
 	// reloginInterval is the least time between two hub logins for one
 	// session.
 	reloginInterval = 3 * time.Second
-	// requestTimeout bounds a proxied request that is not a WebSocket.
+	// requestTimeout bounds a request that is not a relayed WebSocket.
 	requestTimeout = 2 * time.Minute
+	// rejectDrain bounds the time Go spends reading the body of a refused
+	// request before the connection closes.
+	rejectDrain = time.Second
 )
 
 // blockedPaths are never forwarded to the hub from browsers: the daemon
@@ -56,11 +63,13 @@ func reservedPath(p string) bool {
 type proxyKey struct{}
 
 // proxyInfo is what the proxy knows about a relayed request: its session
-// (nil for the static UI) and whether a WebSocket upgrade offered the
-// marker subprotocol.
+// (nil for the static UI), whether a WebSocket upgrade offered the marker
+// subprotocol, and the hub snapshot (port and secrets) the request uses
+// from start to end.
 type proxyInfo struct {
 	sess    *session
 	offered bool
+	view    hubView
 }
 
 func proxyInfoFrom(ctx context.Context) proxyInfo {
@@ -77,11 +86,53 @@ func hubError(w http.ResponseWriter, status int, code string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
 }
 
+// hasBody reports whether r announces a request body.
+func hasBody(r *http.Request) bool {
+	return r.ContentLength != 0 || len(r.TransferEncoding) > 0
+}
+
+// reject answers a refused request. A request with a body gets
+// "Connection: close" and only a short time to finish sending it: what
+// is left of it is never read as another request.
+func reject(w http.ResponseWriter, r *http.Request, status int, code string) {
+	if hasBody(r) {
+		w.Header().Set("Connection", "close")
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(rejectDrain))
+	}
+	hubError(w, status, code)
+}
+
+// prepare starts every request of the listener: it sets the read and
+// write deadlines (a relayed WebSocket clears them when it takes over the
+// connection) and refuses what the listener never serves: announced
+// trailers, a GET or HEAD with a body, an upgrade to anything but a
+// WebSocket, and a WebSocket upgrade with a body. It reports whether
+// handling goes on.
+func (s *Service) prepare(w http.ResponseWriter, r *http.Request) bool {
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(s.reqTimeout))
+	_ = rc.SetWriteDeadline(time.Now().Add(s.reqTimeout))
+	switch {
+	case len(r.Header.Values("Trailer")) > 0 || len(r.Trailer) > 0:
+		reject(w, r, http.StatusBadRequest, "bad_request")
+	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && hasBody(r):
+		reject(w, r, http.StatusBadRequest, "bad_request")
+	case asksUpgrade(r) && (!isWebSocket(r) || hasBody(r)):
+		reject(w, r, http.StatusBadRequest, "upgrade_not_allowed")
+	default:
+		return true
+	}
+	return false
+}
+
 // browserHandler serves browsers: on the TLS side of a listener that
 // also accepts plaintext agents, or on a plaintext listener, where it also
 // serves the agent endpoint.
 func (s *Service) browserHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.prepare(w, r) {
+			return
+		}
 		if !s.tlsListener() && r.URL.Path == "/ws/agent" {
 			// Agents authenticate with their token and are checked by
 			// peer address; their Host is an address (or
@@ -93,7 +144,7 @@ func (s *Service) browserHandler() http.Handler {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		}
 		if !s.hostAllowed(r.Host) {
-			hubError(w, http.StatusMisdirectedRequest, "bad_host")
+			reject(w, r, http.StatusMisdirectedRequest, "bad_host")
 			return
 		}
 		// The hub cleans paths too (it redirects to the clean path), so
@@ -102,7 +153,10 @@ func (s *Service) browserHandler() http.Handler {
 		clean := path.Clean("/" + p)
 		switch {
 		case blockedPaths[p] || blockedPaths[clean]:
-			hubError(w, http.StatusNotFound, "not_found")
+			reject(w, r, http.StatusNotFound, "not_found")
+		case asksUpgrade(r) && !(strings.HasPrefix(p, "/ws/") && strings.HasPrefix(clean, "/ws/")):
+			// Only the hub's WebSockets under /ws/ are relayed.
+			reject(w, r, http.StatusBadRequest, "upgrade_not_allowed")
 		case strings.HasPrefix(p, ownPrefix) || strings.HasPrefix(clean, ownPrefix):
 			s.handleOwn(w, r)
 		case p == "/auth/logout":
@@ -122,10 +176,24 @@ func (s *Service) hostAllowed(host string) bool {
 		return true
 	}
 	ph := PublicHost(s.cfg.PublicURL)
-	return ph != "" && netpolicy.Hostname(host) == strings.ToLower(strings.Trim(ph, "[]"))
+	return ph != "" && canonicalHost(netpolicy.Hostname(host)) == canonicalHost(ph)
 }
 
 func (s *Service) tlsListener() bool { return s.cfg.TLSConfig != nil }
+
+// knownKey reports whether r presents the key of a live session, without
+// asking the database. An expired session it finds is ended.
+func (s *Service) knownKey(r *http.Request) bool {
+	key, _ := presentedKey(r)
+	if key == "" {
+		return false
+	}
+	sess, expired := s.sessions.lookup(key)
+	if expired != nil {
+		s.endSession(expired)
+	}
+	return sess != nil
+}
 
 // sessionFor returns the request's valid session: the presented key names
 // a live session whose account still exists, is approved and has the same
@@ -156,52 +224,76 @@ func (s *Service) sessionFor(r *http.Request) (sess *session, unavailable bool) 
 
 // unauthenticated answers a request without a valid session. The header
 // tells the boot script to drop its key.
-func (s *Service) unauthenticated(w http.ResponseWriter) {
+func (s *Service) unauthenticated(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(SessionHeader, "ended")
-	hubError(w, http.StatusUnauthorized, "auth_required")
+	reject(w, r, http.StatusUnauthorized, "auth_required")
 }
 
-// expectedOrigin is the origin browsers use for the Inspector.
-func (s *Service) expectedOrigin(r *http.Request) string {
-	if s.cfg.PublicURL != "" {
-		return s.cfg.PublicURL
+// expectedOrigin is the origin browsers use for the Inspector, in
+// canonical form.
+func (s *Service) expectedOrigin(r *http.Request) (string, bool) {
+	if s.publicOrigin != "" {
+		return s.publicOrigin, true
 	}
 	scheme := "http"
 	if s.tlsListener() {
 		scheme = "https"
 	}
-	return scheme + "://" + strings.ToLower(r.Host)
+	o, err := canonicalOrigin(scheme + "://" + r.Host)
+	return o, err == nil
 }
 
 // originOK checks the Origin of a WebSocket upgrade, a ticket exchange or
-// another request that is not GET or HEAD.
+// another request that is not GET or HEAD: exactly one Origin header,
+// equal to the Inspector's origin once both are in canonical form.
 func (s *Service) originOK(r *http.Request) bool {
-	o := r.Header.Get("Origin")
-	return o != "" && strings.EqualFold(o, s.expectedOrigin(r))
+	vs := r.Header.Values("Origin")
+	if len(vs) != 1 {
+		return false
+	}
+	got, err := canonicalOrigin(vs[0])
+	if err != nil {
+		return false
+	}
+	want, ok := s.expectedOrigin(r)
+	return ok && got == want
 }
 
-// handleLogout forwards a sign-out to the hub, then ends the daemon
-// session.
+// handleLogout ends the daemon session at once, then forwards the
+// sign-out to the hub. Only POST is accepted (405 otherwise).
 func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		hubError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		reject(w, r, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if !s.knownKey(r) {
+		s.unauthenticated(w, r)
+		return
+	}
+	if !s.originOK(r) {
+		reject(w, r, http.StatusForbidden, "origin_not_allowed")
 		return
 	}
 	sess, unavailable := s.sessionFor(r)
 	if unavailable {
-		hubError(w, http.StatusServiceUnavailable, "unavailable")
+		reject(w, r, http.StatusServiceUnavailable, "unavailable")
 		return
 	}
 	if sess == nil {
-		s.unauthenticated(w)
-		return
-	}
-	if !s.originOK(r) {
-		hubError(w, http.StatusForbidden, "origin_not_allowed")
+		s.unauthenticated(w, r)
 		return
 	}
 	s.logger.Info("inspector session ended by sign-out", "account_id", sess.accountID)
-	s.endSessionSync(r.Context(), sess)
+	s.sessions.remove(sess)
+	if sid := sess.end(); sid != "" {
+		if v := s.hubNow(); v.port != 0 {
+			lctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			if err := s.hub.logout(lctx, v.port, sid); err != nil {
+				_ = s.hubUnreachable(lctx, v.port, err)
+			}
+			cancel()
+		}
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
@@ -212,72 +304,81 @@ func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 // credentials: no session is looked up and none reaches the hub.
 func (s *Service) handleStatic(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		hubError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		reject(w, r, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
-	if isWebSocket(r) {
-		hubError(w, http.StatusNotFound, "not_found")
+	v, serving := s.view()
+	if !serving {
+		reject(w, r, http.StatusServiceUnavailable, "hub_unavailable")
 		return
 	}
-	if _, port, serving := s.agentTarget(); !serving || port == 0 {
-		hubError(w, http.StatusServiceUnavailable, "hub_unavailable")
-		return
-	}
-	r.Body, r.ContentLength = http.NoBody, 0
-	rc := http.NewResponseController(w)
-	_ = rc.SetReadDeadline(time.Now().Add(requestTimeout))
-	_ = rc.SetWriteDeadline(time.Now().Add(requestTimeout))
-	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.reqTimeout)
 	defer cancel()
-	s.proxy.ServeHTTP(w, r.WithContext(context.WithValue(ctx, proxyKey{}, proxyInfo{})))
+	ctx = context.WithValue(ctx, proxyKey{}, proxyInfo{view: v})
+	s.proxy.ServeHTTP(newProxyWriter(w, ctx), r.WithContext(ctx))
 }
 
-// handleProxy relays a request of a valid session to the hub.
+// handleProxy relays a request of a valid session to the hub. The cheap
+// checks come first; the body is read next; then the session is checked
+// against its account and the request is registered with it in one step,
+// so a session that ended meanwhile never starts a request.
 func (s *Service) handleProxy(w http.ResponseWriter, r *http.Request) {
+	if !s.knownKey(r) {
+		s.unauthenticated(w, r)
+		return
+	}
+	upgrade := isWebSocket(r)
+	if (upgrade || (r.Method != http.MethodGet && r.Method != http.MethodHead)) && !s.originOK(r) {
+		reject(w, r, http.StatusForbidden, "origin_not_allowed")
+		return
+	}
+	if s.hooks.afterKeyCheck != nil {
+		s.hooks.afterKeyCheck()
+	}
+	var body []byte
+	if hasBody(r) {
+		var err error
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, maxProxyBody))
+		if err != nil {
+			reject(w, r, http.StatusRequestEntityTooLarge, "body_too_large")
+			return
+		}
+	}
 	sess, unavailable := s.sessionFor(r)
 	if unavailable {
 		hubError(w, http.StatusServiceUnavailable, "unavailable")
 		return
 	}
 	if sess == nil {
-		s.unauthenticated(w)
+		s.unauthenticated(w, r)
 		return
 	}
-	upgrade := isWebSocket(r)
-	if (upgrade || (r.Method != http.MethodGet && r.Method != http.MethodHead)) && !s.originOK(r) {
-		hubError(w, http.StatusForbidden, "origin_not_allowed")
-		return
-	}
-	if _, port, serving := s.agentTarget(); !serving || port == 0 {
+	v, serving := s.view()
+	if !serving {
 		hubError(w, http.StatusServiceUnavailable, "hub_unavailable")
 		return
 	}
-	if r.Body != nil && r.Body != http.NoBody && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxProxyBody))
-		if err != nil {
-			hubError(w, http.StatusRequestEntityTooLarge, "body_too_large")
-			return
-		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		r.ContentLength = int64(len(body))
-		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
-	}
-	ctx, release, ok := sess.track(r.Context())
+	ctx, release, ok := sess.track(r.Context(), s.cfg.Now())
 	if !ok {
-		s.unauthenticated(w)
+		s.unauthenticated(w, r)
 		return
 	}
 	defer release()
-	rc := http.NewResponseController(w)
 	if !upgrade {
-		_ = rc.SetReadDeadline(time.Now().Add(requestTimeout))
-		_ = rc.SetWriteDeadline(time.Now().Add(requestTimeout))
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, requestTimeout)
+		ctx, cancel = context.WithTimeout(ctx, s.reqTimeout)
 		defer cancel()
 	}
 	_, offered := presentedKey(r)
-	s.proxy.ServeHTTP(w, r.WithContext(context.WithValue(ctx, proxyKey{}, proxyInfo{sess: sess, offered: upgrade && offered})))
+	ctx = context.WithValue(ctx, proxyKey{}, proxyInfo{sess: sess, offered: upgrade && offered, view: v})
+	out := r.WithContext(ctx)
+	if body != nil {
+		out.Body = io.NopCloser(bytes.NewReader(body))
+		out.ContentLength = int64(len(body))
+		out.TransferEncoding = nil
+		out.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+	}
+	s.proxy.ServeHTTP(newProxyWriter(w, ctx), out)
 }
 
 // newBrowserProxy relays browser requests to the hub with only the
@@ -288,8 +389,8 @@ func (s *Service) handleProxy(w http.ResponseWriter, r *http.Request) {
 func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			_, port, _ := s.agentTarget()
-			pr.SetURL(&url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(port)})
+			info := proxyInfoFrom(pr.In.Context())
+			pr.SetURL(&url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(info.view.port)})
 			pr.Out.Host = hubHost
 			for _, h := range strippedHeaders {
 				pr.Out.Header.Del(h)
@@ -299,8 +400,8 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 			pr.Out.Header.Del("Sec-WebSocket-Protocol")
 			// Documents are read to insert the boot script.
 			pr.Out.Header.Set("Accept-Encoding", "identity")
-			if sess := proxyInfoFrom(pr.In.Context()).sess; sess != nil {
-				if sid := sess.hubSession(); sid != "" {
+			if info.sess != nil {
+				if sid := info.sess.hubSession(); sid != "" {
 					pr.Out.Header.Set("Cookie", hubCookie+"="+sid)
 				}
 			}
@@ -324,19 +425,27 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 			return injectBoot(resp)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if r.Context().Err() != nil {
-				return // the browser left, or the session ended
-			}
-			if errors.Is(err, errDocument) {
+			info := proxyInfoFrom(r.Context())
+			switch {
+			case r.Context().Err() != nil:
+				// The browser left, the request ran out of time or its
+				// session ended. Answer anyway: never an empty 200.
+				if info.sess != nil && info.sess.isEnded() {
+					w.Header().Set(SessionHeader, "ended")
+					hubError(w, http.StatusUnauthorized, "auth_required")
+					return
+				}
+				hubError(w, http.StatusServiceUnavailable, "hub_unavailable")
+			case errors.Is(err, errDocument):
 				s.logger.Warn("an Inspector page from the hub could not carry the boot script and was not served")
 				s.page(w, http.StatusBadGateway, "Inspector unavailable",
 					"The Inspector page could not be prepared. Try again in a moment from Golem Deploy.")
-				return
+			case errors.Is(err, errHubSessionLost):
+				hubError(w, http.StatusServiceUnavailable, "hub_unavailable")
+			default:
+				s.logger.Debug("inspector proxy request failed", "err", err)
+				hubError(w, http.StatusBadGateway, "hub_unavailable")
 			}
-			s.logger.Debug("inspector proxy request failed", "err", err)
-			// Docker may have restarted the hub on another port.
-			s.refreshHub(context.WithoutCancel(r.Context()))
-			hubError(w, http.StatusBadGateway, "hub_unavailable")
 		},
 		ErrorLog: s.proxyLog,
 	}
@@ -344,39 +453,42 @@ func (s *Service) newBrowserProxy() *httputil.ReverseProxy {
 
 // retryTransport logs in again, once, when the hub no longer knows the
 // session's hub session (the hub restarted), and repeats the request with
-// the new session.
+// the new session. When that fails the request fails (503): the hub's
+// "not signed in" answer never reaches the browser.
 type retryTransport struct {
 	s    *Service
 	base http.RoundTripper
 }
 
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	info := proxyInfoFrom(req.Context())
 	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, t.s.hubUnreachable(req.Context(), info.view.port, err)
+	}
+	if info.sess == nil {
+		return resp, nil
+	}
+	lost, err := hubSessionLost(req, resp)
 	if err != nil {
 		return nil, err
 	}
-	sess := proxyInfoFrom(req.Context()).sess
-	if sess == nil {
-		return resp, nil
-	}
-	var lost bool
-	lost, resp = hubSessionLost(req, resp)
 	if !lost {
 		return resp, nil
 	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	_ = resp.Body.Close()
 	if req.Body != nil && req.Body != http.NoBody && req.GetBody == nil {
-		return resp, nil
+		return nil, errHubSessionLost
 	}
 	old := ""
 	if ck, err := req.Cookie(hubCookie); err == nil {
 		old = ck.Value
 	}
-	sid, ok := t.s.relogin(req.Context(), sess, old)
+	sid, ok := t.s.relogin(req.Context(), info.sess, old, info.view)
 	if !ok {
-		return resp, nil
+		return nil, errHubSessionLost
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	_ = resp.Body.Close()
 	again := req.Clone(req.Context())
 	if req.GetBody != nil {
 		body, err := req.GetBody()
@@ -386,37 +498,53 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		again.Body = body
 	}
 	again.Header.Set("Cookie", hubCookie+"="+sid)
-	return t.base.RoundTrip(again)
+	resp, err = t.base.RoundTrip(again)
+	if err != nil {
+		return nil, t.s.hubUnreachable(req.Context(), info.view.port, err)
+	}
+	if lost, err := hubSessionLost(again, resp); err != nil || lost {
+		if lost {
+			_ = resp.Body.Close()
+			return nil, errHubSessionLost
+		}
+		return nil, err
+	}
+	return resp, nil
 }
 
 // hubSessionLost reports whether the hub answered as if the request had no
-// session: 401, or {"authenticated":false} from /auth/session.
-func hubSessionLost(req *http.Request, resp *http.Response) (bool, *http.Response) {
+// session: 401, or {"authenticated":false} from /auth/session. An
+// /auth/session answer too large to check is errHubAnswer (a 502).
+func hubSessionLost(req *http.Request, resp *http.Response) (bool, error) {
 	if resp.StatusCode == http.StatusUnauthorized {
-		return true, resp
+		return true, nil
 	}
 	if req.URL.Path != "/auth/session" || resp.StatusCode != http.StatusOK {
-		return false, resp
+		return false, nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxSessionAnswer+1))
 	_ = resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(raw))
 	if err != nil {
-		return false, resp
+		return false, err
 	}
+	if len(raw) > maxSessionAnswer {
+		return false, errHubAnswer
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(raw))
 	var v struct {
 		Authenticated *bool `json:"authenticated"`
 	}
 	if json.Unmarshal(raw, &v) == nil && v.Authenticated != nil && !*v.Authenticated {
-		return true, resp
+		return true, nil
 	}
-	return false, resp
+	return false, nil
 }
 
 // relogin replaces the session's hub session (at most once per
-// reloginInterval; never while hub logins are paused). It returns the
-// current hub session when another request already replaced old.
-func (s *Service) relogin(ctx context.Context, sess *session, old string) (string, bool) {
+// reloginInterval; never while hub logins are paused) at the hub of the
+// request's snapshot v. It returns the current hub session when another
+// request already replaced old.
+func (s *Service) relogin(ctx context.Context, sess *session, old string, v hubView) (string, bool) {
 	sess.loginMu.Lock()
 	defer sess.loginMu.Unlock()
 	sess.mu.Lock()
@@ -438,7 +566,7 @@ func (s *Service) relogin(ctx context.Context, sess *session, old string) (strin
 	sess.mu.Unlock()
 	lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	sid, err := s.hubLogin(lctx)
+	sid, err := s.hubLogin(lctx, v)
 	if err != nil {
 		s.logger.Info("could not renew an Inspector session at the hub", "account_id", sess.accountID, "err", err)
 		return "", false
@@ -454,26 +582,43 @@ func (s *Service) relogin(ctx context.Context, sess *session, old string) (strin
 	return sid, true
 }
 
-// hubLogin logs in at the running hub with the daemon's password.
-func (s *Service) hubLogin(ctx context.Context) (string, error) {
-	now := s.cfg.Now()
-	if s.guard.blocked(now) {
-		return "", errHubBlocked
-	}
-	s.mu.Lock()
-	port := s.hubPort
-	pw := ""
-	if s.sec != nil {
-		pw = s.sec.Password
-	}
-	s.mu.Unlock()
-	if port == 0 || pw == "" {
+// guardKey names a hub generation for the login guard: the hub container
+// and the secrets' generation.
+func guardKey(v hubView) string {
+	return v.container + "/" + strconv.FormatInt(v.sec.Generation, 10)
+}
+
+// hubLogin logs in at the hub of snapshot v with the daemon's password.
+// Logins run one at a time; none is tried while the guard holds logins at
+// that hub generation, and the password is sent only after Docker
+// confirmed that the container runs and publishes exactly v.port.
+func (s *Service) hubLogin(ctx context.Context, v hubView) (string, error) {
+	if v.sec == nil || v.port == 0 || v.container == "" {
 		return "", errHubLogin
 	}
-	sid, err := s.hub.login(ctx, port, pw)
-	s.guard.record(now, err)
-	if err != nil && (errors.Is(err, errHubCredentials) || errors.Is(err, errHubRateLimited)) {
-		s.logger.Warn("the Inspector hub refused the daemon's login; logins pause until the hub is applied again or its limit ends", "err", err)
+	select {
+	case s.loginSem <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	defer func() { <-s.loginSem }()
+	key := guardKey(v)
+	if held, cause := s.guard.blocked(key, s.cfg.Now()); held {
+		return "", fmt.Errorf("%w: %w", errHubBlocked, cause)
+	}
+	if err := s.verifyHub(ctx, v.container, v.port); err != nil {
+		return "", fmt.Errorf("%w: %w", errHubLogin, err)
+	}
+	if s.hooks.beforeHubLogin != nil {
+		s.hooks.beforeHubLogin()
+	}
+	sid, err := s.hub.login(ctx, v.port, v.sec.Password)
+	if err != nil && isTransport(err) {
+		_ = s.hubUnreachable(ctx, v.port, err)
+	}
+	s.guard.record(key, s.cfg.Now(), err)
+	if errors.Is(err, errHubCredentials) || errors.Is(err, errHubRateLimited) {
+		s.logger.Warn("the Inspector hub refused the daemon's login; logins pause until the hub or its secrets change, or its limit ends", "err", err)
 	}
 	return sid, err
 }
@@ -483,16 +628,16 @@ func (s *Service) logoutHub(sid string) {
 	if sid == "" {
 		return
 	}
-	s.mu.Lock()
-	port := s.hubPort
-	s.mu.Unlock()
+	port := s.hubNow().port
 	if port == 0 {
 		return
 	}
-	s.bg.Go(func() {
+	s.goBG(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = s.hub.logout(ctx, port, sid)
+		if err := s.hub.logout(ctx, port, sid); err != nil {
+			_ = s.hubUnreachable(ctx, port, err)
+		}
 	})
 }
 
@@ -501,18 +646,4 @@ func (s *Service) logoutHub(sid string) {
 func (s *Service) endSession(sess *session) {
 	s.sessions.remove(sess)
 	s.logoutHub(sess.end())
-}
-
-// endSessionSync is endSession with the hub logout done first, inline.
-func (s *Service) endSessionSync(ctx context.Context, sess *session) {
-	s.sessions.remove(sess)
-	s.mu.Lock()
-	port := s.hubPort
-	s.mu.Unlock()
-	if sid := sess.hubSession(); sid != "" && port != 0 {
-		lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_ = s.hub.logout(lctx, port, sid)
-		cancel()
-	}
-	sess.end()
 }

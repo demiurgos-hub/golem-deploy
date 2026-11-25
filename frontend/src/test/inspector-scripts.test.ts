@@ -33,11 +33,16 @@ class FakeWebSocket {
   }
 }
 
-function boot(key: string | null, respond: (input: unknown, init?: RequestInit) => Response = () => new Response("{}")) {
+function boot(
+  key: string | null,
+  respond: (input: unknown, init?: RequestInit) => Response = () => new Response("{}"),
+  baseURI?: string,
+) {
   if (key !== null) window.sessionStorage.setItem(STORE, key);
   const fetch: FetchMock = vi.fn(async (input: unknown, init?: RequestInit) => respond(input, init));
   const w = {
     location: fakeLocation(PAGE),
+    document: baseURI === undefined ? undefined : { baseURI },
     sessionStorage: window.sessionStorage,
     fetch,
     WebSocket: FakeWebSocket,
@@ -80,7 +85,8 @@ describe("boot.js", () => {
     let h = sentHeaders(fetch, 0);
     expect(h.get("authorization")).toBe(`Bearer ${KEY}`);
     expect(h.get("content-type")).toBe("application/json");
-    expect(fetch.mock.calls[0][0]).toBe("/api/targets");
+    // The URL that was checked, absolute, is what the native fetch gets.
+    expect(fetch.mock.calls[0][0]).toBe("https://insp.example:8444/api/targets");
     expect(fetch.mock.calls[0][1]).toMatchObject({ credentials: "include", method: "POST", body: "{}" });
 
     await f(new URL("https://insp.example:8444/auth/session"));
@@ -88,7 +94,11 @@ describe("boot.js", () => {
 
     const req = new Request("https://insp.example:8444/api/targets", { headers: { "x-a": "1" } });
     await f(req);
-    expect(fetch.mock.calls[2][0]).toBe(req);
+    // A native copy of the Request, whose URL was the one checked.
+    const sent = fetch.mock.calls[2][0] as Request;
+    expect(sent).toBeInstanceOf(Request);
+    expect(sent).not.toBe(req);
+    expect(sent.url).toBe(req.url);
     h = sentHeaders(fetch, 2);
     expect(h.get("x-a")).toBe("1");
     expect(h.get("authorization")).toBe(`Bearer ${KEY}`);
@@ -117,7 +127,42 @@ describe("boot.js", () => {
     fetch.mockClear();
     const req = new Request("https://other.example/api");
     await f(req);
-    expect(fetch.mock.calls[0]).toEqual([req]);
+    expect(fetch.mock.calls[0]).toHaveLength(1);
+    const sent = fetch.mock.calls[0][0] as Request;
+    expect(sent.url).toBe(req.url);
+    expect(sent.headers.get("authorization")).toBeNull();
+  });
+
+  it("checks the URL once, against the document's base URL, and sends exactly that", async () => {
+    // A <base> element that points elsewhere: relative URLs leave the
+    // Inspector's origin, so they get no key.
+    const based = boot(KEY, undefined, "https://other.example/app/");
+    await (based.w.fetch as unknown as typeof globalThis.fetch)("/api/targets", { headers: { "x-a": "1" } });
+    expect(based.fetch.mock.calls[0]).toEqual(["/api/targets", { headers: { "x-a": "1" } }]);
+    expect(new based.ws("/ws/client").args).toEqual(["/ws/client"]);
+
+    // A value whose string form changes: the first form is checked and
+    // sent, the second is never seen by the native calls.
+    const { w, fetch, ws: WS } = boot(KEY);
+    let n = 0;
+    const shifty = { toString: () => (n++ === 0 ? "/api/targets" : "https://evil.example/steal") };
+    await (w.fetch as unknown as typeof globalThis.fetch)(shifty as unknown as string);
+    expect(fetch.mock.calls[0][0]).toBe("https://insp.example:8444/api/targets");
+    expect(sentHeaders(fetch, 0).get("authorization")).toBe(`Bearer ${KEY}`);
+    n = 0;
+    expect(new WS(shifty).args[0]).toBe("wss://insp.example:8444/api/targets");
+
+    // A Request whose url getter lies: the native copy's URL counts.
+    class Lying extends Request {
+      get url() {
+        return "https://insp.example:8444/api/targets";
+      }
+    }
+    fetch.mockClear();
+    await (w.fetch as unknown as typeof globalThis.fetch)(new Lying("https://evil.example/steal"));
+    const sent = fetch.mock.calls[0][0] as Request;
+    expect(sent.url).toBe("https://evil.example/steal");
+    expect(sent.headers.get("authorization")).toBeNull();
   });
 
   it("drops the key and leaves when the daemon says the session ended", async () => {
@@ -158,7 +203,8 @@ describe("boot.js", () => {
     const { w, ws: WS } = boot(KEY);
     const keyProtocol = `golem-deploy.key.${KEY}`;
     expect(new WS("wss://insp.example:8444/ws/client").args).toEqual(["wss://insp.example:8444/ws/client", [MARKER, keyProtocol]]);
-    expect(new WS("/ws/client").args).toEqual(["/ws/client", [MARKER, keyProtocol]]);
+    expect(new WS("/ws/client").args).toEqual(["wss://insp.example:8444/ws/client", [MARKER, keyProtocol]]);
+    expect(new WS("https://insp.example:8444/ws/client").args[0]).toBe("wss://insp.example:8444/ws/client");
     expect(new WS("wss://insp.example:8444/ws/client", "x").args[1]).toEqual(["x", MARKER, keyProtocol]);
     expect(new WS("wss://insp.example:8444/ws/client", ["x", "y"]).args[1]).toEqual(["x", "y", MARKER, keyProtocol]);
     // Other origins get exactly what the page asked for.

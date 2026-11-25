@@ -43,9 +43,17 @@
     return;
   }
 
+  var NativeURL = w.URL;
+  var NativeRequest = typeof w.Request === 'function' ? w.Request : null;
+
+  // resolve returns u as an absolute URL, resolved the way the browser
+  // resolves fetch and WebSocket URLs (against the document's base URL, so
+  // a <base> element counts). u is turned into a string once.
   function resolve(u) {
+    var doc = w.document;
+    var base = doc && typeof doc.baseURI === 'string' && doc.baseURI !== '' ? doc.baseURI : loc.href;
     try {
-      return new w.URL(String(u), loc.href);
+      return new NativeURL(String(u), base);
     } catch (e) {
       return null;
     }
@@ -66,13 +74,30 @@
     return scheme + '//' + u.host === loc.protocol + '//' + loc.host;
   }
 
+  // The URL or the Request that is checked is exactly what reaches the
+  // native fetch and WebSocket: never the page's original value again.
   var origFetch = w.fetch;
   if (typeof origFetch === 'function') {
     w.fetch = function (input, init) {
-      var req = typeof w.Request === 'function' && input instanceof w.Request ? input : null;
-      var target = resolve(req ? req.url : input);
+      var req = null;
+      var target;
+      if (NativeRequest !== null && input instanceof NativeRequest) {
+        // A copy made by the native constructor: its URL is the one the
+        // browser uses, whatever the page's object reports.
+        try {
+          req = new NativeRequest(input);
+        } catch (e) {
+          return origFetch.apply(w, arguments);
+        }
+        target = resolve(req.url);
+      } else {
+        target = resolve(input);
+      }
       if (!sameOrigin(target)) {
-        return origFetch.apply(w, arguments);
+        if (req === null) {
+          return origFetch.apply(w, arguments);
+        }
+        return init === undefined ? origFetch.call(w, req) : origFetch.call(w, req, init);
       }
       var opts = {};
       var k;
@@ -89,7 +114,7 @@
       opts.headers = headers;
       var method = String(opts.method || (req ? req.method : 'GET')).toUpperCase();
       var logout = target.pathname === '/auth/logout' && method === 'POST';
-      return origFetch.call(w, input, opts).then(function (resp) {
+      return origFetch.call(w, req !== null ? req : target.href, opts).then(function (resp) {
         if ((resp.status === 401 && resp.headers.get('X-Golem-Deploy-Session') === 'ended') || (logout && resp.ok)) {
           end();
         }
@@ -101,7 +126,8 @@
   var OrigWebSocket = w.WebSocket;
   if (typeof OrigWebSocket === 'function') {
     var Wrapped = function WebSocket(url, protocols) {
-      if (!sameOrigin(resolve(url))) {
+      var target = resolve(url);
+      if (!sameOrigin(target)) {
         return arguments.length > 1 ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
       }
       var list = [];
@@ -111,7 +137,13 @@
         list = Array.prototype.slice.call(protocols);
       }
       list.push(MARKER, KEY_PROTOCOL + key);
-      return new OrigWebSocket(url, list);
+      var href = target.href;
+      if (target.protocol === 'http:') {
+        href = 'ws:' + href.slice(5);
+      } else if (target.protocol === 'https:') {
+        href = 'wss:' + href.slice(6);
+      }
+      return new OrigWebSocket(href, list);
     };
     Wrapped.prototype = OrigWebSocket.prototype;
     var names = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
