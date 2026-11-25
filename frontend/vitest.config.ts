@@ -7,6 +7,13 @@ export default defineConfig({
       "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
+  server: {
+    fs: {
+      // src/test/inspector-scripts.test.ts loads the daemon's Inspector
+      // scripts (embedded in the Go binary) from there.
+      allow: [".", "../internal/inspector"],
+    },
+  },
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],

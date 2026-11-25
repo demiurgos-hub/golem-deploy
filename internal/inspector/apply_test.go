@@ -184,11 +184,7 @@ func TestApplyLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := plainClient().Get("http://" + addr + ses.Path)
-	if err != nil || resp.StatusCode != 303 {
-		t.Fatalf("enter: %v %v", resp, err)
-	}
-	resp.Body.Close()
+	entryOf(t, postTicket(t, plainClient(), "http://"+addr, ticketOf(t, ses.Path), "http://"+addr, nil))
 	if a.s.sessions.count() != 1 {
 		t.Fatal("no session")
 	}

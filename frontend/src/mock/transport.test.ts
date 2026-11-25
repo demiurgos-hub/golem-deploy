@@ -361,7 +361,7 @@ describe("mock transport: the Inspector", () => {
     expect(await call(token, "POST", "/inspector/sessions", {})).toMatchObject({ status: 403, body: { error: { code: "session_required" } } });
 
     const session = await call(t, "POST", "/inspector/sessions", { server_id: 11 });
-    expect(session).toMatchObject({ status: 200, body: { port: 7700, public_url: "", path: expect.stringMatching(/^\/_golem-deploy\/enter\?/) } });
+    expect(session).toMatchObject({ status: 200, body: { port: 7700, public_url: "", path: expect.stringMatching(/^\/_golem-deploy\/enter#t=[A-Za-z0-9_-]{43}$/) } });
     expect(Date.parse(session.body.expires_at) - Date.now()).toBeLessThanOrEqual(60_000);
     // Every link is a new one.
     expect((await call(t, "POST", "/inspector/sessions", { server_id: 11 })).body.path).not.toBe(session.body.path);

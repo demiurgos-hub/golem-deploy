@@ -490,11 +490,9 @@ func (s *Service) CreateSession(ctx context.Context, acct store.Account, serverI
 	if err != nil {
 		return apitypes.InspectorSession{}, err
 	}
-	p := EnterPath + "?ticket=" + tok
-	if target != "" {
-		p += "&targetId=" + url.QueryEscape(target)
-	}
-	return apitypes.InspectorSession{Path: p, Port: s.port(), PublicURL: s.cfg.PublicURL, ExpiresAt: exp.UTC()}, nil
+	// The ticket travels in the fragment: never in a request line, a
+	// Referer or a log. The target stays bound to the ticket.
+	return apitypes.InspectorSession{Path: EnterPath + "#t=" + tok, Port: s.port(), PublicURL: s.cfg.PublicURL, ExpiresAt: exp.UTC()}, nil
 }
 
 // applyRequest is what one inspector.apply job does.

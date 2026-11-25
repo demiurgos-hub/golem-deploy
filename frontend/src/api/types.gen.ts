@@ -1203,16 +1203,21 @@ export interface CreateInspectorSessionRequest {
  * one-time entry link into the Inspector for the calling account. The route
  * needs a login session (API tokens get 403 session_required) and answers
  * 409 conflict while the Inspector is not running.
- * Opening Path on the Inspector's address signs the browser in there and
- * redirects to the Inspector itself. The Inspector's address is PublicURL
- * when it is set, otherwise the panel's scheme and host name with Port. The
- * link works once and until ExpiresAt (60 seconds). The Inspector session it
- * starts ends after 8 hours, at sign-out there, when the account is deleted,
- * loses its approval or changes its password, and when the daemon restarts.
+ * Opening Path on the Inspector's address signs the browser tab in there
+ * and opens the Inspector itself (on the requested server, if any). The
+ * Inspector's address is PublicURL when it is set, otherwise the panel's
+ * scheme and host name with Port. The link works once and until ExpiresAt
+ * (60 seconds). The Inspector session it starts belongs to the browser tab
+ * that opened the link (a new tab needs a new link; the Inspector listener
+ * uses no cookies) and ends after 8 hours, at sign-out there, when the
+ * account is deleted, loses its approval or changes its password, and when
+ * the daemon restarts.
  */
 export interface InspectorSession {
   /**
-   * Path is an absolute path with a query ("/_golem-deploy/enter?...").
+   * Path is an absolute path with a fragment that holds the one-time
+   * ticket ("/_golem-deploy/enter#t=..."); keep the fragment when opening
+   * it. Browsers never send a fragment in a request.
    */
   path: string;
   port: number /* int */;

@@ -63,33 +63,25 @@ func TestListenerTLSAndPlaintext(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(body, "auth_required") || resp.Header.Get("Strict-Transport-Security") == "" {
 		t.Fatalf("TLS: %d %s %v", resp.StatusCode, body, resp.Header)
 	}
-	// Entering over TLS sets a Secure cookie.
+	// Entering over TLS: the exchange needs the https origin, and the
+	// key, not a cookie, authenticates.
 	ses, _ := e.s.CreateSession(context.Background(), e.acct, nil)
-	resp, err = tlsClient.Get("https://" + e.addr() + ses.Path)
-	if err != nil {
-		t.Fatal(err)
+	if r := postTicket(t, tlsClient, "https://"+e.addr(), ticketOf(t, ses.Path), "http://"+e.addr(), nil); r.StatusCode != http.StatusForbidden {
+		t.Fatalf("http origin over TLS: %d", r.StatusCode)
 	}
-	resp.Body.Close()
-	var cookie *http.Cookie
-	for _, c := range resp.Cookies() {
-		if c.Name == SessionCookie {
-			cookie = c
-		}
-	}
-	if resp.StatusCode != http.StatusSeeOther || cookie == nil || !cookie.Secure {
-		t.Fatalf("%d %+v", resp.StatusCode, cookie)
-	}
+	key := entryOf(t, postTicket(t, tlsClient, "https://"+e.addr(), ticketOf(t, ses.Path), "https://"+e.addr(), nil)).Key
+	e.keys = append(e.keys, key)
 	// The expected Origin is https here.
 	req, _ := http.NewRequest("POST", "https://"+e.addr()+"/api/x", strings.NewReader("{}"))
-	req.AddCookie(cookie)
+	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Origin", "https://"+e.addr())
-	if resp, err := tlsClient.Do(req); err != nil || resp.StatusCode != 200 {
+	if resp, err := tlsClient.Do(req); err != nil || resp.StatusCode != 200 || len(resp.Header.Values("Set-Cookie")) != 0 {
 		t.Fatalf("https origin: %v %v", resp, err)
 	}
 	// Plaintext: only the agent endpoint.
 	for path, want := range map[string]int{"/": http.StatusNotFound, "/api/targets": http.StatusNotFound, EnterPath: http.StatusNotFound,
-		"/ws/agent": http.StatusBadRequest} {
-		r := e.do("GET", path, cookie.Value, nil, nil)
+		bootJSPath: http.StatusNotFound, "/ws/agent": http.StatusBadRequest} {
+		r := e.do("GET", path, key, nil, nil)
 		if r.StatusCode != want {
 			t.Errorf("plaintext %s: %d, want %d", path, r.StatusCode, want)
 		}

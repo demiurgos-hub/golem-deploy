@@ -19,7 +19,10 @@ export function inspectorAddress(publicUrl: string, port: number, loc: PageLocat
   }
 }
 
-/** The one-time entry link: the Inspector's address followed by the session's absolute path. */
+/**
+ * The one-time entry link: the Inspector's address followed by the session's
+ * absolute path, whose fragment (`#t=<ticket>`) is kept as it is.
+ */
 export function inspectorEntryUrl(session: InspectorSession, loc: PageLocation = window.location): string | null {
   const base = inspectorAddress(session.public_url, session.port, loc);
   // Only an absolute path on that address: never another host ("//x") or scheme.
