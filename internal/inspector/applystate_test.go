@@ -76,9 +76,10 @@ func TestApplyNeedsIsolatedNetwork(t *testing.T) {
 	}
 }
 
-// After any failed apply the state is "stopped" with a detail: a failed
-// download before a rotation rotates nothing, and a kept hub that refuses
-// the login is not reported running.
+// A failed download happens before anything is rotated or replaced: it
+// rotates nothing and leaves a hub that serves as it is. After a failure
+// that touched the hub the state is "stopped" with a detail: a kept hub
+// that refuses the login is not reported running.
 func TestApplyFailureStates(t *testing.T) {
 	a := newApplyEnv(t, true)
 	a.enable(t)
@@ -88,8 +89,8 @@ func TestApplyFailureStates(t *testing.T) {
 	if j.Status != store.JobError || a.s.sec.Generation != gen {
 		t.Fatalf("rotated before the download: %+v gen %d\n%s", j, a.s.sec.Generation, log)
 	}
-	if st := a.status(t); st.State != apitypes.InspectorStateStopped || !strings.Contains(st.Detail, "could not be downloaded") {
-		t.Fatalf("%+v", st)
+	if st := a.status(t); st.State != apitypes.InspectorStateRunning || st.Detail != "" || !strings.Contains(j.Detail, "could not be downloaded") {
+		t.Fatalf("a failed download took a working Inspector offline: %+v %+v\n%s", st, j, log)
 	}
 	a.f.SetPullHook(nil)
 	a.enable(t)

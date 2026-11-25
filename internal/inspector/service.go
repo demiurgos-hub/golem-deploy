@@ -847,6 +847,16 @@ func (s *Service) apply(ctx context.Context, w io.Writer, want applyRequest) err
 		return s.disable(ctx, w)
 	}
 	err = s.enable(ctx, w, want)
+	var early unchangedError
+	if errors.As(err, &early) {
+		err = early.err
+		if _, serving := s.view(); serving {
+			// Nothing was replaced yet (the image could not be downloaded):
+			// a hub that serves keeps serving.
+			fmt.Fprintln(w, "the running Inspector was left as it is")
+			return err
+		}
+	}
 	if err != nil {
 		msg := "the Inspector could not be started"
 		var se *jobs.SafeError
@@ -859,6 +869,13 @@ func (s *Service) apply(ctx context.Context, w io.Writer, want applyRequest) err
 	}
 	return err
 }
+
+// unchangedError marks a failure of enable that happened before anything
+// of the current hub was rotated, replaced or removed.
+type unchangedError struct{ err error }
+
+func (e unchangedError) Error() string { return e.err.Error() }
+func (e unchangedError) Unwrap() error { return e.err }
 
 // stopServing records a failed start: the hub is forgotten (requests get
 // 503, the repair cycle tries again) and the state is "stopped" with msg.
@@ -935,7 +952,7 @@ func (s *Service) enable(ctx context.Context, w io.Writer, want applyRequest) er
 	}
 	img, err := s.ensureImage(ctx, w, want)
 	if err != nil {
-		return err
+		return unchangedError{err}
 	}
 	isolated, err := s.cfg.Docker.EnsureNetwork(ctx)
 	switch {
