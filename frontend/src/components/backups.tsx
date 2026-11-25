@@ -262,6 +262,10 @@ export function BackupsTable({
       cell: (b) => (b.note ? <span className="break-words">{b.note}</span> : <span className="text-muted-foreground">-</span>),
     },
   ];
+  // The installation-wide table has two more columns: its actions show
+  // only their icons until the window is wide enough for the words, so they
+  // are not pushed past the right edge.
+  const actionText = showServer ? "hidden 2xl:inline" : undefined;
   return (
     <>
       <DataTable
@@ -276,22 +280,23 @@ export function BackupsTable({
               size="sm"
               variant="outline"
               aria-label={`Download backup ${b.id}`}
+              title="Download"
               loading={download.isPending && download.variables?.id === b.id}
               onClick={() => (b.size_bytes > LARGE_DOWNLOAD_BYTES ? setLarge(b) : download.mutate(b))}
             >
               {!(download.isPending && download.variables?.id === b.id) && <Download />}
-              Download
+              <span className={actionText}>Download</span>
             </Button>
             {onRestore && (
-              <Button size="sm" variant="outline" aria-label={`Restore backup ${b.id}`} onClick={() => onRestore(b)}>
+              <Button size="sm" variant="outline" aria-label={`Restore backup ${b.id}`} title="Restore" onClick={() => onRestore(b)}>
                 <ArchiveRestore />
-                Restore
+                <span className={actionText}>Restore</span>
               </Button>
             )}
             {onDelete && (
-              <Button size="sm" variant="outline" aria-label={`Delete backup ${b.id}`} onClick={() => onDelete(b)}>
+              <Button size="sm" variant="outline" aria-label={`Delete backup ${b.id}`} title="Delete" onClick={() => onDelete(b)}>
                 <Trash2 />
-                Delete
+                <span className={actionText}>Delete</span>
               </Button>
             )}
           </>
