@@ -38,6 +38,7 @@ import type {
   Image,
   Inspector,
   InspectorSession,
+  InspectorTarget,
   Job,
   JobKind,
   PanelCertificate,
@@ -114,6 +115,12 @@ interface MockState {
   inspector: MockInspector;
   /** The Inspector secrets each server's current container was started with (servers started with the Inspector). */
   inspectorTokens: Map<number, number>;
+  /** Running servers whose definition changed apart from the Inspector (env, build, certificate mode, ...): restart_required until their next start. */
+  restartPending: Set<number>;
+  /** Expiry times (ms) of the entry links each account holds, by account id (a link is never used in the mock). */
+  inspectorLinks: Map<number, number[]>;
+  /** Called after every job's own finish step. */
+  onJobEnd?: () => void;
   jobs: Job[];
   jobLogs: Map<number, string[]>;
   follows: Map<number, number>;
@@ -135,6 +142,11 @@ interface MockInspector {
   startedAt: string | null;
   /** Bumped by rotate_secrets: containers started with older secrets cannot connect. */
   secrets: number;
+  /** Whether the host has the Inspector's image (turning the Inspector off keeps it). */
+  imagePresent: boolean;
+  /** Target names the hub saw connected at the last look, and when a target left (ms): the hub lists it a while longer. */
+  connected: Set<string>;
+  left: Map<string, number>;
 }
 
 type Me = Pick<CurrentAccount, "id" | "username" | "role" | "auth">;
@@ -155,9 +167,15 @@ const COMMIT_KART = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b";
 const ENGINE = "v0.4.0-rc.1";
 const FINGERPRINT = "3b6f0c2a91d4e8f7";
 const FINGERPRINT_OLD = "a0c3d9e1f2b47c55";
-const INSPECTOR_IMAGE = "ghcr.io/demiurgos-hub/golem-inspector:latest";
+// The daemon's defaults (--inspector-image, --inspector-listen).
+const INSPECTOR_IMAGE = "ghcr.io/demiurgos-hub/golem-inspector:0.4.0-rc.1";
 const INSPECTOR_IMAGE_ID = "sha256:7e1d0c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a29180f7e6d5c4b3a2918f7e6d5c";
-const INSPECTOR_PORT = 7700;
+const INSPECTOR_PORT = 8444;
+/** How long the hub keeps listing a target after its game left. */
+const INSPECTOR_TARGET_LINGER_MS = 30_000;
+/** Unused entry links one account may hold (the daemon's maxTicketsPerAccount); each works for 60 seconds. */
+const INSPECTOR_LINKS_PER_ACCOUNT = 8;
+const INSPECTOR_LINK_MS = 60_000;
 /** The Docker network gateway the games' Inspector agents connect to. */
 const INSPECTOR_AGENT_ADDRESS = `172.18.0.1:${INSPECTOR_PORT}`;
 /** Games whose engine has no Inspector support: started with it, they never connect. */
@@ -474,8 +492,11 @@ function seed(): MockState {
     omittedEntries: new Map([[14, 2]]),
     inspector: {
       enabled: true, state: "running", detail: "", image: INSPECTOR_IMAGE, imageId: INSPECTOR_IMAGE_ID, startedAt: iso(3 * HOUR), secrets: 1,
+      imagePresent: true, connected: new Set(), left: new Map(),
     },
     inspectorTokens: new Map(servers.filter((s) => s.inspector_active).map((s) => [s.id, 1])),
+    restartPending: new Set(servers.filter((s) => s.restart_required).map((s) => s.id)),
+    inspectorLinks: new Map(),
     jobs: jobs.reverse(),
     jobLogs,
     follows: new Map(),
@@ -568,6 +589,7 @@ function startJob(
       job.finished_at = iso();
       log.push(failing ? `error: ${failDetail}` : "done");
       finish(!failing);
+      st.onJobEnd?.();
     }, 400);
   }, 300);
   return job;
@@ -751,6 +773,7 @@ function authError(auth: ProjectAuth | undefined, kind: "https" | "ssh"): { fiel
 export function createMockTransport(real: Transport): Transport {
   const st = seed();
   const identities = new Map<string, Me>();
+  st.onJobEnd = noteInspectorTargets;
   console.info(`${MOCK_MARKER}: VITE_API_MOCK=1, projects/builds/servers/backups/images/static/volumes/certificates/Inspector are simulated in the browser.`);
 
   /** The caller, as the real daemon sees the bearer token; null lets the request through to the daemon (which answers 401). */
@@ -893,13 +916,39 @@ export function createMockTransport(real: Transport): Transport {
   }
 
   function markRestartRequired() {
-    for (const s of st.servers) if (s.state === "running") s.restart_required = true;
+    for (const s of st.servers) {
+      if (s.state !== "running") continue;
+      st.restartPending.add(s.id);
+      s.restart_required = true;
+    }
+  }
+
+  /**
+   * The Inspector secrets a new container of the server would get (null: no
+   * Inspector variables). Like the daemon, only while its switch and the
+   * installation's Inspector are on (game servers can always reach the mock's).
+   */
+  function inspectorWanted(s: Server): number | null {
+    return s.inspector && st.inspector.enabled ? st.inspector.secrets : null;
+  }
+
+  /**
+   * restart_required of a running server, like the daemon's config hash: its
+   * other pending changes, or Inspector variables that differ from the ones
+   * its container was started with. Turning a switch back before a restart
+   * clears it again.
+   */
+  function syncRestartRequired(s: Server) {
+    if (s.state !== "running") return;
+    s.restart_required = st.restartPending.has(s.id) || (st.inspectorTokens.get(s.id) ?? null) !== inspectorWanted(s);
   }
 
   /** A new container of the server: it runs with the Inspector when its switch and the installation's Inspector are on. */
   function containerStarted(s: Server) {
-    s.inspector_active = s.inspector && st.inspector.enabled;
-    if (s.inspector_active) st.inspectorTokens.set(s.id, st.inspector.secrets);
+    st.restartPending.delete(s.id);
+    const want = inspectorWanted(s);
+    s.inspector_active = want !== null;
+    if (want !== null) st.inspectorTokens.set(s.id, want);
     else st.inspectorTokens.delete(s.id);
   }
 
@@ -909,35 +958,66 @@ export function createMockTransport(real: Transport): Transport {
     st.inspectorTokens.delete(s.id);
   }
 
-  /** GET /inspector: targets are running servers started with the Inspector and its current secrets. */
+  /** The games connected to the hub now: running servers started with the Inspector and its current secrets. */
+  function hubConnected(): Server[] {
+    const ins = st.inspector;
+    if (ins.state !== "running") return [];
+    return st.servers.filter(
+      (s) => s.inspector_active && s.state === "running" && st.inspectorTokens.get(s.id) === ins.secrets && !NO_INSPECTOR_SUPPORT.has(s.name),
+    );
+  }
+
+  /** Notes games that left the hub (before every request and after every job): the hub lists them a while longer. */
+  function noteInspectorTargets() {
+    const ins = st.inspector;
+    const now = new Set(hubConnected().map((s) => s.name));
+    for (const name of ins.connected) if (!now.has(name)) ins.left.set(name, Date.now());
+    for (const name of now) ins.left.delete(name);
+    ins.connected = now;
+  }
+
+  /**
+   * GET /inspector, like the daemon: everything but the setting is left out
+   * while the Inspector is turned off (also while the job that turns it off
+   * runs). The hub knows its targets by name (the server name); they are
+   * matched to servers with the switch on, and the rest are other_targets.
+   */
   function inspectorView(): Inspector {
     const ins = st.inspector;
+    const base = { available: true, enabled: ins.enabled, image: ins.image, port: INSPECTOR_PORT, public_url: "", agents_reachable: true };
+    if (!ins.enabled) {
+      return { ...base, state: "off", detail: "", image_id: "", started_at: null, agent_address: "", targets: null, other_targets: 0 };
+    }
     const running = ins.state === "running";
-    const hubStart = ins.startedAt ? Date.parse(ins.startedAt) : 0;
-    const targets = running
-      ? st.servers
-          .filter((s) => s.inspector_active && s.state === "running" && st.inspectorTokens.get(s.id) === ins.secrets && !NO_INSPECTOR_SUPPORT.has(s.name))
-          .map((s) => ({
-            server_id: s.id,
-            connected: true,
-            entities: 0,
-            connected_at: new Date(Math.max(hubStart, s.started_at ? Date.parse(s.started_at) : 0) + 2000).toISOString(),
-          }))
-      : null;
+    let targets: InspectorTarget[] | null = null;
+    let other = 0;
+    if (running) {
+      const hubStart = ins.startedAt ? Date.parse(ins.startedAt) : 0;
+      const list = hubConnected().map((s) => ({
+        name: s.name,
+        connectedAt: new Date(Math.max(hubStart, s.started_at ? Date.parse(s.started_at) : 0) + 2000).toISOString() as string | null,
+      }));
+      for (const [name, at] of ins.left) {
+        if (Date.now() - at < INSPECTOR_TARGET_LINGER_MS) list.push({ name, connectedAt: null });
+        else ins.left.delete(name);
+      }
+      targets = [];
+      for (const t of list) {
+        const s = st.servers.find((x) => x.inspector && x.name === t.name);
+        if (s) targets.push({ server_id: s.id, connected: t.connectedAt !== null, entities: 0, connected_at: t.connectedAt });
+        else other++;
+      }
+    }
     return {
-      available: true,
-      enabled: ins.enabled,
+      ...base,
       state: ins.state,
       detail: ins.state === "stopped" ? ins.detail : "",
-      image: ins.image,
-      image_id: ins.state === "off" ? "" : ins.imageId,
+      // The image the hub container was created from: none before the hub exists.
+      image_id: ins.imageId,
       started_at: running ? ins.startedAt : null,
-      port: INSPECTOR_PORT,
-      public_url: "",
-      agent_address: ins.enabled ? INSPECTOR_AGENT_ADDRESS : "",
-      agents_reachable: true,
+      agent_address: INSPECTOR_AGENT_ADDRESS,
       targets,
-      other_targets: 0,
+      other_targets: other,
     };
   }
 
@@ -952,36 +1032,37 @@ export function createMockTransport(real: Transport): Transport {
       return fail(st, 400, "validation_failed", "pull_image and rotate_secrets need the Inspector to be on", req.pull_image ? "pull_image" : "rotate_secrets");
     }
     if (activeJobFor(st, "inspector", "hub")) return fail(st, 409, "job_in_progress", "another Inspector job is already running");
-    const wasOn = ins.enabled;
     ins.enabled = on;
+    // The setting counts at once: servers with the switch on now differ from (or match again) what their container was started with.
+    for (const s of st.servers) syncRestartRequired(s);
     if (on && ins.state !== "running") {
       ins.state = "stopped";
-      ins.detail = "the Inspector is starting";
+      ins.detail = "the Inspector is being applied";
     }
+    const download = req.pull_image === true || !ins.imagePresent;
     const steps = on
       ? [
-          `checking image ${ins.image}`,
-          ...(req.pull_image || !wasOn ? [`downloading image ${ins.image}`] : []),
           ...(req.rotate_secrets ? ["replacing the Inspector's secrets and the servers' Inspector tokens"] : []),
+          download ? `downloading the Inspector image ${ins.image}` : `using the Inspector image ${ins.image}`,
           "creating container golem-deploy-inspector",
           "waiting for the Inspector to report ready",
-          `opening the Inspector listener on port ${INSPECTOR_PORT}`,
+          "the daemon is logged in at the hub",
+          `the Inspector is running on port ${INSPECTOR_PORT}`,
         ]
-      : [`closing the Inspector listener on port ${INSPECTOR_PORT}`, "removing container golem-deploy-inspector"];
+      : ["the Inspector listener is closed; Inspector sessions and agent connections ended", "removing the Inspector hub container", "the Inspector is off"];
     const job = startJob(st, me, true, "inspector.apply", "inspector", "hub", steps, () => {
+      // A new hub, or none: it knows no target yet.
+      ins.connected = new Set();
+      ins.left = new Map();
       if (!on) {
-        Object.assign(ins, { state: "off", detail: "", startedAt: null });
-        // Containers started with the Inspector now run an older definition.
-        for (const s of st.servers) if (s.inspector_active && s.state === "running") s.restart_required = true;
+        Object.assign(ins, { state: "off", detail: "", startedAt: null, imageId: "" });
         return;
       }
+      if (download) ins.imagePresent = true;
       if (req.rotate_secrets) ins.secrets++;
-      Object.assign(ins, { state: "running", detail: "", startedAt: iso() });
-      for (const s of st.servers) {
-        if (s.state !== "running" || !s.inspector) continue;
-        // Started without the Inspector, or with secrets that no longer work.
-        if (!s.inspector_active || st.inspectorTokens.get(s.id) !== ins.secrets) s.restart_required = true;
-      }
+      Object.assign(ins, { state: "running", detail: "", startedAt: iso(), imageId: INSPECTOR_IMAGE_ID });
+      // New secrets: containers started with the old ones cannot connect any more.
+      for (const s of st.servers) syncRestartRequired(s);
     });
     return json(st, 202, job);
   }
@@ -989,13 +1070,23 @@ export function createMockTransport(real: Transport): Transport {
   /** POST /inspector/sessions: a one-time entry link for a login session. */
   function inspectorSession(me: Me, req: CreateInspectorSessionRequest): Response {
     if (me.auth !== "session") return fail(st, 403, "session_required", "this action needs a login session; API tokens cannot open the Inspector");
-    if (st.inspector.state !== "running") return fail(st, 409, "conflict", "the Inspector is not running");
-    if (req.server_id !== undefined) {
-      if (!Number.isSafeInteger(req.server_id) || req.server_id <= 0) return fail(st, 400, "bad_request", "server_id must be a positive integer", "server_id");
-      const s = st.servers.find((x) => x.id === req.server_id);
+    // Like the daemon: null is absent, a value that is no integer does not decode, and any other id is looked up (0 or less is unknown).
+    const id: unknown = req.server_id ?? undefined;
+    if (id !== undefined) {
+      if (typeof id !== "number" || !Number.isSafeInteger(id)) return fail(st, 400, "bad_request", "server_id must be an integer");
+      const s = st.servers.find((x) => x.id === id);
       if (!s) return fail(st, 404, "not_found", "server not found");
-      if (!s.inspector) return fail(st, 400, "validation_failed", "the server's Inspector setting is off", "server_id");
+      if (!s.inspector) return fail(st, 400, "validation_failed", "the server's Inspector setting is off; turn it on and restart the server", "server_id");
     }
+    if (st.inspector.state !== "running") return fail(st, 409, "conflict", "the Inspector is not running");
+    const now = Date.now();
+    const links = (st.inspectorLinks.get(me.id) ?? []).filter((exp) => exp > now);
+    st.inspectorLinks.set(me.id, links);
+    if (links.length >= INSPECTOR_LINKS_PER_ACCOUNT) {
+      return fail(st, 429, "rate_limited", "too many open Inspector links; use one or wait a minute", undefined, { "Retry-After": "60" });
+    }
+    const expires = now + INSPECTOR_LINK_MS;
+    links.push(expires);
     // The link leads nowhere real: nothing listens on the mock's Inspector port.
     // Like the daemon's, the ticket (32 random bytes, base64url) is in the
     // fragment and the server stays bound to it, out of the link.
@@ -1007,7 +1098,7 @@ export function createMockTransport(real: Transport): Transport {
       path: `/_golem-deploy/enter#t=${ticket}`,
       port: INSPECTOR_PORT,
       public_url: "",
-      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      expires_at: new Date(expires).toISOString(),
     };
     return json(st, 201, session);
   }
@@ -1110,6 +1201,7 @@ export function createMockTransport(real: Transport): Transport {
     const me = await identify(init);
     if (!me) return null;
     const admin = me.role === "admin";
+    noteInspectorTargets();
 
     // Jobs of mocked subjects (mock job ids start at 900001).
     if (method === "GET" && path === "/jobs") {
@@ -1509,10 +1601,9 @@ export function createMockTransport(real: Transport): Transport {
         const originsChanged = origins.join(",") !== s.allowed_origins.join(",");
         // The autosave period is part of the container's definition; the backup schedule is not.
         const snapshotChange = req.snapshot_interval_seconds !== undefined && req.snapshot_interval_seconds !== s.snapshot_interval_seconds;
-        // The Inspector switch applies on the next (re)start too.
-        const inspectorChange = req.inspector !== undefined && req.inspector !== s.inspector;
+        // The Inspector switch counts on its own (syncRestartRequired): only while the installation's Inspector is on.
         const changed =
-          buildChange || portChange || originsChanged || snapshotChange || inspectorChange || Object.keys(req.env_set ?? {}).length > 0 || (req.env_unset ?? []).length > 0;
+          buildChange || portChange || originsChanged || snapshotChange || Object.keys(req.env_set ?? {}).length > 0 || (req.env_unset ?? []).length > 0;
         if (req.snapshot_interval_seconds !== undefined) s.snapshot_interval_seconds = req.snapshot_interval_seconds;
         if (req.backup_schedule) s.backup_schedule = { ...req.backup_schedule };
         if (req.inspector !== undefined) s.inspector = req.inspector;
@@ -1528,7 +1619,8 @@ export function createMockTransport(real: Transport): Transport {
         s.env_keys = Object.keys(env).sort();
         s.updated_at = iso();
         // PATCH never restarts; a running container now runs an older definition.
-        if (changed && s.state === "running") s.restart_required = true;
+        if (changed && s.state === "running") st.restartPending.add(s.id);
+        syncRestartRequired(s);
         refreshDerived();
         return json(st, 200, s);
       }

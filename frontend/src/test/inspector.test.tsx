@@ -141,7 +141,7 @@ describe("Settings: the Inspector section", () => {
     expect(within(section).getByText(ADDRESS)).toBeInTheDocument();
     expect(within(section).getByText("172.18.0.1:7700")).toBeInTheDocument();
     expect(await within(section).findByText("1 of 2 servers with the Inspector switch on is connected.")).toBeInTheDocument();
-    expect(within(section).getByText(/also knows 2 game servers that are not a server of this installation/)).toBeInTheDocument();
+    expect(within(section).getByText(/^2 entries in the Inspector belong to no server with the Inspector switch on, for example a server whose switch was turned off/)).toBeInTheDocument();
     expect(within(section).queryByText("Game servers cannot reach the Inspector")).toBeNull();
     expect(within(section).getByRole("button", { name: /Open Inspector/ })).toBeInTheDocument();
     expect(within(section).getByRole("button", { name: "Turn off" })).toBeEnabled();
@@ -183,6 +183,26 @@ describe("Settings: the Inspector section", () => {
     const section = await settingsSection();
     expect(await within(section).findByText("Unknown")).toBeInTheDocument();
     expect(within(section).getByText(/Docker cannot be queried, so the state of the Inspector is not known\. It is turned on\./)).toBeInTheDocument();
+  });
+
+  it("shows the daemon's message when it refuses a change because the Inspector is not available", async () => {
+    let available = true;
+    const { user } = renderApp({
+      path: "/admin/settings",
+      signedInAs: admin,
+      routes: settingsRoutes(inspectorOff(), {
+        "GET /inspector": () => jsonResponse(200, available ? inspectorOff() : inspectorOff({ available: false, port: 0 })),
+        "PATCH /inspector": () => {
+          available = false;
+          return errorResponse(409, "conflict", "the Inspector is unavailable: the daemon runs with --inspector-listen off");
+        },
+      }),
+    });
+    const section = await settingsSection();
+    await user.click(await within(section).findByRole("button", { name: "Turn on" }));
+    // The page catches up with the daemon and keeps its message.
+    expect(await within(section).findByText("Not available on this host")).toBeInTheDocument();
+    expect(within(section).getByText("The Inspector is unavailable: the daemon runs with --inspector-listen off.")).toBeInTheDocument();
   });
 
   it("offers no controls when the daemon runs without the Inspector listener", async () => {
@@ -354,14 +374,59 @@ describe("server page: the Inspector", () => {
     expect(await screen.findByLabelText("Job 96")).toBeInTheDocument();
   });
 
-  it("asks for a restart after the Inspector settings changed (secrets replaced)", async () => {
+  it("says that a server with changes waiting for a restart is not connected, without guessing which changes", async () => {
     renderApp({
       path: "/servers/3",
       signedInAs: developer,
       routes: serverRoutes(serverFixture({ inspector: true, inspector_active: true, restart_required: true }), inspectorFixture({ targets: [] })),
     });
     const section = await serverSection();
-    expect(await within(section).findByText("The Inspector settings changed since the game server started. It connects at the next restart.")).toBeInTheDocument();
+    expect(await within(section).findByText("The game server is not connected to the Inspector. It has changes that wait for a restart.")).toBeInTheDocument();
+    expect(within(section).queryByText(/Inspector settings changed/)).toBeNull();
+    expect(within(section).getByRole("button", { name: "Restart echo" })).toBeInTheDocument();
+  });
+
+  it("says that game servers cannot reach the Inspector on this host, with no restart advice", async () => {
+    renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: serverRoutes(
+        serverFixture({ inspector: true, inspector_active: false, restart_required: false }),
+        inspectorFixture({ agents_reachable: false, agent_address: "", targets: [] }),
+      ),
+    });
+    const section = await serverSection();
+    expect(
+      await within(section).findByText(
+        "Game servers cannot reach the Inspector on this host: its listener is bound to a loopback address. An administrator has to change how the daemon is started.",
+      ),
+    ).toBeInTheDocument();
+    expect(within(section).getByRole("status")).not.toHaveTextContent(/restart/i);
+    expect(within(section).queryByRole("button", { name: "Restart echo" })).toBeNull();
+  });
+
+  it("says that the server's state is unknown while Docker cannot be queried", async () => {
+    renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: serverRoutes(serverFixture({ inspector: true, state: "unknown", started_at: null }), inspectorFixture({ targets: [] })),
+    });
+    const section = await serverSection();
+    expect(await within(section).findByText("Docker cannot be queried, so the state of this server is not known.")).toBeInTheDocument();
+    expect(within(section).queryByText(/not running/)).toBeNull();
+  });
+
+  it("says that a running server stays connected until its next restart after its switch was turned off", async () => {
+    renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: serverRoutes(serverFixture({ inspector: false, inspector_active: true, restart_required: true }), inspectorFixture({ targets: [], other_targets: 1 })),
+    });
+    const section = await serverSection();
+    expect(within(section).getByRole("switch", { name: "Connect this server to the Inspector" })).not.toBeChecked();
+    expect(
+      await within(section).findByText("The switch is off, but the running game server was started with it on. It stays connected to the Inspector until its next restart."),
+    ).toBeInTheDocument();
     expect(within(section).getByRole("button", { name: "Restart echo" })).toBeInTheDocument();
   });
 
@@ -442,6 +507,91 @@ describe("opening the Inspector", () => {
     await waitFor(() => expect(tab.location.replace).toHaveBeenCalledWith("https://inspector.example.com/_golem-deploy/enter#t=abc"));
   });
 
+  it("never gives the link to a tab whose opener cannot be cleared: it closes the tab and offers the link in a dialog", async () => {
+    const tab = fakeTab();
+    Object.defineProperty(tab, "opener", {
+      get: () => ({}),
+      set: () => {
+        throw new Error("not allowed");
+      },
+    });
+    vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: { ...connected(), "POST /inspector/sessions": () => jsonResponse(201, session()) },
+    });
+    await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    expect(tab.close).toHaveBeenCalled();
+    expect(tab.location.replace).not.toHaveBeenCalled();
+    expect(within(dialog).getByRole("link", { name: /Open the Inspector/ })).toHaveAttribute("href", `${ADDRESS}/_golem-deploy/enter#t=abc`);
+  });
+
+  it("offers the link in a dialog when the tab was closed before the link arrived", async () => {
+    const tab = fakeTab();
+    vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    let answer!: (r: Response) => void;
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: { ...connected(), "POST /inspector/sessions": () => new Promise<Response>((r) => (answer = r)) },
+    });
+    await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
+    await waitFor(() => expect(answer).toBeDefined());
+    tab.closed = true;
+    answer(jsonResponse(201, session()));
+    const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    expect(dialog).toHaveAccessibleDescription("The Inspector could not be opened in a new tab: the browser blocked the tab, or the tab was closed.");
+    expect(tab.location.replace).not.toHaveBeenCalled();
+  });
+
+  it("does not offer a link that has already expired, and asks for a new one", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    let n = 0;
+    const { user, calls } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: {
+        ...connected(),
+        "POST /inspector/sessions": () => jsonResponse(201, session(n++ === 0 ? { expires_at: new Date(Date.now() - 1000).toISOString() } : {})),
+      },
+    });
+    await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    expect(within(dialog).getByText("The link has expired. Ask for a new one.")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("link")).toBeNull();
+    await user.click(within(dialog).getByRole("button", { name: "Get a new link" }));
+    await waitFor(() => expect(calls.filter((c) => c.method === "POST" && c.path === "/inspector/sessions")).toHaveLength(2));
+    expect(await screen.findByRole("link", { name: /Open the Inspector/ })).toBeInTheDocument();
+  });
+
+  it("hides the link once it has expired, also when the timer was late", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    const { user } = renderApp({
+      path: "/servers/3",
+      signedInAs: developer,
+      routes: { ...connected(), "POST /inspector/sessions": () => jsonResponse(201, session()) },
+    });
+    await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    const link = within(dialog).getByRole("link", { name: /Open the Inspector/ });
+    // After React's handler: was the click let through to open the link?
+    const opened = vi.fn();
+    const after = (e: Event) => {
+      if (!e.defaultPrevented) opened();
+      e.preventDefault();
+    };
+    document.addEventListener("click", after);
+    const start = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => start + 61_000);
+    await user.click(link);
+    expect(await within(dialog).findByText("The link has expired. Ask for a new one.")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("link")).toBeNull();
+    expect(opened).not.toHaveBeenCalled();
+    document.removeEventListener("click", after);
+  });
+
   it("closes the tab again and says why when the request fails", async () => {
     const tab = fakeTab();
     vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
@@ -465,6 +615,7 @@ describe("opening the Inspector", () => {
     });
     await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
     const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
+    expect(dialog).toHaveAccessibleDescription(/the browser blocked the tab, or the tab was closed/);
     expect(within(dialog).getByText("Use this link instead. It works once, within a minute.")).toBeInTheDocument();
     const link = within(dialog).getByRole("link", { name: /Open the Inspector/ });
     expect(link).toHaveAttribute("href", `${ADDRESS}/_golem-deploy/enter#t=abc`);

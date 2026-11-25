@@ -37,12 +37,23 @@ export function inspectorEntryUrl(session: InspectorSession, loc: PageLocation =
 
 /** What the server page says about one server and the Inspector. */
 export type ServerInspectorState =
+  /** The switch is off and the server is not connected. */
   | { kind: "off" }
+  /** The switch is off, but the running container was started with it on: it stays connected until its next restart. */
+  | { kind: "leaving" }
   | { kind: "installation-off" }
   | { kind: "installation-down"; state: Inspector["state"]; detail: string }
+  /** The Inspector listener is bound where containers cannot reach it: no restart helps. */
+  | { kind: "unreachable" }
+  /** Docker could not be queried for the server. */
+  | { kind: "server-unknown" }
   | { kind: "not-running" }
-  | { kind: "restart-needed"; reason: "without" | "changed" }
-  | { kind: "unknown" }
+  /** The running container was started without the Inspector. */
+  | { kind: "restart-needed" }
+  /** Not connected, and the server has changes that wait for a restart (their cause cannot be told). */
+  | { kind: "restart-pending" }
+  /** The Inspector did not answer. */
+  | { kind: "targets-unknown" }
   | { kind: "connected"; target: InspectorTarget }
   | { kind: "not-connected" };
 
@@ -54,15 +65,21 @@ export function serverInspectorState(
   server: Pick<Server, "id" | "inspector" | "inspector_active" | "restart_required" | "state">,
   inspector: Inspector,
 ): ServerInspectorState {
-  if (!server.inspector) return { kind: "off" };
+  if (!server.inspector) {
+    const leaving = server.inspector_active && server.state === "running" && inspector.enabled && inspector.state === "running";
+    return { kind: leaving ? "leaving" : "off" };
+  }
   if (!inspector.available || !inspector.enabled) return { kind: "installation-off" };
   if (inspector.state !== "running") return { kind: "installation-down", state: inspector.state, detail: inspector.detail };
+  if (!inspector.agents_reachable) return { kind: "unreachable" };
+  if (server.state === "unknown") return { kind: "server-unknown" };
   if (server.state !== "running") return { kind: "not-running" };
   const target = inspector.targets?.find((t) => t.server_id === server.id);
   // A connected game server is connected, whatever else waits for a restart (an environment change, say).
   if (server.inspector_active && target?.connected) return { kind: "connected", target };
-  if (!server.inspector_active) return { kind: "restart-needed", reason: "without" };
-  if (server.restart_required) return { kind: "restart-needed", reason: "changed" };
-  if (inspector.targets === null) return { kind: "unknown" };
+  if (!server.inspector_active) return { kind: "restart-needed" };
+  if (inspector.targets === null) return { kind: "targets-unknown" };
+  // restart_required does not say what changed: the Inspector's secrets, or only the environment.
+  if (server.restart_required) return { kind: "restart-pending" };
   return { kind: "not-connected" };
 }
