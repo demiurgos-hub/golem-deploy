@@ -11,6 +11,7 @@ import { buildName } from "@/components/builds";
 import { EnvEditor } from "@/components/env-editor";
 import { GameAddress } from "@/components/game-address";
 import { GettingStarted } from "@/components/getting-started";
+import { INSPECTOR_SWITCH_HINT, OpenInspectorIfRunning } from "@/components/inspector";
 import { InlineJob } from "@/components/jobs";
 import { OriginsEditor, hasOriginErrors, noOriginErrors, originErrorsFrom, validateOrigins, type OriginErrors } from "@/components/origins-editor";
 import { ServerActions } from "@/components/server-actions";
@@ -66,6 +67,7 @@ export function ServersPage() {
         description="Each server runs a successful build of a project in a container, on a port published over both UDP and TCP."
         actions={
           <>
+            <OpenInspectorIfRunning />
             {isAdmin && (
               <>
                 <Button variant="outline" onClick={() => setExporting(true)}>
@@ -238,6 +240,7 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
   const [buildChoice, setBuildChoice] = useState<number | null>(null);
   const [port, setPort] = useState("");
   const [start, setStart] = useState(false);
+  const [inspector, setInspector] = useState(false);
   const [origins, setOriginsState] = useState<string[]>([]);
   const [originErrors, setOriginErrors] = useState<OriginErrors>(noOriginErrors());
   const [env, setEnvDraft] = useState<EnvDraft>(emptyDraft());
@@ -281,6 +284,7 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
         // The daemon's defaults apply to whatever is left out.
         ...(snapshotChanged ? { snapshot_interval_seconds: Number(dataSettings.snapshot.trim()) } : {}),
         ...(scheduleChanged ? { backup_schedule: scheduleOf(dataSettings) } : {}),
+        ...(inspector ? { inspector: true } : {}),
       }),
     onSuccess: (server) => {
       toast.success(`Server ${server.name} created on port ${server.port}.${start ? " Starting it." : ""}`);
@@ -431,6 +435,17 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
             </p>
             <DataSettingsFields value={dataSettings} onChange={setDataSettings} errors={dataErrors} />
           </fieldset>
+          <div className="space-y-1">
+            <Checkbox
+              label="Connect to the Inspector"
+              checked={inspector}
+              aria-describedby="create-server-inspector-hint"
+              onChange={(e) => setInspector(e.target.checked)}
+            />
+            <p id="create-server-inspector-hint" className="pl-6 text-xs text-muted-foreground">
+              The Inspector shows the live entities of the running game. {INSPECTOR_SWITCH_HINT}
+            </p>
+          </div>
           <Checkbox label="Start the server after creating it" checked={start} onChange={(e) => setStart(e.target.checked)} />
           {create.isError && !inline && <ErrorText error={create.error} />}
         </form>

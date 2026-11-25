@@ -44,6 +44,7 @@ export const qk = {
     /** Every backup of the installation, or those taken from one server. */
     list: (serverId: number | null) => ["backups", "list", serverId] as const,
   },
+  inspector: ["inspector"] as const,
   images: ["images"] as const,
   staticFiles: ["static"] as const,
   volumes: ["volumes"] as const,

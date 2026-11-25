@@ -1,4 +1,4 @@
-import type { Backup, BackupList, Build, CertificateInfo, Image, Project, Server, ServerRuntime } from "@/api/types.gen";
+import type { Backup, BackupList, Build, CertificateInfo, Image, Inspector, InspectorTarget, Project, Server, ServerRuntime } from "@/api/types.gen";
 
 // Wire objects with every field of the contract (milestone 3 onwards), for tests to override.
 
@@ -110,10 +110,43 @@ export function serverFixture(overrides: Partial<Server> = {}): Server {
     },
     snapshot_interval_seconds: 300,
     backup_schedule: { interval_hours: 0, keep: 7 },
+    inspector: false,
+    inspector_active: false,
     created_at: "2026-11-20T10:00:00Z",
     updated_at: "2026-11-20T11:00:00Z",
     ...overrides,
   };
+}
+
+export const INSPECTOR_IMAGE_ID = "sha256:" + "7e".repeat(32);
+
+/** A running Inspector; tests override the state and the targets. */
+export function inspectorFixture(overrides: Partial<Inspector> = {}): Inspector {
+  return {
+    available: true,
+    enabled: true,
+    state: "running",
+    detail: "",
+    image: "ghcr.io/demiurgos-hub/golem-inspector:latest",
+    image_id: INSPECTOR_IMAGE_ID,
+    started_at: "2026-11-20T09:00:00Z",
+    port: 7700,
+    public_url: "",
+    agent_address: "172.18.0.1:7700",
+    agents_reachable: true,
+    targets: [],
+    other_targets: 0,
+    ...overrides,
+  };
+}
+
+/** The Inspector when it is off, as the daemon reports it. */
+export function inspectorOff(overrides: Partial<Inspector> = {}): Inspector {
+  return inspectorFixture({ enabled: false, state: "off", image_id: "", started_at: null, agent_address: "", targets: null, ...overrides });
+}
+
+export function targetFixture(overrides: Partial<InspectorTarget> = {}): InspectorTarget {
+  return { server_id: 3, connected: true, entities: 0, connected_at: "2026-11-20T10:00:05Z", ...overrides };
 }
 
 export function backupFixture(overrides: Partial<Backup> = {}): Backup {

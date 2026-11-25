@@ -5,6 +5,7 @@ import { AppRoot } from "@/app/app-root";
 import { createServices } from "@/app/services";
 import type { Account, Status } from "@/api/types.gen";
 import { account, currentAccount, fakeJwt, fakeTransport, jsonResponse, type Handler } from "@/test/fake-api";
+import { inspectorOff } from "@/test/fixtures";
 
 export const STATUS: Status = {
   version: "v0.0.0-test",
@@ -32,6 +33,8 @@ export function renderApp({
     "GET /builds": () => jsonResponse(200, { items: [] }),
     "GET /projects/{id}/builds": () => jsonResponse(200, { items: [] }),
     "GET /backups": () => jsonResponse(200, { items: [], total_bytes: 0, max_content_bytes: 2048 * 1024 * 1024 }),
+    // The server pages and Settings read the Inspector; it is off unless a test says otherwise.
+    "GET /inspector": () => jsonResponse(200, inspectorOff()),
     ...routes,
   });
   const services = createServices({ transport, local: localStorage, session: sessionStorage, channel: null, document: null });

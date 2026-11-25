@@ -28,6 +28,7 @@ const KIND_LABELS: Record<string, string> = {
   "server.data_reset": "Reset data",
   "certificate.issue": "Issue certificate",
   "certificate.renew": "Renew certificates",
+  "inspector.apply": "Update the Inspector",
 };
 
 /** Known kinds get a label; unknown kinds are shown verbatim, as the contract asks. */

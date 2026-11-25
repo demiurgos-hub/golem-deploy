@@ -1,7 +1,8 @@
 /**
  * Dev-only stand-in for the Docker-, git- and file-backed routes (projects,
  * builds, servers and their runtime view and saved data, backups, images,
- * static files, volumes, the certificate settings and their jobs), so the
+ * static files, volumes, the certificate settings, the Inspector and their
+ * jobs), so the
  * web client can be developed
  * without Docker, git or network access. It follows the API v1 contract
  * (docs/API.md) and the generated wire types: access levels, restricted
@@ -28,12 +29,15 @@ import type {
   CertificateMode,
   CreateBackupRequest,
   CreateBuildRequest,
+  CreateInspectorSessionRequest,
   CreateProjectRequest,
   CreateServerRequest,
   CurrentAccount,
   ErrorCode,
   GameCertificate,
   Image,
+  Inspector,
+  InspectorSession,
   Job,
   JobKind,
   PanelCertificate,
@@ -51,6 +55,7 @@ import type {
   SwitchBranchRequest,
   UpdateACMERequest,
   UpdateGameCertificateRequest,
+  UpdateInspectorRequest,
   UpdatePanelCertificateRequest,
   UpdateProjectRequest,
   UpdateServerRequest,
@@ -105,6 +110,10 @@ interface MockState {
   restoreReads: Map<number, number>;
   /** Entries of a server's data directory that a backup leaves out (links, pipes, devices, names not allowed), by server id. */
   omittedEntries: Map<number, number>;
+  /** The installation's Inspector. */
+  inspector: MockInspector;
+  /** The Inspector secrets each server's current container was started with (servers started with the Inspector). */
+  inspectorTokens: Map<number, number>;
   jobs: Job[];
   jobLogs: Map<number, string[]>;
   follows: Map<number, number>;
@@ -117,7 +126,18 @@ interface MockState {
   requestSeq: number;
 }
 
-type Me = Pick<CurrentAccount, "id" | "username" | "role">;
+interface MockInspector {
+  enabled: boolean;
+  state: Inspector["state"];
+  detail: string;
+  image: string;
+  imageId: string;
+  startedAt: string | null;
+  /** Bumped by rotate_secrets: containers started with older secrets cannot connect. */
+  secrets: number;
+}
+
+type Me = Pick<CurrentAccount, "id" | "username" | "role" | "auth">;
 
 const iso = (msAgo = 0) => new Date(Date.now() - msAgo).toISOString();
 const HOUR = 3_600_000;
@@ -135,6 +155,13 @@ const COMMIT_KART = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b";
 const ENGINE = "v0.4.0-rc.1";
 const FINGERPRINT = "3b6f0c2a91d4e8f7";
 const FINGERPRINT_OLD = "a0c3d9e1f2b47c55";
+const INSPECTOR_IMAGE = "ghcr.io/demiurgos-hub/golem-inspector:latest";
+const INSPECTOR_IMAGE_ID = "sha256:7e1d0c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a29180f7e6d5c4b3a2918f7e6d5c";
+const INSPECTOR_PORT = 7700;
+/** The Docker network gateway the games' Inspector agents connect to. */
+const INSPECTOR_AGENT_ADDRESS = `172.18.0.1:${INSPECTOR_PORT}`;
+/** Games whose engine has no Inspector support: started with it, they never connect. */
+const NO_INSPECTOR_SUPPORT = new Set(["flood-test"]);
 
 /** The game host servers use: the page's host name (the real one comes from the daemon's settings). */
 function gameHost(): string {
@@ -313,18 +340,23 @@ function seed(): MockState {
     },
     snapshot_interval_seconds: 300,
     backup_schedule: { interval_hours: 0, keep: 7 },
+    inspector: false,
+    inspector_active: false,
     created_at: iso(10 * DAY),
     updated_at: iso(6 * HOUR),
     ...extra,
   });
   const kart = { build_id: 4, project_id: 2, image: IMG_KART, commit: COMMIT_KART };
   const servers: Server[] = [
-    server(11, "eu-arena", 7000, "running", "running", { allowed_origins: ["https://play.example.com"], backup_schedule: { interval_hours: 24, keep: 7 } }),
+    // Connected to the Inspector.
+    server(11, "eu-arena", 7000, "running", "running", {
+      allowed_origins: ["https://play.example.com"], backup_schedule: { interval_hours: 24, keep: 7 }, inspector: true, inspector_active: true,
+    }),
     // Runs the old build, but its world was saved by the newer one: it cannot start (schema mismatch).
     server(12, "staging", 7001, "stopped", "exited", { build_id: 1, image: IMG_ARENA_OLD, commit: COMMIT_ARENA_OLD }),
     server(13, "crashy", 7002, "running", "exited", { exit_code: 137, updated_at: iso(HOUR) }),
-    // Its game's admin endpoint never answers: the runtime view answers 503.
-    server(14, "flood-test", 7003, "running", "running", { env_keys: [], snapshot_interval_seconds: 0 }),
+    // Its game's admin endpoint never answers: the runtime view answers 503. Started with the Inspector, its game never connects.
+    server(14, "flood-test", 7003, "running", "running", { env_keys: [], snapshot_interval_seconds: 0, inspector: true, inspector_active: true }),
     server(15, "kart-eu", 7004, "running", "running", { ...kart, restart_required: true, snapshot_interval_seconds: 60, backup_schedule: { interval_hours: 6, keep: 3 } }),
     server(16, "fresh", 7005, "stopped", "missing", { env_keys: [] }),
     // Has a container, but "Docker" cannot be queried for it: every action fails, delete answers 503.
@@ -440,6 +472,10 @@ function seed(): MockState {
     backups,
     restoreReads: new Map(),
     omittedEntries: new Map([[14, 2]]),
+    inspector: {
+      enabled: true, state: "running", detail: "", image: INSPECTOR_IMAGE, imageId: INSPECTOR_IMAGE_ID, startedAt: iso(3 * HOUR), secrets: 1,
+    },
+    inspectorTokens: new Map(servers.filter((s) => s.inspector_active).map((s) => [s.id, 1])),
     jobs: jobs.reverse(),
     jobLogs,
     follows: new Map(),
@@ -715,7 +751,7 @@ function authError(auth: ProjectAuth | undefined, kind: "https" | "ssh"): { fiel
 export function createMockTransport(real: Transport): Transport {
   const st = seed();
   const identities = new Map<string, Me>();
-  console.info(`${MOCK_MARKER}: VITE_API_MOCK=1, projects/builds/servers/backups/images/static/volumes/certificates are simulated in the browser.`);
+  console.info(`${MOCK_MARKER}: VITE_API_MOCK=1, projects/builds/servers/backups/images/static/volumes/certificates/Inspector are simulated in the browser.`);
 
   /** The caller, as the real daemon sees the bearer token; null lets the request through to the daemon (which answers 401). */
   async function identify(init: RequestInit | { headers: Record<string, string> }): Promise<Me | null> {
@@ -726,7 +762,7 @@ export function createMockTransport(real: Transport): Transport {
     const res = await real.fetch(`${BASE}/account`, { headers: { Authorization: auth, Accept: "application/json" }, credentials: "omit" });
     if (!res.ok) return null;
     const me = (await res.json()) as CurrentAccount;
-    const out: Me = { id: me.id, username: me.username, role: me.auth === "api_token" ? "developer" : me.role };
+    const out: Me = { id: me.id, username: me.username, role: me.auth === "api_token" ? "developer" : me.role, auth: me.auth };
     identities.set(auth, out);
     return out;
   }
@@ -860,6 +896,117 @@ export function createMockTransport(real: Transport): Transport {
     for (const s of st.servers) if (s.state === "running") s.restart_required = true;
   }
 
+  /** A new container of the server: it runs with the Inspector when its switch and the installation's Inspector are on. */
+  function containerStarted(s: Server) {
+    s.inspector_active = s.inspector && st.inspector.enabled;
+    if (s.inspector_active) st.inspectorTokens.set(s.id, st.inspector.secrets);
+    else st.inspectorTokens.delete(s.id);
+  }
+
+  /** The server has no container any more. */
+  function containerGone(s: Server) {
+    s.inspector_active = false;
+    st.inspectorTokens.delete(s.id);
+  }
+
+  /** GET /inspector: targets are running servers started with the Inspector and its current secrets. */
+  function inspectorView(): Inspector {
+    const ins = st.inspector;
+    const running = ins.state === "running";
+    const hubStart = ins.startedAt ? Date.parse(ins.startedAt) : 0;
+    const targets = running
+      ? st.servers
+          .filter((s) => s.inspector_active && s.state === "running" && st.inspectorTokens.get(s.id) === ins.secrets && !NO_INSPECTOR_SUPPORT.has(s.name))
+          .map((s) => ({
+            server_id: s.id,
+            connected: true,
+            entities: 0,
+            connected_at: new Date(Math.max(hubStart, s.started_at ? Date.parse(s.started_at) : 0) + 2000).toISOString(),
+          }))
+      : null;
+    return {
+      available: true,
+      enabled: ins.enabled,
+      state: ins.state,
+      detail: ins.state === "stopped" ? ins.detail : "",
+      image: ins.image,
+      image_id: ins.state === "off" ? "" : ins.imageId,
+      started_at: running ? ins.startedAt : null,
+      port: INSPECTOR_PORT,
+      public_url: "",
+      agent_address: ins.enabled ? INSPECTOR_AGENT_ADDRESS : "",
+      agents_reachable: true,
+      targets,
+      other_targets: 0,
+    };
+  }
+
+  /** PATCH /inspector: the setting changes at once; a restricted inspector.apply job brings the Inspector in line. */
+  function inspectorApply(me: Me, req: UpdateInspectorRequest): Response {
+    for (const k of ["enabled", "pull_image", "rotate_secrets"] as const) {
+      if (req[k] !== undefined && typeof req[k] !== "boolean") return fail(st, 400, "bad_request", `${k} must be true or false`, k);
+    }
+    const ins = st.inspector;
+    const on = req.enabled ?? ins.enabled;
+    if (!on && (req.pull_image || req.rotate_secrets)) {
+      return fail(st, 400, "validation_failed", "pull_image and rotate_secrets need the Inspector to be on", req.pull_image ? "pull_image" : "rotate_secrets");
+    }
+    if (activeJobFor(st, "inspector", "hub")) return fail(st, 409, "job_in_progress", "another Inspector job is already running");
+    const wasOn = ins.enabled;
+    ins.enabled = on;
+    if (on && ins.state !== "running") {
+      ins.state = "stopped";
+      ins.detail = "the Inspector is starting";
+    }
+    const steps = on
+      ? [
+          `checking image ${ins.image}`,
+          ...(req.pull_image || !wasOn ? [`downloading image ${ins.image}`] : []),
+          ...(req.rotate_secrets ? ["replacing the Inspector's secrets and the servers' Inspector tokens"] : []),
+          "creating container golem-deploy-inspector",
+          "waiting for the Inspector to report ready",
+          `opening the Inspector listener on port ${INSPECTOR_PORT}`,
+        ]
+      : [`closing the Inspector listener on port ${INSPECTOR_PORT}`, "removing container golem-deploy-inspector"];
+    const job = startJob(st, me, true, "inspector.apply", "inspector", "hub", steps, () => {
+      if (!on) {
+        Object.assign(ins, { state: "off", detail: "", startedAt: null });
+        // Containers started with the Inspector now run an older definition.
+        for (const s of st.servers) if (s.inspector_active && s.state === "running") s.restart_required = true;
+        return;
+      }
+      if (req.rotate_secrets) ins.secrets++;
+      Object.assign(ins, { state: "running", detail: "", startedAt: iso() });
+      for (const s of st.servers) {
+        if (s.state !== "running" || !s.inspector) continue;
+        // Started without the Inspector, or with secrets that no longer work.
+        if (!s.inspector_active || st.inspectorTokens.get(s.id) !== ins.secrets) s.restart_required = true;
+      }
+    });
+    return json(st, 202, job);
+  }
+
+  /** POST /inspector/sessions: a one-time entry link for a login session. */
+  function inspectorSession(me: Me, req: CreateInspectorSessionRequest): Response {
+    if (me.auth !== "session") return fail(st, 403, "session_required", "this action needs a login session; API tokens cannot open the Inspector");
+    if (st.inspector.state !== "running") return fail(st, 409, "conflict", "the Inspector is not running");
+    if (req.server_id !== undefined) {
+      if (!Number.isSafeInteger(req.server_id) || req.server_id <= 0) return fail(st, 400, "bad_request", "server_id must be a positive integer", "server_id");
+      const s = st.servers.find((x) => x.id === req.server_id);
+      if (!s) return fail(st, 404, "not_found", "server not found");
+      if (!s.inspector) return fail(st, 400, "validation_failed", "the server's Inspector setting is off", "server_id");
+    }
+    // The link leads nowhere real: nothing listens on the mock's Inspector port.
+    const ticket = [...crypto.getRandomValues(new Uint8Array(24))].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const session: InspectorSession = {
+      path: `/_golem-deploy/enter?ticket=${ticket}${req.server_id !== undefined ? `&server=${req.server_id}` : ""}`,
+      port: INSPECTOR_PORT,
+      public_url: "",
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    };
+    return json(st, 200, session);
+  }
+
   function jobLogStream(job: Job, follow: boolean, onEnd: () => void): ReadableStream<Uint8Array> {
     return streamLines((push, close) => {
       const log = st.jobLogs.get(job.id) ?? [];
@@ -951,7 +1098,8 @@ export function createMockTransport(real: Transport): Transport {
     const mocked =
       /^\/(projects|builds|servers|backups|images|static|volumes)(\/|$)/.test(path) ||
       /^\/certificates\/(game|panel|acme|acme\/renew)$/.test(path) ||
-      (path === "/jobs" && ["project", "server", "certificate"].includes(query.get("subject_type") ?? "")) ||
+      /^\/inspector(\/sessions)?$/.test(path) ||
+      (path === "/jobs" && ["project", "server", "certificate", "inspector"].includes(query.get("subject_type") ?? "")) ||
       (/^\/jobs\/\d+(\/log|\/cancel)?$/.test(path) && st.jobs.some((j) => path.split("/")[2] === String(j.id)));
     if (!mocked) return null;
     const me = await identify(init);
@@ -993,6 +1141,19 @@ export function createMockTransport(real: Transport): Transport {
         return textStream(jobLogStream(job, follow, release));
       }
       return null;
+    }
+
+    // The Inspector: read by any identity, changed by admins, opened by login sessions.
+    if (path === "/inspector") {
+      if (method === "GET") return json(st, 200, inspectorView());
+      if (method === "PATCH") {
+        if (!admin) return forbidden();
+        return inspectorApply(me, typeof init.body === "string" && init.body ? body<UpdateInspectorRequest>() : {});
+      }
+      return null;
+    }
+    if (path === "/inspector/sessions" && method === "POST") {
+      return inspectorSession(me, typeof init.body === "string" && init.body ? body<CreateInspectorSessionRequest>() : {});
     }
 
     // Projects.
@@ -1177,12 +1338,14 @@ export function createMockTransport(real: Transport): Transport {
       if (ee) return fail(st, 400, "validation_failed", ee.message, ee.field);
       const de = dataSettingsError(req);
       if (de) return fail(st, 400, "validation_failed", de.message, de.field);
+      if (req.inspector !== undefined && typeof req.inspector !== "boolean") return fail(st, 400, "bad_request", "inspector must be true or false", "inspector");
       if (st.servers.some((s) => s.name === req.name)) return fail(st, 409, "name_taken", "a server with that name already exists");
       const port = req.port ?? nextPort(st);
       if (port === null || st.servers.some((s) => s.port === port)) return fail(st, 409, "port_in_use", "that port is already assigned to another server (or the port range is full)");
       const s = newServer(req.name, port, oe.value, req.env, req.desired_state ?? "stopped");
       if (req.snapshot_interval_seconds !== undefined) s.snapshot_interval_seconds = req.snapshot_interval_seconds;
       if (req.backup_schedule) s.backup_schedule = { ...req.backup_schedule };
+      if (req.inspector) s.inspector = true;
       applyBuild(s, be.build);
       st.servers.push(s);
       if (s.desired_state === "running") startServerAction(s, "start", me);
@@ -1205,6 +1368,7 @@ export function createMockTransport(real: Transport): Transport {
             desired_state: s.desired_state,
             snapshot_interval_seconds: s.snapshot_interval_seconds,
             backup_schedule: s.backup_schedule,
+            ...(s.inspector ? { inspector: true } : {}),
           };
         }),
       };
@@ -1216,9 +1380,11 @@ export function createMockTransport(real: Transport): Transport {
       // Unknown fields are a decode error (400 bad_request), e.g. the image of a version 1 document.
       for (const spec of req.servers ?? []) {
         const extra = Object.keys(spec).find(
-          (k) => !["name", "project", "commit", "port", "allowed_origins", "env", "desired_state", "snapshot_interval_seconds", "backup_schedule"].includes(k),
+          (k) => !["name", "project", "commit", "port", "allowed_origins", "env", "desired_state", "snapshot_interval_seconds", "backup_schedule", "inspector"].includes(k),
         );
         if (extra) return fail(st, 400, "bad_request", `unknown field "${extra}"`, extra);
+        // A JSON value that is not a boolean is a decode error too.
+        if (spec.inspector !== undefined && typeof spec.inspector !== "boolean") return fail(st, 400, "bad_request", "inspector must be true or false", "inspector");
       }
       if (req.format_version !== 2) return fail(st, 400, "validation_failed", "format_version must be 2", "format_version");
       if (!req.servers?.length) return fail(st, 400, "validation_failed", "the document contains no servers", "servers");
@@ -1263,6 +1429,7 @@ export function createMockTransport(real: Transport): Transport {
         const s = newServer(spec.name, spec.port ?? nextPort(st) ?? 0, resolved[i].origins, spec.env, "stopped");
         if (spec.snapshot_interval_seconds !== undefined) s.snapshot_interval_seconds = spec.snapshot_interval_seconds;
         if (spec.backup_schedule) s.backup_schedule = { ...spec.backup_schedule };
+        if (spec.inspector === true) s.inspector = true;
         applyBuild(s, resolved[i].build);
         st.servers.push(s);
         return s;
@@ -1298,6 +1465,7 @@ export function createMockTransport(real: Transport): Transport {
         if (ee) return fail(st, 400, "validation_failed", ee.message, ee.field);
         const de = dataSettingsError(req);
         if (de) return fail(st, 400, "validation_failed", de.message, de.field);
+        if (req.inspector !== undefined && typeof req.inspector !== "boolean") return fail(st, 400, "bad_request", "inspector must be true or false", "inspector");
         let build: Build | null = st.builds.find((b) => b.id === s.build_id) ?? null;
         if (req.build_id !== undefined) {
           const be = buildError(st, req.build_id);
@@ -1336,10 +1504,13 @@ export function createMockTransport(real: Transport): Transport {
         const originsChanged = origins.join(",") !== s.allowed_origins.join(",");
         // The autosave period is part of the container's definition; the backup schedule is not.
         const snapshotChange = req.snapshot_interval_seconds !== undefined && req.snapshot_interval_seconds !== s.snapshot_interval_seconds;
+        // The Inspector switch applies on the next (re)start too.
+        const inspectorChange = req.inspector !== undefined && req.inspector !== s.inspector;
         const changed =
-          buildChange || portChange || originsChanged || snapshotChange || Object.keys(req.env_set ?? {}).length > 0 || (req.env_unset ?? []).length > 0;
+          buildChange || portChange || originsChanged || snapshotChange || inspectorChange || Object.keys(req.env_set ?? {}).length > 0 || (req.env_unset ?? []).length > 0;
         if (req.snapshot_interval_seconds !== undefined) s.snapshot_interval_seconds = req.snapshot_interval_seconds;
         if (req.backup_schedule) s.backup_schedule = { ...req.backup_schedule };
+        if (req.inspector !== undefined) s.inspector = req.inspector;
         st.env.set(s.id, env);
         // The current container keeps the old build's image until the next start.
         if (buildChange && s.container_id && !containerImage.has(s.id)) containerImage.set(s.id, s.image);
@@ -1404,6 +1575,7 @@ export function createMockTransport(real: Transport): Transport {
         st.env.delete(s.id);
         st.serverCerts.delete(s.id);
         containerImage.delete(s.id);
+        st.inspectorTokens.delete(s.id);
         return json(st, 204, null);
       }
       if ((sub === "/start" || sub === "/stop" || sub === "/restart") && method === "POST") {
@@ -1693,6 +1865,8 @@ export function createMockTransport(real: Transport): Transport {
       data: { volume: "", schema_fingerprint: "", schema_mismatch: false, last_backup_at: null },
       snapshot_interval_seconds: 300,
       backup_schedule: { interval_hours: 0, keep: 7 },
+      inspector: false,
+      inspector_active: false,
       created_at: iso(),
       updated_at: iso(),
     };
@@ -1904,12 +2078,14 @@ export function createMockTransport(real: Transport): Transport {
       if (st.certMode === "self_signed" && !st.serverCerts.has(s.id)) st.serverCerts.set(s.id, selfSignedCert(`server-${s.id}-${Date.now()}`));
       if (ok) {
         Object.assign(s, { state: "running", exit_code: null, started_at: iso(), restart_required: false, container_id: s.container_id || `c0ffee${s.id}0000` });
+        containerStarted(s);
         if (!build.schema_fingerprint) build.schema_fingerprint = FINGERPRINT;
         // The game reports its schema when it becomes ready; a new world gets the build's.
         if (!s.data.volume) newVolume(s);
         if (!s.data.schema_fingerprint) s.data.schema_fingerprint = build.schema_fingerprint;
       } else {
         Object.assign(s, { state: "exited", exit_code: 1, started_at: null, container_id: s.container_id || `c0ffee${s.id}0000` });
+        containerStarted(s);
       }
     }, failDetail);
   }
@@ -1955,6 +2131,7 @@ export function createMockTransport(real: Transport): Transport {
   /** A server whose container was removed (after a reset, or a forced restore it cannot load): it has none until its next start. */
   function removeContainer(s: Server) {
     containerImage.delete(s.id);
+    containerGone(s);
     Object.assign(s, { state: "missing", container_id: "", started_at: null, exit_code: null, restart_required: false });
   }
 
@@ -1996,6 +2173,7 @@ export function createMockTransport(real: Transport): Transport {
       if (s.data.schema_mismatch) removeContainer(s);
       else if (s.desired_state === "running") {
         Object.assign(s, { state: "running", started_at: iso(), exit_code: null, container_id: s.container_id || `c0ffee${s.id}0000`, restart_required: false });
+        containerStarted(s);
       } else Object.assign(s, { state: s.container_id ? "exited" : "missing", started_at: null });
     }, incompleteSafetyDetail(omitted, "restore"));
     st.restoreReads.set(job.id, b.id);
@@ -2030,6 +2208,7 @@ export function createMockTransport(real: Transport): Transport {
         newVolume(s);
         s.data.schema_fingerprint = st.builds.find((x) => x.id === s.build_id)?.schema_fingerprint ?? "";
         Object.assign(s, { state: "running", started_at: iso(), exit_code: null, container_id: s.container_id || `c0ffee${s.id}0000`, restart_required: false });
+        containerStarted(s);
       } else {
         removeContainer(s);
       }
