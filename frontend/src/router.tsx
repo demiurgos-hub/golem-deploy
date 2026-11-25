@@ -53,6 +53,17 @@ const registerRoute = createRoute({
   component: lazyRouteComponent(() => import("@/pages/auth"), "RegisterPage"),
 });
 
+// The first admin's setup page. A signed-in visitor goes to the home page
+// (the redirect also drops the link's fragment from the address bar).
+const setupRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/setup",
+  beforeLoad: ({ context }) => {
+    if (context.services.session.getToken()) throw redirect({ to: "/", replace: true });
+  },
+  component: lazyRouteComponent(() => import("@/pages/auth"), "SetupPage"),
+});
+
 /** Everything behind sign-in. */
 const appRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -172,6 +183,7 @@ const adminSettingsRoute = createRoute({
 const routeTree = rootRoute.addChildren([
   loginRoute,
   registerRoute,
+  setupRoute,
   appRoute.addChildren([
     indexRoute,
     projectsRoute,

@@ -45,6 +45,7 @@ import type {
   ServerRuntime,
   ServerStats,
   SessionResponse,
+  SetupRequest,
   Settings,
   StaticFileList,
   Status,
@@ -77,6 +78,8 @@ export function createEndpoints(c: ApiClient) {
         c.request<Account>("POST", "/auth/register", { body, auth: false }),
       logout: () => c.request<void>("POST", "/auth/logout"),
       refresh: () => c.request<SessionResponse>("POST", "/auth/refresh"),
+      setup: (body: SetupRequest) =>
+        c.request<SessionResponse>("POST", "/setup", { body, auth: false }),
     },
     account: {
       get: (signal?: AbortSignal) => c.request<CurrentAccount>("GET", "/account", { signal }),

@@ -29,7 +29,7 @@ export function AppRoot({ services, history }: { services: AppServices; history?
         // Another tab signed in (possibly as someone else) or refreshed.
         void queryClient.invalidateQueries();
         const path = router.state.location.pathname;
-        if (path === "/login" || path === "/register") void router.navigate({ to: "/projects", replace: true });
+        if (path === "/login" || path === "/register" || path === "/setup") void router.navigate({ to: "/projects", replace: true });
       }
     });
     return () => {

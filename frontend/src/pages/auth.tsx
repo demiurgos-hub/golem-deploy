@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { Link, useNavigate, useSearch } from "@tanstack/react-router";
+import { Link, useNavigate, useRouter, useSearch } from "@tanstack/react-router";
 import { Moon, Sun } from "lucide-react";
 import { useServices, useSession } from "@/app/services";
 import { describeError, isApiError, readyAgain, withWait } from "@/api/errors";
@@ -8,6 +8,7 @@ import type { CurrentAccount } from "@/api/types.gen";
 import { qk } from "@/api/query-keys";
 import { useTheme } from "@/hooks/use-theme";
 import { Button } from "@/components/ui/button";
+import { CopyButton } from "@/components/ui/copy-button";
 import { Checkbox, Field, Input } from "@/components/ui/input";
 import { ErrorText, Notice } from "@/components/ui/states";
 import { normalizeUsername, validatePassword, validateUsername } from "@/lib/validators";
@@ -69,6 +70,36 @@ function errorWithCountdown(err: unknown, wait: number): string {
   return describeError(err);
 }
 
+/** The host command that prints a new setup link (golem-deploy admin setup-link). */
+export const SETUP_LINK_COMMAND =
+  "sudo runuser -u golem-deploy -- golem-deploy admin setup-link --data-dir /var/lib/golem-deploy";
+
+function SetupLinkCommand() {
+  return (
+    <span className="flex items-start gap-1">
+      <code className="min-w-0 flex-1 break-all rounded-md bg-muted px-2 py-1 font-mono text-xs text-foreground">
+        {SETUP_LINK_COMMAND}
+      </code>
+      <CopyButton value={SETUP_LINK_COMMAND} size="icon" variant="ghost" label="Copy the command" />
+    </span>
+  );
+}
+
+/** Shown on the login page while no admin account exists. */
+function SetupRequiredNotice() {
+  return (
+    <Notice title="No admin account yet">
+      <span className="flex flex-col gap-2">
+        <span>
+          This installation has no admin account yet. The setup link creates it. The installer prints the link when it
+          finishes, or make a new one on the host with:
+        </span>
+        <SetupLinkCommand />
+      </span>
+    </Notice>
+  );
+}
+
 export function LoginPage() {
   const { api, session, queryClient } = useServices();
   const snapshot = useSession();
@@ -113,6 +144,7 @@ export function LoginPage() {
     <AuthLayout title="Sign in">
       <form onSubmit={(e) => void submit(e)} noValidate className="flex flex-col gap-4">
         {snapshot.notice && <Notice tone="warning">{snapshot.notice}</Notice>}
+        {options.data?.setup_required && <SetupRequiredNotice />}
         <Field label="Username" error={errors.username}>
           {(p) => (
             <Input
@@ -290,6 +322,152 @@ export function RegisterPage() {
             Sign in
           </Link>
         </p>
+      </form>
+    </AuthLayout>
+  );
+}
+
+/** The setup token in a "#t=<token>" fragment, or null. */
+export function setupTokenFromHash(hash: string): string | null {
+  const params = new URLSearchParams(hash.startsWith("#") ? hash.slice(1) : hash);
+  return params.get("t") || null;
+}
+
+/**
+ * Creates the first admin account with the one-time setup link
+ * (golem-deploy admin setup-link prints "<origin>/setup#t=<token>"). The
+ * token is read once from the fragment, kept only in this component's state
+ * and removed from the address bar straight away.
+ */
+export function SetupPage() {
+  const { api, session, queryClient } = useServices();
+  const router = useRouter();
+  const navigate = useNavigate();
+  const [token, setToken] = useState<string | null>(() => setupTokenFromHash(router.state.location.hash));
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [persist, setPersist] = useState(false);
+  const [errors, setErrors] = useState<FieldErrors>({});
+  const [formError, setFormError] = useState<unknown>(null);
+  const [pending, setPending] = useState(false);
+  const [wait, startWait] = useCountdown();
+
+  useEffect(() => {
+    // The router's history replaces the entry (history.replaceState in a
+    // browser), so the token leaves the address bar and the browser's
+    // history at once.
+    const loc = router.state.location;
+    if (loc.hash) router.history.replace(loc.pathname + loc.searchStr);
+  }, [router]);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    const next: FieldErrors = {
+      username: validateUsername(username),
+      password: validatePassword(password),
+      confirm: confirm !== password ? "The passwords do not match." : null,
+    };
+    setErrors(next);
+    setFormError(null);
+    if (next.username || next.password || next.confirm || !token) return;
+    setPending(true);
+    try {
+      const res = await api.auth.setup({ token, username: normalizeUsername(username), password });
+      queryClient.clear();
+      const me: CurrentAccount = { ...res.account, auth: "session", api_token: null };
+      queryClient.setQueryData(qk.account, me);
+      session.start(res.token, persist);
+      await navigate({ to: "/", replace: true });
+    } catch (err) {
+      setPending(false);
+      if (waitsForRetry(err) && isApiError(err) && err.retryAfter) startWait(err.retryAfter);
+      if (isApiError(err) && err.code === "setup_link_invalid") {
+        setToken(null);
+      } else if (isApiError(err) && err.code === "username_taken") {
+        setErrors({ username: "This username is taken. Choose another." });
+      } else if (isApiError(err) && err.code === "validation_failed" && (err.field === "username" || err.field === "password")) {
+        setErrors({ [err.field]: err.message });
+      } else {
+        setFormError(err);
+      }
+    }
+  }
+
+  if (!token) {
+    return (
+      <AuthLayout title="Set up Golem Deploy">
+        <div className="flex flex-col gap-4 text-sm">
+          <p>This setup link is missing, expired or already used. A setup link works once and only until it expires.</p>
+          <p>The installer prints a setup link when it finishes. To make a new one, run this command on the host:</p>
+          <SetupLinkCommand />
+          <p>Then open the new link in your browser.</p>
+          <p>
+            If an admin account already exists,{" "}
+            <Link to="/login" className="font-medium underline underline-offset-4">
+              sign in
+            </Link>{" "}
+            instead.
+          </p>
+        </div>
+      </AuthLayout>
+    );
+  }
+
+  const waiting = waitsForRetry(formError) && wait > 0;
+  return (
+    <AuthLayout title="Create the admin account">
+      <form onSubmit={(e) => void submit(e)} noValidate className="flex flex-col gap-4">
+        <p className="text-sm text-muted-foreground">
+          Choose the username and password of the first administrator of this installation.
+        </p>
+        <Field label="Username" error={errors.username} hint="3 to 32 characters: lower-case letters, digits, '.', '_' or '-'.">
+          {(p) => (
+            <Input
+              {...p}
+              name="username"
+              autoComplete="username"
+              autoCapitalize="none"
+              spellCheck={false}
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              autoFocus
+            />
+          )}
+        </Field>
+        <Field label="Password" error={errors.password} hint="12 to 72 bytes.">
+          {(p) => (
+            <Input
+              {...p}
+              name="new-password"
+              type="password"
+              autoComplete="new-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          )}
+        </Field>
+        <Field label="Repeat password" error={errors.confirm}>
+          {(p) => (
+            <Input
+              {...p}
+              name="confirm-password"
+              type="password"
+              autoComplete="new-password"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+            />
+          )}
+        </Field>
+        <Checkbox
+          label="Keep me signed in on this device"
+          checked={persist}
+          onChange={(e) => setPersist(e.target.checked)}
+        />
+        {formError !== null && <ErrorText error={formError}>{errorWithCountdown(formError, wait)}</ErrorText>}
+        <Button type="submit" loading={pending} disabled={waiting}>
+          Create admin account
+        </Button>
       </form>
     </AuthLayout>
   );
