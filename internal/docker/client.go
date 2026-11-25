@@ -390,7 +390,10 @@ func (c *Client) Reachable(ctx context.Context) bool {
 	if !c.probeAt.IsZero() && c.now().Sub(c.probeAt) < probeTTL {
 		return c.probeOK
 	}
-	c.probeOK = c.Ping(ctx) == nil
+	// The probe has its own timeout and its answer is shared by every
+	// caller for probeTTL, so it must not fail because the request that
+	// happened to trigger it went away (a page navigation, for example).
+	c.probeOK = c.Ping(context.WithoutCancel(ctx)) == nil
 	c.probeAt = c.now()
 	return c.probeOK
 }

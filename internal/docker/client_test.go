@@ -737,7 +737,26 @@ func TestD5_NetworkIsolation(t *testing.T) {
 	}
 }
 
+// ctxRunner fails like a real command does when its context is over.
+type ctxRunner struct{ next docker.Runner }
+
+func (r ctxRunner) Run(ctx context.Context, path string, cmd docker.Cmd) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.next.Run(ctx, path, cmd)
+}
+
 func TestUnavailableAndProbe(t *testing.T) {
+	// A caller that went away does not make Docker count as unreachable
+	// for everyone else.
+	gone, cancelGone := context.WithCancel(context.Background())
+	cancelGone()
+	c0 := docker.New(docker.Options{Runner: ctxRunner{dockertest.New()}, InstanceID: instance, TempDir: t.TempDir(),
+		LookupEnv: func(k string) (string, bool) { v, ok := daemonEnv[k]; return v, ok }})
+	if !c0.Reachable(gone) || !c0.Reachable(context.Background()) {
+		t.Fatal("a cancelled caller made Docker count as unreachable")
+	}
 	c, f, _ := newClient(t)
 	ctx := context.Background()
 	if !c.Reachable(ctx) {

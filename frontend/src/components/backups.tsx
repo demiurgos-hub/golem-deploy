@@ -198,7 +198,7 @@ export function BackupsTable({
             key: "project",
             header: "Project",
             hideOnSmall: true,
-            className: "min-w-24",
+            className: "min-w-20",
             sortValue: (b: Backup) => b.project_name,
             cell: (b: Backup) =>
               b.project_id === null ? (
@@ -258,7 +258,7 @@ export function BackupsTable({
     {
       key: "note",
       header: "Note",
-      className: "min-w-32 max-w-64",
+      className: "min-w-20 max-w-64",
       cell: (b) => (b.note ? <span className="break-words">{b.note}</span> : <span className="text-muted-foreground">-</span>),
     },
   ];
