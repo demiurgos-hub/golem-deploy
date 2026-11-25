@@ -32,6 +32,22 @@ type RegisterRequest struct {
 type AuthOptions struct {
 	// RegistrationEnabled reports whether POST /api/v1/auth/register is open.
 	RegistrationEnabled bool `json:"registration_enabled"`
+	// SetupRequired is true while no admin account exists, that is no
+	// account that is both an admin and approved (the accounts that the
+	// last-admin protection counts). The first admin is then created with a
+	// setup link (POST /api/v1/setup).
+	SetupRequired bool `json:"setup_required"`
+}
+
+// SetupRequest is the body of POST /api/v1/setup (public). Token is the
+// one-time token from the setup link that "golem-deploy admin setup-link"
+// prints (the part after "#t="). Username and Password follow the rules of
+// RegisterRequest. On success the account is an approved admin and the
+// answer is a SessionResponse (201).
+type SetupRequest struct {
+	Token    string `json:"token"`
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 // SessionResponse is returned by login, refresh and password change. Send the

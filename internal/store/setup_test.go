@@ -176,3 +176,24 @@ func TestCompleteSetupConcurrent(t *testing.T) {
 		t.Fatalf("%d successes, %d accounts", ok, c.Total)
 	}
 }
+
+// The admin check is part of the transaction, not only the deletion of the
+// token: an approved admin that appeared without deleting it still blocks
+// the setup.
+func TestCompleteSetupChecksForAdmins(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	if err := s.SetSetupToken(ctx, "a", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO accounts (username, password_hash, role, approved, token_version, created_at)
+		VALUES ('other', 'h', 'admin', 1, 1, '2026-01-01T00:00:00.000Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := s.CheckSetupToken(ctx, "a"); ok {
+		t.Fatal("token valid with an admin")
+	}
+	if _, err := s.CompleteSetup(ctx, "a", setupAdmin("root")); !errors.Is(err, ErrSetupInvalid) {
+		t.Fatalf("with an admin: %v", err)
+	}
+}

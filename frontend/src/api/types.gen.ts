@@ -40,6 +40,25 @@ export interface AuthOptions {
    * RegistrationEnabled reports whether POST /api/v1/auth/register is open.
    */
   registration_enabled: boolean;
+  /**
+   * SetupRequired is true while no admin account exists, that is no
+   * account that is both an admin and approved (the accounts that the
+   * last-admin protection counts). The first admin is then created with a
+   * setup link (POST /api/v1/setup).
+   */
+  setup_required: boolean;
+}
+/**
+ * SetupRequest is the body of POST /api/v1/setup (public). Token is the
+ * one-time token from the setup link that "golem-deploy admin setup-link"
+ * prints (the part after "#t="). Username and Password follow the rules of
+ * RegisterRequest. On success the account is an approved admin and the
+ * answer is a SessionResponse (201).
+ */
+export interface SetupRequest {
+  token: string;
+  username: string;
+  password: string;
 }
 /**
  * SessionResponse is returned by login, refresh and password change. Send the
@@ -841,6 +860,12 @@ export const ErrorCodeSessionRequired = "session_required";
  */
 export const ErrorCodeRegistrationDisabled = "registration_disabled";
 /**
+ * ErrorCodeSetupLinkInvalid: POST /api/v1/setup got a token that is
+ * missing, wrong, expired or already used, or an admin account already
+ * exists (403). All these cases get the same answer.
+ */
+export const ErrorCodeSetupLinkInvalid = "setup_link_invalid";
+/**
  * ErrorCodeNotFound: unknown route or resource (404).
  */
 export const ErrorCodeNotFound = "not_found";
@@ -935,7 +960,7 @@ export const ErrorCodeUnavailable = "service_unavailable";
 /**
  * Error codes. The HTTP status each one is used with is noted in parentheses.
  */
-export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationFailed | typeof ErrorCodeInvalidCurrentPassword | typeof ErrorCodeUnauthenticated | typeof ErrorCodeInvalidCredentials | typeof ErrorCodeForbidden | typeof ErrorCodeSessionRequired | typeof ErrorCodeRegistrationDisabled | typeof ErrorCodeNotFound | typeof ErrorCodeMethodNotAllowed | typeof ErrorCodeUsernameTaken | typeof ErrorCodeNameTaken | typeof ErrorCodePortInUse | typeof ErrorCodeLastAdmin | typeof ErrorCodeCannotModifySelf | typeof ErrorCodeJobInProgress | typeof ErrorCodeJobNotActive | typeof ErrorCodeSchemaMismatch | typeof ErrorCodeConflict | typeof ErrorCodeBadHost | typeof ErrorCodeRequestTooLarge | typeof ErrorCodeUnsupportedMediaType | typeof ErrorCodeRateLimited | typeof ErrorCodeInsufficientStorage | typeof ErrorCodeInternal | typeof ErrorCodeNotImplemented | typeof ErrorCodeUnavailable;
+export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationFailed | typeof ErrorCodeInvalidCurrentPassword | typeof ErrorCodeUnauthenticated | typeof ErrorCodeInvalidCredentials | typeof ErrorCodeForbidden | typeof ErrorCodeSessionRequired | typeof ErrorCodeRegistrationDisabled | typeof ErrorCodeSetupLinkInvalid | typeof ErrorCodeNotFound | typeof ErrorCodeMethodNotAllowed | typeof ErrorCodeUsernameTaken | typeof ErrorCodeNameTaken | typeof ErrorCodePortInUse | typeof ErrorCodeLastAdmin | typeof ErrorCodeCannotModifySelf | typeof ErrorCodeJobInProgress | typeof ErrorCodeJobNotActive | typeof ErrorCodeSchemaMismatch | typeof ErrorCodeConflict | typeof ErrorCodeBadHost | typeof ErrorCodeRequestTooLarge | typeof ErrorCodeUnsupportedMediaType | typeof ErrorCodeRateLimited | typeof ErrorCodeInsufficientStorage | typeof ErrorCodeInternal | typeof ErrorCodeNotImplemented | typeof ErrorCodeUnavailable;
 
 //////////
 // source: host.go

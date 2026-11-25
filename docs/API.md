@@ -35,6 +35,7 @@ Every non-2xx response has this body:
 | `forbidden` | 403 | Role too low (API tokens are never admin), or a per-resource rule (e.g. restricted job logs, cancelling another account's job) |
 | `session_required` | 403 | Route needs a session JWT, called with an API token |
 | `registration_disabled` | 403 | Self-registration is off |
+| `setup_link_invalid` | 403 | `POST /setup` with a missing, wrong, expired or already used token, or while an admin account exists (one answer for all of them) |
 | `not_found` | 404 | Unknown route or resource |
 | `method_not_allowed` | 405 | See `Allow` header |
 | `bad_host` | 421 | `Host` header is not an IP address, `localhost` or a `--public-host` name |
@@ -75,7 +76,7 @@ Access levels (the **Access** column):
 - **session** — session JWT of any role; API tokens get `403 session_required`.
 - **admin** — session JWT of an admin; developers and all API tokens get `403 forbidden`.
 
-Password checks (login, password change, API token creation) are rate limited in memory. Every attempt is counted before the password is checked and stays counted if it fails:
+Password checks (login, password change, API token creation) and setup tokens (`POST /setup`) are rate limited in memory. Every attempt is counted before the password is checked and stays counted if it fails:
 
 - **Per client address:** 5 failures per 15 minutes (IPv4 address, or IPv6 /64).
 - **Per submitted username:** 20 failures per 15 minutes, counted the same way whether or not the account exists, so the limits reveal nothing about which usernames exist. An address that has logged in successfully as that user since the daemon started is exempt from this limit (not from the per-address one), so someone hammering your username does not lock you out of your usual address. A successful check clears the username's counter.
@@ -88,7 +89,7 @@ The client address is the TCP peer. Behind a reverse proxy, start the daemon wit
 
 Account rules: usernames match `^[a-z0-9][a-z0-9._-]{2,31}$` after lower-casing and are unique case-insensitively; passwords are 12–72 bytes (longer is rejected, never truncated).
 
-The first admin is created on the host: `golem-deploy admin create --username <name>` (see README).
+The first admin is created with a one-time setup link or on the host with `golem-deploy admin create --username <name>` (see README). `golem-deploy admin setup-link` prints the link, `<origin>/setup#t=<token>`; the web client's `/setup` page sends the token with the chosen username and password to `POST /setup`. Only one link is valid at a time (a new one replaces the previous one), it expires (1 hour by default) and it works once. It stops working as soon as an admin account exists, however that account was created.
 
 ## Endpoints
 
@@ -96,7 +97,8 @@ The first admin is created on the host: `golem-deploy admin create --username <n
 
 | Method | Path | Access | Request | Response | Status | Errors |
 |--------|------|--------|---------|----------|--------|--------|
-| GET | `/auth/options` | public | — | 200 `AuthOptions` `{registration_enabled}` | implemented | |
+| GET | `/auth/options` | public | — | 200 `AuthOptions` `{registration_enabled, setup_required}` | implemented | |
+| POST | `/setup` | public | `SetupRequest` `{token, username, password}` | 201 `SessionResponse` (the first admin, signed in) | implemented | `setup_link_invalid`, `validation_failed`, `username_taken`, `rate_limited`, `service_unavailable` |
 | POST | `/auth/login` | public | `LoginRequest` | 200 `SessionResponse` | implemented | `invalid_credentials`, `rate_limited`, `validation_failed` |
 | POST | `/auth/register` | public | `RegisterRequest` | 201 `Account` (developer, unapproved) | implemented | `registration_disabled`, `validation_failed`, `username_taken`, `rate_limited` |
 | POST | `/auth/logout` | session | — | 204 | implemented | Ends **every** session of the account |
@@ -107,7 +109,9 @@ The first admin is created on the host: `golem-deploy admin create --username <n
 | POST | `/account/tokens` | session | `CreateAPITokenRequest` `{name, expires_at?, current_password}` | 201 `CreateAPITokenResponse` (secret shown once) | implemented | `validation_failed`, `invalid_current_password`, `rate_limited`, `service_unavailable`, `conflict` (50 tokens max) |
 | DELETE | `/account/tokens/{id}` | session | — | 204 | implemented | `not_found` |
 
-`GET /auth/options` lets a login page decide whether to offer registration before anyone has signed in; it reveals nothing else.
+`GET /auth/options` lets a login page decide whether to offer registration before anyone has signed in, and `setup_required` says that no admin account exists yet (no account that is both an admin and approved, the accounts the last-admin rule counts); it reveals nothing else.
+
+`POST /setup` creates the first admin account: approved, role admin, with the given username and password, and answers like a login. The token is decided first. A token that is missing, wrong, expired or already used, and any request while an admin account exists, get `403 setup_link_invalid` and count as a failure against the per-address limit above (shared with login); such a request never reaches password hashing. With a valid token the attempt is not counted, and `validation_failed` (username or password rules) does not use the token up. Creating the account, the admin check and using up the token happen in one transaction, so two requests with the same token create one account.
 
 `SessionResponse` is `{token, expires_at, session_expires_at, account}`. Refresh before `expires_at`; after `session_expires_at` log in again. Logging in again does not end other sessions; logout does.
 

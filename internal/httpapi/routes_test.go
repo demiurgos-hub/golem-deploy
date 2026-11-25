@@ -23,6 +23,7 @@ var expectedRoutes = map[string]Access{
 	"POST /api/v1/auth/register":        AccessPublic,
 	"POST /api/v1/auth/logout":          AccessSession,
 	"POST /api/v1/auth/refresh":         AccessSession,
+	"POST /api/v1/setup":                AccessPublic,
 
 	"GET /api/v1/status":     AccessDeveloper,
 	"GET /api/v1/settings":   AccessAdmin,

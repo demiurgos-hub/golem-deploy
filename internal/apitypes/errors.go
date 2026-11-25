@@ -47,6 +47,10 @@ const (
 	ErrorCodeSessionRequired ErrorCode = "session_required"
 	// ErrorCodeRegistrationDisabled: self-registration is turned off (403).
 	ErrorCodeRegistrationDisabled ErrorCode = "registration_disabled"
+	// ErrorCodeSetupLinkInvalid: POST /api/v1/setup got a token that is
+	// missing, wrong, expired or already used, or an admin account already
+	// exists (403). All these cases get the same answer.
+	ErrorCodeSetupLinkInvalid ErrorCode = "setup_link_invalid"
 	// ErrorCodeNotFound: unknown route or resource (404).
 	ErrorCodeNotFound ErrorCode = "not_found"
 	// ErrorCodeMethodNotAllowed: the route exists with another method; the Allow
