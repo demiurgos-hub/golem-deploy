@@ -67,7 +67,8 @@ type Server struct {
 	ExitCode    *int        `json:"exit_code" tstype:"number | null,required"`
 	// RestartRequired is true when the container is running with an older
 	// definition (build, port, env, allowed origins, game host, certificate
-	// mode or daemon run settings changed since it was started). Changes
+	// mode, Inspector settings or daemon run settings changed since it was
+	// started). Changes
 	// never restart a server implicitly. A renewed certificate is picked up
 	// without a restart.
 	RestartRequired bool `json:"restart_required"`
@@ -85,8 +86,16 @@ type Server struct {
 	// BackupSchedule is the server's automatic backup setting (off by
 	// default: interval_hours 0, keep 7).
 	BackupSchedule BackupSchedule `json:"backup_schedule"`
-	CreatedAt      time.Time      `json:"created_at"`
-	UpdatedAt      time.Time      `json:"updated_at"`
+	// Inspector is the server's Inspector setting: when it is on and the
+	// installation's Inspector is turned on (GET /api/v1/inspector), the
+	// game's Inspector agent is pointed at it from the next (re)start, and
+	// the server appears in the Inspector under its name. Off by default.
+	// InspectorActive is true when the server's current container was
+	// started that way (false without a container).
+	Inspector       bool      `json:"inspector"`
+	InspectorActive bool      `json:"inspector_active"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // ServerList is the body of GET /api/v1/servers.
@@ -105,7 +114,8 @@ type ServerList struct {
 // rejected value is reported with field "env.<KEY>". DesiredState defaults
 // to "stopped"; "running" starts a server.start job right after creation.
 // SnapshotIntervalSeconds is 0 or 10 to 86400 (default 300); BackupSchedule
-// defaults to off (see BackupSchedule for its ranges).
+// defaults to off (see BackupSchedule for its ranges). Inspector defaults to
+// false.
 type CreateServerRequest struct {
 	Name                    string            `json:"name"`
 	BuildID                 int64             `json:"build_id"`
@@ -115,6 +125,7 @@ type CreateServerRequest struct {
 	DesiredState            *DesiredState     `json:"desired_state,omitempty"`
 	SnapshotIntervalSeconds *int              `json:"snapshot_interval_seconds,omitempty"`
 	BackupSchedule          *BackupSchedule   `json:"backup_schedule,omitempty"`
+	Inspector               *bool             `json:"inspector,omitempty"`
 }
 
 // UpdateServerRequest is the body of PATCH /api/v1/servers/{id}. Absent fields
@@ -126,6 +137,7 @@ type CreateServerRequest struct {
 // while the server's container is running is refused with 409 conflict
 // (stop the server first). SnapshotIntervalSeconds applies on the next
 // (re)start; BackupSchedule applies at once and never needs a restart.
+// Inspector applies on the next (re)start.
 type UpdateServerRequest struct {
 	BuildID                 *int64            `json:"build_id,omitempty"`
 	Port                    *int              `json:"port,omitempty"`
@@ -134,6 +146,7 @@ type UpdateServerRequest struct {
 	EnvUnset                []string          `json:"env_unset,omitempty"`
 	SnapshotIntervalSeconds *int              `json:"snapshot_interval_seconds,omitempty"`
 	BackupSchedule          *BackupSchedule   `json:"backup_schedule,omitempty"`
+	Inspector               *bool             `json:"inspector,omitempty"`
 }
 
 // ServerStats is the body of GET /api/v1/servers/{id}/stats: a single sample
@@ -167,6 +180,8 @@ type ServerSpec struct {
 	// of an export.
 	SnapshotIntervalSeconds *int            `json:"snapshot_interval_seconds,omitempty"`
 	BackupSchedule          *BackupSchedule `json:"backup_schedule,omitempty"`
+	// Inspector is the server's Inspector setting (false when absent).
+	Inspector bool `json:"inspector,omitempty"`
 }
 
 // ServerExport is the body of GET /api/v1/servers/export and of

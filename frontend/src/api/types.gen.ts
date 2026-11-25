@@ -1047,6 +1047,180 @@ export interface VolumeList {
 }
 
 //////////
+// source: inspector.go
+
+/**
+ * InspectorState is the observed state of the Inspector hub.
+ */
+/**
+ * InspectorStateOff: the Inspector is not turned on.
+ */
+export const InspectorStateOff = "off";
+/**
+ * InspectorStateRunning: the hub container runs and the Inspector
+ * listener is open.
+ */
+export const InspectorStateRunning = "running";
+/**
+ * InspectorStateStopped: the Inspector is turned on but not serving (its
+ * image could not be downloaded, the container is not running or the
+ * listener could not be opened). Detail says why.
+ */
+export const InspectorStateStopped = "stopped";
+/**
+ * InspectorStateUnknown: Docker could not be queried.
+ */
+export const InspectorStateUnknown = "unknown";
+/**
+ * Inspector states.
+ */
+export type InspectorState = typeof InspectorStateOff | typeof InspectorStateRunning | typeof InspectorStateStopped | typeof InspectorStateUnknown;
+/**
+ * Inspector is the body of GET /api/v1/inspector: the Golem Inspector of
+ * this installation. The Inspector shows the live entities of game servers.
+ * Its hub runs as a container the daemon manages; the daemon alone talks to
+ * it. Browsers reach it through the Inspector listener of the daemon, and
+ * the games' Inspector agents connect to that same listener from their
+ * containers.
+ * The hub's own secrets are never returned.
+ */
+export interface Inspector {
+  /**
+   * Available is false when the daemon runs with "--inspector-listen off";
+   * the Inspector cannot be turned on then.
+   */
+  available: boolean;
+  /**
+   * Enabled is the setting (PATCH /api/v1/inspector).
+   */
+  enabled: boolean;
+  state: InspectorState;
+  /**
+   * Detail is a short, user-safe reason while State is "stopped" (empty
+   * otherwise).
+   */
+  detail: string;
+  /**
+   * Image is the configured image reference (--inspector-image) and
+   * ImageID the id of the image the hub container was created from ("" when
+   * there is no container).
+   */
+  image: string;
+  image_id: string;
+  /**
+   * StartedAt is when the hub container started; null unless it runs.
+   */
+  started_at: string | null;
+  /**
+   * Port is the TCP port of the Inspector listener (0 when not Available).
+   * Browsers use it over HTTPS (plain HTTP when the panel itself is served
+   * without TLS); the games' agents use it without TLS from the Docker
+   * network. A host firewall has to allow this port.
+   */
+  port: number /* int */;
+  /**
+   * PublicURL is --inspector-public-url ("https://inspector.example.com",
+   * no trailing slash) when a reverse proxy fronts the listener; otherwise
+   * "" and the Inspector is at the panel's own scheme and host name with
+   * Port.
+   */
+  public_url: string;
+  /**
+   * AgentAddress is the host:port the games' agents connect to from their
+   * containers; "" while it is not known (the Inspector is off or Docker's
+   * network does not exist yet) or when containers cannot reach the
+   * listener (AgentsReachable false).
+   */
+  agent_address: string;
+  /**
+   * AgentsReachable is false when the listener is bound to an address
+   * containers cannot connect to (a loopback address on Linux): the
+   * Inspector opens, but no server appears in it.
+   */
+  agents_reachable: boolean;
+  /**
+   * Targets are the servers whose agents the hub knows, by server name.
+   * Null while the hub is not running or did not answer.
+   */
+  targets: InspectorTarget[] | null;
+  /**
+   * OtherTargets counts targets the hub knows that belong to no server of
+   * this installation (0 when Targets is null).
+   */
+  other_targets: number /* int */;
+}
+/**
+ * InspectorTarget is a server as the Inspector hub sees it. Only values the
+ * daemon can bound are relayed; nothing here is text written by a game.
+ */
+export interface InspectorTarget {
+  server_id: number /* int64 */;
+  /**
+   * Connected reports whether the server's agent is connected to the hub
+   * now. A target stays listed for a short while after its agent left.
+   */
+  connected: boolean;
+  /**
+   * Entities is the number of entities the hub holds for the server; it is
+   * 0 unless somebody is looking at the server in the Inspector.
+   */
+  entities: number /* int */;
+  /**
+   * ConnectedAt is when the agent connected; null when not Connected.
+   */
+  connected_at: string | null;
+}
+/**
+ * UpdateInspectorRequest is the body of PATCH /api/v1/inspector (admin). It
+ * answers 202 with a restricted "inspector.apply" job that brings the hub in
+ * line with the request: with the Inspector on, it downloads the image when
+ * the host does not have it, creates or replaces the hub container, waits
+ * until the hub is ready and opens the listener; with it off, it closes the
+ * listener and removes the container.
+ * Enabled absent leaves the setting as it is (the job then repairs or
+ * refreshes a hub that is on). PullImage downloads the image again even
+ * though the host has it (for a tag that moved). RotateSecrets replaces the
+ * hub's secrets and the tokens of every server: open Inspector sessions end
+ * and servers with the Inspector on report restart_required until they are
+ * restarted. PullImage and RotateSecrets are refused with 400 when the
+ * Inspector would be off.
+ */
+export interface UpdateInspectorRequest {
+  enabled?: boolean;
+  pull_image?: boolean;
+  rotate_secrets?: boolean;
+}
+/**
+ * CreateInspectorSessionRequest is the body of POST
+ * /api/v1/inspector/sessions (the body may be empty). ServerID opens the
+ * Inspector on that server; it must be a server with the Inspector on.
+ */
+export interface CreateInspectorSessionRequest {
+  server_id?: number /* int64 */;
+}
+/**
+ * InspectorSession is the response of POST /api/v1/inspector/sessions: a
+ * one-time entry link into the Inspector for the calling account. The route
+ * needs a login session (API tokens get 403 session_required) and answers
+ * 409 conflict while the Inspector is not running.
+ * Opening Path on the Inspector's address signs the browser in there and
+ * redirects to the Inspector itself. The Inspector's address is PublicURL
+ * when it is set, otherwise the panel's scheme and host name with Port. The
+ * link works once and until ExpiresAt (60 seconds). The Inspector session it
+ * starts ends after 8 hours, at sign-out there, when the account is deleted,
+ * loses its approval or changes its password, and when the daemon restarts.
+ */
+export interface InspectorSession {
+  /**
+   * Path is an absolute path with a query ("/_golem-deploy/enter?...").
+   */
+  path: string;
+  port: number /* int */;
+  public_url: string;
+  expires_at: string /* RFC 3339, UTC */;
+}
+
+//////////
 // source: jobs.go
 
 /**
@@ -1074,9 +1248,14 @@ export const SubjectTypeServer = "server";
  */
 export const SubjectTypeCertificate = "certificate";
 /**
+ * SubjectTypeInspector is the installation's Inspector hub; its subject
+ * id is "hub".
+ */
+export const SubjectTypeInspector = "inspector";
+/**
  * Subject types.
  */
-export type SubjectType = typeof SubjectTypeProject | typeof SubjectTypeServer | typeof SubjectTypeCertificate;
+export type SubjectType = typeof SubjectTypeProject | typeof SubjectTypeServer | typeof SubjectTypeCertificate | typeof SubjectTypeInspector;
 /**
  * JobKind names what a job does. New kinds may be added; clients should
  * display unknown kinds verbatim.
@@ -1106,9 +1285,14 @@ export const JobKindServerDataReset = "server.data_reset";
 export const JobKindCertificateIssue = "certificate.issue";
 export const JobKindCertificateRenew = "certificate.renew";
 /**
+ * JobKindInspectorApply brings the Inspector hub in line with its
+ * setting (PATCH /api/v1/inspector). Restricted (admin).
+ */
+export const JobKindInspectorApply = "inspector.apply";
+/**
  * Job kinds.
  */
-export type JobKind = typeof JobKindProjectClone | typeof JobKindProjectPull | typeof JobKindProjectBranch | typeof JobKindProjectBuild | typeof JobKindServerStart | typeof JobKindServerStop | typeof JobKindServerRestart | typeof JobKindServerDelete | typeof JobKindServerBackup | typeof JobKindServerRestore | typeof JobKindServerDataReset | typeof JobKindCertificateIssue | typeof JobKindCertificateRenew;
+export type JobKind = typeof JobKindProjectClone | typeof JobKindProjectPull | typeof JobKindProjectBranch | typeof JobKindProjectBuild | typeof JobKindServerStart | typeof JobKindServerStop | typeof JobKindServerRestart | typeof JobKindServerDelete | typeof JobKindServerBackup | typeof JobKindServerRestore | typeof JobKindServerDataReset | typeof JobKindCertificateIssue | typeof JobKindCertificateRenew | typeof JobKindInspectorApply;
 /**
  * Job is a long-running operation. Routes that start one respond 202 with the
  * Job; poll GET /api/v1/jobs/{id} or stream GET /api/v1/jobs/{id}/log?follow=1.
@@ -1389,7 +1573,8 @@ export interface Server {
   /**
    * RestartRequired is true when the container is running with an older
    * definition (build, port, env, allowed origins, game host, certificate
-   * mode or daemon run settings changed since it was started). Changes
+   * mode, Inspector settings or daemon run settings changed since it was
+   * started). Changes
    * never restart a server implicitly. A renewed certificate is picked up
    * without a restart.
    */
@@ -1416,6 +1601,16 @@ export interface Server {
    * default: interval_hours 0, keep 7).
    */
   backup_schedule: BackupSchedule;
+  /**
+   * Inspector is the server's Inspector setting: when it is on and the
+   * installation's Inspector is turned on (GET /api/v1/inspector), the
+   * game's Inspector agent is pointed at it from the next (re)start, and
+   * the server appears in the Inspector under its name. Off by default.
+   * InspectorActive is true when the server's current container was
+   * started that way (false without a container).
+   */
+  inspector: boolean;
+  inspector_active: boolean;
   created_at: string /* RFC 3339, UTC */;
   updated_at: string /* RFC 3339, UTC */;
 }
@@ -1437,7 +1632,8 @@ export interface ServerList {
  * rejected value is reported with field "env.<KEY>". DesiredState defaults
  * to "stopped"; "running" starts a server.start job right after creation.
  * SnapshotIntervalSeconds is 0 or 10 to 86400 (default 300); BackupSchedule
- * defaults to off (see BackupSchedule for its ranges).
+ * defaults to off (see BackupSchedule for its ranges). Inspector defaults to
+ * false.
  */
 export interface CreateServerRequest {
   name: string;
@@ -1448,6 +1644,7 @@ export interface CreateServerRequest {
   desired_state?: DesiredState;
   snapshot_interval_seconds?: number /* int */;
   backup_schedule?: BackupSchedule;
+  inspector?: boolean;
 }
 /**
  * UpdateServerRequest is the body of PATCH /api/v1/servers/{id}. Absent fields
@@ -1459,6 +1656,7 @@ export interface CreateServerRequest {
  * while the server's container is running is refused with 409 conflict
  * (stop the server first). SnapshotIntervalSeconds applies on the next
  * (re)start; BackupSchedule applies at once and never needs a restart.
+ * Inspector applies on the next (re)start.
  */
 export interface UpdateServerRequest {
   build_id?: number /* int64 */;
@@ -1468,6 +1666,7 @@ export interface UpdateServerRequest {
   env_unset?: string[];
   snapshot_interval_seconds?: number /* int */;
   backup_schedule?: BackupSchedule;
+  inspector?: boolean;
 }
 /**
  * ServerStats is the body of GET /api/v1/servers/{id}/stats: a single sample
@@ -1505,6 +1704,10 @@ export interface ServerSpec {
    */
   snapshot_interval_seconds?: number /* int */;
   backup_schedule?: BackupSchedule;
+  /**
+   * Inspector is the server's Inspector setting (false when absent).
+   */
+  inspector?: boolean;
 }
 /**
  * ServerExport is the body of GET /api/v1/servers/export and of

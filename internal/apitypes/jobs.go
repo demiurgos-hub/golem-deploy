@@ -26,6 +26,9 @@ const (
 	// SubjectTypeCertificate is the installation's automatic (ACME)
 	// certificates as a whole; its subject id is "acme".
 	SubjectTypeCertificate SubjectType = "certificate"
+	// SubjectTypeInspector is the installation's Inspector hub; its subject
+	// id is "hub".
+	SubjectTypeInspector SubjectType = "inspector"
 )
 
 // JobKind names what a job does. New kinds may be added; clients should
@@ -54,6 +57,9 @@ const (
 	// replaces every managed certificate now. Both are restricted (admin).
 	JobKindCertificateIssue JobKind = "certificate.issue"
 	JobKindCertificateRenew JobKind = "certificate.renew"
+	// JobKindInspectorApply brings the Inspector hub in line with its
+	// setting (PATCH /api/v1/inspector). Restricted (admin).
+	JobKindInspectorApply JobKind = "inspector.apply"
 )
 
 // Job is a long-running operation. Routes that start one respond 202 with the
