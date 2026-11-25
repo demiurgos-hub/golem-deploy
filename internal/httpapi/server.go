@@ -129,6 +129,10 @@ type Server struct {
 	loginIP       *auth.Limiter
 	loginUser     *auth.Limiter
 	registerIP    *auth.Limiter
+	// setupIP counts refused setup tokens per client IP, with the
+	// per-client parameters of loginIP but its own counters, so setup and
+	// login failures never affect each other.
+	setupIP *auth.Limiter
 	knownIPs      *auth.KnownIPs
 	loginFlightIP *auth.InFlight
 	loginFlightU  *auth.InFlight
@@ -225,6 +229,7 @@ func New(cfg Config, d Deps) (*Server, error) {
 		loginIP:    auth.NewLimiter(loginFailuresPerWindow, loginWindow, limiterMaxKeys, d.Now),
 		loginUser:  auth.NewLimiter(usernameFailuresPerWindow, loginWindow, limiterMaxKeys, d.Now),
 		registerIP: auth.NewLimiter(registrationsPerWindow, registerWindow, limiterMaxKeys, d.Now),
+		setupIP:    auth.NewLimiter(loginFailuresPerWindow, loginWindow, limiterMaxKeys, d.Now),
 		knownIPs:   auth.NewKnownIPs(knownIPsPerUser, knownIPUsers),
 
 		loginFlightIP: auth.NewInFlight(loginsInFlightPerIP),
