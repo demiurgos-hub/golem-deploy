@@ -316,24 +316,6 @@ func (s *Service) helperImage(ctx context.Context, sv store.Server, builds []sto
 	return store.Build{}, docker.Image{}, err
 }
 
-// redactor returns what skipped entry names go through before they reach
-// the job log: the server's environment values and admin token replaced.
-// Names are hidden entirely when the environment cannot be read.
-func (s *Service) redactor(sv store.Server) func(string) string {
-	env, err := s.openEnv(sv)
-	if err != nil {
-		return func(string) string { return "[name not shown]" }
-	}
-	values := map[string]string{}
-	for k, v := range env {
-		values[k] = v
-	}
-	if token, err := s.openAdminToken(sv); err == nil {
-		values[EnvAdminToken] = token
-	}
-	return func(name string) string { return docker.RedactValues(name, values) }
-}
-
 // takeBackup copies the server's data directory into a new backup. With
 // live set and the server's game running and answering, it first asks the
 // game for a fresh snapshot. A server without a data volume, or whose data
@@ -383,10 +365,9 @@ func (s *Service) takeBackup(ctx context.Context, sv store.Server, o BackupOptio
 	}
 	defer pending.Discard()
 	var res backups.Result
-	redact := s.redactor(sv)
 	err = s.docker.CopyFromHelper(ctx, h.launch, h.id, build.DataDir, func(r io.Reader) error {
 		var nerr error
-		res, nerr = backups.NormalizeRedacted(r, path.Base(build.DataDir), s.cfg.BackupMaxBytes, redact, pending)
+		res, nerr = backups.Normalize(r, path.Base(build.DataDir), s.cfg.BackupMaxBytes, pending)
 		return nerr
 	})
 	if err != nil {
@@ -394,13 +375,9 @@ func (s *Service) takeBackup(ctx context.Context, sv store.Server, o BackupOptio
 	}
 	s.removeHelper(ctx, h)
 	if res.SkippedCount > 0 {
-		fmt.Fprintf(log, "left out %d entries that are not regular files or directories, or whose names are not allowed:\n", res.SkippedCount)
-		for _, sk := range res.Skipped {
-			fmt.Fprintf(log, "  %s (%s)\n", sk.Name, sk.Reason)
-		}
-		if res.SkippedCount > len(res.Skipped) {
-			fmt.Fprintf(log, "  and %d more\n", res.SkippedCount-len(res.Skipped))
-		}
+		// Only counts: the names were chosen by the game and can hold
+		// anything, also values of the server's environment.
+		fmt.Fprintf(log, "left out %d %s: %s\n", res.SkippedCount, plural(res.SkippedCount, "entry", "entries"), backups.DescribeSkipped(res.Skipped))
 	}
 	if res.Files == 0 {
 		msg := "the server's data directory holds no files; there is nothing to back up"
@@ -848,7 +825,7 @@ func (s *Service) safetyBackup(ctx context.Context, sv store.Server, kind string
 		return nil
 	case errors.As(err, &nothing):
 		return safetyFailure(kind, true, fmt.Sprintf("the data directory holds no regular files, only entries a backup cannot hold (links, pipes, devices or names "+
-			"that are not allowed; listed above: %d), so no backup was stored", nothing.omitted), nil)
+			"that are not allowed; counted above: %d), so no backup was stored", nothing.omitted), nil)
 	case err != nil && ctx.Err() != nil:
 		return ctx.Err()
 	case err != nil:
@@ -864,7 +841,7 @@ func (s *Service) safetyBackup(ctx context.Context, sv store.Server, kind string
 		return safetyFailure(kind, false, detail, kindErr)
 	case b.OmittedEntries > 0:
 		return safetyFailure(kind, true, fmt.Sprintf("the data directory holds entries a backup cannot hold (links, pipes, devices or names "+
-			"that are not allowed; listed above: %d); the incomplete backup was stored as backup %d", b.OmittedEntries, b.ID), nil)
+			"that are not allowed; counted above: %d); the incomplete backup was stored as backup %d", b.OmittedEntries, b.ID), nil)
 	}
 	return nil
 }
@@ -907,6 +884,14 @@ func (s *Service) startAgain(ctx context.Context, id int64, log io.Writer) {
 		}
 		fmt.Fprintf(log, "the server did not start again: %s\n", msg)
 	}
+}
+
+// plural returns one for n == 1 and many otherwise.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // dropOldData removes the container that mounts the server's previous

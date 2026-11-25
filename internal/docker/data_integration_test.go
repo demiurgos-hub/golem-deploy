@@ -109,12 +109,8 @@ func TestIntegrationDataVolumes(t *testing.T) {
 	if res.Files != 2 || res.Dirs != 1 || res.SkippedCount != 3 {
 		t.Fatalf("%+v (raw %v)", res, raw)
 	}
-	reasons := map[string]string{}
-	for _, s := range res.Skipped {
-		reasons[s.Name] = s.Reason
-	}
-	if reasons["link"] != "symbolic link" || reasons["fifo"] != "named pipe" || reasons["hard"] != "hard link" {
-		t.Fatalf("%v", reasons)
+	if res.Skipped[backups.SkipSymlink] != 1 || res.Skipped[backups.SkipPipe] != 1 || res.Skipped[backups.SkipHardLink] != 1 {
+		t.Fatalf("%v", res.Skipped)
 	}
 	// The read-only mount refuses a copy in.
 	if err := c.CopyToHelper(ctx, launch, hid, "/data", func(w io.Writer) error { return tar.NewWriter(w).Close() }); err == nil {
