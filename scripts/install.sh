@@ -173,7 +173,7 @@ docker_candidates_ok() {
 			/^        / && ver == cand && cand != "(none)" && /https:\/\/download\.docker\.com\/linux\// { ok = 1 }
 			END { exit !ok }'; then
 			warn "apt's candidate for $pkg does not come from https://download.docker.com:"
-			LC_ALL=C apt-cache policy "$pkg" </dev/null 2>&1 | sed 's/^/    /' >&2 || true
+			LC_ALL=C apt-cache policy "$pkg" </dev/null 2>&1 | sed -n '1,6s/^/    /p' >&2 || true
 			return 1
 		fi
 	done
@@ -1082,6 +1082,8 @@ EOF
 			systemctl status --no-pager --lines=0 "$SERVICE" >&2 || true
 			printf '\nLog since the restart:\n' >&2
 			journalctl --no-pager -u "$SERVICE" --since "@$restart_at" -n 40 >&2 || true
+			local substate
+			substate=$(systemctl show -p SubState --value "$SERVICE" 2>/dev/null || true)
 			if [ -n "$env_written" ]; then
 				# Otherwise the next run would keep a settings file the daemon refuses.
 				systemctl stop "$SERVICE" >/dev/null 2>&1 || true
@@ -1089,7 +1091,7 @@ EOF
 				warn "the settings file this run wrote was moved to $ENV_FILE.failed;" \
 					"the next run writes a new one from its options"
 			fi
-			die "$SERVICE did not start (state: ${state:-unknown}/$(systemctl show -p SubState --value "$SERVICE")); see the log above and docs/INSTALL.md (Troubleshooting)"
+			die "$SERVICE did not start (state: ${state:-unknown}/${substate:-unknown}); see the log above and docs/INSTALL.md (Troubleshooting)"
 		fi
 	else
 		say "$SERVICE is running"

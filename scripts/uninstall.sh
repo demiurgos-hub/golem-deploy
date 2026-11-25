@@ -434,7 +434,10 @@ main() {
 	if [ -r "$ENV_FILE" ]; then
 		configured=$(sed -n 's/^GOLEM_DEPLOY_DATA_DIR=//p' "$ENV_FILE" | tail -n 1)
 		case $configured in /*) configured_dir=$configured ;; esac
-		[ "$configured_dir" = "$DATA_DIR" ] || other_data_dir=$configured_dir
+		case $configured_dir in
+		"$DATA_DIR" | "$DATA_DIR"/*) ;;
+		*) other_data_dir=$configured_dir ;;
+		esac
 	fi
 
 	# Nothing may be mounted in a directory this run deletes.
