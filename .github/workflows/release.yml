@@ -1,0 +1,134 @@
+name: Release
+
+# A pushed tag vX.Y.Z or vX.Y.Z-rc.N builds and publishes a GitHub release
+# (see docs/RELEASING.md).
+on:
+  push:
+    tags: ['v*']
+
+# Each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check the tag format
+        id: check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! $TAG =~ $re ]]; then
+            echo "::error::$TAG is not a release tag such as v0.1.0 or v0.2.0-rc.1"
+            exit 1
+          fi
+          if [[ $TAG == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: CHANGELOG.md has notes for the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash scripts/release-notes.sh "$TAG"
+
+  checks:
+    name: Checks
+    needs: tag
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build
+    needs: [tag, checks]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Build provenance attestation: a Sigstore certificate (id-token) and
+      # storing the attestation.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # No dependency caches in the release build.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Read Go version from go.mod
+        id: go-version
+        run: echo "minor=$(sed -n 's/^go \([0-9]*\.[0-9]*\).*/\1/p' go.mod)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ steps.go-version.outputs.minor }}.x
+          check-latest: true
+          cache: false
+
+      - name: Build the release files
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          bash scripts/release.sh "$TAG" dist/release
+          bash scripts/release-notes.sh "$TAG" > dist/notes.md
+
+      - uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/release/golem-deploy_linux_amd64.tar.gz
+            dist/release/golem-deploy_linux_arm64.tar.gz
+            dist/release/install.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: dist
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.tag.outputs.prerelease }}
+        run: |
+          (cd dist/release && sha256sum -c SHA256SUMS)
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file dist/notes.md "${flags[@]}" \
+            dist/release/golem-deploy_linux_amd64.tar.gz \
+            dist/release/golem-deploy_linux_arm64.tar.gz \
+            dist/release/install.sh \
+            dist/release/SHA256SUMS
