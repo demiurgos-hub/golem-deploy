@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 )
 
 // NetworkICCOption is the bridge driver option that controls traffic
@@ -18,6 +19,9 @@ type networkInfo struct {
 	ICC bool
 	// Attached counts containers connected to the network.
 	Attached int
+	// Subnets and Gateways are the network's IPAM configuration.
+	Subnets  []netip.Prefix
+	Gateways []netip.Addr
 }
 
 // inspectNetwork returns the named network, or ErrNotFound.
@@ -31,6 +35,12 @@ func (c *Client) inspectNetwork(ctx context.Context, name string) (networkInfo, 
 		Labels     map[string]string `json:"Labels"`
 		Options    map[string]string `json:"Options"`
 		Containers map[string]any    `json:"Containers"`
+		IPAM       struct {
+			Config []struct {
+				Subnet  string `json:"Subnet"`
+				Gateway string `json:"Gateway"`
+			} `json:"Config"`
+		} `json:"IPAM"`
 	}
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return networkInfo{}, fmt.Errorf("decode network inspect: %w", err)
@@ -41,6 +51,14 @@ func (c *Client) inspectNetwork(ctx context.Context, name string) (networkInfo, 
 	n := networkInfo{Labels: raw[0].Labels, ICC: raw[0].Options[NetworkICCOption] != "false", Attached: len(raw[0].Containers)}
 	if n.Labels == nil {
 		n.Labels = map[string]string{}
+	}
+	for _, c := range raw[0].IPAM.Config {
+		if p, err := netip.ParsePrefix(c.Subnet); err == nil {
+			n.Subnets = append(n.Subnets, p.Masked())
+		}
+		if a, err := netip.ParseAddr(c.Gateway); err == nil && a.Zone() == "" {
+			n.Gateways = append(n.Gateways, a.Unmap())
+		}
 	}
 	return n, nil
 }
@@ -108,4 +126,31 @@ func (c *Client) EnsureNetwork(ctx context.Context) (isolated bool, err error) {
 		}
 	}
 	return false, fmt.Errorf("network %q: %w", NetworkName, ErrConflict)
+}
+
+// NetworkAddresses are the IPAM addresses of the managed network.
+type NetworkAddresses struct {
+	Subnets  []netip.Prefix
+	Gateways []netip.Addr
+}
+
+// ManagedNetworkAddresses returns the subnets and gateway addresses of the
+// managed network NetworkName. It returns ErrNotFound when the network
+// does not exist and ErrNotOurs/ErrNotManaged when it is not this
+// installation's.
+func (c *Client) ManagedNetworkAddresses(ctx context.Context) (NetworkAddresses, error) {
+	if err := c.needInstance(); err != nil {
+		return NetworkAddresses{}, err
+	}
+	n, err := c.inspectNetwork(ctx, NetworkName)
+	if err != nil {
+		return NetworkAddresses{}, err
+	}
+	if !IsManaged(n.Labels) {
+		return NetworkAddresses{}, ErrNotManaged
+	}
+	if !c.ours(n.Labels) {
+		return NetworkAddresses{}, ErrNotOurs
+	}
+	return NetworkAddresses{Subnets: n.Subnets, Gateways: n.Gateways}, nil
 }

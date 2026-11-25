@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"path"
 	"slices"
 	"strings"
@@ -272,7 +273,16 @@ func (s *Service) launch(ctx context.Context, sv store.Server, log io.Writer, re
 	if err != nil {
 		return jobs.Fail("could not create the admin token", err)
 	}
-	spec := s.runSpec(sv, b, env, img, p, token)
+	insp, err := s.inspectorVars(ctx, sv, b, &p, log)
+	if err != nil {
+		return err
+	}
+	spec := s.runSpec(sv, b, env, img, p, token, insp)
+	if t := insp[EnvInspectorToken]; t != "" {
+		// waitReady redacts env values from the output it copies.
+		env = maps.Clone(env)
+		env[EnvInspectorToken] = t
+	}
 	launch := sv.PendingLaunch
 	if launch == "" {
 		var nonce [16]byte
@@ -312,6 +322,33 @@ func (s *Service) launch(ctx context.Context, sv store.Server, log io.Writer, re
 	}
 	fmt.Fprintf(log, "container %s started, waiting up to %s for the game to report ready\n", shortID(cid), s.cfg.StartTimeout)
 	return s.waitReady(ctx, sv, b, env, token, log)
+}
+
+// inspectorVars reads the Inspector agent settings into p (after the
+// network exists, so the agent address can be known) and returns the
+// variables of the new container, nil when it gets none.
+func (s *Service) inspectorVars(ctx context.Context, sv store.Server, b store.Build, p *runtimeParams, log io.Writer) (map[string]string, error) {
+	s.inspectorParams(ctx, p)
+	if !sv.Inspector {
+		return nil, nil
+	}
+	if !inspectorActive(sv, *p) {
+		fmt.Fprintln(log, "the server's Inspector switch is on, but the Inspector is off or games cannot reach it; the agent is not configured")
+		return nil, nil
+	}
+	project := ""
+	if pr, err := s.store.GetProject(ctx, b.ProjectID); err == nil {
+		project = pr.Name
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, jobs.Fail("could not read the server's project", err)
+	}
+	token, err := s.cfg.Inspector.AgentToken(sv.ID)
+	if err != nil {
+		s.logger.Warn("could not prepare the Inspector agent token", "job_id", jobIDFrom(ctx), "server_id", sv.ID, "err", err)
+		return nil, jobs.Fail("could not prepare the Inspector agent token; see the daemon log", nil)
+	}
+	fmt.Fprintf(log, "Inspector agent: connects to %s as %q\n", p.inspector.HubURL, sv.Name)
+	return inspectorEnv(sv, b, project, *p, token), nil
 }
 
 // removePending removes only a container matching the identity recorded

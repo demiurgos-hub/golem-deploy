@@ -18,6 +18,12 @@ const (
 	SettingGameCertificateMode  = "game_certificate_mode"
 	SettingPanelCertificateMode = "panel_certificate_mode"
 	SettingACME                 = "acme_settings"
+	// SettingInspectorEnabled is the installation's Inspector setting
+	// ("true" or "false"; missing means off). SettingInspectorSecrets holds
+	// the Inspector hub's secrets, sealed with
+	// secrets.InspectorSecretsPurpose (internal/inspector owns both).
+	SettingInspectorEnabled = "inspector_enabled"
+	SettingInspectorSecrets = "inspector_secrets"
 )
 
 // Settings is the typed view of the settings table. Missing keys take the
@@ -52,8 +58,13 @@ func (s *Store) GetSetting(ctx context.Context, key string) (string, bool, error
 func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 	const upsert = `INSERT INTO settings (key, value) VALUES (?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`
-	if key == SettingGameCertificateMode || key == SettingPanelCertificateMode || key == SettingACME {
+	switch key {
+	case SettingGameCertificateMode, SettingPanelCertificateMode, SettingACME:
 		return mapErr("set certificate state", s.durableWrite(ctx, upsert, key, value))
+	case SettingInspectorEnabled, SettingInspectorSecrets:
+		// The hub container is created from these; a lost write would
+		// leave it with secrets the daemon no longer knows.
+		return mapErr("set inspector state", s.durableWrite(ctx, upsert, key, value))
 	}
 	_, err := s.db.ExecContext(ctx, upsert, key, value)
 	return mapErr("set setting", err)

@@ -21,6 +21,7 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/apitypes"
 	"github.com/demiurgos-hub/golem-deploy/internal/auth"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
+	"github.com/demiurgos-hub/golem-deploy/internal/netpolicy"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -422,7 +423,7 @@ func TestF4_ResolveClientIP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{trustedProxies: trusted}
+	s := &Server{policy: netpolicy.New(nil, trusted, nil)}
 	none := &Server{}
 	tests := []struct {
 		name   string

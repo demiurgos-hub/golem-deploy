@@ -10,8 +10,9 @@ Every installation has a random **instance id** (32 hex characters, generated on
 
 | Object | Name | Labels (prefix `dev.golemengine.deploy.`) |
 |--------|------|--------|
-| Server container | `golem-deploy-<server name>` | `managed`, `instance`, `server-id`, `server`, `project-id`, `commit`, `build-id`, `engine-version`, `config-hash`, `launch-id`, `helper` — all set explicitly on every create (empty when not applicable), so no value can be inherited from the image |
+| Server container | `golem-deploy-<server name>` | `managed`, `instance`, `server-id`, `server`, `project-id`, `commit`, `build-id`, `engine-version`, `config-hash`, `launch-id`, `helper`, `inspector` (`true` when created with the Inspector agent variables), `inspector-hub` (empty) — all set explicitly on every create (empty when not applicable), so no value can be inherited from the image |
 | Helper container | `golem-deploy_helper_<launch id>`, created and never started to copy a data volume ([BACKUPS.md](BACKUPS.md#helper-containers)) | the same set, with `helper=<launch id>` and empty `config-hash` and `launch-id` |
+| Inspector hub container | `golem-deploy_inspector`, one per installation while the Inspector is on ([INSPECTOR.md](INSPECTOR.md)) | the same set, with `inspector-hub=true`, `config-hash` and every other value empty |
 | Network | `golem-deploy` (user-defined bridge, no inter-container traffic) | `managed`, `instance` |
 | Image | `golem-deploy/<project>:<commit[:12]>-b<build id>`, built by a build ([BUILDS.md](BUILDS.md)) | `managed`, `instance`, `project-id`, `commit`, `build-id`, `engine-version` |
 | Volume | `golem-deploy-data-<server id>-<random>`, a server's data volume, recorded on the server row ([BACKUPS.md](BACKUPS.md)) | `managed`, `instance`, `server-id`, `server` |
@@ -69,8 +70,9 @@ The daemon configures every container for the Golem Engine deploy contract (gole
 | `GOLEM_ADMIN_TOKEN` | a random 64-character token generated for each container |
 | `GOLEM_SNAPSHOT_DIR` | `/data` (the data volume: the game loads `world.snapshot` at start and saves it when it stops) |
 | `GOLEM_SNAPSHOT_INTERVAL` | the server's `snapshot_interval_seconds` as a duration (`300s` by default), or `0` for no autosave |
+| `GOLEM_INSPECTOR_HUB_URL`, `GOLEM_INSPECTOR_TOKEN`, `GOLEM_INSPECTOR_TARGET_ID`, `GOLEM_INSPECTOR_LABELS` | only for a server whose Inspector switch is on while the installation's Inspector is on and reachable from containers: `ws://<agent host>:<inspector port>/ws/agent`, the server's own agent token, the server name, and `project=<name>,commit=<commit>,server=<id>` (values containing `,` or `=` are left out). See [INSPECTOR.md](INSPECTOR.md) |
 
-`<port>` is the server's host port and `<game host>` the `game_host` setting (or the first `--public-host`). Everything except the admin token is part of the server's config hash, as is the data volume's name, so changing the game host, the allowed origins, the certificate mode or the autosave period marks running servers `restart_required`.
+`<port>` is the server's host port and `<game host>` the `game_host` setting (or the first `--public-host`). Everything except the admin token is part of the server's config hash, as is the data volume's name, so changing the game host, the allowed origins, the certificate mode or the autosave period marks running servers `restart_required`. For a server that gets the Inspector variables, the hash covers the agent endpoint and the generation of the agent token key instead of the token; the hash of a server with the switch off does not depend on the Inspector at all.
 
 The admin token is stored encrypted on the server row (never returned, never logged), reaches the container only through the env file like other values and is redacted from failed-start excerpts. The daemon talks to the admin endpoint only on `127.0.0.1:<assigned port>` with a strict client with short timeouts, no proxy, no redirects, no compressed bodies and at most 64 KiB per answer. It never logs raw HTTP protocol errors. Strings containing the server's admin token are discarded and other reported strings are bounded and stripped of control and formatting characters.
 
@@ -120,16 +122,18 @@ Servers join the `golem-deploy` bridge network, created with `com.docker.network
 What this does **not** isolate on Linux:
 
 - Servers can reach each other's *published* ports through the host's addresses, exactly like players can.
-- Servers can reach the host itself through the bridge gateway address, including anything listening on all interfaces — such as the panel when `--listen` is `0.0.0.0:…`, SSH or a database.
+- Servers can reach the host itself through the bridge gateway address, including anything listening on all interfaces — such as the panel when `--listen` is `0.0.0.0:…`, SSH or a database. The Inspector's agents use exactly this path to reach the Inspector listener ([INSPECTOR.md](INSPECTOR.md)).
 - Servers can reach anything routable from the host: the internet, your LAN, and cloud metadata services such as `169.254.169.254`.
 
 Operators who want egress filtering can add rules (Docker's iptables backend; rules are not persistent, and must be re-applied when the network is recreated):
 
 ```sh
 BR="br-$(docker network inspect -f '{{printf "%.12s" .Id}}' golem-deploy)"
-# Servers -> the host itself (panel, SSH, ...): replies only.
+# Servers -> the host itself (panel, SSH, ...): replies only, plus the
+# Inspector listener (default port 8444) when the Inspector is used.
 iptables -I INPUT 1 -i "$BR" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -I INPUT 2 -i "$BR" -j DROP
+iptables -I INPUT 2 -i "$BR" -p tcp --dport 8444 -j ACCEPT
+iptables -I INPUT 3 -i "$BR" -j DROP
 # Servers -> metadata service and private networks; players and the
 # internet stay reachable.
 iptables -I DOCKER-USER 1 -i "$BR" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN

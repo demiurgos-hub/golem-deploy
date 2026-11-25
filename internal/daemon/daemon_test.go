@@ -22,7 +22,9 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/datadir"
 	"github.com/demiurgos-hub/golem-deploy/internal/docker/dockertest"
+	"github.com/demiurgos-hub/golem-deploy/internal/inspector"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
+	"github.com/demiurgos-hub/golem-deploy/internal/ports"
 	"github.com/demiurgos-hub/golem-deploy/internal/store"
 )
 
@@ -445,5 +447,55 @@ func TestShutdownJoinsQueuedBuildWatcherBeforeClosingStore(t *testing.T) {
 	record, err := st.GetBuild(t.Context(), id)
 	if err != nil || record.Status != store.BuildStatusCancelled || record.Detail != jobs.DetailShutdown {
 		t.Fatalf("queued build did not save its final status: %+v, %v", record, err)
+	}
+}
+
+// The Inspector flags are validated before anything is opened; the
+// listener port may not collide with the panel, the HTTP listener or the
+// game port range.
+func TestInspectorConfig(t *testing.T) {
+	rng := ports.Range{Lo: 7000, Hi: 7099}
+	base := Options{Listen: "127.0.0.1:8000"}
+	got, err := inspectorConfig(base, rng)
+	if err != nil || got.listen != "127.0.0.1:8444" || got.image != inspector.DefaultImage || got.memoryMB != inspector.DefaultMemoryMB {
+		t.Fatalf("%+v %v", got, err)
+	}
+	off := base
+	off.Inspector.Listen = "off"
+	if got, err := inspectorConfig(off, rng); err != nil || got.listen != "" {
+		t.Fatalf("%+v %v", got, err)
+	}
+	for name, mut := range map[string]func(*Options){
+		"panel port":      func(o *Options) { o.Inspector.Listen = ":8000" },
+		"http port":       func(o *Options) { o.HTTPListen = ":8080"; o.Inspector.Listen = "0.0.0.0:8080" },
+		"game range":      func(o *Options) { o.Inspector.Listen = ":7050" },
+		"bad listen":      func(o *Options) { o.Inspector.Listen = "8444" },
+		"bad image":       func(o *Options) { o.Inspector.Image = "-rm" },
+		"small memory":    func(o *Options) { o.Inspector.MemoryMB = 16 },
+		"bad public url":  func(o *Options) { o.Inspector.PublicURL = "https://x.example/path" },
+		"bad agent host":  func(o *Options) { o.Inspector.AgentHost = "h:1" },
+		"derived on 8444": func(o *Options) { o.Listen = "127.0.0.1:8000" },
+	} {
+		o := base
+		mut(&o)
+		_, err := inspectorConfig(o, rng)
+		if name == "derived on 8444" {
+			if err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	collide := base
+	if _, err := inspectorConfig(collide, ports.Range{Lo: 8400, Hi: 8500}); err == nil {
+		t.Error("derived port inside the game range accepted")
+	}
+	pub := base
+	pub.Inspector.PublicURL = "https://Inspector.Example.com/"
+	if got, err := inspectorConfig(pub, rng); err != nil || got.publicURL != "https://inspector.example.com" {
+		t.Fatalf("%+v %v", got, err)
 	}
 }

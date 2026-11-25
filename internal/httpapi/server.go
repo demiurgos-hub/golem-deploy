@@ -24,6 +24,7 @@ import (
 	"github.com/demiurgos-hub/golem-deploy/internal/build"
 	"github.com/demiurgos-hub/golem-deploy/internal/certs"
 	"github.com/demiurgos-hub/golem-deploy/internal/jobs"
+	"github.com/demiurgos-hub/golem-deploy/internal/netpolicy"
 	"github.com/demiurgos-hub/golem-deploy/internal/secrets"
 	"github.com/demiurgos-hub/golem-deploy/internal/servers"
 	"github.com/demiurgos-hub/golem-deploy/internal/staticfiles"
@@ -49,6 +50,10 @@ type Config struct {
 	// X-Forwarded-For header is believed. Empty means forwarding headers are
 	// ignored and the TCP peer is the client.
 	TrustedProxies []netip.Prefix
+	// Policy, when set, is the Host and client address policy built by the
+	// daemon from PublicHosts and TrustedProxies (shared with the Inspector
+	// listener). When nil, New builds it.
+	Policy *netpolicy.Policy
 }
 
 func (c Config) tls() bool { return c.ManagedTLS || (c.TLSCert != "" && c.TLSKey != "") }
@@ -85,6 +90,8 @@ type Deps struct {
 	// Builds runs project builds; when nil the build routes that need it
 	// answer 503 (listing and reading build records still works).
 	Builds *build.Service
+	// Inspector backs the Inspector routes; when nil they answer 503.
+	Inspector InspectorService
 	// SPA serves non-API paths (the embedded web client). Nil serves 404.
 	SPA http.Handler
 	// Now overrides the clock (tests).
@@ -111,6 +118,7 @@ type Server struct {
 	certs      *certs.Manager
 	automation *certs.Automation
 	builds     *build.Service
+	inspector  InspectorService
 	spa        http.Handler
 	now        func() time.Time
 	proj       *projectState
@@ -129,9 +137,8 @@ type Server struct {
 	// logStreams caps concurrent following log streams per account.
 	logStreams *auth.InFlight
 
-	publicHosts    map[string]bool
-	trustedProxies []netip.Prefix
-	badHostLog     sampledLog
+	policy     *netpolicy.Policy
+	badHostLog sampledLog
 
 	api     *http.ServeMux
 	handler http.Handler
@@ -211,6 +218,7 @@ func New(cfg Config, d Deps) (*Server, error) {
 		certs:      d.Certs,
 		automation: d.Automation,
 		builds:     d.Builds,
+		inspector:  d.Inspector,
 		spa:        d.SPA,
 		now:        d.Now,
 		proj:       newProjectState(d),
@@ -224,13 +232,14 @@ func New(cfg Config, d Deps) (*Server, error) {
 		hashSlots:     auth.NewSlots(d.HashSlots, d.HashSlotWait),
 		logStreams:    auth.NewInFlight(logStreamsPerAccount),
 
-		publicHosts:    map[string]bool{},
-		trustedProxies: append([]netip.Prefix(nil), cfg.TrustedProxies...),
-		shutdown:       make(chan struct{}),
-		drained:        make(chan struct{}),
+		policy:   cfg.Policy,
+		shutdown: make(chan struct{}),
+		drained:  make(chan struct{}),
 	}
-	for _, h := range hosts {
-		s.publicHosts[h] = true
+	if s.policy == nil {
+		s.policy = netpolicy.New(hosts, cfg.TrustedProxies, func(h string) bool {
+			return s.automation != nil && s.automation.IsPanelHost(h)
+		})
 	}
 	s.api = http.NewServeMux()
 	for _, rt := range s.routes() {

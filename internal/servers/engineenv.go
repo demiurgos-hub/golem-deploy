@@ -53,6 +53,16 @@ const (
 	// "0" turns autosave off).
 	EnvSnapshotDir      = "GOLEM_SNAPSHOT_DIR"
 	EnvSnapshotInterval = "GOLEM_SNAPSHOT_INTERVAL"
+	// The Inspector agent (golem-engine golem/inspector/options.go), set
+	// only for a server whose Inspector switch is on while the
+	// installation's Inspector is on and reachable from containers: the
+	// agent endpoint of the daemon's Inspector listener, the server's own
+	// agent token, its target id (the server name) and labels
+	// ("k=v,k=v").
+	EnvInspectorHubURL   = "GOLEM_INSPECTOR_HUB_URL"
+	EnvInspectorToken    = "GOLEM_INSPECTOR_TOKEN"
+	EnvInspectorTargetID = "GOLEM_INSPECTOR_TARGET_ID"
+	EnvInspectorLabels   = "GOLEM_INSPECTOR_LABELS"
 )
 
 // Fixed parts of the contract.
@@ -80,6 +90,38 @@ type runtimeParams struct {
 	certMode    certs.Mode
 	certDir     string
 	groupAdd    []int
+	// inspector is the Inspector agent setting (valid when inspectorOK).
+	inspector   InspectorAgent
+	inspectorOK bool
+}
+
+// inspectorActive reports whether a container of sv gets the Inspector
+// agent variables.
+func inspectorActive(sv store.Server, p runtimeParams) bool {
+	return sv.Inspector && p.inspectorOK && p.inspector.HubURL != ""
+}
+
+// inspectorEnv returns the Inspector agent variables of a container of sv
+// running build b of project projectName (nil when it gets none). Label
+// values that contain "," or "=" are left out (the agent parses
+// "k=v,k=v").
+func inspectorEnv(sv store.Server, b store.Build, projectName string, p runtimeParams, token string) map[string]string {
+	if !inspectorActive(sv, p) {
+		return nil
+	}
+	var labels []string
+	for _, kv := range [][2]string{{"project", projectName}, {"commit", b.Commit}, {"server", strconv.FormatInt(sv.ID, 10)}} {
+		if kv[1] == "" || strings.ContainsAny(kv[1], ",=") {
+			continue
+		}
+		labels = append(labels, kv[0]+"="+kv[1])
+	}
+	return map[string]string{
+		EnvInspectorHubURL:   p.inspector.HubURL,
+		EnvInspectorToken:    token,
+		EnvInspectorTargetID: sv.Name,
+		EnvInspectorLabels:   strings.Join(labels, ","),
+	}
 }
 
 // authority returns host:port for URLs (IPv6 in brackets).
@@ -211,7 +253,9 @@ func snapshotInterval(seconds int) string {
 // change and reveals nothing about the values), the injected engine
 // environment without the per-container token (game host, allowed origins,
 // certificate mode, snapshot settings), the data volume, the certificate
-// mount and the supplementary groups.
+// mount and the supplementary groups, and, only for a container that gets
+// the Inspector agent variables, the agent endpoint and the generation of
+// the agent token key.
 // The certificate's content is not part of it: a replaced certificate is
 // picked up by the running engine.
 func (s *Service) configHash(sv store.Server, b *store.Build, p runtimeParams) string {
@@ -233,6 +277,14 @@ func (s *Service) configHash(sv store.Server, b *store.Build, p runtimeParams) s
 		fmt.Fprintf(h, "%s=%s\x00", k, env[k])
 	}
 	fmt.Fprintf(h, "%s\x00%v\x00%s", p.certDir, p.groupAdd, sv.DataVolume)
+	if inspectorActive(sv, p) {
+		// Only for containers that get the agent variables, so the hash of
+		// every other server stays what it was. The token is derived from
+		// the server id and the token key; the key's generation stands in
+		// for it. The target id (the immutable server name) and the labels
+		// (project, commit, server id) follow from what is hashed above.
+		fmt.Fprintf(h, "\x00inspector\x00%s\x00%d", p.inspector.HubURL, p.inspector.Generation)
+	}
 	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 

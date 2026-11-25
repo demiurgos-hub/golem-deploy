@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -98,6 +99,14 @@ func (c *Client) buildClientEnv(ctx context.Context, spec BuildSpec) ([]string, 
 		// private output files. The daemon always sets a persistent path.
 		dir = filepath.Join(filepath.Dir(spec.MetadataFile), "client-config")
 	}
+	return c.isolatedClientEnv(ctx, dir, buildEnv())
+}
+
+// isolatedClientEnv returns the CLI environment that uses the dedicated
+// client configuration in dir instead of the operator's (no stored
+// registry credentials, no proxies), on the same Docker endpoint. Builds
+// and image pulls use it.
+func (c *Client) isolatedClientEnv(ctx context.Context, dir string, env []string) ([]string, error) {
 	if err := c.prepareBuildConfig(dir); err != nil {
 		return nil, ErrBuildConfig
 	}
@@ -107,8 +116,7 @@ func (c *Client) buildClientEnv(ctx context.Context, spec BuildSpec) ([]string, 
 		(len(cfg.Auths) == 0 && len(cfg.CredHelpers) == 0 && cfg.CredsStore == "") {
 		return nil, ErrBuildConfig
 	}
-	env := buildEnv()
-	env = append(env, "DOCKER_CONFIG="+dir)
+	env = append(slices.Clone(env), "DOCKER_CONFIG="+dir)
 	for _, pair := range c.baseEnv {
 		if !strings.HasPrefix(pair, "DOCKER_CONFIG=") {
 			env = append(env, pair)
