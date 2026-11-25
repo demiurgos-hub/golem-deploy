@@ -9,7 +9,7 @@ The first release.
 ### Added
 
 - A single `golem-deploy` binary that serves the HTTP API under `/api/v1` and the embedded web client, run as a systemd service on Ubuntu and Debian.
-- An installer that downloads a checksum-verified release, installs Docker Engine when it is missing, raises the UDP buffer limits for QUIC and prints a one-time link to create the first admin account. An uninstaller that keeps or purges the data.
+- An installer that downloads a checksum-verified release, installs Docker Engine when it is missing, raises the UDP buffer limits for QUIC and prints a one-time link to create the first admin account. An uninstaller that keeps the data, or purges this installation's data and Docker objects (only those with its instance id).
 - Release archives for linux/amd64 and linux/arm64 with SHA-256 checksums and build provenance attestations.
 - Accounts with the roles admin and developer, optional self-registration with admin approval, sessions and revocable API tokens.
 - Projects: Git repositories cloned over HTTPS or SSH, with pull and branch switching as jobs and encrypted credentials.
