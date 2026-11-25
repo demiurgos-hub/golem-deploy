@@ -997,9 +997,14 @@ export function createMockTransport(real: Transport): Transport {
       if (!s.inspector) return fail(st, 400, "validation_failed", "the server's Inspector setting is off", "server_id");
     }
     // The link leads nowhere real: nothing listens on the mock's Inspector port.
-    const ticket = [...crypto.getRandomValues(new Uint8Array(24))].map((b) => b.toString(16).padStart(2, "0")).join("");
+    // Like the daemon's, the ticket (32 random bytes, base64url) is in the
+    // fragment and the server stays bound to it, out of the link.
+    const ticket = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
     const session: InspectorSession = {
-      path: `/_golem-deploy/enter?ticket=${ticket}${req.server_id !== undefined ? `&server=${req.server_id}` : ""}`,
+      path: `/_golem-deploy/enter#t=${ticket}`,
       port: INSPECTOR_PORT,
       public_url: "",
       expires_at: new Date(Date.now() + 60_000).toISOString(),

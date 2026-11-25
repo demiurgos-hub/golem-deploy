@@ -19,7 +19,7 @@ const PAGE = new URL(window.location.href);
 const ADDRESS = `${PAGE.protocol}//${PAGE.hostname}:7700`;
 
 function session(overrides: Partial<InspectorSession> = {}): InspectorSession {
-  return { path: "/_golem-deploy/enter?ticket=abc", port: 7700, public_url: "", expires_at: new Date(Date.now() + 60_000).toISOString(), ...overrides };
+  return { path: "/_golem-deploy/enter#t=abc", port: 7700, public_url: "", expires_at: new Date(Date.now() + 60_000).toISOString(), ...overrides };
 }
 
 /** A stand-in for the blank tab window.open returns. */
@@ -424,10 +424,10 @@ describe("opening the Inspector", () => {
     await waitFor(() => expect(calls.find((c) => c.method === "POST" && c.path === "/inspector/sessions")?.body).toEqual({ server_id: 3 }));
     expect(tab.location.replace).not.toHaveBeenCalled();
     answer(jsonResponse(200, session()));
-    await waitFor(() => expect(tab.location.replace).toHaveBeenCalledWith(`${ADDRESS}/_golem-deploy/enter?ticket=abc`));
+    await waitFor(() => expect(tab.location.replace).toHaveBeenCalledWith(`${ADDRESS}/_golem-deploy/enter#t=abc`));
     expect(tab.close).not.toHaveBeenCalled();
     // The link is nowhere on the page.
-    expect(document.body.innerHTML).not.toContain("ticket=abc");
+    expect(document.body.innerHTML).not.toContain("#t=abc");
   });
 
   it("uses the public address when the daemon has one", async () => {
@@ -439,7 +439,7 @@ describe("opening the Inspector", () => {
       routes: { ...connected(), "POST /inspector/sessions": () => jsonResponse(200, session({ public_url: "https://inspector.example.com" })) },
     });
     await user.click(await within(await serverSection()).findByRole("button", { name: /Open in Inspector/ }));
-    await waitFor(() => expect(tab.location.replace).toHaveBeenCalledWith("https://inspector.example.com/_golem-deploy/enter?ticket=abc"));
+    await waitFor(() => expect(tab.location.replace).toHaveBeenCalledWith("https://inspector.example.com/_golem-deploy/enter#t=abc"));
   });
 
   it("closes the tab again and says why when the request fails", async () => {
@@ -467,7 +467,7 @@ describe("opening the Inspector", () => {
     const dialog = await screen.findByRole("dialog", { name: "Open the Inspector" });
     expect(within(dialog).getByText("Use this link instead. It works once, within a minute.")).toBeInTheDocument();
     const link = within(dialog).getByRole("link", { name: /Open the Inspector/ });
-    expect(link).toHaveAttribute("href", `${ADDRESS}/_golem-deploy/enter?ticket=abc`);
+    expect(link).toHaveAttribute("href", `${ADDRESS}/_golem-deploy/enter#t=abc`);
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
     link.addEventListener("click", (e) => e.preventDefault());
@@ -557,9 +557,14 @@ describe("Inspector helpers and jobs", () => {
     expect(inspectorAddress("", 7700, loc)).toBe("https://[::1]:7700");
     expect(inspectorAddress("https://inspector.example.com/", 7700, loc)).toBe("https://inspector.example.com");
     expect(inspectorAddress("javascript:alert(1)", 7700, loc)).toBeNull();
-    expect(inspectorEntryUrl(session(), { protocol: "http:", hostname: "10.0.0.5" })).toBe("http://10.0.0.5:7700/_golem-deploy/enter?ticket=abc");
+    expect(inspectorEntryUrl(session(), { protocol: "http:", hostname: "10.0.0.5" })).toBe("http://10.0.0.5:7700/_golem-deploy/enter#t=abc");
     expect(inspectorEntryUrl(session({ path: "//evil.example.com/x" }), loc)).toBeNull();
     expect(inspectorEntryUrl(session({ path: "https://evil.example.com/x" }), loc)).toBeNull();
     expect(inspectorEntryUrl(session({ path: "/\\evil.example.com" }), loc)).toBeNull();
+    // The ticket is in the fragment and stays there, with every base64url character.
+    const tok = "A-b_".repeat(10) + "xyz";
+    expect(inspectorEntryUrl(session({ path: `/_golem-deploy/enter#t=${tok}`, public_url: "https://inspector.example.com" }), loc)).toBe(
+      `https://inspector.example.com/_golem-deploy/enter#t=${tok}`,
+    );
   });
 });
