@@ -116,6 +116,10 @@ GOLEM_DEPLOY_TRUSTED_PROXY=127.0.0.1/32
 
 Only if the proxy runs on another machine does the panel need a non-loopback address, which without TLS also needs `GOLEM_DEPLOY_INSECURE_HTTP=true`; never expose plain HTTP to untrusted networks.
 
+### Inspector
+
+The Inspector (see [INSPECTOR.md](INSPECTOR.md)) is off until an admin turns it on. It then runs one more container (`golem-deploy_inspector`, from `GOLEM_DEPLOY_INSPECTOR_IMAGE`, downloaded anonymously on first use) and opens the Inspector listener, by default on TCP port 8444 of the panel's address (`GOLEM_DEPLOY_INSPECTOR_LISTEN`; `off` disables the Inspector). Allow that one port in the host firewall and in the provider's firewall: browsers open the Inspector on it, and the game servers' Inspector agents connect to it from their containers through the Docker network's gateway, so with ufw it must be allowed (`ufw allow 8444/tcp`) even for the games. Open the Inspector under a host name that no game uses (see the cookie note in [INSPECTOR.md](INSPECTOR.md#security-model-and-limits)).
+
 ### TLS certificates
 
 To enable ACME, make TCP port 80 or 443 reachable for each requested identifier and accept the CA terms. Point `GOLEM_DEPLOY_HTTP_LISTEN` at the HTTP-01 listener if you use port 80. The unit grants only `CAP_NET_BIND_SERVICE` for low ports. See [CERTIFICATES.md](CERTIFICATES.md).
@@ -161,6 +165,8 @@ docker image ls --filter label=dev.golemengine.deploy.managed=true
 docker volume ls --filter label=dev.golemengine.deploy.managed=true
 ```
 
+The Inspector hub container carries the managed label too; its image does not (remove it with `docker image rm` and the configured `GOLEM_DEPLOY_INSPECTOR_IMAGE`).
+
 The apt packages and Docker itself are left installed.
 
 ## Security notes
@@ -169,6 +175,7 @@ The apt packages and Docker itself are left installed.
 - **Managed TLS on network listeners.** A non-loopback listener without TLS files serves HTTPS with a generated certificate until ACME is configured. Keep the panel on loopback if you reach it through an SSH tunnel or a reverse proxy on the same host.
 - The settings file and the TLS key are readable by root and the service group only; the data directory (database and keys) by the service user only.
 - Game servers can reach the host and its networks; see [SERVERS.md](SERVERS.md#network-isolation) for the isolation model and optional egress rules.
+- The Inspector, when turned on, is open to every developer account and runs a hub image pulled from the configured reference; see [INSPECTOR.md](INSPECTOR.md#security-model-and-limits).
 - **Builds and the service sandbox.** `docker build` runs as the service user under the unit's restrictions: the buildx client uses the dedicated `DOCKER_CONFIG` at `/var/lib/golem-deploy/docker-build`, its scratch files in the private `/tmp`, and the daemon writes the generated Dockerfile, `--iidfile` and `--metadata-file` below the data directory's `tmp/`, all writable under `ProtectSystem=strict`. The build itself (and every `RUN` step) executes inside dockerd's BuildKit, outside the sandbox. Keep the default `docker` builder in the dedicated configuration. Builds use public base images by default. To grant registry access deliberately, run `sudo -u golem-deploy env DOCKER_CONFIG=/var/lib/golem-deploy/docker-build docker login <registry>`. Keep proxy settings out of this configuration. Docker discovers buildx in its system plugin paths and the original client's `cli-plugins/`. For other plugin locations, install buildx under the dedicated `cli-plugins/` or set `cliPluginsExtraDirs` there. If the primary Docker client uses a named TLS context, import that context into the dedicated directory as well. Each game's certificate directory (`/var/lib/golem-deploy/certs/servers/<id>`) is bind-mounted by dockerd from its real path, which the unit leaves unchanged.
 
 ## Troubleshooting
