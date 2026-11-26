@@ -4,6 +4,8 @@ All notable changes to Golem Deploy are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.1.0-rc.2] - 2026-11-26
+
 ### Added
 
 - `server.module` in `golem-deploy.yaml`: the directory of `go.mod`, relative to the game root, for a monorepo whose Go server lives in a subdirectory. The preflight reads `go.mod` there and the generated Dockerfile builds the server there.
@@ -27,5 +29,6 @@ The first release candidate.
 - The Golem Inspector hub as a managed container, opened through one-time links from the panel.
 - Static file store, image and volume management, and a web client that covers the path from a repository to a running game.
 
-[Unreleased]: https://github.com/demiurgos-hub/golem-deploy/compare/v0.1.0-rc.1...HEAD
+[Unreleased]: https://github.com/demiurgos-hub/golem-deploy/compare/v0.1.0-rc.2...HEAD
+[0.1.0-rc.2]: https://github.com/demiurgos-hub/golem-deploy/releases/tag/v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/demiurgos-hub/golem-deploy/releases/tag/v0.1.0-rc.1
