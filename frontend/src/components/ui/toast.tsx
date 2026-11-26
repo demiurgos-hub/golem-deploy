@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { CheckCircle2, AlertTriangle, X } from "lucide-react";
 import { describeError, isApiError } from "@/api/errors";
 import { cn } from "@/lib/utils";
@@ -21,16 +21,35 @@ const ToastContext = createContext<ToastApi | null>(null);
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
   const nextId = useRef(1);
+  // Auto-dismiss timers by toast id, cancelled when the toast is dismissed
+  // or the provider unmounts: a timer must never update state afterwards.
+  const timers = useRef(new Map<number, ReturnType<typeof setTimeout>>());
 
   const dismiss = useCallback((id: number) => {
+    const timer = timers.current.get(id);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timers.current.delete(id);
+    }
     setItems((list) => list.filter((t) => t.id !== id));
+  }, []);
+
+  useEffect(() => {
+    const pending = timers.current;
+    return () => {
+      for (const timer of pending.values()) clearTimeout(timer);
+      pending.clear();
+    };
   }, []);
 
   const push = useCallback(
     (tone: ToastItem["tone"], message: string, requestId = "") => {
       const id = nextId.current++;
       setItems((list) => [...list.slice(-3), { id, tone, message, requestId }]);
-      setTimeout(() => dismiss(id), tone === "error" ? 9000 : 4000);
+      timers.current.set(
+        id,
+        setTimeout(() => dismiss(id), tone === "error" ? 9000 : 4000),
+      );
     },
     [dismiss],
   );

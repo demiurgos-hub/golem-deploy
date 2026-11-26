@@ -11,6 +11,10 @@ All notable changes to Golem Deploy are listed here. The format follows [Keep a 
 - `server.module` in `golem-deploy.yaml`: the directory of `go.mod`, relative to the game root, for a monorepo whose Go server lives in a subdirectory. The preflight reads `go.mod` there and the generated Dockerfile builds the server there.
 - `lfs.include` in `golem-deploy.yaml`: the Git LFS path patterns that clones and pulls download, so a large monorepo stays under the checkout size limit. A `golem-deploy.yaml` that cannot be read or has a bad `lfs` section fails the clone or pull of a repository that uses Git LFS.
 
+### Fixed
+
+- Notifications in the web client cancel their auto-dismiss timer when they are dismissed or the page is left.
+
 ## [0.1.0-rc.1] - 2026-11-26
 
 The first release candidate.
