@@ -515,8 +515,10 @@ const deployConfigFile = "golem-deploy.yaml"
 
 // Bounds re-checked on the patterns Options.LFSInclude returns.
 const (
-	maxLFSPatterns     = 32
-	maxLFSIncludeBytes = 4096
+	maxLFSPatterns        = 32
+	maxLFSIncludeBytes    = 4096
+	maxLFSPatternBytes    = 255
+	maxLFSPatternSegments = 16
 )
 
 // lfsPatternRE is the character set of an lfs.include pattern; the first
@@ -524,16 +526,25 @@ const (
 var lfsPatternRE = regexp.MustCompile(`^[A-Za-z0-9_.*][A-Za-z0-9_.*/-]*$`)
 
 // checkLFSPatterns re-checks the patterns before they become an argument
-// of git lfs pull (defence in depth: the deploy config parser validates
-// them fully).
+// of git lfs pull, with the same rules as the deploy config parser
+// (defence in depth: this package cannot import that parser).
 func checkLFSPatterns(patterns []string) error {
 	if len(patterns) > maxLFSPatterns {
 		return errors.New("too many lfs.include patterns")
 	}
 	total := 0
 	for _, p := range patterns {
-		if !lfsPatternRE.MatchString(p) || strings.Contains(p, "/-") {
+		if !lfsPatternRE.MatchString(p) || len(p) > maxLFSPatternBytes {
 			return errors.New("an lfs.include pattern contains characters that are not allowed")
+		}
+		segs := strings.Split(p, "/")
+		if len(segs) > maxLFSPatternSegments {
+			return errors.New("an lfs.include pattern has too many path segments")
+		}
+		for _, seg := range segs {
+			if seg == "" || seg == "." || seg == ".." || strings.HasPrefix(seg, "-") {
+				return errors.New("an lfs.include pattern has a path segment that is not allowed")
+			}
 		}
 		total += len(p) + 1
 	}

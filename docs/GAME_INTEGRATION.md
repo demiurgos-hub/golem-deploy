@@ -97,7 +97,7 @@ Rules for the values:
 
 - **Paths** are relative, use `/` and consist of letters, digits, `.`, `_` and `-`. A segment may not start with `-`, end with `.`, be `.` or `..`, or be `.git`. At most 16 segments and 255 bytes. A leading `./` and a trailing `/` are ignored.
 - **Commands and arguments** run without a shell: no variable expansion, no `&&`. Each word is single-line text of at most 1024 bytes, at most 32 words. For shell features, write the shell out: `build: ["sh", "-c", "npm run lint && npm run build"]`.
-- **`lfs.include` patterns** are relative paths of `/`-separated segments of letters, digits, `.`, `_`, `-` and `*`. A segment may not be empty, be `.` or `..`, or start with `-`. No comma, no white space, 1 to 32 patterns. Quote a pattern that starts with `*`, because YAML reads a bare `*` as an alias.
+- **`lfs.include` patterns** are relative paths of `/`-separated segments of letters, digits, `.`, `_`, `-` and `*`. A segment may not be empty, be `.` or `..`, or start with `-`. No comma, no white space. 1 to 32 patterns, each at most 255 bytes and 16 segments, and at most 4096 bytes in total once joined with commas. Quote a pattern that starts with `*`, because YAML reads a bare `*` as an alias.
 - **Transport paths** are `/` followed by at most 8 segments of letters, digits, `.`, `_`, `~` and `-`, at most 128 bytes. Golem Deploy cannot read the paths from your code: if the game serves other paths than the file declares, the server still starts but clients cannot connect.
 
 An example with every field:

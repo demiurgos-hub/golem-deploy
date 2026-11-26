@@ -22,6 +22,19 @@ func TestLFSInclude(t *testing.T) {
 			t.Fatalf("%q %v", got, err)
 		}
 	})
+	// Only the lfs section is validated during a clone or pull: a mistake
+	// in another key is reported when a build starts, as before.
+	t.Run("other keys are not validated", func(t *testing.T) {
+		for _, body := range []string{"root: ../x\n", "bogus: 1\nlfs:\n  include: [a]\n", "server:\n  module: /abs\n"} {
+			got, err := LFSInclude(writeRepo(t, map[string]string{ConfigFile: body}))
+			if err != nil {
+				t.Fatalf("%q: %v", body, err)
+			}
+			if strings.Contains(body, "lfs:") != (len(got) == 1) {
+				t.Fatalf("%q: %q", body, got)
+			}
+		}
+	})
 	t.Run("no key", func(t *testing.T) {
 		got, err := LFSInclude(writeRepo(t, map[string]string{ConfigFile: "server:\n  module: x\n"}))
 		if err != nil || got != nil {
@@ -33,7 +46,12 @@ func TestLFSInclude(t *testing.T) {
 		want  string
 	}{
 		"invalid pattern":   {map[string]string{ConfigFile: "lfs:\n  include: [\"a,b\"]\n"}, `golem-deploy.yaml: lfs.include pattern "a,b"`},
-		"invalid other key": {map[string]string{ConfigFile: "root: ../x\n"}, "golem-deploy.yaml: root"},
+		"null item":         {map[string]string{ConfigFile: "lfs:\n  include: [content/**, null]\n"}, "lfs.include must be a list of strings"},
+		"number item":       {map[string]string{ConfigFile: "lfs:\n  include: [7]\n"}, "lfs.include must be a list of strings"},
+		"null include":      {map[string]string{ConfigFile: "lfs:\n  include:\n"}, "at least one pattern"},
+		"unknown lfs key":   {map[string]string{ConfigFile: "lfs:\n  exclude: [a]\n"}, "golem-deploy.yaml: lfs has an unknown key"},
+		"lfs not a mapping": {map[string]string{ConfigFile: "lfs: [a]\n"}, "golem-deploy.yaml: lfs must be a mapping"},
+		"stored in Git LFS": {map[string]string{ConfigFile: "version https://git-lfs.github.com/spec/v1\noid sha256:49612254ff41de93d273dea55a5740a4ec192b88aeac815caf24eb4485a8c7f2\nsize 120\n"}, "golem-deploy.yaml is stored in Git LFS"},
 		"not yaml":          {map[string]string{ConfigFile: "lfs: [\n"}, "golem-deploy.yaml is not valid"},
 		"directory":         {map[string]string{ConfigFile + "/": ""}, "golem-deploy.yaml is not a regular file"},
 		"too large":         {map[string]string{ConfigFile: "# " + strings.Repeat("x", maxConfigBytes)}, "golem-deploy.yaml is larger than"},

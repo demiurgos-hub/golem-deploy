@@ -111,9 +111,10 @@ lfs:
 		"unicode":          {`lfs: {include: ["café"]}`, "may only contain"},
 		"null":             {"lfs:\n  include:\n", "at least one pattern"},
 		"explicit null":    {"lfs: {include: null}\n", "at least one pattern"},
-		"number":           {"lfs: {include: 3}\n", "not valid"},
-		"not a list":       {"lfs:\n  include: content/**\n", "not valid"},
-		"list of maps":     {"lfs:\n  include: [{a: b}]\n", "not valid"},
+		"number":           {"lfs: {include: 3}\n", "lfs.include must be a list of strings"},
+		"not a list":       {"lfs:\n  include: content/**\n", "lfs.include must be a list of strings"},
+		"list of maps":     {"lfs:\n  include: [{a: b}]\n", "lfs.include must be a list of strings"},
+		"null item":        {"lfs: {include: [content/**, null]}\n", "lfs.include must be a list of strings"},
 		"unknown key":      {"lfs:\n  exclude: [a]\n", "not valid"},
 		"unquoted star":    {"lfs:\n  include:\n    - *.bin\n", "YAML"},
 	} {

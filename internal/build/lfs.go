@@ -6,8 +6,9 @@ import "errors"
 // the root of the checkout dir, or nil when the file or the key is absent
 // (download everything). The file is read through repoFS (contained to the
 // checkout, no symbolic link, regular file, size-capped) and parsed with
-// ParseConfig, so the whole file must be valid. Every error is a
-// *UserError whose message names the file and is safe to show to users.
+// ParseLFSInclude: only the lfs section is validated here, the rest when a
+// build starts. Every error is a *UserError whose message names the file
+// and is safe to show to users.
 //
 // The daemon passes it to internal/git as git.Options.LFSInclude: the git
 // runner calls it after checking out a commit and before "git lfs pull".
@@ -28,9 +29,5 @@ func LFSInclude(dir string) ([]string, error) {
 		}
 		return nil, &UserError{Msg: ConfigFile + " could not be read", Err: err}
 	}
-	cfg, err := ParseConfig(raw)
-	if err != nil {
-		return nil, err
-	}
-	return cfg.LFS.Include, nil
+	return ParseLFSInclude(raw)
 }

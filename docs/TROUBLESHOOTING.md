@@ -99,8 +99,8 @@ The job's detail names the problem, and the job log has the git output. Authenti
 
 | Message | Fix |
 |---------|-----|
-| `the checkout exceeds the maximum repository size configured on the host` | Usually Git LFS content. First list only the Git LFS files the server needs under `lfs.include` in `golem-deploy.yaml` (see [REPOSITORIES.md](REPOSITORIES.md#git-lfs)). If the checkout is still too large, raise `--max-repo-size-mb` (`GOLEM_DEPLOY_MAX_REPO_SIZE_MB`, default 10240) on the host. |
-| `golem-deploy.yaml: lfs.include pattern "<pattern>" <problem>`, `golem-deploy.yaml is not valid: <parser message>` or another `golem-deploy.yaml` message | The repository uses Git LFS and its `golem-deploy.yaml` cannot be read or is not valid, so the download is not started (it could be far larger than the listed files). Fix the file; the rules are in [GAME_INTEGRATION.md](GAME_INTEGRATION.md#golem-deployyaml). |
+| `the checkout exceeds the maximum repository size configured on the host` | Usually Git LFS content. First list only the Git LFS files the server needs under `lfs.include` in `golem-deploy.yaml` (see [REPOSITORIES.md](REPOSITORIES.md#git-lfs)). If the checkout is still too large, raise `--max-repo-size-mb` (`GOLEM_DEPLOY_MAX_REPO_SIZE_MB`, default 10240) on the host. A failed clone leaves nothing behind, so clone again after the change. A project whose existing checkout went over the limit during a pull keeps the files it already downloaded: delete the project and add it again. |
+| `golem-deploy.yaml: lfs.include pattern "<pattern>" <problem>`, `golem-deploy.yaml is not valid: <parser message>` or another `golem-deploy.yaml` message | The repository uses Git LFS and its `golem-deploy.yaml` cannot be read, is not YAML, is itself stored in Git LFS, or has a bad `lfs` section, so the download is not started (it could be far larger than the listed files). Other keys are only checked when a build starts. Fix the file; the rules are in [GAME_INTEGRATION.md](GAME_INTEGRATION.md#golem-deployyaml). |
 
 ## Builds fail
 

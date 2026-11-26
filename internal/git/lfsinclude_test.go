@@ -33,7 +33,7 @@ func TestCheckLFSPatterns(t *testing.T) {
 		many[i] = "a"
 	}
 	for _, bad := range [][]string{
-		{""}, {"-x"}, {"--exclude=a"}, {"a/-x"}, {"/abs"}, {"a,b"}, {"a b"}, {"a\tb"}, {"a\nb"}, {"a\x00"},
+		{""}, {"-x"}, {"--exclude=a"}, {"a/-x"}, {"a//b"}, {"a/./b"}, {"../a"}, {"a/"}, {strings.Repeat("a", 256)}, {strings.Repeat("a/", 16) + "a"}, {"/abs"}, {"a,b"}, {"a b"}, {"a\tb"}, {"a\nb"}, {"a\x00"},
 		{"ok", "a\\b"}, {"a?"}, {"[ab]"}, {"!a"}, many, {strings.Repeat("a", maxLFSIncludeBytes+1)},
 	} {
 		if err := checkLFSPatterns(bad); err == nil {
