@@ -54,7 +54,7 @@ Every server container is created with:
 
 ## Engine deploy contract
 
-The daemon configures every container for the Golem Engine deploy contract (golem-engine v0.4: `golem.ServerConfigFromEnv` and the generated `Runtime.Host`). The game must use it, with **WebTransport as its primary transport** (the WebSocket fallback needs it; a WebSocket-primary game fails to start with these variables). These variables are injected by the daemon and override operator variables (whose names may not start with `GOLEM_` anyway):
+The daemon configures every container for the Golem Engine deploy contract (golem-engine v0.4: `golem.ServerConfigFromEnv` and the generated `Runtime.Host`). The game must use it, with **WebTransport as its primary transport** (the WebSocket fallback needs it; a WebSocket-primary game fails to start with these variables). `Runtime.Host` is the usual way, not a requirement: a game may also serve the admin endpoint by calling the engine's `host.Run` with `host.RunOptionsFromEnv` and its own options. What the daemon needs is the admin endpoint on `GOLEM_ADMIN_ADDR`, checked with `GOLEM_ADMIN_TOKEN`, and the game listening on `GOLEM_ADDR`. These variables are injected by the daemon and override operator variables (whose names may not start with `GOLEM_` anyway):
 
 | Variable | Value |
 |----------|-------|

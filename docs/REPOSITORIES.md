@@ -53,6 +53,17 @@ A checkout (working tree and `.git`, including Git LFS content) may not grow bey
 
 If the checkout's `.gitattributes` files use `filter=lfs`, the job runs `git lfs pull` with the same credentials after cloning or pulling. When `git-lfs` is not installed the job fails with "the repository uses Git LFS but git-lfs is not installed on the host"; install it (`apt install git-lfs`) and restart the daemon (it checks for `git-lfs` once per run).
 
+By default every Git LFS file is downloaded. A repository can limit this with `lfs.include` in the `golem-deploy.yaml` at its root (see [BUILDS.md](BUILDS.md#golem-deployyaml)):
+
+```yaml
+lfs:
+  include:
+    - content/**
+    - workers/unity/Assets/AssetsByType/Databases/*.bytes
+```
+
+The job then runs `git lfs pull --include=<patterns joined by commas>` and logs one line saying that the download is limited and how many patterns there are. Files outside the patterns stay pointer files. This is the way to keep a large monorepo, such as a game with a Unity client next to its Go server, under the size limit: list only what the server build needs. The file is read from the new checkout before the download, through the same contained reader as the build preflight (no symbolic links, regular file only, at most 32 KiB). When it exists but cannot be read or is not valid, the job fails with a message naming the file (and the bad pattern) instead of downloading everything. Without the file or the key, the job runs `git lfs pull` as before.
+
 The LFS server is always derived from the project's URL, never from the repository: for `https://host/team/game` (with or without `.git`) it is `https://host/team/game.git/info/lfs`, and for an SSH URL it is the SSH remote itself (git-lfs asks the server through `git-lfs-authenticate`). The transport follows the project's URL, so an HTTPS project never makes LFS connections over plain HTTP or SSH. A repository whose `.lfsconfig` sets the LFS server or transfer settings (`lfs.url`, `lfs.pushurl`, `remote.*.lfsurl`, `remote.*.lfspushurl`, `lfs.<url>.access` for another URL, `lfs.customtransfer.*`, `lfs.standalonetransferagent`, `lfs.extension.*`, `url.*.insteadOf`) fails the job with a message naming the keys in the job log; remove them or point the project at the repository that hosts the LFS objects. The LFS server the project points at is trusted: like any Git LFS client, the daemon downloads objects from whatever URLs it returns (often a storage host), without sending the project's credentials there.
 
 ## Troubleshooting

@@ -7,8 +7,8 @@ A build turns a project's checkout into a Docker image that game servers run. It
 In the **game root** (the repository root, or the directory `root` names in `golem-deploy.yaml`):
 
 - `golem.yaml`, the Golem Engine project file.
-- `go.mod` requiring `github.com/demiurgos-hub/golem-engine` at **v0.4.0-rc.1 or newer** (a release, prerelease or pseudo-version; versions with `+build` metadata are refused). Engine modules must not be replaced with local paths (`replace github.com/demiurgos-hub/golem-engine => ../golem-engine` is refused, as is any replacement of the root engine module): the monorepo examples use such replacements, a standalone game requires released versions instead (for npm: `golem-engine@0.4.0-rc.1` and `golem-threlte@0.4.0-rc.1` from the `next` dist-tag instead of `file:` dependencies). The `go` directive (or a newer `toolchain` directive) selects the Go image (`golang:<version>-bookworm`).
-- A server package whose `main` runs the game through the generated `Runtime.Host`, found in this order: `server.package` from `golem-deploy.yaml`, `./cmd/server`, the only directory under `./cmd` with Go files, the game root when it has Go files. The server listens on container port **7777** (TCP for the HTTP sidecar and WebSocket, UDP for WebTransport); the daemon configures it through `GOLEM_*` environment variables (see [SERVERS.md](SERVERS.md)).
+- `go.mod`, in the game root or in the directory `server.module` names (relative to the game root, for a monorepo whose Go server lives in a subdirectory), requiring `github.com/demiurgos-hub/golem-engine` at **v0.4.0-rc.1 or newer** (a release, prerelease or pseudo-version; versions with `+build` metadata are refused). Engine modules must not be replaced with local paths (`replace github.com/demiurgos-hub/golem-engine => ../golem-engine` is refused, as is any replacement of the root engine module): the monorepo examples use such replacements, a standalone game requires released versions instead (for npm: `golem-engine@0.4.0-rc.1` and `golem-threlte@0.4.0-rc.1` from the `next` dist-tag instead of `file:` dependencies). The `go` directive (or a newer `toolchain` directive) selects the Go image (`golang:<version>-bookworm`).
+- A server package whose `main` runs the game through the generated `Runtime.Host`, found in this order, relative to the directory of `go.mod`: `server.package` from `golem-deploy.yaml`, `./cmd/server`, the only directory under `./cmd` with Go files, the directory of `go.mod` when it has Go files. The server listens on container port **7777** (TCP for the HTTP sidecar and WebSocket, UDP for WebTransport); the daemon configures it through `GOLEM_*` environment variables (see [SERVERS.md](SERVERS.md)).
 - Optionally a browser client: a `package.json` in the game root (or `web.dir`). With a lockfile (`package-lock.json` or `npm-shrinkwrap.json`) dependencies are installed with `npm ci`, otherwise with `npm install` (the build log notes it; commit a lockfile for reproducible builds). When `package.json` has a `build` script, `npm run build` builds the client, which must end up in `web/dist` (or `web.dist`).
 - Generated Golem Engine code may be committed or not. When any output `golem.yaml` configures (`proto.out`, an integration's `out`) exists in the checkout, the build verifies it with `golem-bake --check` and fails if it is stale (run `golem-bake` and commit); otherwise the build generates it with `golem-bake`. Baking a JavaScript integration needs `typescript` among the project's npm dependencies (it runs `tsc` from `node_modules`).
 
@@ -19,11 +19,14 @@ In the **game root** (the repository root, or the directory `root` names in `gol
 Optional, at the **repository root**. Unknown keys are errors. The daemon accepts one document and at most 32 KiB in `golem-deploy.yaml` or 64 KiB in `golem.yaml`. Each document may contain up to 1024 nodes, 32 levels and 128 keys per mapping. Aliases are refused. Every path is relative, uses `/`, consists of segments of letters, digits, `.`, `_` and `-` (not starting with `-`, not `.`/`..`, not `.git`), at most 16 segments and 255 bytes; a leading `./` and a trailing `/` are ignored.
 
 ```yaml
-# Directory of golem.yaml and go.mod, relative to the repository root (default ".").
+# Directory of golem.yaml, relative to the repository root (default ".").
 root: games/arena
 
 server:
-  # Go package of the server, relative to the game root (default: detected, see above).
+  # Directory of go.mod, relative to the game root (default ".").
+  module: .
+  # Go package of the server, relative to the directory of go.mod
+  # (default: detected, see above).
   package: ./cmd/arena
   # Arguments passed to the server binary (exec form, no shell; default none).
   args: ["-assets", "web/dist"]
@@ -49,7 +52,18 @@ transport:
   # (host.GameOptions.WebSocketPath, default "/api/ws").
   webtransport_path: /wt
   websocket_path: /api/ws
+
+lfs:
+  # Only these Git LFS paths are downloaded when the project is cloned or
+  # pulled (default: all). Quote a pattern that starts with "*".
+  include:
+    - content/**
+    - "*.bytes"
 ```
+
+`server.module` is for a repository whose `golem.yaml` covers more than the Go server, for example a monorepo with a Unity client next to it. The preflight reads `go.mod` from that directory, and the generated Dockerfile runs `go build` there. `golem-bake`, the web build and the paths in `golem.yaml` stay relative to the game root. The Go image version comes from that `go.mod`. A custom Dockerfile stays relative to the game root.
+
+`lfs.include` limits what `git lfs pull` downloads when the project is cloned or pulled; it is read from the checkout, not at build time (see [REPOSITORIES.md](REPOSITORIES.md#git-lfs)). Each pattern is a relative path of `/`-separated segments of letters, digits, `.`, `_`, `-` and `*` (so `*`, `**`, `*.bytes` and `foo*` work). A segment may not be empty, be `.` or `..`, or start with `-`. No leading `/`, no comma, no white space. At most 32 patterns, each at most 16 segments and 255 bytes, 4096 bytes in total. An empty list is an error: leave out `lfs.include` to download everything. In YAML, a value that starts with `*` must be quoted. Git LFS files outside the patterns stay pointer files (small text files) in the checkout, so the build context has no real content for them: a Dockerfile or a build step must not copy or read them.
 
 `transport` paths are recorded on the build (`webtransport_path`, `websocket_path`) and become the URLs servers running the build publish (`GOLEM_PUBLIC_URL`, `GOLEM_WS_FALLBACK_URL`, see [SERVERS.md](SERVERS.md#engine-deploy-contract)). Each is `/` followed by at most 8 segments of letters, digits, `.`, `_`, `~` and `-` (no `.`/`..`, no empty segment, no trailing `/`, no query), at most 128 bytes. The daemon cannot read the paths from the game's code: if the game serves other paths than the build declares, clients fail to connect while the start still succeeds (the admin endpoint reports ready either way).
 
@@ -66,14 +80,14 @@ Commands and arguments are passed in Dockerfile exec form (a JSON array): there 
 
 The generated Dockerfile (printed at the top of every build log) is a two-stage build:
 
-- **Build stage** `golang:<go version>-bookworm`, with Node.js 24 and npm copied from `node:24-bookworm-slim` when there is a `package.json`. The repository is copied to `/src`, static add-ons on top of the game root, then: `npm ci` (or `npm install`) in each `package.json` directory, `go run github.com/demiurgos-hub/golem-engine/cmd/golem-bake@<engine version>` (with `--check` when generated code is committed), the web build, a check that the web client directory exists, and `CGO_ENABLED=0 go build -trimpath` of the server package. The build checks that Go resolves the package as `main` and that the output is an executable. Go's module and build caches and npm's cache are BuildKit cache mounts whose ids contain a hash of the installation's instance id and the project id, so generated builds get separate cache mounts per project. `GOFLAGS=-mod=mod` lets the go command complete a missing `go.sum` (downloads are still verified against the checksum database).
+- **Build stage** `golang:<go version>-bookworm`, with Node.js 24 and npm copied from `node:24-bookworm-slim` when there is a `package.json`. The repository is copied to `/src`, static add-ons on top of the game root, then: `npm ci` (or `npm install`) in each `package.json` directory, `go run github.com/demiurgos-hub/golem-engine/cmd/golem-bake@<engine version>` (with `--check` when generated code is committed), the web build, a check that the web client directory exists, and `CGO_ENABLED=0 go build -trimpath` of the server package in the directory of `go.mod` (`server.module`). The build checks that Go resolves the package as `main` and that the output is an executable. Go's module and build caches and npm's cache are BuildKit cache mounts whose ids contain a hash of the installation's instance id and the project id, so generated builds get separate cache mounts per project. `GOFLAGS=-mod=mod` lets the go command complete a missing `go.sum` (downloads are still verified against the checksum database).
 - **Final stage** `gcr.io/distroless/static-debian12:nonroot`: working directory `/app` (the game root), the server at `/usr/local/bin/golem-server`, the web client at `/app/<web.dist>`, static add-ons at `/app/<target>`, an empty `/data` owned by uid 65532, `USER 65532:65532`, `EXPOSE 7777/udp 7777/tcp` and the exec-form `ENTRYPOINT ["/usr/local/bin/golem-server", <server.args>...]`.
 
 Every build's `.dockerignore` is the repository's own `.dockerignore` (if any) followed by `.git`, `**/.git`, `node_modules` and `**/node_modules`, which therefore always win.
 
 ### Custom Dockerfile
 
-The admin must set `allow_custom_dockerfile: true` on the project before a build can use the Dockerfile named by `dockerfile:`. Enable this only for a repository you trust with the shared BuildKit builder and cache. A custom Dockerfile can read or write cache mounts of other projects if it knows their ids. The daemon copies the Dockerfile out of the checkout and rejects frontend selection in any directive form. The built-in frontend applies the same `.dockerignore` to the repository context. The preflight requires `golem.yaml` and a valid `go.mod`, and the CLI sets the build labels. Your Dockerfile must produce an image that:
+The admin must set `allow_custom_dockerfile: true` on the project before a build can use the Dockerfile named by `dockerfile:`. Enable this only for a repository you trust with the shared BuildKit builder and cache. A custom Dockerfile can read or write cache mounts of other projects if it knows their ids. The daemon copies the Dockerfile out of the checkout and rejects frontend selection in any directive form. The built-in frontend applies the same `.dockerignore` to the repository context. The preflight requires `golem.yaml` and a valid `go.mod` (in `server.module` when it is set), and the CLI sets the build labels. Your Dockerfile must produce an image that:
 
 - listens on port 7777 (TCP and/or UDP) and is configured through `GOLEM_*` environment variables;
 - runs as a non-root user (the daemon runs every server as uid/gid 65532 with a read-only root filesystem, no capabilities and `no-new-privileges`; write only to `/tmp`, `/data` or declared volumes);

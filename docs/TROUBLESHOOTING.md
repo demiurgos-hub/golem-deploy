@@ -93,6 +93,15 @@ Let's Encrypt refuses names it cannot validate publicly: private and loopback ad
 
 **The game host changed.** In ACME mode the daemon requests a certificate for the new name in the background. Until it arrives, servers keep the old certificate, their certificate shows that it does not cover the game host, and the connection test fails with `The certificate does not cover the game host. Install a certificate issued for that host.`
 
+## Clones and pulls fail
+
+The job's detail names the problem, and the job log has the git output. Authentication, host keys and Git LFS servers are covered in [REPOSITORIES.md](REPOSITORIES.md).
+
+| Message | Fix |
+|---------|-----|
+| `the checkout exceeds the maximum repository size configured on the host` | Usually Git LFS content. First list only the Git LFS files the server needs under `lfs.include` in `golem-deploy.yaml` (see [REPOSITORIES.md](REPOSITORIES.md#git-lfs)). If the checkout is still too large, raise `--max-repo-size-mb` (`GOLEM_DEPLOY_MAX_REPO_SIZE_MB`, default 10240) on the host. |
+| `golem-deploy.yaml: lfs.include pattern "<pattern>" <problem>`, `golem-deploy.yaml is not valid: <parser message>` or another `golem-deploy.yaml` message | The repository uses Git LFS and its `golem-deploy.yaml` cannot be read or is not valid, so the download is not started (it could be far larger than the listed files). Fix the file; the rules are in [GAME_INTEGRATION.md](GAME_INTEGRATION.md#golem-deployyaml). |
+
 ## Builds fail
 
 The build's detail names the problem, and the build log has the output. Build a fresh clone of your game locally first: most build failures also happen there. Making a game buildable is described in [GAME_INTEGRATION.md](GAME_INTEGRATION.md).
@@ -114,7 +123,8 @@ The preflight reads a few files from the checkout before Docker runs:
 | Message | Fix |
 |---------|-----|
 | `golem.yaml was not found in the game root "<root>"; set root in golem-deploy.yaml if the game lives in a subdirectory` | Set `root`, or add `golem.yaml`. |
-| `go.mod was not found in the game root "<root>"` | `go.mod` must be next to `golem.yaml`. |
+| `go.mod was not found in the game root "<root>"; set server.module in golem-deploy.yaml if the Go module lives in a subdirectory` | Add `go.mod` next to `golem.yaml`, or set `server.module` to its directory. |
+| `go.mod was not found in "<dir>" (server.module "<module>" in golem-deploy.yaml)` or `server.module "<module>" in golem-deploy.yaml is not a directory in the game root` | `server.module` is relative to the game root and must name the directory of `go.mod`. |
 | `go.mod does not require github.com/demiurgos-hub/golem-engine; a Golem Engine game is required` | Require the engine. |
 | `go.mod requires github.com/demiurgos-hub/golem-engine <version>; Golem Deploy needs v0.4.0-rc.1 or newer` | Upgrade the engine. |
 | `go.mod requires github.com/demiurgos-hub/golem-engine at a version Golem Deploy does not accept (<version>)` | Use a release, prerelease or pseudo-version without `+build` metadata. |
