@@ -28,9 +28,10 @@ const (
 
 // Config is the parsed golem-deploy.yaml. Every path is a clean relative
 // path in slash form ("." for the directory itself). Root is relative to the
-// repository root; every other path is relative to Root.
+// repository root; Server.Package is relative to Server.Module; every other
+// path is relative to Root.
 type Config struct {
-	// Root is the game root: the directory holding golem.yaml and go.mod.
+	// Root is the game root: the directory holding golem.yaml.
 	Root   string
 	Server ServerConfig
 	Web    WebConfig
@@ -38,6 +39,16 @@ type Config struct {
 	// generated one.
 	Dockerfile string
 	Transport  TransportConfig
+	LFS        LFSConfig
+}
+
+// LFSConfig limits what the checkout downloads with Git LFS.
+type LFSConfig struct {
+	// Include lists the Git LFS path patterns that are downloaded (passed
+	// to "git lfs pull --include"); nil means all. Each pattern passed
+	// cleanLFSPattern, so none contains a comma, white space or a leading
+	// '-'.
+	Include []string
 }
 
 // TransportConfig names the endpoint paths the game server serves its
@@ -60,8 +71,11 @@ const (
 
 // ServerConfig configures the game server binary.
 type ServerConfig struct {
-	// Package is the Go package of the server ("." or a relative directory);
-	// empty means detect.
+	// Module is the directory of go.mod, relative to the game root ("."
+	// by default).
+	Module string
+	// Package is the Go package of the server ("." or a directory relative
+	// to Module); empty means detect.
 	Package string
 	// Args are passed to the server after the binary (exec form).
 	Args []string
@@ -88,6 +102,7 @@ const DefaultWebDist = "web/dist"
 type rawConfig struct {
 	Root   *string `yaml:"root"`
 	Server *struct {
+		Module  *string   `yaml:"module"`
 		Package *string   `yaml:"package"`
 		Args    *[]string `yaml:"args"`
 	} `yaml:"server"`
@@ -101,6 +116,11 @@ type rawConfig struct {
 		WebTransportPath *string `yaml:"webtransport_path"`
 		WebSocketPath    *string `yaml:"websocket_path"`
 	} `yaml:"transport"`
+	LFS *struct {
+		// A node, so that an explicit null is told apart from an absent
+		// key (both would leave a *[]string nil).
+		Include yaml.Node `yaml:"include"`
+	} `yaml:"lfs"`
 }
 
 // command accepts a list of words (exec form) or a string split on white
@@ -132,7 +152,7 @@ func (c *command) UnmarshalYAML(n *yaml.Node) error {
 // ParseConfig parses and validates golem-deploy.yaml. Empty input yields
 // the defaults. Errors are *UserError values safe to show to users.
 func ParseConfig(data []byte) (Config, error) {
-	cfg := Config{Root: "."}
+	cfg := Config{Root: ".", Server: ServerConfig{Module: "."}}
 	if len(data) > maxConfigBytes {
 		return Config{}, userErr("%s is larger than %d KiB", ConfigFile, maxConfigBytes>>10)
 	}
@@ -141,6 +161,9 @@ func ParseConfig(data []byte) (Config, error) {
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
 		return cfg, nil
+	}
+	if err := checkNotLFSPointer(data); err != nil {
+		return Config{}, err
 	}
 	if err := checkYAML(ConfigFile, data); err != nil {
 		return Config{}, err
@@ -161,6 +184,11 @@ func ParseConfig(data []byte) (Config, error) {
 		}
 	}
 	if s := raw.Server; s != nil {
+		if s.Module != nil {
+			if cfg.Server.Module, err = cleanPath("server.module", *s.Module, true); err != nil {
+				return Config{}, err
+			}
+		}
 		if s.Package != nil {
 			if cfg.Server.Package, err = cleanPackage(*s.Package); err != nil {
 				return Config{}, err
@@ -208,7 +236,168 @@ func ParseConfig(data []byte) (Config, error) {
 			}
 		}
 	}
+	if l := raw.LFS; l != nil && l.Include.Kind != 0 {
+		if cfg.LFS.Include, err = lfsIncludeNode(&l.Include); err != nil {
+			return Config{}, err
+		}
+	}
 	return cfg, nil
+}
+
+// lfsPointerPrefix starts a Git LFS pointer file.
+const lfsPointerPrefix = "version https://git-lfs.github.com/spec/"
+
+// checkNotLFSPointer refuses a golem-deploy.yaml that is itself stored in
+// Git LFS: the daemon reads it before any LFS content is downloaded.
+func checkNotLFSPointer(data []byte) error {
+	if bytes.HasPrefix(bytes.TrimSpace(data), []byte(lfsPointerPrefix)) {
+		return userErr("%s is stored in Git LFS; keep it as a normal Git file (exclude it from the filter=lfs rules in .gitattributes)", ConfigFile)
+	}
+	return nil
+}
+
+// lfsIncludeNode validates the value of lfs.include: a list of strings
+// (an explicit null counts as an empty list and is refused like one).
+func lfsIncludeNode(n *yaml.Node) ([]string, error) {
+	var patterns []string
+	switch {
+	case n.Kind == yaml.ScalarNode && n.Tag == "!!null":
+	case n.Kind == yaml.SequenceNode:
+		for _, item := range n.Content {
+			if item.Kind != yaml.ScalarNode || item.Tag != "!!str" {
+				return nil, fieldErr("lfs.include", "must be a list of strings")
+			}
+			patterns = append(patterns, item.Value)
+		}
+	default:
+		return nil, fieldErr("lfs.include", "must be a list of strings")
+	}
+	return cleanLFSInclude(patterns)
+}
+
+// ParseLFSInclude returns the lfs.include patterns of a golem-deploy.yaml
+// (nil when the key is absent). It is what a clone or pull needs before
+// "git lfs pull": the file must be a YAML mapping within the usual size
+// and complexity limits, and only the lfs section is validated. The other
+// keys are checked by ParseConfig when a build starts, so a mistake there
+// does not stop a clone. Errors are *UserError values safe to show.
+func ParseLFSInclude(data []byte) ([]string, error) {
+	if len(data) > maxConfigBytes {
+		return nil, userErr("%s is larger than %d KiB", ConfigFile, maxConfigBytes>>10)
+	}
+	if !utf8.Valid(data) {
+		return nil, userErr("%s is not valid UTF-8", ConfigFile)
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, nil
+	}
+	if err := checkNotLFSPointer(data); err != nil {
+		return nil, err
+	}
+	if err := checkYAML(ConfigFile, data); err != nil {
+		return nil, err
+	}
+	var raw struct {
+		LFS yaml.Node `yaml:"lfs"`
+	}
+	if err := yaml.NewDecoder(bytes.NewReader(data)).Decode(&raw); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, nil
+		}
+		return nil, userErr("%s is not valid: %s", ConfigFile, yamlMessage(err))
+	}
+	l := &raw.LFS
+	if l.Kind == 0 || (l.Kind == yaml.ScalarNode && l.Tag == "!!null") {
+		return nil, nil
+	}
+	if l.Kind != yaml.MappingNode {
+		return nil, fieldErr("lfs", "must be a mapping")
+	}
+	var include *yaml.Node
+	for i := 0; i+1 < len(l.Content); i += 2 {
+		if key := l.Content[i]; key.Kind != yaml.ScalarNode || key.Value != "include" {
+			return nil, fieldErr("lfs", "has an unknown key; only include is allowed")
+		}
+		include = l.Content[i+1]
+	}
+	if include == nil {
+		return nil, nil
+	}
+	return lfsIncludeNode(include)
+}
+
+// Limits of lfs.include.
+const (
+	maxLFSPatterns     = 32
+	maxLFSIncludeBytes = 4096
+)
+
+var lfsSegmentRE = regexp.MustCompile(`^[A-Za-z0-9_.*][A-Za-z0-9_.*-]*$`)
+
+// cleanLFSInclude validates lfs.include: 1 to maxLFSPatterns patterns that
+// pass cleanLFSPattern, at most maxLFSIncludeBytes bytes once joined with
+// commas (the single "--include=" argument of git lfs pull).
+func cleanLFSInclude(patterns []string) ([]string, error) {
+	const field = "lfs.include"
+	if len(patterns) == 0 {
+		return nil, fieldErr(field, "must list at least one pattern (omit lfs.include to download every Git LFS file)")
+	}
+	if len(patterns) > maxLFSPatterns {
+		return nil, fieldErr(field, "must have at most %d patterns", maxLFSPatterns)
+	}
+	total := len(patterns) - 1
+	for _, p := range patterns {
+		if err := cleanLFSPattern(p); err != nil {
+			return nil, err
+		}
+		total += len(p)
+	}
+	if total > maxLFSIncludeBytes {
+		return nil, fieldErr(field, "must be at most %d bytes in total", maxLFSIncludeBytes)
+	}
+	return append([]string{}, patterns...), nil
+}
+
+// cleanLFSPattern validates one Git LFS include pattern: a relative path
+// of '/'-separated segments of letters, digits, '.', '_', '-' and '*'
+// (not starting with '-', not "." or ".."), no empty segment, at most
+// maxPathDepth segments and maxPathBytes bytes. A pattern therefore holds
+// no comma (the list separator), no white space, no control character and
+// cannot be read as an option. Messages quote the pattern escaped and
+// clipped.
+func cleanLFSPattern(p string) error {
+	const field = "lfs.include"
+	bad := func(format string, a ...any) error {
+		// logsafe keeps tabs; a message must be a single plain line.
+		quoted := strings.ReplaceAll(clip(logsafe.String(p), 80), "\t", `\x09`)
+		return fieldErr(field, "pattern \"%s\" %s", quoted, fmt.Sprintf(format, a...))
+	}
+	if p == "" {
+		return fieldErr(field, "patterns must not be empty")
+	}
+	if len(p) > maxPathBytes {
+		return bad("must be at most %d bytes", maxPathBytes)
+	}
+	if strings.HasPrefix(p, "/") {
+		return bad("must be a relative path")
+	}
+	segs := strings.Split(p, "/")
+	if len(segs) > maxPathDepth {
+		return bad("must have at most %d path segments", maxPathDepth)
+	}
+	for _, s := range segs {
+		switch {
+		case s == "":
+			return bad("must not contain empty segments or end with '/'")
+		case s == "." || s == "..":
+			return bad("must not contain '.' or '..' segments")
+		case strings.HasPrefix(s, "-"):
+			return bad("segments must not start with '-'")
+		case !lfsSegmentRE.MatchString(s):
+			return bad("may only contain letters, digits, '.', '_', '-', '*' and '/'")
+		}
+	}
+	return nil
 }
 
 // Limits of a transport endpoint path.

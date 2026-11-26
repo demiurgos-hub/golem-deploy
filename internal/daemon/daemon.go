@@ -696,12 +696,21 @@ func prepareGit(ctx context.Context, st *store.Store, layout datadir.Layout, max
 	if err != nil {
 		logger.Warn("could not remove all orphaned checkouts", "err", err)
 	}
-	r, err := git.New(git.Options{TempDir: layout.Tmp(), KnownHostsFile: layout.KnownHosts(), MaxRepoSize: maxRepoSize})
+	r, err := git.New(gitOptions(layout, maxRepoSize))
 	if err != nil {
 		logger.Warn("git is not available; project clone, pull and branch operations are disabled", "err", err)
 		return nil, nil
 	}
 	return r, nil
+}
+
+// gitOptions configures the git runner. LFSInclude lets the runner limit
+// "git lfs pull" to the lfs.include patterns of the checkout's
+// golem-deploy.yaml, read and parsed by the build package (internal/git
+// cannot import it: the build package depends on internal/git).
+func gitOptions(layout datadir.Layout, maxRepoSize int64) git.Options {
+	return git.Options{TempDir: layout.Tmp(), KnownHostsFile: layout.KnownHosts(), MaxRepoSize: maxRepoSize,
+		LFSInclude: build.LFSInclude}
 }
 
 // checkDataDirPath refuses a data directory whose absolute path cannot be

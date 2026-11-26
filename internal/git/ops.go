@@ -10,9 +10,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/demiurgos-hub/golem-deploy/internal/logsafe"
 )
 
 // Checkout describes a working tree after a successful operation.
@@ -175,7 +179,11 @@ func (s *session) finish(ctx context.Context, op, dir, branch string) (Checkout,
 		if err := s.checkLFSConfig(ctx, op, dir); err != nil {
 			return Checkout{}, err
 		}
-		if err := s.run(ctx, op, dir, cmdOpts{network: true, lfsSmudge: true, watch: dir}, lfsPullArgs()...); err != nil {
+		include, err := s.lfsIncludes(op, dir)
+		if err != nil {
+			return Checkout{}, err
+		}
+		if err := s.run(ctx, op, dir, cmdOpts{network: true, lfsSmudge: true, watch: dir}, lfsPullArgs(include)...); err != nil {
 			removePartialDownloads(dir)
 			return Checkout{}, err
 		}
@@ -375,7 +383,16 @@ func attributesArgs() []string {
 	return []string{"ls-files", "-z", "--", ".gitattributes", ":(glob)**/.gitattributes"}
 }
 
-func lfsPullArgs() []string { return []string{"lfs", "pull"} }
+// lfsPullArgs adds the include patterns as exactly one stuck
+// "--include=<p1>,<p2>" argument (patterns passed checkLFSPatterns: no
+// comma, no white space, none starts with '-').
+func lfsPullArgs(include []string) []string {
+	args := []string{"lfs", "pull"}
+	if len(include) > 0 {
+		args = append(args, "--include="+strings.Join(include, ","))
+	}
+	return args
+}
 
 func lfsConfigListArgs() []string {
 	return []string{"config", "--file=.lfsconfig", "--no-includes", "--list", "-z"}
@@ -490,4 +507,97 @@ func disallowedLFSKeys(list []byte, endpoint string) []string {
 		}
 	}
 	return bad
+}
+
+// deployConfigFile is the repository's optional deploy configuration
+// (build.ConfigFile), named in messages about lfs.include.
+const deployConfigFile = "golem-deploy.yaml"
+
+// Bounds re-checked on the patterns Options.LFSInclude returns.
+const (
+	maxLFSPatterns        = 32
+	maxLFSIncludeBytes    = 4096
+	maxLFSPatternBytes    = 255
+	maxLFSPatternSegments = 16
+)
+
+// lfsPatternRE is the character set of an lfs.include pattern; the first
+// character is neither '-' nor '/'.
+var lfsPatternRE = regexp.MustCompile(`^[A-Za-z0-9_.*][A-Za-z0-9_.*/-]*$`)
+
+// checkLFSPatterns re-checks the patterns before they become an argument
+// of git lfs pull, with the same rules as the deploy config parser
+// (defence in depth: this package cannot import that parser).
+func checkLFSPatterns(patterns []string) error {
+	if len(patterns) > maxLFSPatterns {
+		return errors.New("too many lfs.include patterns")
+	}
+	total := 0
+	for _, p := range patterns {
+		if !lfsPatternRE.MatchString(p) || len(p) > maxLFSPatternBytes {
+			return errors.New("an lfs.include pattern contains characters that are not allowed")
+		}
+		segs := strings.Split(p, "/")
+		if len(segs) > maxLFSPatternSegments {
+			return errors.New("an lfs.include pattern has too many path segments")
+		}
+		for _, seg := range segs {
+			if seg == "" || seg == "." || seg == ".." || strings.HasPrefix(seg, "-") {
+				return errors.New("an lfs.include pattern has a path segment that is not allowed")
+			}
+		}
+		total += len(p) + 1
+	}
+	if total > maxLFSIncludeBytes+1 {
+		return errors.New("the lfs.include patterns are too long")
+	}
+	return nil
+}
+
+// lfsIncludes returns the patterns that limit "git lfs pull" (nil: all)
+// from Options.LFSInclude, logging one line when the download is limited.
+// A golem-deploy.yaml that cannot be read or is not valid fails the
+// operation: silently downloading everything could be tens of gigabytes.
+func (s *session) lfsIncludes(op, dir string) ([]string, error) {
+	if s.r.lfsInclude == nil {
+		return nil, nil
+	}
+	fail := func(cause error, msg string) error {
+		msg = safeDetail(msg)
+		s.log.println("error: " + msg)
+		return &Error{Op: op, Reason: ReasonDeployConfig, Err: cause, detail: msg}
+	}
+	patterns, err := s.r.lfsInclude(dir)
+	if err != nil {
+		return nil, fail(err, err.Error())
+	}
+	if len(patterns) == 0 {
+		return nil, nil
+	}
+	if err := checkLFSPatterns(patterns); err != nil {
+		return nil, fail(err, deployConfigFile+": "+err.Error())
+	}
+	noun := "patterns"
+	if len(patterns) == 1 {
+		noun = "pattern"
+	}
+	s.log.println(fmt.Sprintf("Git LFS: downloading only the paths listed under lfs.include in %s (%d %s)", deployConfigFile, len(patterns), noun))
+	return patterns, nil
+}
+
+// maxDetail bounds a user-facing failure detail.
+const maxDetail = 300
+
+// safeDetail renders msg as a single line with control and bidirectional
+// characters escaped, clipped to maxDetail bytes.
+func safeDetail(msg string) string {
+	msg = logsafe.String(strings.Join(strings.Fields(msg), " "))
+	if len(msg) <= maxDetail {
+		return msg
+	}
+	cut := maxDetail
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + "..."
 }

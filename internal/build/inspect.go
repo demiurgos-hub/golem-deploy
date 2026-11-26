@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/version"
 	"path"
 	"regexp"
@@ -45,10 +46,13 @@ const (
 )
 
 // Plan is everything the build needs from a checkout, validated. Paths are
-// clean slash paths: Root relative to the repository, the others relative
-// to Root.
+// clean slash paths: Root relative to the repository, ServerPackage
+// relative to Module, the others relative to Root.
 type Plan struct {
 	Root string
+	// Module is the directory of go.mod relative to Root (server.module;
+	// "." or empty for the game root). The Go build runs there.
+	Module string
 	// EngineVersion is the Golem Engine version go.mod requires.
 	EngineVersion string
 	// GoVersion selects the Go toolchain image (go directive or toolchain,
@@ -135,7 +139,7 @@ func inspect(repo *repoFS, allowCustomDockerfile bool) (*Plan, error) {
 	if cfg.Dockerfile != "" && !allowCustomDockerfile {
 		return nil, userErr("the repository requests a custom Dockerfile; ask an admin to enable allow_custom_dockerfile for this project")
 	}
-	p := &Plan{Root: cfg.Root, ServerArgs: cfg.Server.Args,
+	p := &Plan{Root: cfg.Root, Module: cfg.Server.Module, ServerArgs: cfg.Server.Args,
 		WebTransportPath: cmp.Or(cfg.Transport.WebTransportPath, DefaultWebTransportPath),
 		WebSocketPath:    cmp.Or(cfg.Transport.WebSocketPath, DefaultWebSocketPath)}
 	if raw != nil {
@@ -159,6 +163,9 @@ func inspect(repo *repoFS, allowCustomDockerfile bool) (*Plan, error) {
 	}
 	if err := p.readGoMod(repo); err != nil {
 		return nil, err
+	}
+	if !p.defaultModule() {
+		p.Notes = append(p.Notes, "Go module: "+p.Module+" (server.module); the server is built there")
 	}
 
 	if cfg.Dockerfile != "" {
@@ -222,12 +229,29 @@ func selectsFrontend(data []byte) bool {
 	return false
 }
 
-// readGoMod validates the game's go.mod: the engine requirement and its
-// version, no local replacement of engine modules, and the Go version.
+// moduleDir is the directory of go.mod relative to the repository root.
+func (p *Plan) moduleDir() string { return join(p.Root, p.Module) }
+
+// defaultModule reports whether go.mod is in the game root.
+func (p *Plan) defaultModule() bool { return p.Module == "" || p.Module == "." }
+
+// readGoMod validates the game's go.mod (in the module directory): the
+// engine requirement and its version, no local replacement of engine
+// modules, and the Go version.
 func (p *Plan) readGoMod(repo *repoFS) error {
-	data, err := repo.readFile(join(p.Root, "go.mod"), maxGoModBytes)
+	if !p.defaultModule() {
+		if k, err := repo.kind(p.moduleDir()); err != nil {
+			return err
+		} else if k != kindDir {
+			return userErr("server.module %q in %s is not a directory in the game root", p.Module, ConfigFile)
+		}
+	}
+	data, err := repo.readFile(join(p.moduleDir(), "go.mod"), maxGoModBytes)
 	if errors.Is(err, errMissing) {
-		return userErr("go.mod was not found in the game root %q", p.Root)
+		if p.defaultModule() {
+			return userErr("go.mod was not found in the game root %q; set server.module in %s if the Go module lives in a subdirectory", p.Root, ConfigFile)
+		}
+		return userErr("go.mod was not found in %q (server.module %q in %s)", p.moduleDir(), p.Module, ConfigFile)
 	}
 	if err != nil {
 		return err
@@ -276,29 +300,36 @@ func (p *Plan) readGoMod(repo *repoFS) error {
 	return nil
 }
 
-// findServer resolves the server package: the configured one, else
-// ./cmd/server, else the only ./cmd/* directory with Go files, else the
-// game root when it has Go files.
+// findServer resolves the server package, relative to the module
+// directory: the configured one, else ./cmd/server, else the only ./cmd/*
+// directory with Go files, else the module directory itself when it has Go
+// files.
 func (p *Plan) findServer(repo *repoFS, cfg Config) error {
+	base := p.moduleDir()
+	where, self := "the game root", "the game root"
+	if !p.defaultModule() {
+		where = fmt.Sprintf("the module directory %q (server.module)", p.Module)
+		self = "the module directory"
+	}
 	if pkg := cfg.Server.Package; pkg != "" {
-		k, err := repo.kind(join(p.Root, pkg))
+		k, err := repo.kind(join(base, pkg))
 		if err != nil {
 			return err
 		}
 		if k != kindDir {
-			return userErr("server.package %q in %s is not a directory in the game root", pkg, ConfigFile)
+			return userErr("server.package %q in %s is not a directory in %s", pkg, ConfigFile, where)
 		}
 		p.ServerPackage = pkg
 		return nil
 	}
-	if k, err := repo.kind(join(p.Root, "cmd/server")); err != nil {
+	if k, err := repo.kind(join(base, "cmd/server")); err != nil {
 		return err
 	} else if k == kindDir {
 		p.ServerPackage = "cmd/server"
 		return nil
 	}
 	var mains []string
-	entries, err := repo.readDir(join(p.Root, "cmd"))
+	entries, err := repo.readDir(join(base, "cmd"))
 	if err != nil && !errors.Is(err, errMissing) {
 		return err
 	}
@@ -306,7 +337,7 @@ func (p *Plan) findServer(repo *repoFS, cfg Config) error {
 		if !e.IsDir() || !segmentRE.MatchString(e.Name()) {
 			continue
 		}
-		ok, err := hasGoFiles(repo, join(p.Root, "cmd", e.Name()))
+		ok, err := hasGoFiles(repo, join(base, "cmd", e.Name()))
 		if err != nil {
 			return err
 		}
@@ -324,14 +355,14 @@ func (p *Plan) findServer(repo *repoFS, cfg Config) error {
 		slices.Sort(mains)
 		return userErr("several commands were found (%s); set server.package in %s", strings.Join(clipList(mains, 5), ", "), ConfigFile)
 	}
-	if ok, err := hasGoFiles(repo, p.Root); err != nil {
+	if ok, err := hasGoFiles(repo, base); err != nil {
 		return err
 	} else if ok {
 		p.ServerPackage = "."
-		p.Notes = append(p.Notes, "Server package: the game root")
+		p.Notes = append(p.Notes, "Server package: "+self)
 		return nil
 	}
-	return userErr("the server package was not found (looked for ./cmd/server, a single ./cmd/* command and Go files in the game root); set server.package in %s", ConfigFile)
+	return userErr("the server package was not found (looked for ./cmd/server, a single ./cmd/* command and Go files in %s); set server.package in %s", where, ConfigFile)
 }
 
 func clipList(items []string, n int) []string {

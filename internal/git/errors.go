@@ -32,6 +32,10 @@ const (
 	// ReasonDiskSpace: free space on the data filesystem is below
 	// Options.MinFreeSpace.
 	ReasonDiskSpace
+	// ReasonDeployConfig: the checkout's golem-deploy.yaml could not be
+	// read or is not valid, so the Git LFS download could not be limited
+	// (Options.LFSInclude).
+	ReasonDeployConfig
 )
 
 // Error is returned by Runner operations. Its Error text contains no
@@ -44,6 +48,9 @@ type Error struct {
 	// checkout, which is still in its previous state.
 	Unchanged bool
 	Err       error
+	// detail is a user-safe description (sanitised, single line) that
+	// Message returns for ReasonDeployConfig.
+	detail string
 }
 
 // Error returns "git <op>: <cause>", or the reason's message when there is
@@ -93,6 +100,11 @@ func (e *Error) Message() string {
 		return "the checkout exceeds the maximum repository size configured on the host"
 	case ReasonDiskSpace:
 		return "not enough free disk space on the host for the checkout"
+	case ReasonDeployConfig:
+		if e.detail != "" {
+			return e.detail
+		}
+		return "the repository's " + deployConfigFile + " could not be read or is not valid; see the job log"
 	}
 	return "the Git operation failed; see the job log"
 }

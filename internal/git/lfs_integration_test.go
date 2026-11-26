@@ -307,3 +307,129 @@ func TestG1_NegativeControlWithoutPin(t *testing.T) {
 		t.Fatalf("without the pin, the .lfsconfig endpoint was not contacted; the trap tests prove nothing\n%s", log.String())
 	}
 }
+
+// fakeLFSInclude stands in for build.LFSInclude (which internal/git cannot
+// import): it reads "    - <pattern>" lines of golem-deploy.yaml in the
+// checkout, and fails when the file contains "invalid".
+func fakeLFSInclude(dir string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "golem-deploy.yaml"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if bytes.Contains(data, []byte("invalid")) {
+		return nil, errors.New(`golem-deploy.yaml: lfs.include pattern "a,b" may only contain letters, digits, '.', '_', '-', '*' and '/'`)
+	}
+	var patterns []string
+	for _, l := range strings.Split(string(data), "\n") {
+		if p, ok := strings.CutPrefix(l, "    - "); ok {
+			patterns = append(patterns, p)
+		}
+	}
+	return patterns, nil
+}
+
+func isLFSPointer(t *testing.T, path string) bool {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bytes.HasPrefix(data, []byte("version https://git-lfs.github.com/spec/v1\n"))
+}
+
+// TestLFSIncludeLimitsDownload: with lfs.include only the included LFS
+// files become real content, the others stay pointer files; a pull with a
+// wider list downloads the rest.
+func TestLFSIncludeLimitsDownload(t *testing.T) {
+	requireLFS(t)
+	g := newGitServer(t)
+	content := g.commitLFS("content/a.bin", 2048)
+	big := g.commitLFS("unity/Assets/b.bin", 4096)
+	g.commit("golem-deploy.yaml", "lfs:\n  include:\n    - content/**\n")
+	g.push()
+	r, base := g.runner(t, func(o *Options) { o.LFSInclude = fakeLFSInclude })
+	dir := filepath.Join(base, "repositories", "1")
+	var log bytes.Buffer
+	ctx := context.Background()
+	co, err := r.Clone(ctx, Remote{URL: g.url("repo.git"), Auth: httpsAuth(srvPass)}, dir, &log)
+	if err != nil || !co.LFS {
+		t.Fatalf("clone: %+v %v\n%s", co, err, log.String())
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "content", "a.bin")); !bytes.Equal(got, content) {
+		t.Fatal("included file is not the LFS content")
+	}
+	if !isLFSPointer(t, filepath.Join(dir, "unity", "Assets", "b.bin")) {
+		t.Fatal("excluded file is not a pointer")
+	}
+	for _, want := range []string{
+		"Git LFS: downloading only the paths listed under lfs.include in golem-deploy.yaml (1 pattern)",
+		"$ git lfs pull --include=content/**\n",
+	} {
+		if !strings.Contains(log.String(), want) {
+			t.Fatalf("log lacks %q:\n%s", want, log.String())
+		}
+	}
+
+	g.commit("golem-deploy.yaml", "lfs:\n  include:\n    - content/**\n    - unity/**\n")
+	g.push()
+	log.Reset()
+	if _, err := r.Pull(ctx, Remote{URL: g.url("repo.git"), Branch: "main", Auth: httpsAuth(srvPass)}, dir, &log); err != nil {
+		t.Fatalf("pull: %v\n%s", err, log.String())
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "unity", "Assets", "b.bin")); !bytes.Equal(got, big) {
+		t.Fatalf("newly included file not fetched on pull\n%s", log.String())
+	}
+	if !strings.Contains(log.String(), "$ git lfs pull --include=content/**,unity/**\n") {
+		t.Fatalf("log:\n%s", log.String())
+	}
+
+	// Without golem-deploy.yaml the command and the result are unchanged.
+	g2 := newGitServer(t)
+	all := g2.commitLFS("unity/c.bin", 512)
+	g2.push()
+	r2, base2 := g2.runner(t, func(o *Options) { o.LFSInclude = fakeLFSInclude })
+	dir2 := filepath.Join(base2, "repositories", "1")
+	log.Reset()
+	if _, err := r2.Clone(ctx, Remote{URL: g2.url("repo.git"), Auth: httpsAuth(srvPass)}, dir2, &log); err != nil {
+		t.Fatalf("clone without config: %v\n%s", err, log.String())
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir2, "unity", "c.bin")); !bytes.Equal(got, all) {
+		t.Fatal("LFS content not fetched without lfs.include")
+	}
+	if !strings.Contains(log.String(), "$ git lfs pull\n") || strings.Contains(log.String(), "lfs.include") {
+		t.Fatalf("log:\n%s", log.String())
+	}
+}
+
+// TestLFSIncludeInvalidConfigFails: a golem-deploy.yaml that cannot be
+// parsed fails the operation before any LFS download, with the message in
+// the job detail and the job log; a failed clone leaves nothing behind.
+func TestLFSIncludeInvalidConfigFails(t *testing.T) {
+	requireLFS(t)
+	g := newGitServer(t)
+	g.commitLFS("content/a.bin", 64)
+	g.commit("golem-deploy.yaml", "invalid\n")
+	g.push()
+	r, base := g.runner(t, func(o *Options) { o.LFSInclude = fakeLFSInclude })
+	dir := filepath.Join(base, "repositories", "1")
+	var log bytes.Buffer
+	_, err := r.Clone(context.Background(), Remote{URL: g.url("repo.git"), Auth: httpsAuth(srvPass)}, dir, &log)
+	var ge *Error
+	if !errors.As(err, &ge) || ge.Reason != ReasonDeployConfig || !ge.Unchanged {
+		t.Fatalf("clone: %v\n%s", err, log.String())
+	}
+	if !strings.HasPrefix(SafeMessage(err), `golem-deploy.yaml: lfs.include pattern "a,b"`) ||
+		!strings.Contains(log.String(), `error: golem-deploy.yaml: lfs.include pattern "a,b"`) {
+		t.Fatalf("unclear failure: %s\n%s", SafeMessage(err), log.String())
+	}
+	if len(g.batches()) != 0 || strings.Contains(log.String(), "$ git lfs pull") {
+		t.Fatal("git lfs pull ran")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("checkout left behind")
+	}
+	assertNoLeftovers(t, filepath.Join(base, "tmp"))
+}

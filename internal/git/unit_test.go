@@ -248,8 +248,11 @@ func TestArgv(t *testing.T) {
 		"head":      {headArgs(), {"rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"}},
 		"branch":    {currentBranchArgs(), {"symbolic-ref", "--quiet", "--short", "HEAD"}},
 		"ls-remote": {lsRemoteArgs("ssh://h/x"), {"ls-remote", "--heads", "--end-of-options", "ssh://h/x"}},
-		"lfs":       {lfsPullArgs(), {"lfs", "pull"}},
-		"attrs":     {attributesArgs(), {"ls-files", "-z", "--", ".gitattributes", ":(glob)**/.gitattributes"}},
+		"lfs":       {lfsPullArgs(nil), {"lfs", "pull"}},
+		"lfs-empty": {lfsPullArgs([]string{}), {"lfs", "pull"}},
+		"lfs-include": {lfsPullArgs([]string{"content/**", "workers/unity/Assets/*.bytes", "*.bin"}),
+			{"lfs", "pull", "--include=content/**,workers/unity/Assets/*.bytes,*.bin"}},
+		"attrs": {attributesArgs(), {"ls-files", "-z", "--", ".gitattributes", ":(glob)**/.gitattributes"}},
 	}
 	for name, g := range golden {
 		if !reflect.DeepEqual(g[0], g[1]) {
