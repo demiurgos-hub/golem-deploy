@@ -43,6 +43,7 @@ func TestHelperArgvExact(t *testing.T) {
 		"--label", "dev.golemengine.deploy.helper=" + launch,
 		"--label", "dev.golemengine.deploy.inspector=",
 		"--label", "dev.golemengine.deploy.inspector-hub=",
+		"--label", "dev.golemengine.deploy.profiling=",
 		"--entrypoint", "/golem-deploy-helper-is-never-started",
 		"--restart", "no", "--no-healthcheck", "--network", "none", "--read-only", "--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges", "--pids-limit", "16", "--log-driver", "none", "--user", "65532:65532",

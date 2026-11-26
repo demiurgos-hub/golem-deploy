@@ -92,7 +92,8 @@ export interface ApiClient {
   request<T>(method: string, path: string, opts?: RequestOptions): Promise<T>;
   /** Opens a streaming text response; the caller reads `body`. */
   stream(path: string, opts: { query?: Query; signal: AbortSignal }): Promise<Response>;
-  download(path: string, opts?: { signal?: AbortSignal }): Promise<{ blob: Blob; filename: string | null }>;
+  /** A file with the bearer header; `filename` from Content-Disposition. No timeout: a profile capture answers only after its length. */
+  download(path: string, opts?: { query?: Query; signal?: AbortSignal }): Promise<{ blob: Blob; filename: string | null }>;
   upload<T>(
     path: string,
     body: FormData,
@@ -230,7 +231,7 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
 
     async download(path, opts = {}) {
       const { headers, token } = authHeaders(true);
-      const res = await send("GET", buildUrl(base, path), { headers, signal: opts.signal });
+      const res = await send("GET", buildUrl(base, path, opts.query), { headers, signal: opts.signal });
       if (!res.ok) return failed(res, token, opts.signal);
       let blob: Blob;
       try {

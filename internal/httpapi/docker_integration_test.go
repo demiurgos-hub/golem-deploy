@@ -249,6 +249,10 @@ func TestIntegrationServersAPI(t *testing.T) {
 	if !rt.Ready || rt.Entities != 7 || rt.Tick.Rate != 20 || rt.SchemaFingerprint != "itest-fp-1" || rt.Transport != "webtransport" || !rt.CertificateHashesPublished {
 		t.Fatalf("runtime %+v", rt)
 	}
+	// A profile through the admin endpoint (the server profiles by default).
+	if rr := h.do("GET", base+"/profile?kind=heap", tok, nil); rr.Code != http.StatusOK || !bytes.HasPrefix(rr.Body.Bytes(), []byte{0x1f, 0x8b}) {
+		t.Fatalf("profile %d %q", rr.Code, rr.Body.String())
+	}
 
 	// The game serves the server's certificate on the published TCP
 	// port, and picks up a replacement without a restart.

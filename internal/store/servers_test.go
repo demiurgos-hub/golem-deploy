@@ -95,6 +95,44 @@ func TestServerInspectorSwitch(t *testing.T) {
 	}
 }
 
+// The Profiling switch is written at create and changed only by an update
+// that names it; rows that existed before the column (and any insert that
+// leaves it out) are on, and the database refuses other values.
+func TestServerProfilingSwitch(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	p1, p2 := 7001, 7002
+	off, err := s.CreateServer(ctx, Server{Name: "off", Port: &p1}, nil)
+	if err != nil || off.Profiling {
+		t.Fatalf("%+v %v", off, err)
+	}
+	on, err := s.CreateServer(ctx, Server{Name: "on", Port: &p2, Profiling: true}, nil)
+	if err != nil || !on.Profiling {
+		t.Fatalf("%+v %v", on, err)
+	}
+	yes, no := true, false
+	if got, err := s.UpdateServer(ctx, off.ID, ServerUpdate{Profiling: &yes}); err != nil || !got.Profiling {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if got, err := s.UpdateServer(ctx, off.ID, ServerUpdate{SetOrigins: true}); err != nil || !got.Profiling {
+		t.Fatalf("an update without the switch changed it: %+v %v", got, err)
+	}
+	if got, err := s.UpdateServer(ctx, on.ID, ServerUpdate{Profiling: &no}); err != nil || got.Profiling {
+		t.Fatalf("%+v %v", got, err)
+	}
+	batch, err := s.CreateServers(ctx, []Server{{Name: "imported", Profiling: true}}, nil)
+	if err != nil || !batch[0].Profiling {
+		t.Fatalf("%+v %v", batch, err)
+	}
+	var def int
+	if err := s.db.QueryRowContext(ctx, "SELECT dflt_value FROM pragma_table_info('servers') WHERE name = 'profiling'").Scan(&def); err != nil || def != 1 {
+		t.Fatalf("profiling column default %d %v, want 1", def, err)
+	}
+	if _, err := s.db.ExecContext(ctx, "UPDATE servers SET profiling = 2 WHERE id = ?", on.ID); err == nil {
+		t.Fatal("profiling = 2 accepted")
+	}
+}
+
 // The Inspector settings are plain rows of the settings table.
 func TestInspectorSettings(t *testing.T) {
 	s := openTest(t)

@@ -3,6 +3,8 @@
  * give immediate feedback; the daemon remains the authority.
  */
 
+import type { ProfileKind } from "@/api/types.gen";
+
 export const USERNAME_RE = /^[a-z0-9][a-z0-9._-]{2,31}$/;
 export const RESOURCE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 export const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
@@ -317,6 +319,23 @@ export const validateBackupKeep: Validator = (value) => {
   if (n < 1 || n > BACKUP_KEEP_MAX) return `Keep 1 to ${BACKUP_KEEP_MAX} scheduled backups.`;
   return null;
 };
+
+/**
+ * GET /servers/{id}/profile: the capture length in seconds of the timed kinds, from 1 to `max`
+ * (servers.ProfileSeconds); the other kinds take no `seconds`.
+ */
+export const PROFILE_SECONDS: Partial<Record<ProfileKind, { default: number; max: number }>> = {
+  cpu: { default: 30, max: 60 },
+  trace: { default: 5, max: 15 },
+};
+
+export function validateProfileSeconds(kind: ProfileKind, value: string): string | null {
+  const limits = PROFILE_SECONDS[kind];
+  if (!limits) return null;
+  const n = wholeNumber(value);
+  if (n === null || n < 1 || n > limits.max) return `Enter a whole number of seconds from 1 to ${limits.max}.`;
+  return null;
+}
 
 /** A regular expression character class of code points and inclusive ranges. */
 function charClass(points: readonly (number | readonly [number, number])[]): string {

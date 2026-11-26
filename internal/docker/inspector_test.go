@@ -43,6 +43,7 @@ func TestHubSpecArgs(t *testing.T) {
 		"--label", "dev.golemengine.deploy.helper=",
 		"--label", "dev.golemengine.deploy.inspector=",
 		"--label", "dev.golemengine.deploy.inspector-hub=true",
+		"--label", "dev.golemengine.deploy.profiling=",
 		"--restart", "unless-stopped",
 		"--init",
 		"--no-healthcheck",

@@ -32,6 +32,7 @@ import type {
   JobList,
   LoginRequest,
   PanelCertificate,
+  ProfileKind,
   Project,
   ProjectList,
   RegisterRequest,
@@ -195,6 +196,12 @@ export function createEndpoints(c: ApiClient) {
       /** Admin. 202 server.data_reset job. */
       resetData: (id: number, body: ResetServerDataRequest) =>
         c.request<Job>("POST", `/servers/${seg(id)}/data/reset`, { body }),
+      /**
+       * A Go profile of the running game as a file. `seconds` only for cpu and trace, whose answer
+       * arrives after that long (no client timeout). 409 conflict, profiling_disabled, profile_in_progress; 503.
+       */
+      profile: (id: number, kind: ProfileKind, seconds?: number, signal?: AbortSignal) =>
+        c.download(`/servers/${seg(id)}/profile`, { query: { kind, seconds }, signal }),
     },
     backups: {
       /** Newest first; `server_id` filters by the server a backup was taken from. */

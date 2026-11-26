@@ -47,6 +47,9 @@ const (
 	// EnvAdminAddr and EnvAdminToken open the admin listener.
 	EnvAdminAddr  = "GOLEM_ADMIN_ADDR"
 	EnvAdminToken = "GOLEM_ADMIN_TOKEN"
+	// EnvAdminProfiling ("1", set only while the server's Profiling switch
+	// is on) makes the admin listener serve GET /profile/{kind}.
+	EnvAdminProfiling = "GOLEM_ADMIN_PROFILING"
 	// EnvSnapshotDir enables entity snapshots in that directory (the data
 	// volume): the game loads world.snapshot at start and saves it when it
 	// stops. EnvSnapshotInterval is the autosave period (a Go duration;
@@ -235,6 +238,9 @@ func engineEnv(sv store.Server, b *store.Build, p runtimeParams, token string) m
 	}
 	if token != "" {
 		env[EnvAdminToken] = token
+	}
+	if sv.Profiling {
+		env[EnvAdminProfiling] = "1"
 	}
 	return env
 }

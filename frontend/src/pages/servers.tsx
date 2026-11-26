@@ -12,6 +12,7 @@ import { EnvEditor } from "@/components/env-editor";
 import { GameAddress } from "@/components/game-address";
 import { GettingStarted } from "@/components/getting-started";
 import { INSPECTOR_SWITCH_HINT, OpenInspectorIfRunning } from "@/components/inspector";
+import { PROFILING_SWITCH_HINT } from "@/components/profiling";
 import { InlineJob } from "@/components/jobs";
 import { OriginsEditor, hasOriginErrors, noOriginErrors, originErrorsFrom, validateOrigins, type OriginErrors } from "@/components/origins-editor";
 import { ServerActions } from "@/components/server-actions";
@@ -241,6 +242,7 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
   const [port, setPort] = useState("");
   const [start, setStart] = useState(false);
   const [inspector, setInspector] = useState(false);
+  const [profiling, setProfiling] = useState(true);
   const [origins, setOriginsState] = useState<string[]>([]);
   const [originErrors, setOriginErrors] = useState<OriginErrors>(noOriginErrors());
   const [env, setEnvDraft] = useState<EnvDraft>(emptyDraft());
@@ -285,6 +287,7 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
         ...(snapshotChanged ? { snapshot_interval_seconds: Number(dataSettings.snapshot.trim()) } : {}),
         ...(scheduleChanged ? { backup_schedule: scheduleOf(dataSettings) } : {}),
         ...(inspector ? { inspector: true } : {}),
+        ...(profiling ? {} : { profiling: false }),
       }),
     onSuccess: (server) => {
       toast.success(`Server ${server.name} created on port ${server.port}.${start ? " Starting it." : ""}`);
@@ -444,6 +447,17 @@ function CreateServerDialog({ initialProjectId, onClose }: { initialProjectId?: 
             />
             <p id="create-server-inspector-hint" className="pl-6 text-xs text-muted-foreground">
               The Inspector shows the live entities of the running game. {INSPECTOR_SWITCH_HINT}
+            </p>
+          </div>
+          <div className="space-y-1">
+            <Checkbox
+              label="Allow profiling"
+              checked={profiling}
+              aria-describedby="create-server-profiling-hint"
+              onChange={(e) => setProfiling(e.target.checked)}
+            />
+            <p id="create-server-profiling-hint" className="pl-6 text-xs text-muted-foreground">
+              Developers can download Go profiles of the running game from the server&apos;s page. {PROFILING_SWITCH_HINT}
             </p>
           </div>
           <Checkbox label="Start the server after creating it" checked={start} onChange={(e) => setStart(e.target.checked)} />

@@ -72,6 +72,7 @@ func (s *Server) routes() []route {
 		{method: "GET", path: "/servers/{id}/stats", access: AccessDeveloper, handler: s.handleServerStats},
 		{method: "GET", path: "/servers/{id}/runtime", access: AccessDeveloper, handler: s.handleServerRuntime},
 		{method: "GET", path: "/servers/{id}/connectivity", access: AccessDeveloper, handler: s.handleServerConnectivity},
+		{method: "GET", path: "/servers/{id}/profile", access: AccessDeveloper, handler: s.handleServerProfile},
 		{method: "POST", path: "/servers/{id}/backups", access: AccessDeveloper, handler: s.handleCreateBackup},
 		{method: "POST", path: "/servers/{id}/restore", access: AccessAdmin, handler: s.handleRestoreServer},
 		{method: "POST", path: "/servers/{id}/data/reset", access: AccessAdmin, handler: s.handleResetServerData},

@@ -76,6 +76,13 @@ const (
 	// the fingerprint of the server's build, so the server would not load
 	// it; repeat the restore with force to do it anyway (409).
 	ErrorCodeSchemaMismatch ErrorCode = "schema_mismatch"
+	// ErrorCodeProfilingDisabled: the server's Profiling switch is off, its
+	// running container was started without it (restart the server), or its
+	// game's engine does not serve profiles (409).
+	ErrorCodeProfilingDisabled ErrorCode = "profiling_disabled"
+	// ErrorCodeProfileInProgress: a profile of the server is already being
+	// captured (409).
+	ErrorCodeProfileInProgress ErrorCode = "profile_in_progress"
 	// ErrorCodeConflict: any other state conflict, e.g. deleting something that is
 	// still in use or the API token limit (409).
 	ErrorCodeConflict ErrorCode = "conflict"

@@ -100,6 +100,9 @@ type RunSpec struct {
 	// Inspector records that DaemonEnv points the game's Inspector agent at
 	// the daemon (the LabelInspector label).
 	Inspector bool
+	// Profiling records that DaemonEnv turns on the game's profile endpoint
+	// (the LabelProfiling label).
+	Profiling bool
 	// ReadOnlyBinds are extra read-only bind mounts.
 	ReadOnlyBinds []BindMount
 	// DataVolume is an optional named volume mounted read-write.
@@ -310,6 +313,7 @@ func (s RunSpec) Args(instance, envFilePath string) ([]string, error) {
 		"--label", LabelHelper + "=",
 		"--label", LabelInspector + "=" + boolLabel(s.Inspector),
 		"--label", LabelInspectorHub + "=",
+		"--label", LabelProfiling + "=" + boolLabel(s.Profiling),
 		"--restart", "no",
 		"--init",
 		"--no-healthcheck",

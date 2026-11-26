@@ -148,6 +148,11 @@ func TestEngineEnvContract(t *testing.T) {
 	if _, ok := v6[EnvAdminToken]; ok {
 		t.Fatal("empty token injected")
 	}
+	profiled := sv
+	profiled.Profiling = true
+	if on := engineEnv(profiled, nil, runtimeParams{gameHost: "play.example.com"}, ""); on[EnvAdminProfiling] != "1" || len(on) != len(v6)+1 {
+		t.Fatalf("profiling env %v", on)
+	}
 	// A build that recorded other transport paths (golem-deploy.yaml) gets
 	// URLs with them; a build recorded before paths existed the defaults.
 	custom := engineEnv(sv, &store.Build{WebTransportPath: "/game/wt", WebSocketPath: "/game/ws"}, runtimeParams{gameHost: "play.example.com"}, "")
@@ -220,6 +225,7 @@ func TestConfigHash(t *testing.T) {
 		"mode":   func() string { q := p; q.certMode = certs.ModeCustom; return svc.configHash(base, &b, q) },
 		"mount":  func() string { q := p; q.certDir = "/elsewhere"; return svc.configHash(base, &b, q) },
 		"groups": func() string { q := p; q.groupAdd = nil; return svc.configHash(base, &b, q) },
+		"profiling": func() string { sv := base; sv.Profiling = true; return svc.configHash(sv, &b, p) },
 	}
 	for name, fn := range variants {
 		if fn() == h {

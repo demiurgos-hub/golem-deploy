@@ -90,6 +90,8 @@ const MAX_ACTIVE_BUILDS = 4;
 const MAX_ADDONS = 16;
 const MAX_ORIGINS = 16;
 const BACKUP_MAX_CONTENT = 2048 * 1024 * 1024;
+/** GET /servers/{id}/profile: [default, max] seconds of each kind (servers.profileLimits; 0 for kinds without a length). */
+const PROFILE_LIMITS: Record<string, [number, number]> = { cpu: [30, 60], trace: [5, 15], heap: [0, 0], allocs: [0, 0], goroutine: [0, 0] };
 
 interface MockState {
   projects: Project[];
@@ -117,6 +119,8 @@ interface MockState {
   inspectorTokens: Map<number, number>;
   /** Running servers whose definition changed apart from the Inspector (env, build, certificate mode, ...): restart_required until their next start. */
   restartPending: Set<number>;
+  /** Servers a profile is being captured for (one at a time per server). */
+  profileCaptures: Set<number>;
   /** Expiry times (ms) of the entry links each account holds, by account id (a link is never used in the mock). */
   inspectorLinks: Map<number, number[]>;
   /** Called after every job's own finish step. */
@@ -360,6 +364,9 @@ function seed(): MockState {
     backup_schedule: { interval_hours: 0, keep: 7 },
     inspector: false,
     inspector_active: false,
+    // Containers of the seed were started with the switch on (the default); Docker cannot tell for an unknown one.
+    profiling: true,
+    profiling_active: state !== "missing" && state !== "unknown",
     created_at: iso(10 * DAY),
     updated_at: iso(6 * HOUR),
     ...extra,
@@ -375,7 +382,10 @@ function seed(): MockState {
     server(13, "crashy", 7002, "running", "exited", { exit_code: 137, updated_at: iso(HOUR) }),
     // Its game's admin endpoint never answers: the runtime view answers 503. Started with the Inspector, its game never connects.
     server(14, "flood-test", 7003, "running", "running", { env_keys: [], snapshot_interval_seconds: 0, inspector: true, inspector_active: true }),
-    server(15, "kart-eu", 7004, "running", "running", { ...kart, restart_required: true, snapshot_interval_seconds: 60, backup_schedule: { interval_hours: 6, keep: 3 } }),
+    // Its container was started before the Profiling switch was on: captures need a restart.
+    server(15, "kart-eu", 7004, "running", "running", {
+      ...kart, restart_required: true, snapshot_interval_seconds: 60, backup_schedule: { interval_hours: 6, keep: 3 }, profiling_active: false,
+    }),
     server(16, "fresh", 7005, "stopped", "missing", { env_keys: [] }),
     // Has a container, but "Docker" cannot be queried for it: every action fails, delete answers 503.
     server(17, "docker-lost", 7006, "running", "unknown", { env_keys: [], started_at: null }),
@@ -496,6 +506,7 @@ function seed(): MockState {
     },
     inspectorTokens: new Map(servers.filter((s) => s.inspector_active).map((s) => [s.id, 1])),
     restartPending: new Set(servers.filter((s) => s.restart_required).map((s) => s.id)),
+    profileCaptures: new Set(),
     inspectorLinks: new Map(),
     jobs: jobs.reverse(),
     jobLogs,
@@ -934,18 +945,20 @@ export function createMockTransport(real: Transport): Transport {
 
   /**
    * restart_required of a running server, like the daemon's config hash: its
-   * other pending changes, or Inspector variables that differ from the ones
-   * its container was started with. Turning a switch back before a restart
-   * clears it again.
+   * other pending changes, or Inspector variables or a Profiling switch that
+   * differ from the ones its container was started with. Turning a switch
+   * back before a restart clears it again.
    */
   function syncRestartRequired(s: Server) {
     if (s.state !== "running") return;
-    s.restart_required = st.restartPending.has(s.id) || (st.inspectorTokens.get(s.id) ?? null) !== inspectorWanted(s);
+    s.restart_required =
+      st.restartPending.has(s.id) || (st.inspectorTokens.get(s.id) ?? null) !== inspectorWanted(s) || s.profiling !== s.profiling_active;
   }
 
-  /** A new container of the server: it runs with the Inspector when its switch and the installation's Inspector are on. */
+  /** A new container of the server: it runs with the Inspector when its switch and the installation's Inspector are on, and with profiling when its switch is on. */
   function containerStarted(s: Server) {
     st.restartPending.delete(s.id);
+    s.profiling_active = s.profiling;
     const want = inspectorWanted(s);
     s.inspector_active = want !== null;
     if (want !== null) st.inspectorTokens.set(s.id, want);
@@ -955,6 +968,7 @@ export function createMockTransport(real: Transport): Transport {
   /** The server has no container any more. */
   function containerGone(s: Server) {
     s.inspector_active = false;
+    s.profiling_active = false;
     st.inspectorTokens.delete(s.id);
   }
 
@@ -1451,6 +1465,7 @@ export function createMockTransport(real: Transport): Transport {
       const de = dataSettingsError(req);
       if (de) return fail(st, 400, "validation_failed", de.message, de.field);
       if (req.inspector !== undefined && typeof req.inspector !== "boolean") return fail(st, 400, "bad_request", "inspector must be true or false", "inspector");
+      if (req.profiling !== undefined && typeof req.profiling !== "boolean") return fail(st, 400, "bad_request", "profiling must be true or false", "profiling");
       if (st.servers.some((s) => s.name === req.name)) return fail(st, 409, "name_taken", "a server with that name already exists");
       const port = req.port ?? nextPort(st);
       if (port === null || st.servers.some((s) => s.port === port)) return fail(st, 409, "port_in_use", "that port is already assigned to another server (or the port range is full)");
@@ -1458,6 +1473,7 @@ export function createMockTransport(real: Transport): Transport {
       if (req.snapshot_interval_seconds !== undefined) s.snapshot_interval_seconds = req.snapshot_interval_seconds;
       if (req.backup_schedule) s.backup_schedule = { ...req.backup_schedule };
       if (req.inspector) s.inspector = true;
+      if (req.profiling === false) s.profiling = false;
       applyBuild(s, be.build);
       st.servers.push(s);
       if (s.desired_state === "running") startServerAction(s, "start", me);
@@ -1481,6 +1497,7 @@ export function createMockTransport(real: Transport): Transport {
             snapshot_interval_seconds: s.snapshot_interval_seconds,
             backup_schedule: s.backup_schedule,
             ...(s.inspector ? { inspector: true } : {}),
+            profiling: s.profiling,
           };
         }),
       };
@@ -1492,11 +1509,15 @@ export function createMockTransport(real: Transport): Transport {
       // Unknown fields are a decode error (400 bad_request), e.g. the image of a version 1 document.
       for (const spec of req.servers ?? []) {
         const extra = Object.keys(spec).find(
-          (k) => !["name", "project", "commit", "port", "allowed_origins", "env", "desired_state", "snapshot_interval_seconds", "backup_schedule", "inspector"].includes(k),
+          (k) => !["name", "project", "commit", "port", "allowed_origins", "env", "desired_state", "snapshot_interval_seconds", "backup_schedule", "inspector", "profiling"].includes(k),
         );
         if (extra) return fail(st, 400, "bad_request", `unknown field "${extra}"`, extra);
         // A JSON value that is not a boolean is a decode error too.
         if (spec.inspector !== undefined && typeof spec.inspector !== "boolean") return fail(st, 400, "bad_request", "inspector must be true or false", "inspector");
+        // null is absent for the daemon's *bool: on.
+        if (spec.profiling !== undefined && spec.profiling !== null && typeof spec.profiling !== "boolean") {
+          return fail(st, 400, "bad_request", "profiling must be true or false", "profiling");
+        }
       }
       if (req.format_version !== 2) return fail(st, 400, "validation_failed", "format_version must be 2", "format_version");
       if (!req.servers?.length) return fail(st, 400, "validation_failed", "the document contains no servers", "servers");
@@ -1542,6 +1563,7 @@ export function createMockTransport(real: Transport): Transport {
         if (spec.snapshot_interval_seconds !== undefined) s.snapshot_interval_seconds = spec.snapshot_interval_seconds;
         if (spec.backup_schedule) s.backup_schedule = { ...spec.backup_schedule };
         if (spec.inspector === true) s.inspector = true;
+        if (spec.profiling === false) s.profiling = false;
         applyBuild(s, resolved[i].build);
         st.servers.push(s);
         return s;
@@ -1549,6 +1571,7 @@ export function createMockTransport(real: Transport): Transport {
       refreshDerived();
       return json(st, 201, { created });
     }
+    if ((m = path.match(/^\/servers\/(\d+)\/profile$/)) && method === "GET") return profile(Number(m[1]), query);
     if ((m = path.match(/^\/servers\/(\d+)(\/start|\/stop|\/restart|\/logs|\/stats|\/runtime|\/connectivity|\/backups|\/restore|\/data\/reset)?$/))) {
       const s = st.servers.find((x) => x.id === Number(m?.[1]));
       if (!s) return fail(st, 404, "not_found", "server not found");
@@ -1578,6 +1601,7 @@ export function createMockTransport(real: Transport): Transport {
         const de = dataSettingsError(req);
         if (de) return fail(st, 400, "validation_failed", de.message, de.field);
         if (req.inspector !== undefined && typeof req.inspector !== "boolean") return fail(st, 400, "bad_request", "inspector must be true or false", "inspector");
+        if (req.profiling !== undefined && typeof req.profiling !== "boolean") return fail(st, 400, "bad_request", "profiling must be true or false", "profiling");
         let build: Build | null = st.builds.find((b) => b.id === s.build_id) ?? null;
         if (req.build_id !== undefined) {
           const be = buildError(st, req.build_id);
@@ -1616,12 +1640,13 @@ export function createMockTransport(real: Transport): Transport {
         const originsChanged = origins.join(",") !== s.allowed_origins.join(",");
         // The autosave period is part of the container's definition; the backup schedule is not.
         const snapshotChange = req.snapshot_interval_seconds !== undefined && req.snapshot_interval_seconds !== s.snapshot_interval_seconds;
-        // The Inspector switch counts on its own (syncRestartRequired): only while the installation's Inspector is on.
+        // The Inspector and Profiling switches count on their own (syncRestartRequired): the Inspector only while the installation's is on.
         const changed =
           buildChange || portChange || originsChanged || snapshotChange || Object.keys(req.env_set ?? {}).length > 0 || (req.env_unset ?? []).length > 0;
         if (req.snapshot_interval_seconds !== undefined) s.snapshot_interval_seconds = req.snapshot_interval_seconds;
         if (req.backup_schedule) s.backup_schedule = { ...req.backup_schedule };
         if (req.inspector !== undefined) s.inspector = req.inspector;
+        if (req.profiling !== undefined) s.profiling = req.profiling;
         st.env.set(s.id, env);
         // The current container keeps the old build's image until the next start.
         if (buildChange && s.container_id && !containerImage.has(s.id)) containerImage.set(s.id, s.image);
@@ -1979,6 +2004,8 @@ export function createMockTransport(real: Transport): Transport {
       backup_schedule: { interval_hours: 0, keep: 7 },
       inspector: false,
       inspector_active: false,
+      profiling: true,
+      profiling_active: false,
       created_at: iso(),
       updated_at: iso(),
     };
@@ -2200,6 +2227,62 @@ export function createMockTransport(real: Transport): Transport {
         containerStarted(s);
       }
     }, failDetail);
+  }
+
+  /**
+   * GET /servers/{id}/profile in the daemon's order: the query, the server, its switch, its container, the container's
+   * profiling, one capture at a time. A timed capture answers after its length; flood-test's game never answers.
+   */
+  async function profile(id: number, query: URLSearchParams): Promise<Response> {
+    const kind = query.get("kind") ?? "";
+    let seconds: number | null = null;
+    if (query.has("seconds")) {
+      const raw = query.get("seconds") ?? "";
+      if (!/^[+-]?\d{1,18}$/.test(raw)) return fail(st, 400, "validation_failed", "seconds must be a whole number", "seconds");
+      seconds = Number(raw);
+    }
+    const limits = Object.prototype.hasOwnProperty.call(PROFILE_LIMITS, kind) ? PROFILE_LIMITS[kind] : null;
+    if (!limits) return fail(st, 400, "validation_failed", "kind must be cpu, trace, heap, allocs or goroutine", "kind");
+    const [def, max] = limits;
+    if (max === 0 && seconds !== null) return fail(st, 400, "validation_failed", "seconds is only accepted for cpu and trace", "seconds");
+    if (max > 0 && seconds !== null && (seconds < 1 || seconds > max)) {
+      return fail(st, 400, "validation_failed", `seconds must be from 1 to ${max} for ${kind}`, "seconds");
+    }
+    const n = max === 0 ? 0 : (seconds ?? def);
+    const s = st.servers.find((x) => x.id === id);
+    if (!s) return fail(st, 404, "not_found", "server not found");
+    const disabled =
+      "profiling is off for this server, its running container was started without it (restart the server), or its game's engine does not serve profiles";
+    if (!s.profiling) return fail(st, 409, "profiling_disabled", disabled);
+    if (s.state === "unknown") return fail(st, 503, "service_unavailable", "Docker is unreachable");
+    if (!s.container_id) return fail(st, 409, "conflict", "the server has no container yet; start it first");
+    if (s.state !== "running") return fail(st, 409, "conflict", "the server is not running");
+    if (!s.profiling_active) return fail(st, 409, "profiling_disabled", disabled);
+    if (st.profileCaptures.has(s.id)) return fail(st, 409, "profile_in_progress", "a profile of this server is already being captured; wait for it to finish");
+    st.profileCaptures.add(s.id);
+    try {
+      await sleep(n * 1000);
+      // The game stopped meanwhile, or never answers.
+      if (s.name === "flood-test" || s.state !== "running" || !st.servers.includes(s)) {
+        return fail(st, 503, "service_unavailable", "the game's admin endpoint did not answer; see the server log");
+      }
+    } finally {
+      st.profileCaptures.delete(s.id);
+    }
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+    const filename = `${s.name}-${kind}-${stamp}${kind === "trace" ? ".trace" : ".pb.gz"}`;
+    // Not a real profile: the format's magic bytes and a line of text.
+    const enc = new TextEncoder();
+    const magic = kind === "trace" ? [...enc.encode("go 1.23 trace"), 0, 0, 0] : [0x1f, 0x8b, 0x08, 0x00];
+    const bytes = new Uint8Array([...magic, ...enc.encode(` pretend ${kind} profile of ${s.name}`)]);
+    return new Response(new Blob([bytes]), {
+      status: 200,
+      headers: headers(st, {
+        "Content-Type": "application/octet-stream",
+        "Content-Disposition": `attachment; filename=${filename}`,
+        "X-Content-Type-Options": "nosniff",
+      }),
+    });
   }
 
   /** POST /servers/{id}/backups: a fresh snapshot from a running game, or the files as they are. */

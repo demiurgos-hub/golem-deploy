@@ -533,3 +533,79 @@ describe("mock transport: the Inspector", () => {
     expect((await call(t, "GET", "/inspector")).body).toMatchObject({ targets: [], other_targets: 0 });
   }, 30_000);
 });
+
+describe("mock transport: profiling", () => {
+  async function finished(t: Transport, id: number) {
+    let j = (await call(t, "GET", `/jobs/${id}`)).body;
+    for (let i = 0; i < 80 && (j.status === "queued" || j.status === "running"); i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      j = (await call(t, "GET", `/jobs/${id}`)).body;
+    }
+    return j;
+  }
+  const profile = (t: Transport, id: number, query: string) => call(t, "GET", `/servers/${id}/profile?${query}`);
+
+  it("checks a capture in the daemon's order: the query, the server, the switch, the container, then one at a time", async () => {
+    const t = createMockTransport(real);
+    const field = (f: string) => ({ status: 400, body: { error: { code: "validation_failed", field: f } } });
+    // The query is checked before the server is looked up.
+    expect(await profile(t, 999, "kind=bogus")).toMatchObject(field("kind"));
+    expect(await profile(t, 999, "kind=bogus&seconds=x")).toMatchObject(field("seconds"));
+    expect(await profile(t, 999, "kind=heap&seconds=5")).toMatchObject(field("seconds"));
+    for (const q of ["kind=cpu&seconds=0", "kind=cpu&seconds=61", "kind=trace&seconds=16", "kind=cpu&seconds=1.5"]) {
+      expect(await profile(t, 999, q)).toMatchObject(field("seconds"));
+    }
+    expect(await profile(t, 999, "kind=heap")).toMatchObject({ status: 404 });
+    // Switch off: refused at once, although the running container still has it.
+    expect((await call(t, "PATCH", "/servers/11", { profiling: false })).body).toMatchObject({ profiling: false, profiling_active: true, restart_required: true });
+    expect(await profile(t, 11, "kind=heap")).toMatchObject({ status: 409, body: { error: { code: "profiling_disabled" } } });
+    expect((await call(t, "PATCH", "/servers/11", { profiling: true })).body).toMatchObject({ profiling: true, restart_required: false });
+    expect(await profile(t, 16, "kind=heap")).toMatchObject({ status: 409, body: { error: { code: "conflict" } } }); // no container
+    expect(await profile(t, 12, "kind=heap")).toMatchObject({ status: 409, body: { error: { code: "conflict" } } }); // not running
+    expect(await profile(t, 17, "kind=heap")).toMatchObject({ status: 503, body: { error: { code: "service_unavailable" } } }); // Docker unreachable
+    expect(await profile(t, 15, "kind=heap")).toMatchObject({ status: 409, body: { error: { code: "profiling_disabled" } } }); // started without it
+    expect(await profile(t, 14, "kind=heap")).toMatchObject({ status: 503, body: { error: { code: "service_unavailable" } } }); // the game never answers
+
+    const heap = await t.fetch("/api/v1/servers/11/profile?kind=goroutine", { method: "GET", headers: auth });
+    expect(heap.status).toBe(200);
+    expect(heap.headers.get("Content-Type")).toBe("application/octet-stream");
+    expect(heap.headers.get("Content-Disposition")).toMatch(/^attachment; filename=eu-arena-goroutine-\d{8}T\d{6}Z\.pb\.gz$/);
+    expect((await heap.arrayBuffer()).byteLength).toBeGreaterThan(0);
+
+    // One capture per server at a time; another server is not affected.
+    const cpu = t.fetch("/api/v1/servers/11/profile?kind=cpu&seconds=1", { method: "GET", headers: auth });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(await profile(t, 11, "kind=heap")).toMatchObject({ status: 409, body: { error: { code: "profile_in_progress" } } });
+    expect((await cpu).headers.get("Content-Disposition")).toMatch(/filename=eu-arena-cpu-\d{8}T\d{6}Z\.pb\.gz$/);
+    const trace = await t.fetch("/api/v1/servers/11/profile?kind=trace&seconds=1", { method: "GET", headers: auth });
+    expect(trace.headers.get("Content-Disposition")).toMatch(/filename=eu-arena-trace-\d{8}T\d{6}Z\.trace$/);
+  }, 15_000);
+
+  it("keeps the switch on create, export and import (on when absent) and applies it at the next start", async () => {
+    const t = createMockTransport(real);
+    expect(await call(t, "POST", "/servers", { name: "p", build_id: 3, profiling: "yes" })).toMatchObject({ status: 400, body: { error: { code: "bad_request" } } });
+    expect((await call(t, "POST", "/servers", { name: "p", build_id: 3 })).body).toMatchObject({ profiling: true, profiling_active: false });
+    expect((await call(t, "POST", "/servers", { name: "q", build_id: 3, profiling: false })).body).toMatchObject({ profiling: false });
+    const exported = (await call(t, "GET", "/servers/export")).body;
+    const byName = new Map<string, Record<string, unknown>>(exported.servers.map((s: { name: string }) => [s.name, s]));
+    expect(byName.get("eu-arena")).toMatchObject({ profiling: true });
+    expect(byName.get("q")).toMatchObject({ profiling: false });
+    const spec = { project: "arena-shooter" };
+    expect(await call(t, "POST", "/servers/import", { format_version: 2, servers: [{ ...spec, name: "c0", profiling: 1 }] })).toMatchObject({ status: 400 });
+    const imported = await call(t, "POST", "/servers/import", {
+      format_version: 2,
+      servers: [{ ...spec, name: "c1" }, { ...spec, name: "c2", profiling: false }, { ...spec, name: "c3", profiling: null }],
+    });
+    expect(imported.body.created.map((s: { profiling: boolean }) => s.profiling)).toEqual([true, false, true]);
+
+    // A container started with the switch off has no profiling; turning it on asks for a restart, which applies it.
+    expect(await call(t, "PATCH", "/servers/16", { profiling: "no" })).toMatchObject({ status: 400, body: { error: { code: "bad_request" } } });
+    expect((await call(t, "PATCH", "/servers/16", { profiling: false })).body).toMatchObject({ profiling: false, restart_required: false });
+    expect(await finished(t, (await call(t, "POST", "/servers/16/start")).body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", "/servers/16")).body).toMatchObject({ state: "running", profiling_active: false, restart_required: false });
+    expect((await call(t, "PATCH", "/servers/16", { profiling: true })).body).toMatchObject({ profiling: true, profiling_active: false, restart_required: true });
+    expect(await profile(t, 16, "kind=heap")).toMatchObject({ status: 409, body: { error: { code: "profiling_disabled" } } });
+    expect(await finished(t, (await call(t, "POST", "/servers/16/restart")).body.id)).toMatchObject({ status: "success" });
+    expect((await call(t, "GET", "/servers/16")).body).toMatchObject({ profiling_active: true, restart_required: false });
+  }, 45_000);
+});

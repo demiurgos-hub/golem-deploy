@@ -112,6 +112,8 @@ export function serverFixture(overrides: Partial<Server> = {}): Server {
     backup_schedule: { interval_hours: 0, keep: 7 },
     inspector: false,
     inspector_active: false,
+    profiling: true,
+    profiling_active: true,
     created_at: "2026-11-20T10:00:00Z",
     updated_at: "2026-11-20T11:00:00Z",
     ...overrides,

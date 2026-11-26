@@ -23,6 +23,7 @@ import { EnvEditor } from "@/components/env-editor";
 import { ServerInspectorSection } from "@/components/inspector";
 import { InlineJob, JobsPanel, useShownJob } from "@/components/jobs";
 import { OriginsEditor, hasOriginErrors, noOriginErrors, originErrorsFrom, validateOrigins, type OriginErrors } from "@/components/origins-editor";
+import { ServerProfilingSection } from "@/components/profiling";
 import { ServerActions } from "@/components/server-actions";
 import { SchemaMismatchNotice, ServerDataSection } from "@/components/server-data";
 import { ServerStateBadge, isContainerActive, portLocked, serverActionsBlocked } from "@/components/status-badges";
@@ -337,6 +338,7 @@ function ServerDetail({ id }: { id: number }) {
           onReset={() => setDialog("reset")}
         />
         <ServerInspectorSection server={s} busy={activeJob !== null} onJob={shown.show} />
+        <ServerProfilingSection server={s} busy={activeJob !== null} onJob={shown.show} />
         <div className="grid gap-6 lg:grid-cols-2">
           <OriginsSection server={s} />
           <CertificateSection server={s} />

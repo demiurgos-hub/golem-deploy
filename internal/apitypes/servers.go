@@ -96,8 +96,16 @@ type Server struct {
 	// not whether the hub runs at that moment: a server started while the
 	// hub is down still gets them, and its agent connects once the hub is
 	// repaired.
-	Inspector       bool      `json:"inspector"`
-	InspectorActive bool      `json:"inspector_active"`
+	Inspector       bool `json:"inspector"`
+	InspectorActive bool `json:"inspector_active"`
+	// Profiling is the server's Profiling setting: when it is on, the game's
+	// admin listener serves Go profiles from the next (re)start
+	// (GOLEM_ADMIN_PROFILING=1), and GET /api/v1/servers/{id}/profile relays
+	// them. On by default. ProfilingActive is true when the server's current
+	// container was started that way (false without a container, and while
+	// Docker cannot be queried).
+	Profiling       bool      `json:"profiling"`
+	ProfilingActive bool      `json:"profiling_active"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -119,7 +127,7 @@ type ServerList struct {
 // to "stopped"; "running" starts a server.start job right after creation.
 // SnapshotIntervalSeconds is 0 or 10 to 86400 (default 300); BackupSchedule
 // defaults to off (see BackupSchedule for its ranges). Inspector defaults to
-// false.
+// false, Profiling to true.
 type CreateServerRequest struct {
 	Name                    string            `json:"name"`
 	BuildID                 int64             `json:"build_id"`
@@ -130,6 +138,7 @@ type CreateServerRequest struct {
 	SnapshotIntervalSeconds *int              `json:"snapshot_interval_seconds,omitempty"`
 	BackupSchedule          *BackupSchedule   `json:"backup_schedule,omitempty"`
 	Inspector               *bool             `json:"inspector,omitempty"`
+	Profiling               *bool             `json:"profiling,omitempty"`
 }
 
 // UpdateServerRequest is the body of PATCH /api/v1/servers/{id}. Absent fields
@@ -141,7 +150,7 @@ type CreateServerRequest struct {
 // while the server's container is running is refused with 409 conflict
 // (stop the server first). SnapshotIntervalSeconds applies on the next
 // (re)start; BackupSchedule applies at once and never needs a restart.
-// Inspector applies on the next (re)start.
+// Inspector and Profiling apply on the next (re)start.
 type UpdateServerRequest struct {
 	BuildID                 *int64            `json:"build_id,omitempty"`
 	Port                    *int              `json:"port,omitempty"`
@@ -151,6 +160,7 @@ type UpdateServerRequest struct {
 	SnapshotIntervalSeconds *int              `json:"snapshot_interval_seconds,omitempty"`
 	BackupSchedule          *BackupSchedule   `json:"backup_schedule,omitempty"`
 	Inspector               *bool             `json:"inspector,omitempty"`
+	Profiling               *bool             `json:"profiling,omitempty"`
 }
 
 // ServerStats is the body of GET /api/v1/servers/{id}/stats: a single sample
@@ -186,6 +196,8 @@ type ServerSpec struct {
 	BackupSchedule          *BackupSchedule `json:"backup_schedule,omitempty"`
 	// Inspector is the server's Inspector setting (false when absent).
 	Inspector bool `json:"inspector,omitempty"`
+	// Profiling is the server's Profiling setting (true when absent).
+	Profiling *bool `json:"profiling,omitempty"`
 }
 
 // ServerExport is the body of GET /api/v1/servers/export and of
@@ -267,3 +279,18 @@ type ServerConnectivity struct {
 	TestOrigins       []string `json:"test_origins"`
 	TestOriginsActive bool     `json:"test_origins_active"`
 }
+
+// ProfileKind is the kind query parameter of GET
+// /api/v1/servers/{id}/profile: a CPU profile (?seconds 1 to 60, default
+// 30) or an execution trace (?seconds 1 to 15, default 5), or the current
+// heap, allocation or goroutine profile (no ?seconds).
+type ProfileKind string
+
+// Profile kinds.
+const (
+	ProfileKindCPU       ProfileKind = "cpu"
+	ProfileKindTrace     ProfileKind = "trace"
+	ProfileKindHeap      ProfileKind = "heap"
+	ProfileKindAllocs    ProfileKind = "allocs"
+	ProfileKindGoroutine ProfileKind = "goroutine"
+)

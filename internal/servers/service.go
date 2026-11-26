@@ -175,6 +175,8 @@ type Service struct {
 	// pendingVolumes holds data volumes a running job created and has not
 	// recorded (or switched to) yet; they cannot be deleted meanwhile.
 	pendingVolumes sync.Map
+	// profiling holds the ids of servers a profile is being captured for.
+	profiling sync.Map
 }
 
 // New returns a Service.
@@ -353,6 +355,7 @@ func (s *Service) runSpec(sv store.Server, b store.Build, env map[string]string,
 		ConfigHash:    s.configHash(sv, &b, p),
 		GroupAdd:      p.groupAdd,
 		AdminPort:     AdminContainerPort,
+		Profiling:     sv.Profiling,
 	}
 	if len(insp) > 0 {
 		for k, v := range insp {
@@ -446,6 +449,7 @@ func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p r
 		SnapshotIntervalSeconds: sv.SnapshotIntervalSeconds,
 		BackupSchedule:          apitypes.BackupSchedule{IntervalHours: sv.BackupIntervalHours, Keep: sv.BackupKeep},
 		Inspector:               sv.Inspector,
+		Profiling:               sv.Profiling,
 		CreatedAt:               sv.CreatedAt.UTC(),
 		UpdatedAt:               sv.UpdatedAt.UTC(),
 	}
@@ -468,6 +472,7 @@ func (s *Service) view(ctx context.Context, sv store.Server, b *store.Build, p r
 		out.State = mapState(ct.State)
 		out.ContainerID = ct.ID
 		out.InspectorActive = ct.Labels[docker.LabelInspector] == docker.ManagedValue
+		out.ProfilingActive = ct.Labels[docker.LabelProfiling] == docker.ManagedValue
 		if !ct.StartedAt.IsZero() {
 			t := ct.StartedAt
 			out.StartedAt = &t
@@ -773,7 +778,8 @@ func (s *Service) Create(ctx context.Context, req apitypes.CreateServerRequest) 
 	defer s.writeMu.Unlock()
 	seal := func(id int64) ([]byte, error) { return s.sealEnv(id, req.Env) }
 	row := store.Server{Name: req.Name, BuildID: &b.ID, AllowedOrigins: origins, DesiredState: string(desired),
-		SnapshotIntervalSeconds: snapshot, BackupIntervalHours: interval, BackupKeep: keep, Inspector: req.Inspector != nil && *req.Inspector}
+		SnapshotIntervalSeconds: snapshot, BackupIntervalHours: interval, BackupKeep: keep, Inspector: req.Inspector != nil && *req.Inspector,
+		Profiling: req.Profiling == nil || *req.Profiling}
 	for attempt := 0; ; attempt++ {
 		port := 0
 		if req.Port != nil {
@@ -843,7 +849,7 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 		if err != nil {
 			return apitypes.Server{}, err
 		}
-		u := store.ServerUpdate{SetOrigins: req.AllowedOrigins != nil, AllowedOrigins: origins, Inspector: req.Inspector}
+		u := store.ServerUpdate{SetOrigins: req.AllowedOrigins != nil, AllowedOrigins: origins, Inspector: req.Inspector, Profiling: req.Profiling}
 		if req.SnapshotIntervalSeconds != nil || req.BackupSchedule != nil {
 			snapshot, interval, keep, err := dataSettings("", req.SnapshotIntervalSeconds, req.BackupSchedule,
 				sv.SnapshotIntervalSeconds, sv.BackupIntervalHours, sv.BackupKeep)
@@ -931,7 +937,7 @@ func (s *Service) Update(ctx context.Context, id int64, req apitypes.UpdateServe
 	s.logger.Info("server updated", "server_id", id, "build_changed", req.BuildID != nil, "port_changed", req.Port != nil,
 		"origins_changed", req.AllowedOrigins != nil, "env_set", len(req.EnvSet), "env_unset", len(req.EnvUnset),
 		"snapshot_interval_changed", req.SnapshotIntervalSeconds != nil, "backup_schedule_changed", req.BackupSchedule != nil,
-		"inspector_changed", req.Inspector != nil)
+		"inspector_changed", req.Inspector != nil, "profiling_changed", req.Profiling != nil)
 	ct, derr := s.container(ctx, updated)
 	if derr != nil {
 		// The update is stored; a cancelled caller only loses the view.

@@ -28,7 +28,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-const SPEC_FIELDS = new Set(["name", "project", "commit", "port", "allowed_origins", "env", "desired_state", "snapshot_interval_seconds", "backup_schedule", "inspector"]);
+const SPEC_FIELDS = new Set(["name", "project", "commit", "port", "allowed_origins", "env", "desired_state", "snapshot_interval_seconds", "backup_schedule", "inspector", "profiling"]);
 
 function isWhole(v: unknown): v is number {
   return typeof v === "number" && Number.isInteger(v);
@@ -136,6 +136,8 @@ export function checkServerImport(text: string): ImportCheck {
     }
     // Optional since the Inspector milestone; absent means off.
     if (raw.inspector !== undefined && typeof raw.inspector !== "boolean") errors.push(`${label}: inspector must be true or false.`);
+    // Optional since profiling; absent (or null, like the daemon's *bool) means on.
+    if (raw.profiling !== undefined && raw.profiling !== null && typeof raw.profiling !== "boolean") errors.push(`${label}: profiling must be true or false.`);
     if (raw.env !== undefined && raw.env !== null) {
       if (!isRecord(raw.env)) errors.push(`${label}: env must be an object of names to values.`);
       else {

@@ -227,6 +227,7 @@ func (s HelperSpec) Args(instance string) ([]string, error) {
 		"--label", LabelHelper + "=" + s.LaunchID,
 		"--label", LabelInspector + "=",
 		"--label", LabelInspectorHub + "=",
+		"--label", LabelProfiling + "=",
 		"--entrypoint", helperEntrypoint,
 		"--restart", "no",
 		"--no-healthcheck",

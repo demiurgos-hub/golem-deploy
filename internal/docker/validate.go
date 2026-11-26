@@ -32,7 +32,10 @@ const (
 	// image.
 	LabelInspector    = "dev.golemengine.deploy.inspector"
 	LabelInspectorHub = "dev.golemengine.deploy.inspector-hub"
-	ManagedValue      = "true"
+	// LabelProfiling is "true" on a server container created with
+	// GOLEM_ADMIN_PROFILING=1 and empty otherwise; every create sets it.
+	LabelProfiling = "dev.golemengine.deploy.profiling"
+	ManagedValue   = "true"
 )
 
 // Naming and fixed runtime parameters.

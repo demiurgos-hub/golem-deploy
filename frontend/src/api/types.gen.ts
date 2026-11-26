@@ -911,6 +911,17 @@ export const ErrorCodeJobNotActive = "job_not_active";
  */
 export const ErrorCodeSchemaMismatch = "schema_mismatch";
 /**
+ * ErrorCodeProfilingDisabled: the server's Profiling switch is off, its
+ * running container was started without it (restart the server), or its
+ * game's engine does not serve profiles (409).
+ */
+export const ErrorCodeProfilingDisabled = "profiling_disabled";
+/**
+ * ErrorCodeProfileInProgress: a profile of the server is already being
+ * captured (409).
+ */
+export const ErrorCodeProfileInProgress = "profile_in_progress";
+/**
  * ErrorCodeConflict: any other state conflict, e.g. deleting something that is
  * still in use or the API token limit (409).
  */
@@ -960,7 +971,7 @@ export const ErrorCodeUnavailable = "service_unavailable";
 /**
  * Error codes. The HTTP status each one is used with is noted in parentheses.
  */
-export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationFailed | typeof ErrorCodeInvalidCurrentPassword | typeof ErrorCodeUnauthenticated | typeof ErrorCodeInvalidCredentials | typeof ErrorCodeForbidden | typeof ErrorCodeSessionRequired | typeof ErrorCodeRegistrationDisabled | typeof ErrorCodeSetupLinkInvalid | typeof ErrorCodeNotFound | typeof ErrorCodeMethodNotAllowed | typeof ErrorCodeUsernameTaken | typeof ErrorCodeNameTaken | typeof ErrorCodePortInUse | typeof ErrorCodeLastAdmin | typeof ErrorCodeCannotModifySelf | typeof ErrorCodeJobInProgress | typeof ErrorCodeJobNotActive | typeof ErrorCodeSchemaMismatch | typeof ErrorCodeConflict | typeof ErrorCodeBadHost | typeof ErrorCodeRequestTooLarge | typeof ErrorCodeUnsupportedMediaType | typeof ErrorCodeRateLimited | typeof ErrorCodeInsufficientStorage | typeof ErrorCodeInternal | typeof ErrorCodeNotImplemented | typeof ErrorCodeUnavailable;
+export type ErrorCode = typeof ErrorCodeBadRequest | typeof ErrorCodeValidationFailed | typeof ErrorCodeInvalidCurrentPassword | typeof ErrorCodeUnauthenticated | typeof ErrorCodeInvalidCredentials | typeof ErrorCodeForbidden | typeof ErrorCodeSessionRequired | typeof ErrorCodeRegistrationDisabled | typeof ErrorCodeSetupLinkInvalid | typeof ErrorCodeNotFound | typeof ErrorCodeMethodNotAllowed | typeof ErrorCodeUsernameTaken | typeof ErrorCodeNameTaken | typeof ErrorCodePortInUse | typeof ErrorCodeLastAdmin | typeof ErrorCodeCannotModifySelf | typeof ErrorCodeJobInProgress | typeof ErrorCodeJobNotActive | typeof ErrorCodeSchemaMismatch | typeof ErrorCodeProfilingDisabled | typeof ErrorCodeProfileInProgress | typeof ErrorCodeConflict | typeof ErrorCodeBadHost | typeof ErrorCodeRequestTooLarge | typeof ErrorCodeUnsupportedMediaType | typeof ErrorCodeRateLimited | typeof ErrorCodeInsufficientStorage | typeof ErrorCodeInternal | typeof ErrorCodeNotImplemented | typeof ErrorCodeUnavailable;
 
 //////////
 // source: host.go
@@ -1652,6 +1663,16 @@ export interface Server {
    */
   inspector: boolean;
   inspector_active: boolean;
+  /**
+   * Profiling is the server's Profiling setting: when it is on, the game's
+   * admin listener serves Go profiles from the next (re)start
+   * (GOLEM_ADMIN_PROFILING=1), and GET /api/v1/servers/{id}/profile relays
+   * them. On by default. ProfilingActive is true when the server's current
+   * container was started that way (false without a container, and while
+   * Docker cannot be queried).
+   */
+  profiling: boolean;
+  profiling_active: boolean;
   created_at: string /* RFC 3339, UTC */;
   updated_at: string /* RFC 3339, UTC */;
 }
@@ -1674,7 +1695,7 @@ export interface ServerList {
  * to "stopped"; "running" starts a server.start job right after creation.
  * SnapshotIntervalSeconds is 0 or 10 to 86400 (default 300); BackupSchedule
  * defaults to off (see BackupSchedule for its ranges). Inspector defaults to
- * false.
+ * false, Profiling to true.
  */
 export interface CreateServerRequest {
   name: string;
@@ -1686,6 +1707,7 @@ export interface CreateServerRequest {
   snapshot_interval_seconds?: number /* int */;
   backup_schedule?: BackupSchedule;
   inspector?: boolean;
+  profiling?: boolean;
 }
 /**
  * UpdateServerRequest is the body of PATCH /api/v1/servers/{id}. Absent fields
@@ -1697,7 +1719,7 @@ export interface CreateServerRequest {
  * while the server's container is running is refused with 409 conflict
  * (stop the server first). SnapshotIntervalSeconds applies on the next
  * (re)start; BackupSchedule applies at once and never needs a restart.
- * Inspector applies on the next (re)start.
+ * Inspector and Profiling apply on the next (re)start.
  */
 export interface UpdateServerRequest {
   build_id?: number /* int64 */;
@@ -1708,6 +1730,7 @@ export interface UpdateServerRequest {
   snapshot_interval_seconds?: number /* int */;
   backup_schedule?: BackupSchedule;
   inspector?: boolean;
+  profiling?: boolean;
 }
 /**
  * ServerStats is the body of GET /api/v1/servers/{id}/stats: a single sample
@@ -1749,6 +1772,10 @@ export interface ServerSpec {
    * Inspector is the server's Inspector setting (false when absent).
    */
   inspector?: boolean;
+  /**
+   * Profiling is the server's Profiling setting (true when absent).
+   */
+  profiling?: boolean;
 }
 /**
  * ServerExport is the body of GET /api/v1/servers/export and of
@@ -1859,6 +1886,21 @@ export interface ServerConnectivity {
   test_origins: string[];
   test_origins_active: boolean;
 }
+/**
+ * ProfileKind is the kind query parameter of GET
+ * /api/v1/servers/{id}/profile: a CPU profile (?seconds 1 to 60, default
+ * 30) or an execution trace (?seconds 1 to 15, default 5), or the current
+ * heap, allocation or goroutine profile (no ?seconds).
+ */
+export const ProfileKindCPU = "cpu";
+export const ProfileKindTrace = "trace";
+export const ProfileKindHeap = "heap";
+export const ProfileKindAllocs = "allocs";
+export const ProfileKindGoroutine = "goroutine";
+/**
+ * Profile kinds.
+ */
+export type ProfileKind = typeof ProfileKindCPU | typeof ProfileKindTrace | typeof ProfileKindHeap | typeof ProfileKindAllocs | typeof ProfileKindGoroutine;
 
 //////////
 // source: system.go

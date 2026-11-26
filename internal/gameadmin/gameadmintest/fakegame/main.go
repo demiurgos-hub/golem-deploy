@@ -6,7 +6,8 @@
 // and GOLEM_TLS_KEY_FILE (reloaded when either file's size or modification
 // time changes, like golem/net), and the admin listener on GOLEM_ADMIN_ADDR
 // with bearer GOLEM_ADMIN_TOKEN (/live, /ready, /info, /stats, POST
-// /snapshot). With GOLEM_SNAPSHOT_DIR it keeps an entity snapshot there like
+// /snapshot, and GET /profile/{kind} with GOLEM_ADMIN_PROFILING=1, answering
+// a few fixed bytes). With GOLEM_SNAPSHOT_DIR it keeps an entity snapshot there like
 // the engine: world.snapshot (the engine's header with the game's schema
 // fingerprint) and content/state.txt, written to a hidden name and renamed,
 // on POST /snapshot and when it stops; at start it loads world.snapshot and
@@ -29,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -162,6 +164,7 @@ func main() {
 	}
 	token := os.Getenv("GOLEM_ADMIN_TOKEN")
 	neverReady := os.Getenv("FAKEGAME_NEVER_READY") == "1"
+	profiling := os.Getenv("GOLEM_ADMIN_PROFILING") == "1"
 	started := time.Now()
 	schema := "itest-fp-1"
 	if v := os.Getenv("FAKEGAME_SCHEMA"); v != "" {
@@ -267,6 +270,15 @@ func main() {
 					"tick": map[string]any{"tick": int(time.Since(started).Seconds() * 20), "rate": 20, "budget_ms": 50, "last_ms": 0.1, "max_ms": 0.5},
 				})
 			default:
+				if strings.HasPrefix(r.URL.Path, "/profile/") {
+					if !profiling {
+						writeJSON(w, 404, map[string]string{"error": "profiling_disabled"})
+						return
+					}
+					w.Header().Set("Content-Type", "application/octet-stream")
+					_, _ = w.Write([]byte{0x1f, 0x8b, 0x08, 0, 'f', 'a', 'k', 'e'})
+					return
+				}
 				writeJSON(w, 404, map[string]string{"error": "not_found"})
 			}
 		}),

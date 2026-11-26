@@ -4,6 +4,14 @@ All notable changes to Golem Deploy are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- Profiling: a per-server Profiling switch, on by default, sets `GOLEM_ADMIN_PROFILING=1` so the game's admin endpoint serves Go profiles (golem-engine with the admin profile endpoint). `GET /api/v1/servers/{id}/profile?kind=cpu|trace|heap|allocs|goroutine&seconds=N` captures one and answers with the file, and the server page has a capture form that downloads it. New error codes `profiling_disabled` and `profile_in_progress`.
+
+### Changed
+
+- Existing servers get the Profiling switch turned on by the upgrade, so a running server reports `restart_required` once until it is restarted.
+
 ## [0.1.0-rc.2] - 2026-11-26
 
 ### Added

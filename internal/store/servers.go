@@ -52,6 +52,8 @@ type Server struct {
 	BackupFailedAt *time.Time
 	// Inspector is the server's Inspector switch (off by default).
 	Inspector bool
+	// Profiling is the server's Profiling switch (on by default).
+	Profiling bool
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -66,7 +68,7 @@ const (
 // caller read it (a concurrent update won); the caller re-reads and retries.
 var ErrStale = errors.New("store: server changed concurrently")
 
-const serverCols = `id, name, build_id, port, env, desired_state, container_id, allowed_origins, admin_port, admin_token, pending_launch, start_complete, data_volume, data_fingerprint, snapshot_interval_seconds, backup_interval_hours, backup_keep, backup_failed_at, inspector, created_at, updated_at`
+const serverCols = `id, name, build_id, port, env, desired_state, container_id, allowed_origins, admin_port, admin_token, pending_launch, start_complete, data_volume, data_fingerprint, snapshot_interval_seconds, backup_interval_hours, backup_keep, backup_failed_at, inspector, profiling, created_at, updated_at`
 
 func scanServer(r scanner) (Server, error) {
 	var sv Server
@@ -75,7 +77,7 @@ func scanServer(r scanner) (Server, error) {
 	var origins, created, updated string
 	var backupFailed sql.NullString
 	if err := r.Scan(&sv.ID, &sv.Name, &buildID, &port, &sv.Env, &sv.DesiredState, &containerID, &origins, &adminPort, &sv.AdminToken, &sv.PendingLaunch, &sv.StartComplete,
-		&sv.DataVolume, &sv.DataFingerprint, &sv.SnapshotIntervalSeconds, &sv.BackupIntervalHours, &sv.BackupKeep, &backupFailed, &sv.Inspector, &created, &updated); err != nil {
+		&sv.DataVolume, &sv.DataFingerprint, &sv.SnapshotIntervalSeconds, &sv.BackupIntervalHours, &sv.BackupKeep, &backupFailed, &sv.Inspector, &sv.Profiling, &created, &updated); err != nil {
 		return Server{}, err
 	}
 	sv.BuildID = int64Ptr(buildID)
@@ -132,9 +134,9 @@ func insertServer(ctx context.Context, tx *sql.Tx, sv Server, now string) (Serve
 		sv.BackupKeep = DefaultBackupKeep
 	}
 	return scanServer(tx.QueryRowContext(ctx,
-		`INSERT INTO servers (name, build_id, port, env, desired_state, allowed_origins, snapshot_interval_seconds, backup_interval_hours, backup_keep, inspector, created_at, updated_at)
-		 VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING `+serverCols,
-		sv.Name, nullInt64(sv.BuildID), intPtrArg(sv.Port), sv.DesiredState, origins, sv.SnapshotIntervalSeconds, sv.BackupIntervalHours, sv.BackupKeep, sv.Inspector, now, now))
+		`INSERT INTO servers (name, build_id, port, env, desired_state, allowed_origins, snapshot_interval_seconds, backup_interval_hours, backup_keep, inspector, profiling, created_at, updated_at)
+		 VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING `+serverCols,
+		sv.Name, nullInt64(sv.BuildID), intPtrArg(sv.Port), sv.DesiredState, origins, sv.SnapshotIntervalSeconds, sv.BackupIntervalHours, sv.BackupKeep, sv.Inspector, sv.Profiling, now, now))
 }
 
 // CreateServer inserts sv (ID, ContainerID, admin and data fields and
@@ -277,6 +279,8 @@ type ServerUpdate struct {
 	BackupKeep              *int
 	// Inspector changes the server's Inspector switch.
 	Inspector *bool
+	// Profiling changes the server's Profiling switch.
+	Profiling *bool
 }
 
 // UpdateServer applies u to server id (UpdatedAt is set to now) and returns
@@ -382,6 +386,10 @@ func (s *Store) updateServer(ctx context.Context, tx *sql.Tx, id int64, u Server
 	if u.Inspector != nil {
 		sets = append(sets, "inspector = ?")
 		args = append(args, *u.Inspector)
+	}
+	if u.Profiling != nil {
+		sets = append(sets, "profiling = ?")
+		args = append(args, *u.Profiling)
 	}
 	if u.SetOrigins {
 		origins, err := originsArg(u.AllowedOrigins)

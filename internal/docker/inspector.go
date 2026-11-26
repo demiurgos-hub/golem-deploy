@@ -113,6 +113,7 @@ func (s HubSpec) Args(instance, envFilePath string) ([]string, error) {
 		"--label", LabelHelper + "=",
 		"--label", LabelInspector + "=",
 		"--label", LabelInspectorHub + "=" + ManagedValue,
+		"--label", LabelProfiling + "=",
 		// The hub is stateless; keep it serving across Docker restarts,
 		// like the daemon keeps it across its own restarts.
 		"--restart", "unless-stopped",

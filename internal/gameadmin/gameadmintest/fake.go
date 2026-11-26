@@ -1,6 +1,7 @@
 // Package gameadmintest is a fake Golem Engine admin endpoint for tests:
-// an httptest server on 127.0.0.1 that answers /ready, /info, /stats and
-// POST /snapshot like golem/host, and can misbehave like a hostile game.
+// an httptest server on 127.0.0.1 that answers /ready, /info, /stats,
+// POST /snapshot and GET /profile/{kind} like golem/host, and can misbehave
+// like a hostile game.
 package gameadmintest
 
 import (
@@ -59,6 +60,14 @@ type Server struct {
 	Snapshots       int
 	// OnBusy, when set, runs (without the lock) before a 409 answer.
 	OnBusy func()
+	// ProfileStatus is the status of GET /profile/{kind} (0: 200 with
+	// ProfileBody, by default a few gzip bytes, and ProfileContentType, by
+	// default application/octet-stream). OnProfile, when set, runs (without
+	// the lock) before the answer, e.g. to hold a capture open.
+	ProfileStatus      int
+	ProfileBody        []byte
+	ProfileContentType string
+	OnProfile          func()
 	// Auth records the Authorization header of every request.
 	Auth  []string
 	Paths []string
@@ -98,6 +107,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/snapshot" {
 		s.snapshot(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/profile/") {
+		s.profile(w, r)
 		return
 	}
 	s.mu.Lock()
@@ -166,6 +179,38 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 	}
+}
+
+func (s *Server) profile(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.Auth = append(s.Auth, r.Header.Get("Authorization"))
+	s.Paths = append(s.Paths, r.URL.RequestURI())
+	scheme, tok, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+	if scheme != "Bearer" || tok == "" || (s.ExpectToken != nil && tok != s.ExpectToken()) {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	status, body, ct, hook := s.ProfileStatus, s.ProfileBody, s.ProfileContentType, s.OnProfile
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	codes := map[int]string{http.StatusNotFound: "profiling_disabled", http.StatusConflict: "profile_in_progress",
+		http.StatusBadRequest: "invalid_profile", http.StatusServiceUnavailable: "not_ready"}
+	if status != 0 && status != http.StatusOK {
+		writeJSON(w, status, map[string]string{"error": codes[status], "message": "fake " + codes[status]})
+		return
+	}
+	if body == nil {
+		body = []byte{0x1f, 0x8b, 0x08, 0x00, 'p', 'r', 'o', 'f'}
+	}
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Disposition", `attachment; filename="profile"`)
+	_, _ = w.Write(body)
 }
 
 func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {

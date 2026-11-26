@@ -74,6 +74,11 @@ func serversError(what string, err error) error {
 		return conflict(apitypes.ErrorCodeConflict, "the "+what+" is in use")
 	case errors.Is(err, servers.ErrConflict):
 		return conflict(apitypes.ErrorCodeConflict, "the change conflicts with a concurrent change; retry")
+	case errors.Is(err, servers.ErrProfilingOff):
+		return conflict(apitypes.ErrorCodeProfilingDisabled,
+			"profiling is off for this server, its running container was started without it (restart the server), or its game's engine does not serve profiles")
+	case errors.Is(err, servers.ErrProfileInProgress):
+		return conflict(apitypes.ErrorCodeProfileInProgress, "a profile of this server is already being captured; wait for it to finish")
 	case errors.Is(err, servers.ErrAdminUnavailable):
 		e := newError(http.StatusServiceUnavailable, apitypes.ErrorCodeUnavailable,
 			"the game's admin endpoint did not answer; see the server log")
