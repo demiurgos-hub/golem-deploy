@@ -69,7 +69,7 @@ func Dockerfile(p *Plan, prm DockerfileParams) ([]byte, error) {
 	if !goVersionRE.MatchString(p.GoVersion) || !ValidEngineVersion(p.EngineVersion) {
 		return nil, fmt.Errorf("build: invalid version in plan")
 	}
-	for _, v := range append([]string{p.Root, p.ServerPackage, p.WebDir}, npmDirs(p)...) {
+	for _, v := range append([]string{p.Root, p.Module, p.ServerPackage, p.WebDir}, npmDirs(p)...) {
 		if _, err := cleanPath("plan", v, true); err != nil {
 			return nil, fmt.Errorf("build: invalid path in plan")
 		}
@@ -148,6 +148,9 @@ func Dockerfile(p *Plan, prm DockerfileParams) ([]byte, error) {
 		// The path passed cleanPath: no quoting or expansion is possible.
 		line(`RUN test -d %s || { echo "golem-deploy: the web client directory %s (web.dist) does not exist after the web build" >&2; exit 1; }`, p.WebDist, p.WebDist)
 	}
+	// The Go module may live below the game root (server.module); the
+	// server is listed and built there, with the package relative to it.
+	workdir(join(src, p.Module))
 	pkg := "."
 	if p.ServerPackage != "." {
 		pkg = "./" + p.ServerPackage

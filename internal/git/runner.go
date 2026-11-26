@@ -63,6 +63,15 @@ type Options struct {
 	// have before a clone, pull or branch switch starts (ReasonDiskSpace
 	// otherwise). 0 means DefaultMinFreeSpace; negative disables the check.
 	MinFreeSpace int64
+	// LFSInclude, when set, is called with the checkout directory after a
+	// commit was checked out and before "git lfs pull" (only when the tree
+	// uses Git LFS). It returns the Git LFS path patterns to download (nil
+	// for all) from the repository's golem-deploy.yaml; the daemon passes
+	// build.LFSInclude, which reads the untrusted file through a contained
+	// reader. Its errors must have user-safe text: the operation fails with
+	// ReasonDeployConfig and shows it (sanitised and clipped). Patterns are
+	// checked again here before they become an argument.
+	LFSInclude func(dir string) ([]string, error)
 
 	sizeInterval       time.Duration // tests only; 0 means sizeCheckInterval
 	skipLFSConfigCheck bool          // tests only: exercise the LFS endpoint pin alone
@@ -84,6 +93,7 @@ type Runner struct {
 	sizeInterval   time.Duration
 	skipLFSCheck   bool
 	noLFSPin       bool
+	lfsInclude     func(dir string) ([]string, error)
 
 	lfsOnce sync.Once
 	lfsOK   bool
@@ -152,6 +162,7 @@ func New(o Options) (*Runner, error) {
 		sizeInterval:   o.sizeInterval,
 		skipLFSCheck:   o.skipLFSConfigCheck,
 		noLFSPin:       o.noLFSPin,
+		lfsInclude:     o.LFSInclude,
 	}, nil
 }
 

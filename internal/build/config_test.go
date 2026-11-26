@@ -14,7 +14,7 @@ func TestParseConfigDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: %v", in, err)
 		}
-		if !reflect.DeepEqual(cfg, Config{Root: "."}) {
+		if !reflect.DeepEqual(cfg, Config{Root: ".", Server: ServerConfig{Module: "."}}) {
 			t.Fatalf("%q: %+v", in, cfg)
 		}
 	}
@@ -36,7 +36,7 @@ web:
 	}
 	want := Config{
 		Root:   "games/arena",
-		Server: ServerConfig{Package: "cmd/arena", Args: []string{"-assets", "web/dist", `--name=it's "quoted"`}},
+		Server: ServerConfig{Module: ".", Package: "cmd/arena", Args: []string{"-assets", "web/dist", `--name=it's "quoted"`}},
 		Web:    WebConfig{Dir: "client", Build: []string{"npm", "run", "build:prod"}, Dist: "client/dist"},
 	}
 	if !reflect.DeepEqual(cfg, want) {
