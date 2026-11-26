@@ -4,6 +4,8 @@ All notable changes to Golem Deploy are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.1.0-rc.3] - 2026-11-26
+
 ### Added
 
 - Profiling: a per-server Profiling switch, on by default, sets `GOLEM_ADMIN_PROFILING=1` so the game's admin endpoint serves Go profiles (golem-engine with the admin profile endpoint). `GET /api/v1/servers/{id}/profile?kind=cpu|trace|heap|allocs|goroutine&seconds=N` captures one and answers with the file, and the server page has a capture form that downloads it. New error codes `profiling_disabled` and `profile_in_progress`.
@@ -41,6 +43,7 @@ The first release candidate.
 - The Golem Inspector hub as a managed container, opened through one-time links from the panel.
 - Static file store, image and volume management, and a web client that covers the path from a repository to a running game.
 
-[Unreleased]: https://github.com/demiurgos-hub/golem-deploy/compare/v0.1.0-rc.2...HEAD
+[Unreleased]: https://github.com/demiurgos-hub/golem-deploy/compare/v0.1.0-rc.3...HEAD
+[0.1.0-rc.3]: https://github.com/demiurgos-hub/golem-deploy/releases/tag/v0.1.0-rc.3
 [0.1.0-rc.2]: https://github.com/demiurgos-hub/golem-deploy/releases/tag/v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/demiurgos-hub/golem-deploy/releases/tag/v0.1.0-rc.1
