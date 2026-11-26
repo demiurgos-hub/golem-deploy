@@ -4,7 +4,9 @@ All notable changes to Golem Deploy are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
-The first release.
+## [0.1.0-rc.1] - 2026-11-26
+
+The first release candidate.
 
 ### Added
 
@@ -20,4 +22,5 @@ The first release.
 - The Golem Inspector hub as a managed container, opened through one-time links from the panel.
 - Static file store, image and volume management, and a web client that covers the path from a repository to a running game.
 
-[Unreleased]: https://github.com/demiurgos-hub/golem-deploy/commits/main
+[Unreleased]: https://github.com/demiurgos-hub/golem-deploy/compare/v0.1.0-rc.1...HEAD
+[0.1.0-rc.1]: https://github.com/demiurgos-hub/golem-deploy/releases/tag/v0.1.0-rc.1
